@@ -71,6 +71,13 @@ DOCUMENTED_EXIT_TOKENS = {
     "resident_prefix_insufficient",
     "tenant_limit",
     "prefill_thrash_cooldown",
+    # Thrash-gate refusal, request-scoped half (LP-0MVXSSYTN001TBW5): this very
+    # request already had a local dispatch cancelled post-deadline, so local is
+    # terminal for it. A deferral, not a fault.
+    "post_deadline_terminal",
+    # Reason-scoped local 5xx release (LP-0MVWFKESK0005G61): the measured
+    # cache-deficit abort detours the request without quarantining the entry.
+    "measured_cache_deficit",
     # Contention queue.
     "fallback_after_queue",
     "local_concurrency_limit",
@@ -79,6 +86,10 @@ DOCUMENTED_EXIT_TOKENS = {
     # Structural refusals.
     "local_only_no_local_route",
     "local_route_unavailable",
+    # Bounded deferral (LP-0MVUH9PL0005PW90): the session spent its
+    # retryable-refusal budget, so the pin is declined and a remote tier serves
+    # the request. A promotion with its own token — not a capacity reason.
+    "deferral_refusals_exhausted",
 }
 
 
@@ -197,20 +208,36 @@ def test_no_local_route_is_documented_as_a_refusal_not_a_fall_through():
 
 
 def test_response_headers_section_keeps_the_other_two_preferences_accurate():
-    """prefer-local unchanged / remote-ok structural, per the X-Local-Route docs."""
+    """The default falls through / no preference strips, per the X-Local-Route
+    docs.
+
+    The section must state that the default (``remote-ok``, which an absent
+    header resolves to) falls through **and** that the only chain-level strip is
+    the capacity filter — a ``remote-ok`` request keeps the local route
+    (LP-0MVUH9OYZ007GMWF AC1/AC5), so a sentence claiming the preference removes
+    local entries fails here. Since LP-0MVUH9PUU005HVS4 ``prefer-local`` is
+    retired, so the default is the value that sentence must name.
+    """
     text = ROUTING_DOC.read_text()
 
     headers = text[text.index("### Response headers") :]
     headers = headers[: headers.index("### Per-reason retry contract")]
     # Line wrapping is not part of the contract: compare on normalised prose.
     plain = " ".join(headers.split())
-    assert "`prefer-local` (the default) keeps today's behaviour unchanged" in plain, (
-        "the response-header section must state that prefer-local falls through "
-        "exactly as before"
+    assert (
+        "`remote-ok` (the default, and what an absent header resolves to) keeps "
+        "the local route" in plain
+    ), (
+        "the response-header section must name the live default and state that "
+        "it keeps the local route and falls through"
     )
-    assert "removed from the chain *before* dispatch" in plain, (
-        "the response-header section must state that remote-ok strips local "
-        "structurally"
+    assert "The only chain-level strip that exists is the capacity filter" in plain, (
+        "the response-header section must re-anchor stripping on the capacity "
+        "verdict — no preference removes a local entry"
+    )
+    assert "so a `remote-ok` request reaches a local-route exit exactly like an " in plain, (
+        "the response-header section must state that remote-ok keeps the local "
+        "route (its name is historic)"
     )
 
 
@@ -245,12 +272,21 @@ def test_promoting_rows_are_exactly_the_implementation_too_large_reasons():
     outcomes = _documented_outcomes(_section(ROUTING_DOC.read_text()))
     promoting = {token for token, outcome in outcomes.items() if outcome == "promoting"}
 
-    assert promoting == set(admission_reserve.CAPACITY_TOO_LARGE_REASONS), (
-        "routing.md must mark exactly the implementation's too-large reasons as "
+    # Two promotion *causes* exist and both must read as promoting: the
+    # capacity verdict (this prompt can never fit local) and the bounded
+    # deferral (this session has been told to retry too many times). The
+    # equivalence stays exact in both directions — a new promoting row that is
+    # neither fails here, and a cause that stops promoting fails too
+    # (LP-0MVUH9PL0005PW90).
+    expected_promoting = set(admission_reserve.CAPACITY_TOO_LARGE_REASONS) | {
+        admission_reserve.LOCAL_FALLBACK_DEFERRAL_EXHAUSTED
+    }
+    assert promoting == expected_promoting, (
+        "routing.md must mark exactly the implementation's promotion reasons as "
         "promoting; documented-but-not-implemented="
-        f"{sorted(promoting - set(admission_reserve.CAPACITY_TOO_LARGE_REASONS))} "
+        f"{sorted(promoting - expected_promoting)} "
         "implemented-but-not-documented="
-        f"{sorted(set(admission_reserve.CAPACITY_TOO_LARGE_REASONS) - promoting)}"
+        f"{sorted(expected_promoting - promoting)}"
     )
     # AC3 names the two promoting exits explicitly.
     assert {"context_too_large", "prefill_budget_exceeded"} <= promoting, (
@@ -337,4 +373,113 @@ def test_response_headers_document_promotion_and_the_unstrippable_chain():
     assert "no non-local entry" in plain and "is never stripped" in plain, (
         "the X-Local-Route section must state that a chain with no non-local "
         "entry is never stripped (it keeps deferring/refusing)"
+    )
+
+
+def test_refusal_line_fields_and_the_fallback_claim_are_documented():
+    """LP-0MVNTJQVB007QWEZ AC2/AC3: the countable token, its context fields and
+    the truthful fallback claim are documented where operators look.
+
+    An operator counts this failure class by one token, so the prose must name
+    that token and the fields that make a refusal attributable; and it must
+    state that the ``… → routing to next provider`` line belongs to a real
+    fall-through only — otherwise the docs would bless the false claim this
+    item removed.
+    """
+    section = _section(ROUTING_DOC.read_text())
+
+    for field in (
+        "local_only_refused",
+        "route=refused",
+        "session=",
+        "provider=",
+        "priority=",
+        "new_tokens=",
+        "budget_tokens=",
+        "eta_prefill_seconds=",
+        "budget_seconds=",
+    ):
+        assert field in section, (
+            f"the refusal-line contract must document {field!r} — an operator "
+            "cannot count what the docs do not name (AC2/AC3)"
+        )
+
+    fallback_lines = [
+        line
+        for line in section.splitlines()
+        if "local_admission_guard_direct_fallback" in line
+    ]
+    assert fallback_lines, (
+        "the direct-guard dispatch line must stay documented"
+    )
+    assert any("real fall-through" in line for line in fallback_lines) or any(
+        "only" in line.lower() and "fall" in line.lower()
+        for line in fallback_lines
+    ), (
+        "the docs must state that the '→ routing to next provider' line is "
+        "emitted only on a real fall-through (AC1)"
+    )
+
+
+#: Heading of the worked-example subsection that shows the reproduced incident
+#: (LP-0MVNTJQVB007QWEZ AC5).
+WORKED_EXAMPLE_HEADING = "**Worked example"
+
+#: The 2026-10-25 refusal's session id — the case the example reproduces.
+INCIDENT_REFUSAL_SESSION = "herdr-1792897705-4039879-16152"
+
+#: The test that reproduces the incident end-to-end (and asserts the example is
+#: the exact line it emits).
+REPRODUCTION_TEST = (
+    "test_direct_guard_pin_refusal_is_attributable_and_claims_no_fallback"
+)
+
+
+def _worked_example_block(section: str) -> str:
+    """The fenced log block of the worked example, fences stripped."""
+    rest = section[section.index(WORKED_EXAMPLE_HEADING) :]
+    fence_start = rest.index("```")
+    fence_end = rest.index("```", fence_start + 3)
+    return rest[fence_start + 3 : fence_end]
+
+
+def test_worked_example_shows_the_reproduced_incident_log_output():
+    """LP-0MVNTJQVB007QWEZ AC5: the incident's output is written down.
+
+    "Reproducible in a test" is only verifiable if the output an operator
+    actually sees is recorded next to the reproducer: the worked example must
+    show the refusal line for the 2026-10-25 session, name the test that
+    reproduces it, and — because the refusal was never routed anywhere — claim
+    no fall-through inside the example. (The reproducer additionally asserts
+    the example *is* the line it emits, so the sample cannot be invented.)
+    """
+    section = _section(ROUTING_DOC.read_text())
+    block = _worked_example_block(section)
+
+    assert INCIDENT_REFUSAL_SESSION in block, (
+        "the worked example must show the log output of the 2026-10-25 "
+        f"incident (session {INCIDENT_REFUSAL_SESSION}); got {block!r}"
+    )
+    example_lines = [line.strip() for line in block.splitlines() if line.strip()]
+    assert any(
+        line.startswith("local_only_refused ")
+        and f"session={INCIDENT_REFUSAL_SESSION}" in line
+        for line in example_lines
+    ), (
+        "the worked example must show the countable refusal line for the "
+        f"incident; got {example_lines!r}"
+    )
+    assert any(
+        line.startswith("local_admission_guard decision=reject") for line in example_lines
+    ), (
+        "the worked example must also show the guard decision line the refusal "
+        f"accompanies; got {example_lines!r}"
+    )
+    assert "routing to next provider" not in block, (
+        "the worked example must not show a fall-through claim for a refused "
+        f"request — nothing was routed; got {block!r}"
+    )
+    assert REPRODUCTION_TEST in section, (
+        f"the worked example must name its reproducer ({REPRODUCTION_TEST}) "
+        "so an operator can regenerate the output"
     )

@@ -1,4 +1,5 @@
 #!/bin/sh
-# worklog:post-pull-hook:v1
-# Wrapper that delegates to central Worklog post-pull script (committed hooks).
-exec "/home/rgardler/projects/llm-manager/.githooks/worklog-post-pull" "$@"
+# worklog:post-pull-hook:v2
+# Delegate to this repository's Worklog post-pull sync script (repo-owned).
+# Set WORKLOG_SKIP_POST_PULL=1 to bypass (see .githooks/worklog-post-pull).
+exec "$(git rev-parse --show-toplevel)/.githooks/worklog-post-pull" "$@"

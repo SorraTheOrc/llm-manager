@@ -40,6 +40,13 @@ HTTP JSON parsing and URL building patterns found in both
   liveness signal llama.cpp b8782 still exposes), used by the
   prefill-progress dispatch-lease extension (LP-0MSE05J53004C6EL,
   LP-0MSUO5Z0K007HBSS).
+- ``_sample_slot_occupancy(srv)`` / ``_slot_metrics_loop()`` — slot-occupancy
+  sampler (LP-0MVT1O0VG00905EL): publishes total/busy/per-slot/in-flight slot
+  gauges and a last-successful-sample heartbeat on the proxy's ``/metrics``,
+  sampling through the coalesced path at
+  ``server.llama_slot_metrics_interval_seconds`` (default 10 s). A failed
+  ``/slots`` query publishes nothing, so a gap is visible instead of looking
+  like an idle GPU.
 
 See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
@@ -80,6 +87,10 @@ backend_signal_counts: dict = {
     # Per-entry ``max_context_tokens`` ceiling skip (LP-0MVF9N3BV00155RI):
     # mirrors ``context_too_large``; a size mismatch, never a failure signal.
     "provider_context_exceeded": 0,
+    # Downstream write stall: the client stopped draining its socket and the
+    # response was abandoned after the write-progress deadline
+    # (LP-0MVWZ9CH6006NW1H). Not a backend failure — a wedged/absent reader.
+    "client_stall": 0,
 }
 
 
@@ -516,6 +527,33 @@ async def _fetch_slots_payload(
     )
 
 
+def _resolve_slots_model_id(model: str | None) -> str:
+    """Return *model*, or a cached ``/models``-derived id when none was given.
+
+    Guarantees every proxy ``/slots`` request carries ``?model=``
+    (LP-0MVP7HV7Q001AJF8 AC2): the three query helpers append it
+    unconditionally, so a model-less request is unreachable. Resolution is
+    cache-only on this (sync) path —
+    :func:`proxy.router_helpers.resolve_local_model_id` never performs HTTP;
+    the async dispatch path warms the ``/models`` snapshot with
+    ``ensure_router_model_ids``, keeping the hot path round-trip free
+    (LP-0MVU7ZZIA0092AXW).
+    """
+    explicit = str(model).strip() if model is not None else ""
+    if explicit:
+        return explicit
+    try:
+        from proxy.router_helpers import (
+            LAST_RESORT_MODEL_ID,
+            resolve_local_model_id,
+        )
+
+        resolved, _source = resolve_local_model_id(_srv())
+        return resolved or LAST_RESORT_MODEL_ID
+    except Exception:
+        return "Qwen3"
+
+
 async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None,
     base_url: str | None = None,
@@ -553,10 +591,9 @@ async def _query_slots(
     truthful (LP-0MVKSXR4P001V0CM AC3).
     """
     try:
+        resolved_model = _resolve_slots_model_id(model)
         url = _build_llama_url(llama_port, "/slots", base_url=base_url)
-
-        if model:
-            url = f"{url}?model={model}"
+        url = f"{url}?model={resolved_model}"
         # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls behind a
         # short TTL so N status pollers produce a bounded number of upstream
         # requests (not N per interval).
@@ -691,10 +728,11 @@ async def _query_slots_detail(
     Returns an empty list on any failure (HTTP error, connection error,
     timeout, or unexpected response shape).
     """
+    resolved_model = _resolve_slots_model_id(model)
+    url = ""
     try:
         url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
-        if model:
-            url = f"{url}?model={model}"
+        url = f"{url}?model={resolved_model}"
         if _client is not None:
             slots_resp = await _client.get(url)
             if slots_resp.status_code == 200:
@@ -730,11 +768,220 @@ async def _query_slots_detail(
             return result
     except Exception as exc:
         _srv().logger.debug(
-            "Slot detail query failed [%s] for %s?model=%s: %s",
-            type(exc).__name__, _build_llama_url(llama_port, "/slots"),
-            model or "(none)", exc,
+            "Slot detail query failed [%s] for %s: %s",
+            type(exc).__name__, url, exc,
         )
     return []
+
+
+# ===================================================================
+# Slot-occupancy sampling for Prometheus (LP-0MVT1O0VG00905EL)
+#
+# Power/VRAM/GTT reach Prometheus through node_exporter, but nothing published
+# llama-server *workload*, so "the GPU drew 115 W" could not be attributed to
+# llama-server. The proxy is the only component with a working /slots path
+# (child-port discovery, single-flight coalescing, failure counter), so the
+# sampler lives here rather than in a second host-side poller.
+#
+# Two hard requirements shape this code:
+#
+#   1. **Reuse the coalesced path.** A dedicated /slots client would multiply
+#      upstream requests on an endpoint that has already produced 1 392 timeout
+#      failures on this host, so every sample goes through
+#      ``_fetch_slots_payload()`` (1 s TTL, single-flight, 5 s failure backoff)
+#      targeting the discovered child port via ``_resolve_local_slots_target()``.
+#   2. **A failed query publishes nothing.** ``record_slot_occupancy(None)``
+#      leaves every gauge untouched; the heartbeat
+#      ``llama_slots_sample_timestamp_seconds`` therefore stops advancing, which
+#      is what makes a gap queryable instead of invisible.
+# ===================================================================
+
+DEFAULT_SLOT_METRICS_INTERVAL_SECONDS = 10.0
+"""Default sampler cadence (``server.llama_slot_metrics_interval_seconds``).
+
+One sample per 10 s bounds the added upstream load to less than the existing
+model-health loop's cadence, and Prometheus scrapes at 15 s so the extra
+resolution is not wasted.
+"""
+
+_SLOT_METRICS_TIMEOUT_SECONDS = 2.0
+"""``/slots`` budget for one sampler fetch — the existing 2 s default.
+
+Deliberately not configurable: the sampler must never extend the timeout budget
+of the status/progress paths that share the coalesced fetch.
+"""
+
+
+def _slot_metrics_interval_seconds(server_cfg: dict | None = None) -> float:
+    """Resolve the sampler cadence from the ``server`` config section.
+
+    Args:
+        server_cfg: The config's ``server`` mapping (or ``None``/``{}`` when
+            absent).
+
+    Returns:
+        The configured interval in seconds. An absent or malformed value falls
+        back to :data:`DEFAULT_SLOT_METRICS_INTERVAL_SECONDS`; a value ``<= 0``
+        means "disabled" and is returned as ``0.0`` (distinguishable from the
+        default so an explicit opt-out is honoured rather than silently
+        replaced by 10 s).
+    """
+    if not isinstance(server_cfg, dict):
+        return DEFAULT_SLOT_METRICS_INTERVAL_SECONDS
+    raw = server_cfg.get("llama_slot_metrics_interval_seconds")
+    if raw is None:
+        return DEFAULT_SLOT_METRICS_INTERVAL_SECONDS
+    try:
+        interval = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SLOT_METRICS_INTERVAL_SECONDS
+    return max(0.0, interval)
+
+
+async def _fetch_slots_payload_for_sampler(
+    url: str, timeout: float
+) -> tuple[list | None, str | None]:
+    """Fetch one ``/slots`` payload for the sampler, classifying failures.
+
+    Returns ``(payload, None)`` on a healthy 200 list body, else
+    ``(None, reason)`` where *reason* is the label the existing
+    ``llama_slots_query_failures_total{reason=...}`` counter uses
+    (``http_<code>``, ``timeout``, ``connection_error``, ``invalid_payload``,
+    ``unknown``).
+
+    The classification mirrors ``_query_slots()`` on purpose: the sampler needs
+    the raw list (per-slot ``is_processing`` / ``id_task``) rather than the
+    ``(available, total)`` tuple, so it calls the shared coalesced fetch itself
+    and must keep the failure vocabulary identical for the alert to work.
+    """
+    try:
+        status, data = await _fetch_slots_payload(url, timeout, None)
+    except TimeoutError:
+        return None, "timeout"
+    except Exception as exc:
+        if isinstance(exc, (ConnectionError, OSError)):
+            return None, "connection_error"
+        return None, "unknown"
+    if status != 200:
+        return None, f"http_{status}"
+    if not isinstance(data, list):
+        return None, "invalid_payload"
+    return data, None
+
+
+async def _sample_slot_occupancy(srv) -> dict | None:
+    """Take one slot-occupancy sample, or ``None`` when ``/slots`` failed.
+
+    Targets the discovered local child port (the router serialises
+    ``/slots?model=...`` behind the busy child and answers 500 to a cancelled
+    proxied poll) and goes through the coalesced fetch, so the sampler adds no
+    new HTTP client and no new request volume beyond its interval.
+
+    On failure the existing failure counter is incremented and ``None`` is
+    returned — the caller must publish nothing (never zero busy slots).
+    """
+    from proxy.metrics import summarise_slot_occupancy
+
+    config = getattr(srv, "config", None) or {}
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    try:
+        llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+    except (TypeError, ValueError):
+        llama_port = 8080
+    model = getattr(srv, "current_model", None) or None
+
+    try:
+        from proxy.router_helpers import _resolve_local_slots_target
+
+        # Filter to the current model so the sample does not describe the idle
+        # embedding child while the chat model is the one doing work.
+        _, llama_port = _resolve_local_slots_target(
+            srv, model=model, router_port=llama_port
+        )
+    except Exception:
+        # Discovery is best-effort: fall back to the router port and let the
+        # fetch below report the outcome (a failure still publishes nothing).
+        pass
+
+    url = _build_llama_url(llama_port, "/slots")
+    # Never model-less: the router answers a bare /slots with HTTP 400, so a
+    # missing current_model is filled from the cached /models resolution
+    # (slice 4, LP-0MVU7ZZIA0092AXW).
+    url = f"{url}?model={_resolve_slots_model_id(model)}"
+
+    payload, reason = await _fetch_slots_payload_for_sampler(
+        url, _SLOT_METRICS_TIMEOUT_SECONDS
+    )
+    if payload is None:
+        _record_slots_query_failure(reason or "unknown")
+        return None
+    return summarise_slot_occupancy(payload, sampled_at=time.time())
+
+
+async def _slot_metrics_loop(
+    interval_seconds: float | None = None, srv=None
+) -> None:
+    """Refresh the slot-occupancy gauges on a fixed interval.
+
+    Takes one sample immediately so the first Prometheus scrape after a proxy
+    restart already sees occupancy, then repeats every *interval_seconds*.
+
+    Args:
+        interval_seconds: Cadence override; resolved from
+            ``server.llama_slot_metrics_interval_seconds`` when ``None``. A value
+            ``<= 0`` disables sampling and returns immediately.
+        srv: Server module stand-in (tests); defaults to the live
+            ``proxy.server`` module.
+
+    Never lets a sample failure escape: an exception is swallowed so one bad
+    iteration cannot cancel the sampler (or the proxy's lifespan) — the gauge
+    values simply stay at the previous successful sample.
+    """
+    if srv is None:
+        srv = _srv()
+    if interval_seconds is None:
+        config = getattr(srv, "config", None) or {}
+        server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+        interval_seconds = _slot_metrics_interval_seconds(server_cfg)
+
+    logger = getattr(srv, "logger", None)
+    if interval_seconds <= 0:
+        if logger is not None:
+            logger.info(
+                "Slot occupancy sampler disabled "
+                "(server.llama_slot_metrics_interval_seconds=%s)",
+                interval_seconds,
+            )
+        return
+
+    if logger is not None:
+        logger.info(
+            "Slot occupancy sampler started (interval %.1fs)", interval_seconds
+        )
+
+    while True:
+        try:
+            snapshot = await _sample_slot_occupancy(srv)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A sampler bug must not take the proxy down; the gauges keep their
+            # last successful values and the failure counter stays untouched
+            # (only classified /slots failures are counted there).
+            if logger is not None:
+                logger.debug(
+                    "Slot occupancy sample failed [%s]: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            snapshot = None
+        try:
+            from proxy.metrics import record_slot_occupancy
+
+            record_slot_occupancy(snapshot)
+        except Exception:
+            pass
+        await asyncio.sleep(interval_seconds)
 
 
 async def _query_slots_progress(
@@ -769,10 +1016,11 @@ async def _query_slots_progress(
 
     Pass ``_client`` only in tests to avoid real HTTP.
     """
+    resolved_model = _resolve_slots_model_id(model)
+    url = ""
     try:
         url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
-        if model:
-            url = f"{url}?model={model}"
+        url = f"{url}?model={resolved_model}"
         if _client is not None:
             slots_resp = await _client.get(url)
             if slots_resp.status_code == 200:
@@ -799,7 +1047,7 @@ async def _query_slots_progress(
     except Exception as exc:
         _srv().logger.debug(
             "Slot progress query failed [%s] for %s: %s",
-            type(exc).__name__, _build_llama_url(llama_port, "/slots", base_url=endpoint), exc,
+            type(exc).__name__, url, exc,
         )
     return {}
 
@@ -1774,6 +2022,183 @@ def downgrade_stale_capacity_hint(
     return CAPACITY_PREFILL_BOUND
 
 
+# ---------------------------------------------------------------------------
+# Local-route availability (LP-0MVWFKIKJ005XHAY — parent LP-0MVWEZCB0006WPBQ AC10)
+#
+# ``capacity_hint`` above answers "is the ENGINE busy?". A consumer also needs
+# "is the ROUTE armed?" — the two are independent: on 2026-10-31 the local
+# entry was quarantined for 60 s at a time (217 arms / 5.5 h, 100 % of local
+# attempts refused) while ``/llama/local/status`` kept serving
+# ``available_slots: 2, capacity_hint: idle``. The herdr downtime dispatcher
+# reads only slot counts, so it dispatched an audit into a poisoned route.
+#
+# The tokens below are canonical members of
+# ``admission_reserve.LOCAL_FALLBACK_REASON_TOKENS`` — the single vocabulary
+# shared with the ``X-Local-Fallback-Reason`` header and the routing log lines
+# — so a consumer sees the same spelling on the status payload as on the
+# response header (LP-0MVRMC1W6003MV3Y AC1).
+# ---------------------------------------------------------------------------
+
+#: The local provider entry is inside a cooldown window (chain-resolution skip).
+LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN = "local_provider_cooldown"
+
+#: The local provider entry is outside its configured ``available_times``.
+LOCAL_ROUTE_REASON_OUTSIDE_WINDOW = "outside_available_window"
+
+
+def local_provider_entries(config: dict | None) -> list[dict]:
+    """Every ``type: local`` provider entry declared by *config*, deduplicated.
+
+    ``/llama/local/status`` is model-agnostic while local entries live inside
+    each model's ``providers`` list (``local-qwen3`` is referenced by several
+    models), so the distinct entry names are collected across every model in
+    declaration order. A missing/unreadable config yields ``[]`` — the caller's
+    payload then stays well-formed and absent-safe (AC10b).
+    """
+    entries: list[dict] = []
+    seen: set[str] = set()
+    models = config.get("models") if isinstance(config, dict) else None
+    if not isinstance(models, dict):
+        return entries
+    for model_cfg in models.values():
+        providers = model_cfg.get("providers") if isinstance(model_cfg, dict) else None
+        if not isinstance(providers, (list, tuple)):
+            continue
+        for entry in providers:
+            if not isinstance(entry, dict) or entry.get("type") != "local":
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name or name in seen:
+                continue
+            seen.add(name)
+            entries.append(entry)
+    return entries
+
+
+def _local_entry_serves_model(entry: dict, model: str) -> bool:
+    """True when *entry* serves the local model id *model*.
+
+    ``llama_model`` is matched case-insensitively, tolerating the preset/alias
+    mismatch the child-port resolver already tolerates (``Qwen3-32B`` vs the
+    log's ``Qwen3``): equal, or one a prefix of the other on a ``-`` boundary.
+    Without this filter the embed entry (``mxbai-embed``) would decide the chat
+    route's availability — and vice versa.
+    """
+    llama_model = entry.get("llama_model")
+    if not isinstance(llama_model, str) or not llama_model:
+        return False
+    candidate = llama_model.strip().lower()
+    target = model.strip().lower()
+    if not candidate or not target:
+        return False
+    return (
+        candidate == target
+        or candidate.startswith(target + "-")
+        or target.startswith(candidate + "-")
+    )
+
+
+def local_route_availability(config: dict | None, model: str | None = None) -> dict:
+    """Read-only snapshot of the local route's *routing* availability (AC10).
+
+    Answers the question a slot count cannot: would the routing chain accept
+    the local route right now, and if not, why? The values are read from the
+    existing armed-state helpers — ``_entry_cooldown_key`` /
+    ``_provider_cooldown_remaining`` (the exact predicate the chain-resolution
+    skip uses) and ``_provider_failure_count`` — at request time. Nothing here
+    is a gate: the proxy's own routing decision never reads this function
+    (AC10c), and no new timer or poll is introduced.
+
+    *model* is the local model id the status payload is reporting on
+    (``current_model``). When it matches at least one declared local entry,
+    only those entries are judged, so the embed route and the chat route never
+    decide each other's availability. With no resolvable model the whole local
+    entry set is judged (fail-open, still truthful about arms that are known).
+
+    Returns::
+
+        {"local_route_available": bool,
+         "local_route_reason": str | None,   # canonical fallback token
+         "local_route_cooldown_remaining_s": int | None,
+         "local_route_failure_count": int}   # log-only evidence
+
+    Semantics (judged over the selected entries):
+
+    * **Any** eligible entry → ``True`` / ``None`` / ``None``. A multi-backend
+      model with one armed entry still has a usable local route, so this never
+      reports a false "unavailable".
+    * No eligible entry, at least one armed → ``False`` /
+      ``local_provider_cooldown`` / the **shortest** remaining arm, i.e. how
+      long until the route becomes usable again. A cooldown takes precedence
+      over a window because it is the actionable (waitable) reason.
+    * No eligible entry, none armed, at least one outside its
+      ``available_times`` → ``False`` / ``outside_available_window`` /
+      ``None`` (a window is not a cooldown, so no fabricated ``0``).
+    * No local entry at all (or unresolvable config) → ``True`` / ``None`` /
+      ``None``: absent-safe, never a fabricated cooldown.
+
+    Engine health (``llama_server_running``, ``capacity_hint``) is deliberately
+    *not* folded in: the whole point is to distinguish "engine busy" from
+    "route armed".
+    """
+    snapshot = {
+        "local_route_available": True,
+        "local_route_reason": None,
+        "local_route_cooldown_remaining_s": None,
+        "local_route_failure_count": 0,
+    }
+    try:
+        from proxy import provider as _provider
+
+        entries = local_provider_entries(config)
+    except Exception:  # pragma: no cover - defensive: payload stays well-formed
+        return snapshot
+    if not entries:
+        return snapshot
+
+    if isinstance(model, str) and model.strip():
+        serving = [e for e in entries if _local_entry_serves_model(e, model)]
+        if serving:
+            entries = serving
+
+    eligible = 0
+    armed_remaining: list[int] = []
+    outside_window = False
+    failure_count = 0
+    for entry in entries:
+        try:
+            name = entry.get("name")
+            failures = _provider._provider_failure_count.get(name, 0)
+            if isinstance(failures, int) and not isinstance(failures, bool):
+                failure_count = max(failure_count, failures)
+            cooldown_key = _provider._entry_cooldown_key(entry)
+            if cooldown_key is not None:
+                remaining = _provider._provider_cooldown_remaining(cooldown_key)
+                if remaining > 0:
+                    armed_remaining.append(remaining)
+                    continue
+            if not _provider._provider_in_allowed_window(entry, config):
+                outside_window = True
+                continue
+            eligible += 1
+        except Exception:
+            # One unreadable entry must never break the whole payload: the
+            # remaining entries still contribute their evidence.
+            continue
+
+    snapshot["local_route_failure_count"] = failure_count
+    if eligible:
+        return snapshot
+    if armed_remaining:
+        snapshot["local_route_available"] = False
+        snapshot["local_route_reason"] = LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN
+        snapshot["local_route_cooldown_remaining_s"] = min(armed_remaining)
+    elif outside_window:
+        snapshot["local_route_available"] = False
+        snapshot["local_route_reason"] = LOCAL_ROUTE_REASON_OUTSIDE_WINDOW
+    return snapshot
+
+
 def _build_status_slot_owners(srv) -> dict[int, dict]:
     """Map llama-server slot_id -> the dispatch lease reserving it.
 
@@ -1859,21 +2284,71 @@ def annotate_slots_for_status(
     """Annotate compact ``/slots`` dicts with capacity fields (AC2/AC3/AC5).
 
     Adds, per slot: ``owner_session_id``, ``lease_state``, ``phase``,
-    ``context_tokens``, ``prefill_eta_seconds`` and the abandonment annotation
+    ``context_tokens``, ``prefill_eta_seconds``, and its labelling
+    (``prefill_eta_kind`` / ``prefill_eta_assumed_cached_ratio``) plus the
+    abandonment annotation
     (``abandoned`` / ``abandonment_reason`` / ``abandoned_session_id`` /
-    ``abandoned_at_seconds_ago``, LP-0MVRMI5HK00558TB AC1). Never mutates the
+    ``abandoned_at_seconds_ago`` / ``abandoned_scope``,
+    LP-0MVRMI5HK00558TB AC1). Never mutates the
     input dicts (the per-slot detail cache must stay pristine) and never raises
     — a failure leaves the base fields intact. Per-slot ETAs are ``None`` when
     the underlying ``/slots`` poll is stale (AC7) rather than echoing a stale
     number, and the estimate comes from the shared ``prefill_eta`` calibration
     (AC3), never a second estimator.
+
+    The abandonment annotation is matched in order
+    (LP-0MVUVHB1V006HA5I AC2/AC3):
+
+    1. the **exact** ``(endpoint, slot)`` registry entry — ``abandoned_scope``
+       is ``"slot"``;
+    2. the **endpoint-wide** entry (:func:`_abandoned_slot_endpoint_wide`),
+       which names no slot and is therefore applied **only** to a processing
+       slot with no lease owner and no live dispatch record (that is exactly
+       what ``owner_session_id is None`` means here) — ``abandoned_scope`` is
+       ``"endpoint"``;
+    3. otherwise no annotation (``abandoned_scope`` is ``None``).
+
+    Step 2 closes the shapes the exact match cannot: an abandonment whose
+    resolved slot id no longer matches the slot llama-server is still draining,
+    and one recorded with no slot identity at all (the measured cache-deficit
+    abort). A pool occupied only by such ghosts then reads
+    ``abandoned_busy`` from rule 0 of :func:`compute_capacity_hint`, never
+    ``saturated`` — while any live proxy-owned work keeps its verdict.
+
+    On a **fresh** snapshot (``stale=False``) the annotation also clears the
+    registry entries the backend has disproved: a slot reported not processing
+    drops its exact entry, and a snapshot with nothing processing drops the
+    endpoint-wide entry (:func:`proxy.router_helpers._clear_abandoned_slot`).
+    A *stale* snapshot is a fossil of a past request and never clears
+    anything. Clearing is registry hygiene only — no lease is released and no
+    capacity counter changes. A snapshot that reports **no slots at all** (no
+    model loaded, server down) annotates and clears nothing: omitting a slot id
+    is not evidence about that slot.
+
+    The per-slot ETA carries the same labelling as the top-level field
+    (LP-0MVSD5RJW008F1IB AC2): ``per_slot_prefill_eta_seconds`` always prices
+    the slot's prompt with ``cached_ratio = 0.0``, so each slot publishes
+    ``prefill_eta_kind`` (``reference_cold_bound``) and
+    ``prefill_eta_assumed_cached_ratio`` (``0.0``). A slot consumer therefore
+    sees the same cache-cold semantics as a top-level payload reader.
     """
     if not slot_details:
         return []
+    # Fail-open labelling vocabulary: if the shared calibration cannot be
+    # imported the literal values are still emitted (and the ETA is ``None``).
+    eta_kind = "reference_cold_bound"
+    eta_assumed_ratio = 0.0
     try:
-        from proxy.prefill_eta import per_slot_prefill_eta_seconds
+        from proxy.prefill_eta import (
+            PREFILL_ETA_ASSUMED_CACHED_RATIO,
+            PREFILL_ETA_KIND,
+            per_slot_prefill_eta_seconds,
+        )
     except Exception:  # pragma: no cover - defensive
         per_slot_prefill_eta_seconds = None
+    else:
+        eta_kind = PREFILL_ETA_KIND
+        eta_assumed_ratio = PREFILL_ETA_ASSUMED_CACHED_RATIO
 
     try:
         owners = _build_status_slot_owners(srv)
@@ -1886,9 +2361,36 @@ def annotate_slots_for_status(
     except Exception:
         processing_map = {}
     try:
-        from proxy.router_helpers import _abandoned_slot_for
+        from proxy.router_helpers import _abandoned_slot_endpoint_wide, _abandoned_slot_for
     except Exception:  # pragma: no cover - defensive
         _abandoned_slot_for = None
+        _abandoned_slot_endpoint_wide = None
+    try:
+        from proxy.router_helpers import _clear_abandoned_slot
+    except Exception:  # pragma: no cover - defensive
+        _clear_abandoned_slot = None
+
+    # Fresh evidence of freedom drops what the backend has disproved
+    # (LP-0MVUVHB1V006HA5I). Ordering matters: clear *before* annotating so a
+    # slot llama-server reports free cannot be labelled from an entry this very
+    # call has just removed. A stale snapshot never clears anything — a cached
+    # ``is_processing`` is a fossil, not proof of release.
+    if not stale and _clear_abandoned_slot is not None:
+        try:
+            any_processing = False
+            for slot in slot_details:
+                if not isinstance(slot, dict):
+                    continue
+                if bool(slot.get("is_processing", False)):
+                    any_processing = True
+                    continue
+                _clear_abandoned_slot(slot.get("slot_id"), scope="slot")
+            if not any_processing:
+                # Nothing is processing on this endpoint, so no slot-less
+                # abandonment can still describe a draining ghost.
+                _clear_abandoned_slot(scope="endpoint")
+        except Exception:
+            pass
 
     annotated: list[dict] = []
     for slot in slot_details:
@@ -1924,17 +2426,45 @@ def annotate_slots_for_status(
         # that no longer report prompt progress) so the payload contract is stable.
         entry["context_tokens"] = entry.get("context_tokens")
         entry["prefill_eta_seconds"] = prefill_eta
+        # LP-0MVSD5RJW008F1IB AC2: the per-slot ETA is a cache-cold estimate of
+        # this slot's loaded context, labelled so a slot consumer cannot read
+        # it as a cache-warm expectation.
+        entry["prefill_eta_kind"] = eta_kind
+        entry["prefill_eta_assumed_cached_ratio"] = eta_assumed_ratio
         # AC1 (LP-0MVRMI5HK00558TB): "busy, not ours". A slot the proxy has
         # abandoned (registry match on the slot identity) is annotated so a
         # consumer can tell a ghost from live proxy-owned work. Always present
         # and always attributable — ``abandoned`` is paired with the reason and
         # the abandoning session, never emitted as a bare boolean.
+        #
+        # LP-0MVUVHB1V006HA5I AC2/AC3: an exact match wins; failing that, an
+        # endpoint-wide entry annotates a *processing* slot that neither a
+        # lease nor a live dispatch record owns (``owner_session_id is None``),
+        # which is what makes the draining ghost behind a cancelled dispatch
+        # attributable without ever relabelling live work. ``abandoned_scope``
+        # publishes which of the two produced the annotation (additive field,
+        # ``None`` when the slot is not abandoned).
         abandonment = None
+        abandoned_scope = None
         if _abandoned_slot_for is not None and slot_id is not None:
             try:
                 abandonment = _abandoned_slot_for(slot_id)
             except Exception:
                 abandonment = None
+            if abandonment is not None:
+                abandoned_scope = "slot"
+        if (
+            abandonment is None
+            and is_processing
+            and owner_session_id is None
+            and _abandoned_slot_endpoint_wide is not None
+        ):
+            try:
+                abandonment = _abandoned_slot_endpoint_wide()
+            except Exception:
+                abandonment = None
+            if abandonment is not None:
+                abandoned_scope = "endpoint"
         entry["abandoned"] = abandonment is not None
         entry["abandonment_reason"] = (
             abandonment.get("reason") if abandonment else None
@@ -1947,6 +2477,7 @@ def annotate_slots_for_status(
             if abandonment
             else None
         )
+        entry["abandoned_scope"] = abandoned_scope
         annotated.append(entry)
     return annotated
 

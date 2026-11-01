@@ -49,6 +49,19 @@ rate 43.1 tok/s measured on this host, parent finding 4). ``waste_after`` is
 ``prompt_progress`` event to before any prefill compute (``processed = 0``),
 so the abort discards nothing but the detour latency.
 
+Incident replay (the benefit gate)
+----------------------------------
+
+:func:`load_incident_fixture` / :func:`replay_incident` replay the **five
+recorded aborts** of the 2026-10-31 pin-local incident
+(LP-0MVWDZ1RH006HTFS, parent LP-0MVWBD91Z004U135 AC8) through the same real
+decision, with the *benefit gate* configured from the shipped
+``proxy/config.yaml``. Pre-gate every one of those five rows aborts (measured
+deficit 14 380 tokens, admission-priced 48) and arms a 600 s thrash cooldown;
+with the gate the measured cold ETA (56.1 s at the shipped default fit) fits
+the 114 s prefill-deadline budget, so the row continues and no cooldown is
+armed. The replay is the numeric oracle the wiring tests assert against.
+
 This module is analysis/test tooling: no production module may import it.
 """
 
@@ -56,11 +69,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import yaml
 from proxy.measured_cache_abort import (
+    ENABLED_KEY,
     MEASURED_CACHE_DEFICIT_REASON,
     AbortDecision,
     AbortSettings,
@@ -72,6 +87,27 @@ FIXTURE_PATH = (
     / "fixtures"
     / "measured_prefill_window_2026_10_26.jsonl"
 )
+
+#: The five recorded aborts of the 2026-10-31 pin-local incident
+#: (LP-0MVWDZ1RH006HTFS / parent AC8).
+INCIDENT_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "measured_cache_abort_incident_2026_10_31.jsonl"
+)
+
+#: The shipped configuration (``proxy/config.yaml``) — the gate's comparator is
+#: resolved from it, exactly as production resolves it.
+SHIPPED_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+
+#: The model the incident pane was dispatched to (``routing_check
+#: provider=local-qwen3``), i.e. the calibration key the gate must price with.
+INCIDENT_MODEL = "local-qwen3"
+
+#: Measured host prompt-eval rates (2026-10-31, 224 paired samples) used only to
+#: state the incident row's measured range in an assertion message.
+HOST_MEDIAN_TOKENS_PER_S = 371.0
+HOST_P25_TOKENS_PER_S = 170.0
 
 #: Measured prompt-eval p10 on this host (parent finding 4). Used only by the
 #: waste model, never by a decision.
@@ -230,10 +266,27 @@ def measured_cache(
 
 
 def settings_for(enabled: bool = True) -> AbortSettings:
-    """Resolved settings for the shipped configuration, or its rollback."""
-    return AbortSettings.from_config(
-        {"server": {"local_measured_cache_abort_enabled": 1 if enabled else 0}}
-    )
+    """Resolved settings for the **shipped** configuration, or its rollback.
+
+    The settings are resolved from ``proxy/config.yaml`` itself (only the
+    enable switch is overridden), so a replay measures what a deployment of
+    that config does — including the measured-cache *benefit gate*, whose
+    comparator (``budget_safety_fraction x local_prefill_deadline_seconds`` =
+    114 s) and calibrated model come from the same block.
+
+    Resolving the shipped config is behaviour-neutral while the gate does not
+    exist yet (the deadline keys are simply not part of ``AbortSettings``), and
+    it is what keeps these rows honest afterwards instead of replaying a
+    configuration no deployment runs. ``enabled=False`` is the documented
+    rollback switch.
+    """
+    config = shipped_config()
+    server = dict(config.get("server") or {})
+    server[ENABLED_KEY] = 1 if enabled else 0
+    # No model: an unpriced calibration key resolves to the shipped default fit
+    # (3.9 ms/token), which keeps the replayed ETA independent of whatever
+    # samples an earlier test module left in the process-wide window.
+    return AbortSettings.from_config({"server": server})
 
 
 def replay(
@@ -357,6 +410,150 @@ def replay_result_to_json(result: ReplayResult) -> dict[str, Any]:
             for event in result.events
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Benefit-gate incident replay (LP-0MVWDZ1RH006HTFS, parent AC8)
+# ---------------------------------------------------------------------------
+
+
+def load_incident_fixture(
+    path: Path | None = None,
+) -> tuple[dict[str, Any], list[dict]]:
+    """Load the incident fixture: ``(meta, records)``."""
+    fixture = Path(path) if path is not None else INCIDENT_FIXTURE_PATH
+    with fixture.open(encoding="utf-8") as handle:
+        header = json.loads(handle.readline())
+        records = [json.loads(line) for line in handle if line.strip()]
+    if "_meta" not in header:  # pragma: no cover - fixture corruption alarm
+        raise AssertionError("fixture is missing its `_meta` header line")
+    return header["_meta"], records
+
+
+def incident_aborts(records: Iterable[dict]) -> list[dict]:
+    """The recorded ``measured_cache_abort`` events of the incident."""
+    return [record for record in records if record.get("kind") == "abort"]
+
+
+def shipped_config() -> dict:
+    """The shipped ``proxy/config.yaml`` (the gate's real input)."""
+    return yaml.safe_load(SHIPPED_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+
+
+def incident_settings(
+    config: dict | None = None,
+    **overrides: Any,
+) -> AbortSettings:
+    """Gate settings resolved from the shipped config, priced for the incident.
+
+    ``AbortSettings.from_config`` supplies the comparator (``0.95 x 120 s`` =
+    114 s with the shipped keys); ``model`` and ``config`` are what let the
+    decision price the **measured** deficit with the admission guard's own
+    calibrated call (parent decision D3(a)).
+    """
+    resolved = shipped_config() if config is None else config
+    settings = AbortSettings.from_config(resolved)
+    return replace(settings, model=INCIDENT_MODEL, config=resolved, **overrides)
+
+
+@dataclass(frozen=True)
+class IncidentReplayRecord:
+    """One recorded abort re-decided under the benefit gate."""
+
+    ts: str
+    total: int
+    cache: int
+    priced_new_tokens: float
+    wait_budget_s: float
+    deadline_s: float
+    decision: AbortDecision
+    eta_at_host_median_s: float
+    eta_at_p25_s: float
+
+    @property
+    def abort(self) -> bool:
+        return self.decision.abort
+
+    @property
+    def measured_eta_s(self) -> float | None:
+        return self.decision.measured_eta_s
+
+    @property
+    def budget_s(self) -> float | None:
+        return self.decision.budget_s
+
+
+@dataclass
+class IncidentReplay:
+    """Structured replay outcome for the incident fixture."""
+
+    records: list[IncidentReplayRecord]
+    settings: AbortSettings
+    totals: dict[str, Any] = field(default_factory=dict)
+
+
+def replay_incident(
+    records: list[dict] | None = None,
+    *,
+    settings: AbortSettings | None = None,
+    config: dict | None = None,
+) -> IncidentReplay:
+    """Re-decide every recorded incident abort under the benefit gate.
+
+    The caller owns the calibration window (``prefill_eta.reset()`` for the
+    shipped default-fit row). The armed-cooldown count is derived from the
+    abort verdict because ``router.py`` arms
+    ``prefill_thrash_cooldown_started`` inside the abort branch — a declined
+    abort therefore arms nothing, which is the parent's AC3.
+    """
+    source = load_incident_fixture()[1] if records is None else records
+    effective = settings if settings is not None else incident_settings(config)
+
+    replayed: list[IncidentReplayRecord] = []
+    for record in incident_aborts(source):
+        total = int(record["total"])
+        cache = int(record["cache"])
+        decision = decide_measured_cache_abort(
+            {"total": total, "cache": cache},
+            record["priced_new_tokens"],
+            effective,
+        )
+        measured_new = total - cache
+        replayed.append(
+            IncidentReplayRecord(
+                ts=str(record.get("ts", "")),
+                total=total,
+                cache=cache,
+                priced_new_tokens=float(record["priced_new_tokens"]),
+                wait_budget_s=float(record["wait_budget_s"]),
+                deadline_s=float(record["deadline_s"]),
+                decision=decision,
+                eta_at_host_median_s=measured_new / HOST_MEDIAN_TOKENS_PER_S,
+                eta_at_p25_s=measured_new / HOST_P25_TOKENS_PER_S,
+            )
+        )
+
+    aborted = [row for row in replayed if row.abort]
+    result = IncidentReplay(records=replayed, settings=effective)
+    result.totals = {
+        "aborts": len(aborted),
+        "continued": len(replayed) - len(aborted),
+        "cooldowns_armed": len(aborted),
+        "details": sorted({row.decision.detail for row in replayed}),
+        "measured_eta_s": sorted(
+            {
+                round(row.measured_eta_s, 3)
+                for row in replayed
+                if row.measured_eta_s is not None
+            }
+        ),
+        "budget_s": sorted(
+            {round(row.budget_s, 3) for row in replayed if row.budget_s is not None}
+        ),
+        "wait_budget_s": sorted({row.wait_budget_s for row in replayed}),
+        "deadline_s": sorted({row.deadline_s for row in replayed}),
+    }
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - CLI helper

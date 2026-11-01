@@ -41,9 +41,9 @@ from proxy import contention_queue, prefill_eta
 class _DummyRequest:
     """Minimal request stub (matches the other admission tests)."""
 
-    def __init__(self, body: bytes = b'{"model":"test"}'):
+    def __init__(self, body: bytes = b'{"model":"test"}', headers=None):
         self._body = body
-        self.headers = {}
+        self.headers = headers or {}
         self.method = "POST"
         self.url = type("U", (), {"path": "/v1/chat/completions"})()
 
@@ -192,7 +192,11 @@ def test_zero_occupancy_keeps_legacy_verdict():
 
 @pytest.mark.asyncio
 async def test_occupancy_refusal_never_enters_the_queue(caplog):
-    """AC1 end-to-end: no queue wait, no local dispatch, remote takes over."""
+    """AC1 end-to-end: no queue wait and no local dispatch.
+
+    The queue entry is a pin-local surface, so the refusal is the retryable
+    ``429`` deferral rather than a paid dispatch (LP-0MVUH9PUU005HVS4).
+    """
     caplog.set_level(logging.INFO, logger="llama-proxy")
     _seed_calibration()
     calls: list[str] = []
@@ -223,11 +227,14 @@ async def test_occupancy_refusal_never_enters_the_queue(caplog):
         _guard_patches(),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(), "v1/chat/completions", config, _cfg()
+            _DummyRequest(headers={"X-Local-Preference": "local-preferred"}),
+            "v1/chat/completions",
+            config,
+            _cfg(),
         )
 
-    assert result.status_code == 200
-    assert calls == ["remote"], "a refused request must not dispatch local"
+    assert result.status_code == 429
+    assert calls == [], "a refused request must not dispatch anywhere"
     assert contention_queue.queue_depth() == 0
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "local_admission_guard decision=reject" in messages
@@ -345,7 +352,7 @@ async def test_in_flight_prefill_with_unobservable_progress_is_counted(caplog):
             _cfg(),
             0,
             1,
-            _DummyRequest(),
+            _DummyRequest(headers={"X-Local-Preference": "local-preferred"}),
             {},
             {},
             {"name": "local-llama", "llama_model": "Qwen3"},
@@ -353,7 +360,7 @@ async def test_in_flight_prefill_with_unobservable_progress_is_counted(caplog):
             priority="low",
         )
 
-    assert action == "admission_reject"
+    assert action == "refused_local_only"
     assert reason == "eta_exceeds_budget"
     assert elapsed is None
     assert contention_queue.queue_depth() == 0

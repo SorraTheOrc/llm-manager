@@ -378,3 +378,140 @@ Modelling note: the capture has no per-slot prefill progress
 session owning no slot, i.e. a measured zero prefix. That is the conservative
 assumption for an AC whose claim is "cold prompts above the budget from
 non-resident sessions are never admitted".
+
+# 2026-10-28 Addendum: 24 h AC4 verification (re-arm #2) — FAIL (attribution blind)
+
+**Work item:** LP-0MVN44XB0009M33K (follow-up of LP-0MVN1IQTF0037WTG AC4/AC5).
+**Verdict: FAIL / not pass.** The window-scoped measurement succeeded, but the
+AC7 observability check failed as a *finding* (all residency decisions
+unmeasured), which AC7 defines as "never a pass". This addendum supersedes the
+2026-10-24 numbers as the current measurement; the 2026-10-24 figures below
+remain **historical reference only**, never a baseline.
+
+## Window (restart-free, attested)
+
+The first pinned window (`2026-10-26T21:02:00Z → 2026-10-27T21:02:00Z`) was
+invalidated by two proxy restarts inside it (`2026-10-27T09:33:12Z` pid
+3775724 and `2026-10-27T10:16:12Z` pid 3791954, both `source=manual
+actor=unknown`). Re-armed per producer decision A to the latest restart + 24 h:
+
+- **Measured window:** `2026-10-27T10:17:00Z → 2026-10-28T10:17:00Z` (start =
+  first whole minute after the 10:16:12 restart).
+- **Restart-freedom:** PID 3791954, `ps -o lstart` = `Tue Oct 27 10:16:11
+  2026`, continuous uptime `1-00:23:07`; the only restart marker in the six
+  overlapping files is the 10:16:12 anchor, **before** the window start.
+- **Code identity:** shared checkout tip `1908f431` at run; ladder
+  (`_should_skip_local` + `ResidencyView` + `routing_resident_prefix`) present;
+  config `local_resident_prefix_min_ratio: 0.5`,
+  `local_cold_prefill_budget_tokens: 25000`,
+  `local_prefill_deadline_seconds: 120`.
+
+## Corrected capture invocation (the documented one omitted `--log`)
+
+`capture_prefill_thrash_window.py` requires `--log`; the earlier snippet in the
+work item omitted it. The working, window-scoped invocation (every disjoint
+file, including the daily rotation) is:
+
+```bash
+python3 proxy/scripts/capture_prefill_thrash_window.py \
+  --start "2026-10-27 10:17:00" --end "2026-10-28 10:17:00" \
+  --log /var/log/llama-proxy/proxy.log.2026-10-27_10 \
+  --log /var/log/llama-proxy/proxy.log.2026-10-27_16 \
+  --log /var/log/llama-proxy/proxy.log-2026-10-28_00 \
+  --log /var/log/llama-proxy/proxy.log.2026-10-27_22 \
+  --log /var/log/llama-proxy/proxy.log.2026-10-28_04 \
+  --log /var/log/llama-proxy/proxy.log \
+  --out /tmp/ac4_window_rearm2.jsonl
+python3 proxy/scripts/replay_prefill_occupancy.py x \
+  --window-fixture /tmp/ac4_window_rearm2.jsonl
+```
+
+## Measured result
+
+| Metric | Value |
+|---|---|
+| `prefill_deadline_exceeded` | **99** (user 85 / audit 14) |
+| Wasted prefill tokens | **750,042** (overstated per LP-0MVODJ3P6000AIUM: fields recomputed post-hoc) |
+| `prefill_budget_exceeded` refusals | 2,546 |
+| Provider exhaustion / upstream 503 | 483 / 100 |
+| `residency_decisions` | 3,607 (**measured 0 / unmeasured 3,607**) |
+| `residency_resident_admits` | 0 |
+| `residency_evicted_denials` | 2,113 |
+| `residency_tenant_limit_denials` | 15 |
+| slot-owner churn | 31 of 100 sessions |
+
+**AC4 split** (join: same session's most recent `routing_resident_prefix` at/
+before each deadline event + the `local_eviction` owner at/around it; ambiguous
+events are counted separately and NOT attributed — conservative):
+
+| Class | Count |
+|---|---|
+| Scheduling-attributed (rule b only; rule a unevaluable) | 22 |
+| Ambiguous (no join / owner `none`) | 57 |
+| Genuine GPU-speed miss | 20 |
+
+**Window-scoped baseline** (capture → replay through the real ladder):
+12,105 attempts, 136 deadline-cancelled, ~631,946 wasted tokens modelled;
+replay → 11,238 over budget, 11,224 `resident_prefix_insufficient`, 881
+admitted, 14 idle-exempt, **0 over-budget cold admissions (must be 0)**.
+
+## Why FAIL — AC7 finding is decisive
+
+The usage report's `## Residency-aware admission` section and churn table
+render, but **every one of the 3,607 decisions is unmeasured**: even
+`decision=admit` / `residency_source=session_slot` (234 resident decisions)
+logs `n_past_actual=none / reuse_ratio=none`. AC7 states that "decisions logged
+but all unmeasured is a finding (ladder not emitting), never a pass". As a
+consequence, AC4 rule (a) (`reuse_ratio < 0.5`) could not fire for any of the
+99 events; 57 events are ambiguous and the ≥ 90 % reduction claim cannot be
+computed rigorously against a window-scoped scheduling-attributed baseline.
+
+AC6 gate (ii) — no `local_lease_active` refusal window longer than the 180 s
+watchdog — is **met on a per-session basis** (52 refusals; max
+`queued_duration` 60.09 s; max per-session refusal span 79.8 s), with one
+aggregate multi-session contention episode of 181 s flagged as marginal.
+
+Follow-up: **LP-0MVRZXPH70025ZNR** (`discovered-from:LP-0MVN44XB0009M33K`) —
+populate the measured prefix at admission so AC4 rule (a) and AC7 become
+evaluable; the 24 h verification re-runs on a fresh restart-free window after
+it lands.
+
+## Re-arm #3 — the attribution gap is closed (LP-0MVRZXPH70025ZNR)
+
+The follow-up landed on `dev` on 2026-10-30 (`0e270c1f`, `0ff1d7fe`,
+`d463a35a`, `2d91ab27`, `07d0ef40`, with the regression suites `5b2d5fb5`,
+`77291663`). The change is measurement-only — no residency threshold, tenancy
+bound or pricing rule moved:
+
+- a new rung between the live `/slots` `context_tokens` measurement and the
+  ownership-only `session_slot` sentinel reports the last measured dispatch's
+  `total` for the `(model, session)` pair as
+  `residency_source=measured_last_dispatch` with a **numeric**
+  `n_past_actual` / `reuse_ratio`;
+- every decision now carries an additive `measurement=` field: `measured`, or a
+  closed unmeasured reason (`unavailable:no_slot`,
+  `unavailable:no_prior_measurement`, `unavailable:stale_view`,
+  `unavailable:capture_disabled`), so `reuse_ratio=none` is no longer the only
+  signal;
+- captured measurements are invalidated on eviction, slot release and model
+  switch, and the rung requires live slot ownership, so a stale ratio cannot be
+  fabricated;
+- the usage report's `## Residency-aware admission` section reports
+  `residency_measured_decisions` plus a per-reason `residency_unmeasured_reasons`
+  breakdown, so the "decisions logged but all unmeasured" condition that made
+  this window a FAIL is now a visible finding rather than a silent zero.
+
+**Re-arming rule (unchanged in spirit, restated):** the 24 h window starts at
+the first whole minute after a proxy restart that loads the fix (a running
+uvicorn does not reload code), runs exactly 24 h, and the run instant is the
+window end. Arming is performed through the start-proxy skill, never by killing
+the proxy. The full procedure, the arming evidence to record and the expected
+measurement shape for re-arm #3 are in
+[`docs/dev/resident-prefix-rollout.md`](../../resident-prefix-rollout.md) §
+*Re-arming the 24 h AC4 window (re-arm #3)*.
+
+**Status:** re-arm #2 stays a FAIL and its numbers above remain the last
+complete measurement. The re-arm #3 window is armed against the first fix-loaded
+restart after 2026-10-30T07:00:00Z (deliberately after the concurrent
+`LP-0MVRMI5HK00558TB` overnight window closes, so that measurement is not
+split); no PASS may be claimed until that window closes and is measured.

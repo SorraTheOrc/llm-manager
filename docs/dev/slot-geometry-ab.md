@@ -21,6 +21,15 @@ LP-0MSAZXXDY005AWA1) and the warm ceiling is
 `round(local_large_context_economic_ceiling_ratio x ctx_size)` capped by the
 absolute `local_large_context_warm_cache_threshold` (LP-0MU466L1X003RTHN).
 
+Neither arm is a structural commitment: the slot count is the single
+`session_slot_pool_size` value (shipped as 2), so Arm B is a config change. The
+desk audit of what that change does on its own — which mechanisms follow the
+slot count, which must be edited by hand, and what it costs in throughput — is
+[`docs/dev/single-slot-impact.md`](single-slot-impact.md)
+(LP-0MVTF26NP003KXKJ). Read it before running the protocol: it records that the
+per-slot clamp doubles while the effective warm ceiling does **not** move unless
+the ratio and absolute cap are raised with it.
+
 ---
 
 ## 0. Gating precondition (AC0) — do not start measuring before it is met

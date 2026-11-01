@@ -17,6 +17,12 @@ Includes:
 - Session handling helper
 - Concurrency/slot helpers
 - Backend retry wrappers
+- Local→remote boundary compaction (``evaluate_boundary_compaction``,
+  ``summarise_on_session_slot``): the single hook that compacts a
+  locally-served session's oldest turns on its own local slot before a
+  ``type: remote`` dispatch. Its trigger, fail-open WARNING reason tokens
+  and the slot-reuse KV caveat are documented in
+  ``docs/llama-router.md`` → "Boundary compaction (local → remote)".
 """
 
 import asyncio
@@ -808,20 +814,38 @@ def _build_backend_error_response(
     is_delta_request: bool,
     session_fallback_reason: str | None,
     retry_after: int | None = None,
+    local_dispatch_reason: str | None = None,
 ) -> JSONResponse:
     """Build a 503 error response with session information headers.
 
     Used by both streaming and non-streaming paths in proxy_to_local
     when the backend is unavailable or returns an error.
+
+    *local_dispatch_reason* names why local released the dispatch when that
+    reason says nothing about local's health (LP-0MVWFKESK0005G61). It is
+    stamped twice — as ``X-Local-Dispatch-Reason`` on the wire and as an
+    in-process attribute on the response object — so the fallback loop can
+    defer this one request instead of quarantining the whole local entry, and
+    a header lost in transit cannot silently re-enable that quarantine. The
+    default (``None``) emits nothing, leaving every other backend error
+    byte-identical.
     """
     if retry_after is None:
         from proxy.backend_health import _self_heal_retry_after_seconds
         retry_after = _self_heal_retry_after_seconds()
 
+    if local_dispatch_reason:
+        from proxy.admission_reserve import (
+            HEADER_LOCAL_DISPATCH_REASON,
+            LOCAL_DISPATCH_REASON_ATTR,
+        )
+
     headers = {
         "Retry-After": str(retry_after),
         "Cache-Control": "no-store",
     }
+    if local_dispatch_reason:
+        headers[HEADER_LOCAL_DISPATCH_REASON] = local_dispatch_reason
     if session_id:
         headers["X-Session-Id"] = session_id
         headers["X-Session-Created"] = "true" if session_created else "false"
@@ -839,7 +863,13 @@ def _build_backend_error_response(
         "path": f"/{path}",
         "retry_after": retry_after,
     }
-    return JSONResponse(status_code=503, content=payload, headers=headers)
+    response = JSONResponse(status_code=503, content=payload, headers=headers)
+    if local_dispatch_reason:
+        try:
+            setattr(response, LOCAL_DISPATCH_REASON_ATTR, local_dispatch_reason)
+        except Exception:  # pragma: no cover - response stand-ins
+            pass
+    return response
 
 
 def _build_backend_unavailable_response(
@@ -1198,15 +1228,37 @@ def _get_prefill_deadline_seconds(srv) -> float:
 # prompts (93,038 x2, 93,006 x3, …) with zero tokens delivered.
 #
 # The cooldown is a per-session, in-process window armed by router.py when
-# the prefill deadline fires. While it is armed, provider.py skips local for
-# that session (``routing_skip_local reason=prefill_thrash_cooldown``) so the
-# request reaches the next provider immediately instead of re-prefilling.
+# the prefill deadline fires. While it is armed, local dispatch is refused for
+# that session before any local resource is acquired — provider.py's chain gate
+# skips local and the acquisition choke points refuse it — so the request
+# reaches the next provider immediately instead of re-prefilling. Both sites
+# log ``routing_skip_local reason=prefill_thrash_cooldown`` (the choke points
+# add ``entry=router_dispatch`` / ``entry=lease_acquire``; the choke-point
+# half of the gate is LP-0MVSAMN14001DMTY AC2).
 # Other sessions are untouched. The window is cleared on expiry (lazy prune)
 # and on a successful local first byte, and ``0`` disables it (documented
 # rollback).
 
-DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS = 600.0
-"""Default post-deadline cooldown for a thrashing session (10 minutes)."""
+DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS = 120.0
+"""Default post-deadline cooldown for a thrashing session (2 minutes).
+
+Was 600 s. Reduced to 120 s on 2026-10-31 (LP-0MVWC8JCG007GAPW, operator
+option B) because the measured-cache early abort (LP-0MVR7IN0O000DPXN) fires
+~0.1 s into a dispatch and then armed this *client-visible* quarantine: a
+6000x asymmetry that became a ten-minute outage for every pin-local
+(``local-preferred``) session, which by contract receives
+``429 Local admission refused`` instead of a remote fallback. Two minutes
+still spans two client retry intervals, so the retry storm this window exists
+to suppress stays suppressed while a pinned session recovers without operator
+help. This is an interim value: the benefit gate in LP-0MVWBD91Z004U135 stops
+the abort firing for prompts that fit the budget, after which this should be
+re-tuned upward rather than left at 120 by default.
+
+A missing or malformed config value falls back to this constant, so it must
+agree with ``server.local_prefill_thrash_cooldown_seconds`` in
+``proxy/config.yaml`` (pinned by
+``proxy/tests/test_prefill_thrash_cooldown_default.py``).
+"""
 
 DEFAULT_PREFILL_THRASH_RECOVERY_FRACTION = 0.9
 """Share of the cancelled prompt a success must reach to clear the window.
@@ -1257,6 +1309,40 @@ _prefill_thrash_cancel_tokens: dict[tuple[str, str], int] = {}
 _PREFILL_THRASH_FINGERPRINT_HEX_CHARS = 32
 
 
+def _prefill_thrash_turn_messages(messages: list) -> list:
+    """Return the messages of the *current turn* (the ones being prefilled).
+
+    The arming site and the gate site hold different bodies for the same
+    request (LP-0MVSAMN14001DMTY AC2): when session delta routing is active,
+    ``_handle_session`` rewrites ``body_json["messages"]`` to the delta it is
+    about to prefill, so ``router.py`` arms the window from the *delta* while
+    ``provider.py``'s chain gate fingerprints the *original* client body it
+    parsed. Fingerprinting the whole list therefore produced two different
+    digests for one request and the window never matched — the same
+    non-engagement, one level down (the 2026-10-26 incident logged **zero**
+    ``routing_skip_local reason=prefill_thrash_cooldown`` lines for the
+    affected session across four successive local dispatches).
+
+    The delta is always a *trailing suffix* of the original list (the client
+    appends the new turn), so fingerprinting everything after the last
+    assistant message yields the same digest for both bodies while staying a
+    prompt-scoped identity: a different turn (different content, order or
+    tools) still yields a different digest. A body with no assistant message
+    (a first turn, or the delta itself) keeps the whole list, which is also
+    what makes the two bodies agree.
+    """
+    if not isinstance(messages, list):
+        return []
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, Mapping) and message.get("role") == "assistant":
+            turn = messages[index + 1:]
+            # A trailing assistant message (no new turn) keeps the whole list
+            # rather than fingerprinting "nothing".
+            return turn or messages
+    return messages
+
+
 def _prefill_thrash_fingerprint(body_json) -> str | None:
     """Return a stable, bounded fingerprint of the request's prompt.
 
@@ -1266,24 +1352,32 @@ def _prefill_thrash_fingerprint(body_json) -> str | None:
     compact separators so the same payload always yields the same digest and
     message order is significant.
 
+    The digest covers the **current turn** (:func:`_prefill_thrash_turn_messages`)
+    rather than the whole message list, so the router's post-session delta
+    body and ``provider.py``'s original client body fingerprint identically
+    for the same request (LP-0MVSAMN14001DMTY AC2).
+
     Fail-open: returns ``None`` when the payload carries no usable messages
     (streaming bookkeeping-only bodies, malformed JSON, a non-list
     ``messages``). Callers then fall back to the session-wide window, so a
     site that cannot fingerprint never stops engaging the gate.
 
-    Cost: one ``json.dumps`` + one ``sha256`` over the messages, at the arming
-    site (once per abandoned dispatch) and the gate site (once per local
-    candidate). No body re-read: the router and ``proxy_with_fallback``
-    already hold the parsed payload.
+    Cost: one ``json.dumps`` + one ``sha256`` over the current turn, at the
+    arming site (once per abandoned dispatch) and the gate site (once per
+    local candidate). No body re-read: the router and
+    ``proxy_with_fallback`` already hold the parsed payload.
     """
     if not isinstance(body_json, Mapping):
         return None
     messages = body_json.get("messages")
     if not isinstance(messages, list) or not messages:
         return None
+    turn = _prefill_thrash_turn_messages(messages)
+    if not turn:
+        return None
     try:
         canonical = json.dumps(
-            messages,
+            turn,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -1347,12 +1441,14 @@ def _prefill_thrash_config_section(config) -> Mapping:
 
 
 def _get_prefill_thrash_cooldown_seconds(config) -> float:
-    """Return the post-deadline cooldown in seconds (default 600; 0 disables).
+    """Return the post-deadline cooldown in seconds (default 120; 0 disables).
 
     ``server.local_prefill_thrash_cooldown_seconds`` is the rollback knob: 0
     disables the cooldown entirely (both the arming on a deadline event and
-    the routing skip). A missing or malformed value falls back to the default
-    so a config typo cannot silently switch the protection off.
+    the routing skip). A missing or malformed value falls back to
+    :data:`DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS` so a config typo cannot
+    silently switch the protection off (and cannot silently restore the
+    600 s value this default replaced either — see that constant).
     """
     section = _prefill_thrash_config_section(config)
     raw = section.get(
@@ -1392,7 +1488,7 @@ def _get_prefill_thrash_recovery_fraction(config) -> float:
 
 
 def _record_prefill_thrash_cooldown(
-    session_id, config, now=None, tokens=None, fingerprint=None
+    session_id, config, now=None, tokens=None, fingerprint=None, reason=None
 ) -> float:
     """Arm (or re-arm) a cooldown window; return its monotonic deadline.
 
@@ -1414,6 +1510,12 @@ def _record_prefill_thrash_cooldown(
     :func:`_clear_prefill_thrash_cooldown`); when it is absent or not a
     positive integer the window is still armed, but the clear path falls back
     to the fail-open clear-on-any-success behaviour.
+
+    *reason* names the arming cause with a canonical routing token
+    (``prefill_thrash_cooldown`` for the deadline, ``measured_cache_deficit``
+    for the early abort). It is passed to the local-route starvation detector
+    (LP-0MVWFKIVO007EGDU AC11) so a sustained armed window is attributable from
+    one log line; it never changes the window the caller gets back.
     """
     if not session_id:
         return 0.0
@@ -1435,6 +1537,15 @@ def _record_prefill_thrash_cooldown(
         _prefill_thrash_cancel_tokens[key] = size
     else:
         _prefill_thrash_cancel_tokens.pop(key, None)
+    if reason:
+        try:
+            from proxy.local_route_starvation import record_local_route_arm
+
+            # ``_now`` is the same monotonic clock the detector measures its
+            # window on, so the arm lands at the instant the window was armed.
+            record_local_route_arm(reason, seconds, now=_now, config=config)
+        except Exception:  # pragma: no cover - observability only
+            pass
     return deadline
 
 
@@ -1627,6 +1738,179 @@ def _reset_prefill_thrash_cooldowns() -> None:
 
 
 # ===================================================================
+# Post-deadline local dispatch gate (LP-0MVSAMN14001DMTY AC1/AC2)
+#
+# Measured defect (2026-10-26 10:39-10:47, ``proxy.log.2026-10-26_131429``):
+# a local dispatch cancelled by ``prefill_deadline_exceeded`` released its
+# lease truthfully, and ~150 ms later the *same request* re-dispatched local
+# and acquired a **fresh** lease, which no watchdog progress could ever
+# release until the 180 s no-progress watchdog (≈308 s of unproductive hold,
+# other sessions denied 311-322 s each). The armed 600 s thrash cooldown never
+# engaged: zero ``routing_skip_local reason=prefill_thrash_cooldown`` lines
+# for the affected session across four successive dispatches, because the
+# in-request retry loops re-enter ``proxy_to_local`` *after* provider.py's
+# chain gate has already been passed.
+#
+# Two gates therefore sit at the acquisition choke points themselves, where no
+# dispatch path can skip them:
+#
+# 1. **Session cooldown** (AC1) — the same
+#    ``_prefill_thrash_cooldown_remaining`` provider.py consults, checked in
+#    ``_try_acquire_local_dispatch`` (the lease choke point) and in
+#    ``proxy_to_local`` before *any* local resource is acquired (the gate for
+#    the anonymous ``_increment_local_active_queries`` path and other direct
+#    callers).
+# 2. **Request-scoped terminal marker** (AC2) — ``prefill_deadline_exceeded``
+#    marks the request object, so local is terminal for that request even when
+#    the session cooldown cannot be resolved (a header-less request arms the
+#    window under the session id the router generated, which no gate site can
+#    re-derive from the headers). The marker lives on the ``Request`` object,
+#    so a concurrent unrelated request from the same session is unaffected.
+# ===================================================================
+
+#: ``Request`` attribute holding the monotonic time at which this request had a
+#: local dispatch cancelled by ``prefill_deadline_exceeded`` (or the measured
+#: cache-deficit early abort). Request-scoped by construction: it dies with the
+#: ``Request`` object, so it can never leak across requests or sessions.
+_LOCAL_DISPATCH_TERMINAL_ATTR = "_local_dispatch_post_deadline_ts"
+
+#: The gate's two refusal reasons (LP-0MVXSSYTN001TBW5). Both are canonical
+#: local-route exit tokens (``admission_reserve.LOCAL_FALLBACK_REASON_TOKENS``)
+#: and both are **deferrals**: they say something about *this* request/prompt,
+#: never about local's health. The router stamps them as the 503's
+#: ``X-Local-Dispatch-Reason`` marker so the fallback loop detours the one
+#: request instead of quarantining the whole ``local`` entry for every session.
+LOCAL_GATE_REASON_POST_DEADLINE_TERMINAL = "post_deadline_terminal"
+LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN = "prefill_thrash_cooldown"
+
+
+def _mark_local_dispatch_terminal(request, now=None) -> float | None:
+    """Mark *request* as terminal for local dispatch for the rest of its life.
+
+    Called by ``router.py`` when a local dispatch is cancelled before its first
+    byte — ``prefill_deadline_exceeded`` (and the measured cache-deficit early
+    abort). The deadline detour is then terminal for local **within that
+    request**: the same request can never acquire a fresh dispatch lease after
+    the release, so the 2026-10-26 in-request re-dispatch (a fresh ``[local]
+    POST`` 147-150 ms after ``lease_released reason=prefill_deadline``) cannot
+    happen. Mechanism, scope and the evidence line
+    (``routing_skip_local reason=post_deadline_terminal``):
+    LP-0MVSAMN14001DMTY AC2, verified by LP-0MVSAMS5O006OAIS.
+
+    Scope is deliberately the request, not the session: the session-wide
+    cooldown is what suppresses *later* requests, while a concurrent request
+    from the same session (a different ``Request`` object) keeps its own
+    admission decision.
+
+    Returns the recorded monotonic timestamp, or ``None`` when the request
+    object cannot carry attributes (``None``, a slotted test double).
+    """
+    if request is None:
+        return None
+    _now = time.monotonic() if now is None else now
+    try:
+        setattr(request, _LOCAL_DISPATCH_TERMINAL_ATTR, _now)
+    except Exception:
+        return None
+    return _now
+
+
+def _local_dispatch_terminal_at(request) -> float | None:
+    """Return when *request* became terminal for local dispatch, else ``None``."""
+    if request is None:
+        return None
+    try:
+        value = getattr(request, _LOCAL_DISPATCH_TERMINAL_ATTR, None)
+    except Exception:
+        return None
+    return value if isinstance(value, (int, float)) else None
+
+
+def _local_dispatch_gate(
+    srv,
+    session_key,
+    *,
+    request=None,
+    config=None,
+    fingerprint=None,
+    entry="router",
+) -> tuple[bool, str, float]:
+    """Consult the post-deadline local gates at a dispatch acquisition point.
+
+    Returns ``(refused, reason, remaining_seconds)``:
+
+    - ``(True, "post_deadline_terminal", 0.0)`` — this request already had a
+      local dispatch cancelled post-deadline: local is terminal for it
+      (LP-0MVSAMN14001DMTY AC2).
+    - ``(True, "prefill_thrash_cooldown", remaining)`` — the session's
+      post-deadline window is armed for this prompt (AC1). ``remaining`` is the
+      seconds left, so a caller can surface ``Retry-After``.
+    - ``(False, "", 0.0)`` — admitted; nothing armed.
+
+    Both refusals log ``routing_skip_local … reason=<reason>`` so the gate is
+    attributable in ``proxy.log`` from the dispatch side (provider.py logs the
+    same event from the chain side; ``entry=`` names the site). The existing
+    log vocabulary is kept — ``routing_skip_local``,
+    ``prefill_thrash_cooldown_started``, ``lease_released``.
+
+    The free-GPU release (:func:`_release_prefill_thrash_cooldown_on_free_gpu`)
+    is deliberately **not** attempted here. It belongs to provider.py's chain
+    entry, which runs before this point for every new request: by the time this
+    choke point is reached the window has already been released when the
+    proxy's own evidence proved the GPU free. Keeping the choke point purely
+    deterministic is what makes it a reliable safety net for the paths that
+    bypass the chain (in-request retries, ``ui.py``'s direct dispatch) instead
+    of a second, racy release site.
+
+    Fail-open by construction: an unknown session, a disabled rollback knob
+    (``local_prefill_thrash_cooldown_seconds: 0``) or an expired window all
+    return ``(False, …, 0.0)``.
+    """
+    terminal_at = _local_dispatch_terminal_at(request)
+    if terminal_at is not None:
+        _log_local_dispatch_gate_skip(
+            srv,
+            session_key,
+            LOCAL_GATE_REASON_POST_DEADLINE_TERMINAL,
+            0.0,
+            entry,
+        )
+        return (True, LOCAL_GATE_REASON_POST_DEADLINE_TERMINAL, 0.0)
+    remaining = _prefill_thrash_cooldown_remaining(
+        session_key,
+        config if config is not None else _server_config_of(srv),
+        fingerprint=fingerprint,
+    )
+    if remaining > 0:
+        _log_local_dispatch_gate_skip(
+            srv,
+            session_key,
+            LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN,
+            remaining,
+            entry,
+        )
+        return (True, LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN, remaining)
+    return (False, "", 0.0)
+
+
+def _log_local_dispatch_gate_skip(
+    srv, session_key, reason: str, remaining: float, entry: str
+) -> None:
+    """Log a dispatch-side gate refusal (never raises; logging is optional)."""
+    try:
+        srv.logger.info(
+            "routing_skip_local session=%s reason=%s cooldown_remaining=%.0fs "
+            "entry=%s → refusing local dispatch, chain falls to next provider",
+            session_key if session_key else "unknown",
+            reason,
+            remaining,
+            entry,
+        )
+    except Exception:
+        pass
+
+
+# ===================================================================
 # Abandoned local dispatch registry (LP-0MVRMI5HK00558TB AC1)
 #
 # Measured defect (LP-0MVOG7IP80003MLV, 2026-10-24 20:00 -> 2026-10-25
@@ -1675,17 +1959,40 @@ ABANDONED_SLOT_REASONS = frozenset(
 #: processing (the deadline is 90 s; a stuck prefill is capped far below this).
 DEFAULT_ABANDONED_SLOT_TTL_SECONDS = 900.0
 
-_abandoned_slots: dict[tuple[str, int], dict] = {}
-"""``{(endpoint_or_empty, slot_id): entry}`` for abandoned local dispatches.
+ABANDONED_SLOT_ENDPOINT_WIDE: int = -1
+"""Registry key for an abandonment whose **slot identity is unknown**.
 
-``entry`` carries ``slot_id``, ``endpoint``, ``session_id``, ``reason``,
-``abandoned_at`` and ``ttl_seconds`` — always attributable, never a bare
-boolean (LP-0MVRMI5HK00558TB AC1).
+A documented sentinel, deliberately an ``int`` because the registry is keyed
+the same way and deliberately negative because llama-server slot ids are always
+non-negative — so the endpoint-wide entry can never collide with a real slot
+(LP-0MVUVHAQP001IRKK AC1).
+
+Readers must go through :func:`_abandoned_slot_endpoint_wide`, **never**
+:func:`_abandoned_slot_for`: an endpoint-wide entry names no slot, so applying
+it to a live slot is only safe behind the "no live dispatch record / lease
+owner" guard of the status builder (LP-0MVUVHB1V006HA5I). It is dropped by
+:func:`_clear_abandoned_slot` (``scope="endpoint"``) once a **fresh**
+``/slots`` snapshot reports nothing processing on the endpoint.
+"""
+
+_abandoned_slots: dict[tuple[str, int], dict] = {}
+"""``{(endpoint_or_empty, key): entry}`` for abandoned local dispatches.
+
+``key`` is the slot id when it is known, otherwise
+:data:`ABANDONED_SLOT_ENDPOINT_WIDE`.
+
+``entry`` carries ``slot_id`` (``None`` for an endpoint-wide entry),
+``endpoint``, ``session_id``, ``reason``, ``abandoned_at``, ``ttl_seconds``
+and ``scope`` (``"slot"`` | ``"endpoint"``) — always attributable, never a
+bare boolean (LP-0MVRMI5HK00558TB AC1). An abandonment is never silently
+dropped: an unresolvable identity records the endpoint-wide entry so nothing
+the proxy gave up on is unattributable (LP-0MVUVHAQP001IRKK AC1).
 
 Memory bound: the key is the slot identity, so the registry can never hold
-more entries than there are ``(endpoint, slot)`` pairs — re-abandoning the same
-slot overwrites its entry. Expiry is lazy (pruned on read and by the periodic
-sweep), so no timer task is needed.
+more entries than there are ``(endpoint, slot)`` pairs plus **one**
+endpoint-wide entry per endpoint — re-abandoning the same slot (or the same
+endpoint without an identity) overwrites/refreshes its entry. Expiry is lazy
+(evaluated on every read), so no timer task is needed.
 """
 
 
@@ -1697,8 +2004,8 @@ def _abandoned_slot_key(endpoint: str | None, slot_id: int) -> tuple[str, int]:
 def _prune_abandoned_slots(now: float | None = None) -> int:
     """Drop expired entries; return how many were removed.
 
-    Expiry is lazy (evaluated on read and on this sweep) so the registry needs
-    no timer of its own.
+    Expiry is lazy (evaluated on every registry read) so the registry needs no
+    timer of its own.
     """
     _now = time.monotonic() if now is None else now
     expired = [
@@ -1712,6 +2019,19 @@ def _prune_abandoned_slots(now: float | None = None) -> int:
     return len(expired)
 
 
+def _abandoned_slot_is_real_id(slot_id: Any) -> bool:
+    """Return True when *slot_id* can name a real llama-server slot.
+
+    llama-server slot ids are non-negative integers; everything else (``None``,
+    a string, a bool, the endpoint-wide sentinel) is an **unresolved** identity.
+    """
+    return (
+        isinstance(slot_id, int)
+        and not isinstance(slot_id, bool)
+        and slot_id >= 0
+    )
+
+
 def _record_abandoned_slot(
     slot_id: int | None,
     *,
@@ -1720,22 +2040,25 @@ def _record_abandoned_slot(
     reason: str,
     now: float | None = None,
     ttl: float | None = None,
-) -> dict | None:
+) -> dict:
     """Record that the proxy gave up on *slot_id* for *reason*.
 
     Called from every abandonment path (deadline, session eviction, watchdog,
-    client disconnect) AFTER the upstream cancel has been attempted, so the
-    status payload can annotate a slot that is still processing as
-    "abandoned" rather than as live proxy-owned work
-    (LP-0MVRMI5HK00558TB AC1). Re-recording the same slot refreshes the
-    window (a slot abandoned twice must not expire from the first event).
+    client disconnect, orphan sweep, measured cache-deficit abort) AFTER the
+    upstream cancel has been attempted, so the status payload can annotate a
+    slot that is still processing as "abandoned" rather than as live
+    proxy-owned work (LP-0MVRMI5HK00558TB AC1). Re-recording the same slot
+    refreshes the window (a slot abandoned twice must not expire from the
+    first event).
 
-    Returns the stored entry, or ``None`` when no slot identity is known (the
-    cancel attempt then carries AC1 alone — an unattributable entry would be
-    indistinguishable from a bare boolean, which the AC forbids).
+    **Never drops an abandonment** (LP-0MVUVHAQP001IRKK AC1): when *slot_id* is
+    not a usable slot identity the entry is stored endpoint-wide under the
+    :data:`ABANDONED_SLOT_ENDPOINT_WIDE` sentinel with ``slot_id=None`` and
+    ``scope="endpoint"``, so a release that could not resolve a slot is still
+    attributable to the endpoint it gave work up on.
+
+    Returns the stored entry.
     """
-    if not isinstance(slot_id, int):
-        return None
     _now = time.monotonic() if now is None else now
     try:
         _ttl = float(ttl) if ttl is not None else DEFAULT_ABANDONED_SLOT_TTL_SECONDS
@@ -1743,15 +2066,23 @@ def _record_abandoned_slot(
         _ttl = DEFAULT_ABANDONED_SLOT_TTL_SECONDS
     if _ttl <= 0:
         _ttl = DEFAULT_ABANDONED_SLOT_TTL_SECONDS
+    resolved_slot_id = int(slot_id) if _abandoned_slot_is_real_id(slot_id) else None
+    scope = "slot" if resolved_slot_id is not None else "endpoint"
+    key_id = (
+        resolved_slot_id
+        if resolved_slot_id is not None
+        else ABANDONED_SLOT_ENDPOINT_WIDE
+    )
     entry = {
-        "slot_id": slot_id,
+        "slot_id": resolved_slot_id,
         "endpoint": endpoint or "",
         "session_id": session_id,
         "reason": str(reason),
         "abandoned_at": _now,
         "ttl_seconds": _ttl,
+        "scope": scope,
     }
-    _abandoned_slots[_abandoned_slot_key(endpoint, slot_id)] = entry
+    _abandoned_slots[_abandoned_slot_key(endpoint, key_id)] = entry
     return entry
 
 
@@ -1768,8 +2099,13 @@ def _abandoned_slot_for(
     that could not resolve the endpoint still annotates the slot the status
     payload reads (the annotation must never silently vanish because two call
     sites disagree about the endpoint spelling).
+
+    Only a **real** slot id can match: an endpoint-wide entry (recorded with no
+    identity, keyed by :data:`ABANDONED_SLOT_ENDPOINT_WIDE`) is never returned
+    here, so this lookup can never mis-attribute a ghost to a live slot. Use
+    :func:`_abandoned_slot_endpoint_wide` for that entry behind its guard.
     """
-    if not isinstance(slot_id, int):
+    if not _abandoned_slot_is_real_id(slot_id):
         return None
     _now = time.monotonic() if now is None else now
     _prune_abandoned_slots(now=_now)
@@ -1785,9 +2121,89 @@ def _abandoned_slot_for(
     # (multi-backend deployments; the local status payload describes the
     # current local child, which may or may not carry an explicit label).
     for (ep, sid), entry in _abandoned_slots.items():
-        if sid == slot_id:
+        if entry.get("slot_id") is not None and sid == slot_id:
             return entry
     return None
+
+
+def _abandoned_slot_endpoint_wide(
+    *, endpoint: str | None = None, now: float | None = None
+) -> dict | None:
+    """Return the live **endpoint-wide** abandonment entry (``None`` when none).
+
+    The only sanctioned reader of an entry recorded without a slot identity.
+    Resolved the same way as :func:`_abandoned_slot_for` — exact endpoint first,
+    then the legacy/default label, then any endpoint — so an entry written by a
+    path that carried a different endpoint spelling is still readable.
+
+    A caller **must** apply the "no live dispatch record / no lease owner"
+    guard before annotating a slot from this entry: it names no slot, so it can
+    only ever describe a draining ghost (LP-0MVUVHB1V006HA5I).
+    """
+    _now = time.monotonic() if now is None else now
+    _prune_abandoned_slots(now=_now)
+    keys = [_abandoned_slot_key(endpoint, ABANDONED_SLOT_ENDPOINT_WIDE)]
+    fallback = _abandoned_slot_key(None, ABANDONED_SLOT_ENDPOINT_WIDE)
+    if fallback not in keys:
+        keys.append(fallback)
+    for key in keys:
+        entry = _abandoned_slots.get(key)
+        if entry is not None:
+            return entry
+    for (ep, sid), entry in _abandoned_slots.items():
+        if sid == ABANDONED_SLOT_ENDPOINT_WIDE:
+            return entry
+    return None
+
+
+def _clear_abandoned_slot(
+    slot_id: int | None = None,
+    *,
+    scope: str = "slot",
+) -> int:
+    """Drop live abandonment entries for one slot or for the whole endpoint.
+
+    The *only* sanctioned clear path, and the exact mirror of the lookups:
+
+    - ``scope="slot"`` drops every entry naming *slot_id* — the shape a
+      **fresh** ``/slots`` reading reporting that slot not processing proves
+      is no longer draining (LP-0MVUVHB1V006HA5I AC2).
+    - ``scope="endpoint"`` drops the endpoint-wide entries
+      (:data:`ABANDONED_SLOT_ENDPOINT_WIDE`), used only when a fresh snapshot
+      reports **nothing** processing on the endpoint.
+
+    Both clear across endpoint labels, symmetrically with
+    :func:`_abandoned_slot_for` / :func:`_abandoned_slot_endpoint_wide`: when
+    the write and read sides disagree about the label, a stale annotation must
+    still be removable once the backend reports the slot free.
+
+    Callers **must** gate this on fresh evidence. A cached snapshot is a
+    fossil of a past request and is never proof that the slot was released, so
+    the status builder only clears when ``not stale``.
+
+    Read-only with respect to capacity: clearing touches only this in-process
+    registry — no lease is released, no counter is decremented, nothing is
+    re-recorded. Returns how many entries were removed (0 is normal).
+    """
+    if scope == "endpoint":
+        doomed = [
+            key
+            for key in _abandoned_slots
+            if key[1] == ABANDONED_SLOT_ENDPOINT_WIDE
+        ]
+    elif _abandoned_slot_is_real_id(slot_id):
+        doomed = [
+            key
+            for key, entry in _abandoned_slots.items()
+            if entry.get("slot_id") == slot_id
+        ]
+    else:
+        # Nothing to clear: an unresolvable identity names no slot, and the
+        # endpoint-wide entry is only reachable through ``scope="endpoint"``.
+        return 0
+    for key in doomed:
+        _abandoned_slots.pop(key, None)
+    return len(doomed)
 
 
 def _abandoned_slot_count(
@@ -1814,17 +2230,235 @@ def _abandoned_slot_lookup(
 
     Read-only (never assigns): the abandonment paths call this *before* the
     slot assignment is freed, so the registry entry can name the slot the
-    ghost actually occupies. Best-effort — an unknown slot means the
-    cancellation attempt carries AC1 alone.
+    ghost actually occupies. Best-effort — an unknown slot is recorded
+    endpoint-wide by :func:`_record_abandoned_slot` rather than dropped.
     """
     if not session_id:
         return None
     try:
         from proxy.session import _assigned_slot_for_session
 
-        return _assigned_slot_for_session(session_id, endpoint=endpoint)
+        # The dispatch-lease key treats the legacy literal ``"local"`` as "no
+        # endpoint" (``_dispatch_lease_key``) while the slot registry stores
+        # the empty label, so normalise before looking up — otherwise an
+        # identity that exists silently fails to resolve and the abandonment
+        # is recorded endpoint-wide for no reason (LP-0MVUVHAQP001IRKK).
+        lookup_endpoint = "" if endpoint == "local" else endpoint
+        return _assigned_slot_for_session(session_id, endpoint=lookup_endpoint)
     except Exception:
         return None
+
+
+def _observed_abandoned_slot(
+    session_id: str | None, endpoint: str | None = None
+) -> int | None:
+    """Return the slot llama-server **currently reports** for *session_id*.
+
+    Reads the in-process ``/slots``-derived pairing
+    (``observability._processing_slot_assignments``, slot id → session id). This
+    is the backend's own view, independent of the proxy's slot assignment, so
+    comparing it with the recorded id is what makes an identity mismatch
+    diagnosable (LP-0MVUVHAQP001IRKK). Read-only and synchronous; ``None`` when
+    the pairing has no entry for the session (no status poll yet, or already
+    cleaned up).
+    """
+    if not session_id:
+        return None
+    try:
+        from proxy import observability as _observability
+
+        assignments = getattr(_observability, "_processing_slot_assignments", None)
+        if not isinstance(assignments, dict):
+            return None
+        for slot_id, owner in list(assignments.items()):
+            if owner == session_id and _abandoned_slot_is_real_id(slot_id):
+                return int(slot_id)
+    except Exception:
+        return None
+    return None
+
+
+@dataclass(frozen=True)
+class AbandonedSlotIdentity:
+    """Slot identity resolved for an abandonment release.
+
+    ``slot_id`` is the slot the proxy recorded (or ``None`` when it could not
+    resolve one), ``source`` is the provenance published as ``slot_source=``
+    (``"explicit"`` | ``"assignment"`` | ``"endpoint_wide"``) and
+    ``observed_slot_id`` is the slot llama-server reported for the session when
+    the release was taken. ``slot_id != observed_slot_id`` (both known) is the
+    shape-1 mismatch that used to be silent.
+    """
+
+    slot_id: int | None
+    source: str
+    observed_slot_id: int | None
+
+
+SLOT_SOURCE_EXPLICIT = "explicit"
+SLOT_SOURCE_ASSIGNMENT = "assignment"
+SLOT_SOURCE_ENDPOINT_WIDE = "endpoint_wide"
+
+
+def _resolve_abandoned_slot_identity(
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    explicit: int | None = None,
+    record: Mapping[str, Any] | None = None,
+) -> AbandonedSlotIdentity:
+    """Resolve the slot identity to record for an abandonment release.
+
+    Precedence: the caller's *explicit* slot id, then the dispatch *record*'s
+    pinned ``slot_id`` (captured at admission, so it survives a later assignment
+    free), then the live session assignment. All three are read **before** the
+    caller frees the assignment; an unresolvable identity yields ``source ==
+    "endpoint_wide"`` and the caller records the endpoint-wide entry instead of
+    dropping the abandonment.
+    """
+    if _abandoned_slot_is_real_id(explicit):
+        slot_id: int | None = int(explicit)  # type: ignore[arg-type]
+        source = SLOT_SOURCE_EXPLICIT
+    else:
+        pinned = record.get("slot_id") if isinstance(record, Mapping) else None
+        if _abandoned_slot_is_real_id(pinned):
+            slot_id = int(pinned)  # type: ignore[arg-type]
+            source = SLOT_SOURCE_ASSIGNMENT
+        else:
+            assigned = _abandoned_slot_lookup(session_id, endpoint)
+            if _abandoned_slot_is_real_id(assigned):
+                slot_id = int(assigned)  # type: ignore[arg-type]
+                source = SLOT_SOURCE_ASSIGNMENT
+            else:
+                slot_id = None
+                source = SLOT_SOURCE_ENDPOINT_WIDE
+    return AbandonedSlotIdentity(
+        slot_id=slot_id,
+        source=source,
+        observed_slot_id=_observed_abandoned_slot(session_id, endpoint),
+    )
+
+
+def _record_abandoned_identity(
+    srv,
+    identity: AbandonedSlotIdentity,
+    *,
+    session_id: str | None,
+    endpoint: str | None = None,
+    reason: str,
+) -> dict:
+    """Record *identity* and publish the ``slot_source`` provenance on the log.
+
+    Re-verifies the resolved id against the slot llama-server actually reports
+    (captured in *identity* before the assignment was freed). On mismatch the
+    release logs ``abandoned_slot_mismatch`` with ``recorded_slot=`` /
+    ``observed_slot=`` and records the endpoint-wide entry **as well as** the
+    recorded exact entry, so shape 1 (attributable but unmatched) becomes
+    diagnosable from production logs instead of silent (LP-0MVUVHAQP001IRKK).
+
+    Every recording logs ``abandoned_slot_recorded ... slot_source=`` so the
+    intake OPEN QUESTION (why attributable polls showed
+    ``local_abandoned_slots=0``) is answerable from the logs alone. Never
+    raises: an abandonment log line must never break the release path.
+    Returns the entry that represents the abandonment (endpoint-wide when the
+    identity was unresolvable or mismatched, else the exact entry).
+    """
+    logger = getattr(srv, "logger", None)
+    recorded = identity.slot_id
+    observed = identity.observed_slot_id
+    mismatch = (
+        recorded is not None and observed is not None and observed != recorded
+    )
+    if mismatch:
+        try:
+            if logger is not None:
+                logger.warning(
+                    "abandoned_slot_mismatch session=%s endpoint=%s "
+                    "recorded_slot=%s observed_slot=%s reason=%s",
+                    session_id if session_id else "unknown",
+                    endpoint or "default",
+                    recorded,
+                    observed,
+                    reason,
+                )
+        except Exception:
+            pass
+    exact_entry = None
+    if recorded is not None:
+        exact_entry = _record_abandoned_slot(
+            recorded,
+            session_id=session_id,
+            endpoint=endpoint,
+            reason=reason,
+        )
+        _log_abandoned_slot_recorded(
+            logger, exact_entry, identity.source, session_id, endpoint
+        )
+    wide_entry = None
+    if recorded is None or mismatch:
+        wide_entry = _record_abandoned_slot(
+            None,
+            session_id=session_id,
+            endpoint=endpoint,
+            reason=reason,
+        )
+        _log_abandoned_slot_recorded(
+            logger, wide_entry, SLOT_SOURCE_ENDPOINT_WIDE, session_id, endpoint
+        )
+    return wide_entry if wide_entry is not None else exact_entry
+
+
+def _pin_dispatch_slot(
+    srv, record_key, session_key: str | None, endpoint: str | None = None
+) -> None:
+    """Pin the dispatch record's slot identity at admission (best effort).
+
+    Captured while the session's slot assignment exists, so the abandonment
+    paths can name the slot the proxy gave up on even after the assignment has
+    been freed, and the recorded id can later be re-verified against the slot
+    llama-server reports (LP-0MVUVHAQP001IRKK). ``_dispatch_evidence`` fills
+    the same ``slot_id`` key with ``None``, hence the explicit overwrite once
+    the record exists. A missing record / unresolvable assignment is a no-op.
+    """
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if not isinstance(records, dict):
+            return
+        record = records.get(record_key)
+        if not isinstance(record, dict):
+            return
+        slot_id = _abandoned_slot_lookup(session_key, endpoint)
+        if _abandoned_slot_is_real_id(slot_id):
+            record["slot_id"] = int(slot_id)  # type: ignore[arg-type]
+    except Exception:
+        pass
+
+
+def _log_abandoned_slot_recorded(
+    logger,
+    entry: Mapping[str, Any] | None,
+    slot_source: str,
+    session_id: str | None,
+    endpoint: str | None,
+) -> None:
+    """Emit one ``abandoned_slot_recorded`` line carrying the provenance."""
+    if entry is None:
+        return
+    try:
+        if logger is None:
+            return
+        logger.info(
+            "abandoned_slot_recorded session=%s endpoint=%s slot=%s "
+            "slot_source=%s reason=%s ttl_s=%.0f",
+            session_id if session_id else "unknown",
+            endpoint or "default",
+            entry.get("slot_id"),
+            slot_source,
+            entry.get("reason"),
+            entry.get("ttl_seconds", 0.0),
+        )
+    except Exception:
+        pass
 
 
 #: Cached-token ratio at or above which a local dispatch counts as a
@@ -2488,6 +3122,9 @@ async def _increment_local_active_queries(
                             admission_evidence=admission_evidence,
                         ),
                     }
+                    _pin_dispatch_slot(
+                        srv, record_key, session_key, backend
+                    )
         except Exception:
             pass
 
@@ -3128,6 +3765,21 @@ def _record_local_eviction(
     except Exception:
         pass
 
+    # LP-0MVT2QFAP0082BKR (AC eviction): the reclaimed slot no longer holds this
+    # session's prefix, so its captured measurement is stale. Every reclaim
+    # reason funnels through this chokepoint, so clearing here covers them all:
+    # the next admission for the session must report
+    # ``unavailable:no_prior_measurement`` instead of reusing a ratio measured
+    # against a prefix the pool has dropped. The routed model is deliberately
+    # not known here, so every model's measurement for the session goes.
+    # Fail-open: clearing never raises and never changes a decision.
+    try:
+        from proxy.measured_prefill import clear_measured_prefill
+
+        clear_measured_prefill(None, session_key)
+    except Exception:
+        pass
+
     if plan is not None:
         _spawn_detached_release(
             _save_evicted_snapshot(
@@ -3268,6 +3920,7 @@ async def _try_acquire_local_dispatch(
     body_json: dict | None = None,
     model_name: str | None = None,
     admission_evidence: dict | None = None,
+    request=None,
 ) -> tuple:
     """Try to acquire the local dispatch for *session_key*.
 
@@ -3308,10 +3961,37 @@ async def _try_acquire_local_dispatch(
     If the server does not have *local_dispatch_records* or
     *local_dispatch_records_lock* attributes (legacy state), the function
     silently returns ``(True, None, 0, 1.0)`` to allow the request.
+
+    Post-deadline thrash gate (LP-0MVSAMN14001DMTY AC1/AC2): this is the
+    **lease acquisition choke point**, so every path that can obtain a local
+    dispatch lease — the provider chain, the provider's in-request local retry
+    loops (``local_slot_exhaustion_retry`` / ``local_http_retry``), ``ui.py``'s
+    direct dispatch, the contention-queue re-dispatch — passes through
+    :func:`_local_dispatch_gate` *before* the record is created. A request
+    whose local dispatch was cancelled by the prefill deadline is refused
+    (``reason=post_deadline_terminal``) and a session whose post-deadline
+    cooldown is armed for this prompt is refused
+    (``reason=prefill_thrash_cooldown``), so the ~150 ms post-release
+    re-acquisition observed on 2026-10-26 is impossible even on the paths that
+    never consult provider.py's chain gate.
     """
     # Guard: skip if dispatch tracking is not initialised
     if not hasattr(srv, "local_dispatch_records") or not hasattr(srv, "local_dispatch_records_lock"):
         return (True, None, 0, 1.0)
+
+    _gate_refused, _gate_reason, _gate_remaining = _local_dispatch_gate(
+        srv,
+        session_key,
+        request=request,
+        fingerprint=(
+            _prefill_thrash_fingerprint(body_json)
+            if isinstance(body_json, dict)
+            else None
+        ),
+        entry="lease_acquire",
+    )
+    if _gate_refused:
+        return (False, None, 0, max(1.0, _gate_remaining))
 
     lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
     now = time.monotonic()
@@ -3472,6 +4152,10 @@ async def _try_acquire_local_dispatch(
                         admission_evidence=admission_evidence,
                     ),
                 }
+                # LP-0MVUVHAQP001IRKK: pin the slot identity on the record at
+                # admission (before any release can free the assignment) so
+                # every abandonment path can name the slot it gave up on.
+                _pin_dispatch_slot(srv, record_key, session_key, backend)
                 # Register prefill hold for the prefill-aware guard.
                 try:
                     _p = getattr(srv, "local_prefill_in_flight", None)
@@ -3588,6 +4272,605 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     return removed
 
 
+#: Machine-readable reasons reported by :func:`summarise_on_session_slot` and
+#: logged by the local→remote boundary hook (parent LP-0MVRBQBDF0037OZ5 AC4).
+BOUNDARY_REASON_COMPACT = "boundary_compact"
+BOUNDARY_REASON_NO_SLOT = "boundary_no_slot"
+BOUNDARY_REASON_SLOT_UNAVAILABLE = "boundary_slot_unavailable"
+BOUNDARY_REASON_SUMMARIZER_FAILED = "boundary_summarizer_failed"
+#: Decision outcomes (``decide_boundary_compaction``) — normal skips, logged
+#: at INFO because they are the shipped-steady-state (knob off) behaviour.
+BOUNDARY_REASON_DISABLED = "boundary_disabled"
+BOUNDARY_REASON_NOT_REMOTE = "boundary_not_remote"
+BOUNDARY_REASON_NO_LOCAL_PROVENANCE = "boundary_no_local_provenance"
+#: Skip reasons that are worth a WARNING: a session that *should* have been
+#: compacted was not.
+BOUNDARY_REASON_BELOW_GUARD = "boundary_below_guard"
+#: Idempotence guard — the boundary was already evaluated for this request.
+BOUNDARY_REASON_ALREADY_EVALUATED = "already_evaluated"
+#: The hook itself failed; the request proceeds remote untouched.
+BOUNDARY_REASON_EVALUATION_FAILED = "boundary_evaluation_failed"
+
+#: Reasons ``summarise_on_session_slot`` already emits a WARNING for — the
+#: hook must not warn twice for the same skip (AC3: *one* WARNING with the
+#: token per skip).
+_BOUNDARY_HELPER_WARNING_REASONS = frozenset(
+    {
+        BOUNDARY_REASON_NO_SLOT,
+        BOUNDARY_REASON_SLOT_UNAVAILABLE,
+        BOUNDARY_REASON_SUMMARIZER_FAILED,
+    }
+)
+#: Skip reasons the hook itself logs at WARNING.
+_BOUNDARY_WARNING_REASONS = frozenset(
+    {
+        BOUNDARY_REASON_BELOW_GUARD,
+        BOUNDARY_REASON_EVALUATION_FAILED,
+    }
+    | _BOUNDARY_HELPER_WARNING_REASONS
+)
+
+
+def _log_boundary_event(srv, level: str, message: str, **fields) -> None:
+    """Emit a boundary-compaction line through ``srv.logger`` when present.
+
+    Logging must never break dispatch, so a missing logger or a failing
+    handler is swallowed (the request still proceeds remote untouched).
+    """
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    try:
+        logger = getattr(srv, "logger", None)
+        if logger is None:
+            return
+        getattr(logger, level)(f"{message} {payload}".strip())
+    except Exception:
+        pass
+
+
+async def summarise_on_session_slot(
+    srv,
+    session_id: str,
+    messages: list[dict],
+    *,
+    config: dict | None = None,
+    summarizer_builder=None,
+    endpoint: str | None = None,
+) -> dict:
+    """Summarise *messages* on the local slot already assigned to *session_id*.
+
+    Local→remote boundary helper (LP-0MVTDU91C003Q9YZ, parent AC2/AC3): the
+    session is leaving the local model, so its own slot is disposable — the
+    summary is produced there instead of on another session's warm slot or on
+    a dedicated summariser backend.
+
+    Ordering contract: the session's local dispatch lease is released the
+    instant the summariser returns (success, failure **or** timeout) and
+    therefore **before** the caller's remote stream starts — no local slot
+    stays pinned to a session now served remotely.
+
+    The slot is looked up with the **read-only**
+    ``proxy.session._assigned_slot_for_session``; this helper never assigns a
+    slot (a session without one is skipped, never given another session's).
+
+    Args:
+        srv: Proxy server object (provides ``local_dispatch_records`` and the
+            optional ``logger``).
+        session_id: Session whose slot is reused.
+        messages: Messages to summarise (the turns being compacted away).
+        config: Proxy config dict; defaults to ``srv.config``. Supplies the
+            llama-server port and the summariser knobs — no new timeout knob
+            is introduced (``compaction_summarizer_timeout`` bounds the call).
+        summarizer_builder: Optional ``Callable[[int], Summarizer]`` called
+            exactly once with the resolved slot id. Production defaults to
+            ``build_slot_pinned_summarizer(config, slot_id, llama_port=…)``;
+            tests inject fakes here.
+        endpoint: Optional per-endpoint local llama-server URL, used for both
+            the slot lookup and the lease release.
+
+    Returns:
+        ``{"slot_id", "summary", "reason", "released"}``. ``summary`` is the
+        summary text on success and ``None`` otherwise; ``reason`` is one of
+        ``boundary_compact``, ``boundary_no_slot``,
+        ``boundary_slot_unavailable`` or ``boundary_summarizer_failed``.
+    """
+    cfg = config if isinstance(config, dict) else None
+    if cfg is None:
+        srv_config = getattr(srv, "config", None)
+        cfg = srv_config if isinstance(srv_config, dict) else {}
+    server_cfg = cfg.get("server") if isinstance(cfg.get("server"), dict) else {}
+    try:
+        llama_port = int(server_cfg.get("llama_server_port", 8080))
+    except (TypeError, ValueError):
+        llama_port = 8080
+    if endpoint:
+        try:
+            _, endpoint_port = _parse_endpoint_url(endpoint)
+            llama_port = endpoint_port
+        except Exception:
+            pass
+
+    # Read-only slot lookup — never ``_slot_id_for_session`` (which assigns).
+    slot_id = None
+    try:
+        from proxy.session import _assigned_slot_for_session
+
+        if endpoint:
+            slot_id = _assigned_slot_for_session(session_id, endpoint=endpoint)
+        else:
+            slot_id = _assigned_slot_for_session(session_id)
+    except Exception:
+        slot_id = None
+
+    reason = BOUNDARY_REASON_NO_SLOT
+    summary: str | None = None
+    released = False
+    try:
+        if slot_id is None:
+            # No slot of its own: never borrow another session's.
+            _log_boundary_event(
+                srv,
+                "warning",
+                "boundary_compaction_skipped",
+                session=session_id,
+                reason=BOUNDARY_REASON_NO_SLOT,
+            )
+        else:
+            if summarizer_builder is not None:
+                summarizer = summarizer_builder(slot_id)
+            else:
+                from proxy.compaction_summarizer import (
+                    build_slot_pinned_summarizer,
+                )
+
+                summarizer = build_slot_pinned_summarizer(
+                    cfg, slot_id, llama_port=llama_port
+                )
+            try:
+                # Run in a worker thread: the pinned local call blocks until
+                # the slot is free (bounded by ``compaction_summarizer_timeout``)
+                # and this runs *before* the remote dispatch, so an inline
+                # call would freeze the event loop — including the very
+                # stream whose slot we may be waiting on
+                # (LP-0MU1RXEY10075TUU, the same reason
+                # ``evaluate_and_apply_compaction`` uses ``asyncio.to_thread``).
+                text = await asyncio.to_thread(summarizer, messages)
+            except httpx.TransportError:
+                # Connection-level failure: the pinned slot could not be
+                # reached at all.
+                reason = BOUNDARY_REASON_SLOT_UNAVAILABLE
+                _log_boundary_event(
+                    srv,
+                    "warning",
+                    "boundary_compaction_skipped",
+                    session=session_id,
+                    slot=slot_id,
+                    reason=reason,
+                )
+            except Exception as exc:
+                reason = BOUNDARY_REASON_SUMMARIZER_FAILED
+                _log_boundary_event(
+                    srv,
+                    "warning",
+                    "boundary_compaction_skipped",
+                    session=session_id,
+                    slot=slot_id,
+                    reason=reason,
+                    error=type(exc).__name__,
+                )
+            else:
+                text = text if isinstance(text, str) else None
+                if text and text.strip():
+                    summary = text
+                    reason = BOUNDARY_REASON_COMPACT
+                    _log_boundary_event(
+                        srv,
+                        "info",
+                        "boundary_compaction_summarised",
+                        session=session_id,
+                        slot=slot_id,
+                        reason=reason,
+                    )
+                else:
+                    # Blank text and the fail-open ``EmptySummary`` sentinel
+                    # both mean "no usable summary" — never injected.
+                    reason = BOUNDARY_REASON_SUMMARIZER_FAILED
+                    _log_boundary_event(
+                        srv,
+                        "warning",
+                        "boundary_compaction_skipped",
+                        session=session_id,
+                        slot=slot_id,
+                        reason=reason,
+                    )
+    finally:
+        # Immediate release: this runs before the helper returns, so the
+        # caller cannot start the remote stream while the slot is still held —
+        # even when the summariser raised or timed out. It also runs on the
+        # no-slot path so no stale lease survives.
+        try:
+            released = await _release_local_dispatch(
+                srv, session_id, endpoint=endpoint
+            )
+        except Exception:
+            released = False
+
+    return {
+        "slot_id": slot_id,
+        "summary": summary,
+        "reason": reason,
+        "released": released,
+    }
+
+
+def _boundary_request_evaluated(request) -> bool:
+    """True when the boundary was already evaluated for *request*.
+
+    The per-request idempotence gate (matching the assembly path's
+    ``result["compaction_evaluated"]``): a boundary compaction summarises
+    once per request cycle, never once per provider attempt. Stored on the
+    request object, which both remote dispatch cycles share across their
+    provider/chain-hold retries.
+    """
+    return bool(getattr(request, "_boundary_compaction_evaluated", False))
+
+
+def _mark_boundary_request_evaluated(request) -> None:
+    """Record that the boundary decision for *request* has been taken."""
+    try:
+        request._boundary_compaction_evaluated = True
+    except Exception:
+        pass
+
+
+async def evaluate_boundary_compaction(
+    srv,
+    config: dict | None,
+    body_json: dict,
+    session_id: str | None,
+    provider_cfg: Mapping[str, Any] | None,
+    *,
+    request: Request | None = None,
+    estimated_tokens: int | None = None,
+    session_manager: Any | None = None,
+    summarizer_builder: Any | None = None,
+    estimate_tokens: Any | None = None,
+    endpoint: str | None = None,
+    mode: str = "fast",
+) -> dict:
+    """Compact a locally-served session's history before a remote dispatch.
+
+    The single local→remote boundary hook (LP-0MVTDUBR00038ZRL) called by
+    both remote dispatch points in ``proxy.provider`` and by ``proxy.ui``'s
+    direct remote dispatches, immediately before the remote POST. It consumes
+    the pieces the earlier children provide:
+
+    1. :func:`proxy.compaction.decide_boundary_compaction` — the gates
+       (knob, ``type: remote``, recorded local provenance, size guard).
+    2. :func:`proxy.compaction.plan_boundary_compaction_span` — what to fold
+       and what to keep verbatim.
+    3. :func:`summarise_on_session_slot` — the slot-pinned summariser plus
+       the immediate lease release.
+    4. :func:`proxy.compaction.apply_boundary_compaction_summary` — the
+       compacted message list, injected into the outgoing body.
+
+    **Why not ``evaluate_and_apply_compaction``?** That helper is gated by
+    ``compaction_trigger_ratio``, which ships at ``0`` (assembly-time
+    compaction deliberately disabled, LP-0MU61IRVC003RRN6), so it can never
+    fire for a boundary session. Reusing it would require re-enabling the
+    operator's kill-switch. The boundary path therefore calls
+    ``decide_boundary_compaction`` directly and owns its own trigger, while
+    reusing the same planning primitives (retention set, recent window,
+    summary marker), the same per-request idempotence discipline and the same
+    session-history writes.
+
+    Success rewrites ``body_json["messages"]`` in place, sets
+    ``cache_prompt`` (the compacted prefix no longer matches the client's
+    history — a full prompt must be sent) and refreshes the cached
+    ``request._body`` so the remote dispatcher forwards the compacted list.
+    The compacted history is also stored on the session
+    (``update_messages`` + ``mark_compacted``), inheriting the
+    post-compaction delta heal (LP-0MTXEED8E003EDM8). ``outcome`` is
+    mirrored onto ``request._boundary_compaction_result`` so response header
+    bridges can surface it.
+
+    Fail-open, never lossy: every skip and failure — knob off, non-remote
+    provider, no provenance, below the guard, no assigned slot, unreachable
+    slot, blank / ``EmptySummary`` / raising summariser, or an exception in
+    this helper — leaves the outgoing body byte-identical and lets the
+    remote dispatch proceed. There is no remote summariser fallback
+    (parent Appendix Q3).
+
+    Idempotent per request cycle: the request-level
+    ``_boundary_compaction_evaluated`` flag makes a second call a no-op, so
+    a provider retry never re-summarises (exactly one summarisation per
+    request).
+
+    Costs are only paid when the gates pass: the knob and provider-type
+    checks run before the provenance read and the token estimate, so the
+    shipped default (knob off) adds no measurable work per request.
+
+    Args:
+        srv: Server object (``config`` fallback, ``logger``, and — unless
+            ``session_manager`` is passed — ``session_manager``).
+        config: Proxy config (flat or nested ``server``); defaults to
+            ``srv.config``.
+        body_json: Parsed outgoing request body (mutated on success).
+        session_id: Session whose history is compacted.
+        provider_cfg: Provider entry about to be dispatched (``type``).
+        request: The incoming request; carries the idempotence flag and the
+            cached body that the dispatcher reads.
+        estimated_tokens: Pre-computed estimate of the outgoing history;
+            computed here when omitted.
+        session_manager: Session store; defaults to ``srv.session_manager``.
+        summarizer_builder: Optional ``Callable[[int], Summarizer]`` forwarded
+            to :func:`summarise_on_session_slot` (tests inject fakes).
+        estimate_tokens: Optional estimator over a full message list;
+            defaults to the routing estimator (production) — tests inject a
+            deterministic one.
+        endpoint: Optional per-endpoint local llama-server URL.
+        mode: Compaction budget (default ``fast``).
+
+    Returns:
+        The outcome dict: ``evaluated``, ``applied``, ``reason``, ``slot_id``,
+        ``estimated_before``, ``estimated_after``, ``turns_summarized``,
+        ``recent_turns_kept``, ``summary_text``, ``messages`` and
+        ``duration_ms``. Never raises.
+    """
+    started = time.monotonic()
+    outcome: dict[str, Any] = {
+        "evaluated": False,
+        "applied": False,
+        "reason": None,
+        "slot_id": None,
+        "estimated_before": 0,
+        "estimated_after": 0,
+        "turns_summarized": 0,
+        "recent_turns_kept": 0,
+        "summary_text": None,
+        "messages": None,
+        "duration_ms": 0.0,
+    }
+
+    def _emit(level: str, **fields: Any) -> None:
+        """Emit the ONE structured boundary line for this evaluation (AC4)."""
+        outcome["duration_ms"] = round((time.monotonic() - started) * 1000.0, 1)
+        _log_boundary_event(
+            srv,
+            level,
+            "boundary_compaction",
+            session=session_id or "unknown",
+            provider=_provider_name(provider_cfg),
+            slot=outcome["slot_id"],
+            est_before=outcome["estimated_before"],
+            est_after=outcome["estimated_after"],
+            turns_summarized=outcome["turns_summarized"],
+            recent_turns_kept=outcome["recent_turns_kept"],
+            duration_ms=outcome["duration_ms"],
+            outcome=outcome["reason"],
+            **fields,
+        )
+
+    def _finish(reason: str, *, record: bool = True) -> dict:
+        outcome["reason"] = reason
+        if record:
+            outcome["evaluated"] = True
+            level = (
+                "warning"
+                if reason in _BOUNDARY_WARNING_REASONS
+                and reason not in _BOUNDARY_HELPER_WARNING_REASONS
+                else "info"
+            )
+            _emit(level)
+            if request is not None:
+                try:
+                    request._boundary_compaction_result = {
+                        k: v for k, v in outcome.items() if k != "messages"
+                    }
+                except Exception:
+                    pass
+        return outcome
+
+    try:
+        cfg = config if isinstance(config, dict) else None
+        if cfg is None:
+            srv_config = getattr(srv, "config", None)
+            cfg = srv_config if isinstance(srv_config, dict) else {}
+        server_cfg = cfg.get("server") if isinstance(cfg.get("server"), dict) else {}
+
+        # --- Cheap gates first: no provenance read, no estimate, no
+        # summariser unless boundary compaction could possibly apply.
+        from proxy.provider import compaction_config
+
+        if not bool(compaction_config(cfg)["remote_boundary_compaction"]):
+            return _finish(BOUNDARY_REASON_DISABLED, record=False)
+        provider_type = str(
+            (provider_cfg or {}).get("type") if isinstance(provider_cfg, Mapping) else ""
+        ).strip().lower()
+        if provider_type != "remote":
+            return _finish(BOUNDARY_REASON_NOT_REMOTE, record=False)
+        if not session_id:
+            return _finish("boundary_no_session", record=False)
+        if _boundary_request_evaluated(request):
+            return _finish(BOUNDARY_REASON_ALREADY_EVALUATED, record=False)
+
+        # From here on the decision is taken: never re-evaluate this cycle.
+        _mark_boundary_request_evaluated(request)
+
+        messages = (
+            body_json.get("messages") if isinstance(body_json, dict) else None
+        )
+        if not isinstance(messages, list) or not messages:
+            # Non-chat routes (``v1/embeddings``, completions without a message
+            # list) carry no history to compact: skip silently rather than log
+            # a below-guard WARNING for traffic the feature never applies to.
+            return _finish("boundary_no_history", record=False)
+
+        manager = (
+            session_manager
+            if session_manager is not None
+            else getattr(srv, "session_manager", None)
+        )
+        has_provenance = False
+        if manager is not None:
+            try:
+                has_provenance = bool(
+                    await manager.has_local_provenance(session_id)
+                )
+            except Exception:
+                has_provenance = False
+
+        from proxy.compaction import decide_boundary_compaction
+
+        estimate = (
+            estimate_tokens
+            if callable(estimate_tokens)
+            else _boundary_estimator(body_json, server_cfg)
+        )
+        if estimated_tokens is None:
+            try:
+                estimated_tokens = int(estimate(list(messages or [])) or 0)
+            except Exception:
+                estimated_tokens = 0
+        outcome["estimated_before"] = int(estimated_tokens or 0)
+
+        decision = decide_boundary_compaction(
+            provider_type=provider_type,
+            has_local_provenance=has_provenance,
+            estimated_tokens=outcome["estimated_before"],
+            config=cfg,
+        )
+        if not decision["should_compact"]:
+            return _finish(decision["reason"] or "boundary_not_compacted")
+
+        from proxy.compaction import plan_boundary_compaction_span
+
+        span = plan_boundary_compaction_span(
+            list(messages or []), mode=mode, estimate_tokens=estimate
+        )
+        outcome["estimated_before"] = int(span.get("estimated_before", 0) or 0)
+        if span.get("action") != "plan":
+            return _finish(span.get("reason") or "boundary_not_compacted")
+
+        summarised = await summarise_on_session_slot(
+            srv,
+            session_id,
+            span["middle_messages"],
+            config=cfg,
+            summarizer_builder=summarizer_builder,
+            endpoint=endpoint,
+        )
+        outcome["slot_id"] = summarised.get("slot_id")
+        if not summarised.get("summary"):
+            # The helper already warned with the machine-readable token
+            # (boundary_no_slot / boundary_slot_unavailable /
+            # boundary_summarizer_failed); this line is the AC4 record.
+            return _finish(
+                summarised.get("reason") or BOUNDARY_REASON_SUMMARIZER_FAILED,
+                record=True,
+            )
+
+        from proxy.compaction import apply_boundary_compaction_summary
+
+        plan = apply_boundary_compaction_summary(
+            span, summarised["summary"], estimate_tokens=estimate
+        )
+        if plan["action"] != "compact":
+            return _finish(plan.get("reason") or BOUNDARY_REASON_SUMMARIZER_FAILED)
+
+        # --- Apply: the compacted list is what the remote dispatcher sends.
+        body_json["messages"] = list(plan["messages"])
+        body_json["cache_prompt"] = True
+        body_json["session_id"] = session_id
+        if request is not None:
+            try:
+                request._body = json.dumps(body_json).encode("utf-8")
+            except Exception:
+                # The body refresh is best-effort: a synthetic request
+                # without a writable body still gets the parsed rewrite, and
+                # the dispatch itself reads through ``request.body()``.
+                pass
+
+        outcome.update(
+            applied=True,
+            estimated_after=int(plan.get("estimated_after", 0) or 0),
+            turns_summarized=int(plan.get("turns_summarized", 0) or 0),
+            recent_turns_kept=int(plan.get("recent_turns_kept", 0) or 0),
+            summary_text=plan.get("summary_text"),
+            messages=list(plan["messages"]),
+        )
+
+        # Persist the compacted history so the next request's routing estimate
+        # and the delta heal see the same history the remote provider saw.
+        if manager is not None:
+            try:
+                await manager.update_messages(session_id, list(plan["messages"]))
+                await manager.mark_compacted(
+                    session_id,
+                    len(messages or []),
+                    len(plan["messages"]),
+                )
+            except Exception:
+                pass  # non-fatal: dispatch still sends the compacted body
+
+        return _finish(BOUNDARY_REASON_COMPACT)
+    except Exception as exc:  # never raise into the dispatch loop
+        outcome["applied"] = False
+        outcome["reason"] = BOUNDARY_REASON_EVALUATION_FAILED
+        try:
+            _emit("warning", error=type(exc).__name__)
+        except Exception:
+            pass
+        return outcome
+
+
+def _provider_name(provider_cfg: Mapping[str, Any] | None) -> str:
+    """Best-effort provider label for boundary log lines."""
+    if not isinstance(provider_cfg, Mapping):
+        return "unknown"
+    return str(
+        provider_cfg.get("name")
+        or provider_cfg.get("provider")
+        or provider_cfg.get("model")
+        or "unknown"
+    )
+
+
+def _boundary_estimator(body_json: dict, server_cfg: dict):
+    """Return a token estimator over a full message list (routing parity).
+
+    Resolved once per evaluation so the decision, the span selection and the
+    post-compaction estimate all price the history with the same tokenizer
+    (the same parity contract ``evaluate_and_apply_compaction`` keeps with
+    routing, LP-0MU5A84YU003YOTY). Falls back to tiktoken via
+    ``_estimate_prompt_tokens_for_routing``.
+    """
+    from proxy.provider import (
+        _estimate_prompt_tokens_for_routing,
+        _get_tokenizer_for_model,
+    )
+
+    model_cfg: dict = {}
+    try:
+        model_name = body_json.get("model") if isinstance(body_json, dict) else None
+        if model_name:
+            from proxy.lifecycle import get_model_config
+
+            model_cfg = get_model_config(model_name) or {}
+    except Exception:
+        model_cfg = {}
+    tokenizer, _multiplier = _get_tokenizer_for_model(model_cfg, server_cfg)
+
+    def estimate(msgs) -> int:
+        return int(
+            _estimate_prompt_tokens_for_routing(
+                {"messages": msgs}, tokenizer=tokenizer
+            )
+            or 0
+        )
+
+    return estimate
+
+
 async def _release_unserved_dispatch(
     srv,
     session_key: str | None,
@@ -3625,25 +4908,33 @@ async def _release_unserved_dispatch(
       during prefill — so the abort is prompt (evidence: 42 of 82
       ``Connection handling canceled`` events on 2026-10-28 cancelled a task
       that never reached ``prompt processing done``).
-    - **Record the abandoned slot identity** (*abandoned_slot_id*, falling
-      back to the session's slot assignment) so a slot the backend has not
-      released yet is annotated "busy, not ours" in the status payload and
-      its ``capacity_hint`` is never ``saturated`` (never ``idle`` either).
+    - **Record the abandoned slot identity** (*abandoned_slot_id*, then the
+      released record's pinned ``slot_id``, then the session's slot
+      assignment — all captured before the assignment is freed) so a slot the
+      backend has not released yet is annotated "busy, not ours" in the status
+      payload and its ``capacity_hint`` is never ``saturated`` (never
+      ``idle`` either). An identity that cannot be resolved records the
+      endpoint-wide entry; a recorded-vs-observed mismatch logs
+      ``abandoned_slot_mismatch`` **and** records the endpoint-wide entry
+      (LP-0MVUVHAQP001IRKK).
 
     Returns ``(removed, released_record)``. Fail-soft: these are exceptional
     paths and must never raise. Wakes the cross-session contention queue when
     state was released.
-    """
+
+    Ordering (LP-0MVSAMN14001DMTY AC3): the dispatch record and this session's
+    ``local_prefill_in_flight`` marker are removed **first**, then the upstream
+    stream is closed and *awaited* (bounded by
+    ``server.disconnect_cleanup_timeout``) before returning. Both halves matter
+    for a retry that lands immediately afterwards (the incident's 147-150 ms):
+    ``_extend_lease_during_prefill`` needs an active record **and** the
+    session's own marker, so nothing can re-extend a cancelled dispatch, and a
+    marker can never outlive the dispatch it marks.
+    """""
     if not session_key:
         return (False, None)
     removed = False
     released_record = None
-    # Capture the abandoned slot identity BEFORE the release frees it: the
-    # slot assignment is the only link from the session to the llama-server
-    # slot, and the status annotation matches on exactly that pair.
-    slot_id = abandoned_slot_id
-    if slot_id is None:
-        slot_id = _abandoned_slot_lookup(session_key, endpoint)
     record_key = _dispatch_lease_key(endpoint, session_key)
     try:
         async with srv.local_dispatch_records_lock:
@@ -3729,7 +5020,7 @@ async def _release_unserved_dispatch(
         try:
             await asyncio.wait_for(
                 _close_stream_cm(stream_cm),
-                timeout=_abandoned_stream_close_timeout(),
+                timeout=_abandoned_stream_close_timeout(srv),
             )
         except BaseException:
             pass
@@ -3737,36 +5028,53 @@ async def _release_unserved_dispatch(
     #    can annotate a slot the backend has not released yet as "busy, not
     #    ours". The reason recorded is the eviction/release reason the caller
     #    already publishes, keeping logs and payload attributable to one word.
+    #    An unresolvable identity records the endpoint-wide entry instead of
+    #    dropping the abandonment, and a recorded-vs-observed mismatch is
+    #    logged rather than matched silently (LP-0MVUVHAQP001IRKK).
     if removed or marker_popped:
         try:
-            entry = _record_abandoned_slot(
-                slot_id,
+            _record_abandoned_identity(
+                srv,
+                _resolve_abandoned_slot_identity(
+                    session_key,
+                    endpoint=endpoint,
+                    explicit=abandoned_slot_id,
+                    record=released_record,
+                ),
                 session_id=session_key,
                 endpoint=endpoint,
                 reason=release_reason,
             )
-            if entry is not None:
-                srv.logger.info(
-                    "abandoned_slot_recorded session=%s endpoint=%s slot=%s "
-                    "reason=%s ttl_s=%.0f",
-                    session_key if session_key else "unknown",
-                    endpoint or "default",
-                    slot_id,
-                    release_reason,
-                    entry.get("ttl_seconds", 0.0),
-                )
         except Exception:
             pass
     return (removed, released_record)
 
 
-def _abandoned_stream_close_timeout() -> float:
+def _abandoned_stream_close_timeout(srv=None) -> float:
     """Bound on closing an abandoned upstream stream (never wedge a request).
 
     Best effort by construction: a stream that will not close must not delay
     the release path, so the ghost is annotated instead of awaited forever.
+
+    The bound is the request's own ``disconnect_cleanup_timeout`` (default
+    5 s, the value the deadline / measured-abort twins use for the same
+    cleanup steps) so the release path honours one configured budget instead of
+    a hard-coded copy of it (LP-0MVSAMN14001DMTY AC3). A missing, malformed or
+    non-positive value keeps the 5 s default — a config typo must not make the
+    close unbounded.
     """
-    return 5.0
+    default = 5.0
+    if srv is None:
+        try:
+            srv = _srv()
+        except Exception:
+            return default
+    try:
+        raw = _server_config_of(srv).get("disconnect_cleanup_timeout", default)
+        timeout = float(raw)
+    except Exception:
+        return default
+    return timeout if timeout > 0 else default
 
 
 async def _release_prefill_deadline_dispatch(
@@ -3822,6 +5130,8 @@ async def _release_measured_cache_abort_dispatch(
     *,
     measured: Any | None = None,
     priced_new_tokens: float | None = None,
+    abandoned_slot_id: int | None = None,
+    upstream_stream_cm: Any | None = None,
 ) -> bool:
     """Release the lease of a dispatch aborted on a measured cache deficit.
 
@@ -3831,6 +5141,13 @@ async def _release_measured_cache_abort_dispatch(
     detour is attributable and never counted as a 120 s deadline eviction. The
     eviction snapshot additionally carries the *measured* evidence
     (``measured_cache`` / ``total`` / ``priced_new_tokens``) the decision used.
+
+    ``abandoned_slot_id`` / ``upstream_stream_cm`` are forwarded exactly like
+    the deadline twin (LP-0MVUVHAQP001IRKK): the caller passes the dispatch
+    record's pinned slot identity and the live upstream stream, so the upstream
+    cancel and the abandonment annotation both fire on the **earliest** abort
+    path — the one that used to pass neither and therefore relied on a
+    post-free session lookup.
 
     Returns True when a record was removed.
     """
@@ -3857,6 +5174,8 @@ async def _release_measured_cache_abort_dispatch(
         release_reason=MEASURED_CACHE_DEFICIT_REASON,
         eviction_reason=MEASURED_CACHE_DEFICIT_REASON,
         extra_eviction_fields=extra_fields or None,
+        abandoned_slot_id=abandoned_slot_id,
+        upstream_stream_cm=upstream_stream_cm,
     )
     return removed
 
@@ -3868,6 +5187,12 @@ class MeasuredAbortPrefetch:
     The router replays ``chunks`` (the raw upstream reads already consumed,
     in order) through its normal stream loop before reading anything new, so
     the peek never loses bytes and never changes the client-visible stream.
+
+    A non-abort ``decision`` is the benefit-gate verdict that *declined* the
+    abort (LP-0MVWDZ22I005A26B): the router reports it on the
+    ``measured_cache_abort`` line (``detail``/``measured_eta_s``/``budget_s``)
+    so a tolerated deficit is explainable. ``None`` when no decision was taken
+    (no measurement, or the peek ended before one).
     """
 
     chunks: list[bytes]
@@ -3943,6 +5268,7 @@ async def _prefetch_measured_cache_abort(
     chunks: list[bytes] = [] if chunks_sink is None else chunks_sink
     capture = PromptProgressCapture()
     decided_measured = None
+    decided_decision = None
     deadline_at = time.monotonic() + timeout if timeout > 0 else None
 
     while len(chunks) < max_chunks:
@@ -3971,11 +5297,15 @@ async def _prefetch_measured_cache_abort(
         try:
             chunk = read_task.result()
         except StopAsyncIteration:
-            return MeasuredAbortPrefetch(chunks=chunks, complete=True)
+            return MeasuredAbortPrefetch(
+                chunks=chunks, complete=True, decision=decided_decision
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # read error — fail open, replay + raise later
-            return MeasuredAbortPrefetch(chunks=chunks, error=exc)
+            return MeasuredAbortPrefetch(
+                chunks=chunks, error=exc, decision=decided_decision
+            )
         chunks.append(chunk)
 
         try:
@@ -3985,7 +5315,9 @@ async def _prefetch_measured_cache_abort(
                     # First complete client-visible event: stop peeking so the
                     # replay releases it immediately (AC2 latency).
                     return MeasuredAbortPrefetch(
-                        chunks=chunks, measured=decided_measured
+                        chunks=chunks,
+                        measured=decided_measured,
+                        decision=decided_decision,
                     )
                 if decided_measured is not None:
                     # Only the FIRST progress event decides (its ``cache`` is
@@ -3999,20 +5331,29 @@ async def _prefetch_measured_cache_abort(
                 decision = decide_measured_cache_abort(
                     progress, priced_new_tokens, effective
                 )
+                decided_decision = decision
                 if decision.abort:
                     return MeasuredAbortPrefetch(
                         chunks=chunks, abort=True, decision=decision, measured=measured
                     )
                 # No abort: keep peeking so ``local_prefill_deadline_seconds``
-                # keeps bounding the whole pre-first-byte wait.
+                # keeps bounding the whole pre-first-byte wait. The declined
+                # decision travels with the outcome so the caller can report
+                # the benefit-gate evidence (LP-0MVWDZ22I005A26B).
         except asyncio.CancelledError:
             raise
         except TimeoutError:
             raise
         except Exception:  # AC5: an observation error degrades
-            return MeasuredAbortPrefetch(chunks=chunks, measured=decided_measured)
+            return MeasuredAbortPrefetch(
+                chunks=chunks,
+                measured=decided_measured,
+                decision=decided_decision,
+            )
         # No complete event yet (partial/empty read): keep reading.
-    return MeasuredAbortPrefetch(chunks=chunks, measured=decided_measured)
+    return MeasuredAbortPrefetch(
+        chunks=chunks, measured=decided_measured, decision=decided_decision
+    )
 
 
 class ClientDisconnectedDuringPrefillError(Exception):
@@ -4156,9 +5497,6 @@ def _release_client_disconnect_dispatch(
     removed = False
     stream_cm = None
     released_record = None
-    # AC1 (LP-0MVRMI5HK00558TB): resolve the slot identity before the release
-    # frees the assignment, so the abandonment is attributable to a slot.
-    abandoned_slot_id = _abandoned_slot_lookup(session_key, endpoint)
     records = getattr(srv, "local_dispatch_records", None)
     if records is not None:
         try:
@@ -4197,6 +5535,15 @@ def _release_client_disconnect_dispatch(
     except Exception:
         marker_popped = False
 
+    # AC1 (LP-0MVRMI5HK00558TB): resolve the slot identity **before** the
+    # assignment is freed below (the released record's pinned ``slot_id`` first,
+    # then the live assignment), so the abandonment is attributable to a slot —
+    # or, when neither resolves, to an endpoint-wide entry
+    # (LP-0MVUVHAQP001IRKK).
+    identity = _resolve_abandoned_slot_identity(
+        session_key, endpoint=endpoint, record=released_record
+    )
+
     if removed or marker_popped:
         # LP-0MVN1IQTF0037WTG AC6: an observed client disconnect releases the
         # reservation immediately (one cleanup cycle, no waiting). Record the
@@ -4231,10 +5578,13 @@ def _release_client_disconnect_dispatch(
     # AC1 (LP-0MVRMI5HK00558TB): a client that vanished mid-prefill abandoned
     # this dispatch. The slot identity is captured before the assignment was
     # freed above; recording it lets the status payload annotate a slot the
-    # backend has not released yet as "busy, not ours".
+    # backend has not released yet as "busy, not ours". An unresolvable
+    # identity records the endpoint-wide entry instead of dropping it
+    # (LP-0MVUVHAQP001IRKK).
     if removed or marker_popped:
-        _record_abandoned_slot(
-            abandoned_slot_id,
+        _record_abandoned_identity(
+            srv,
+            identity,
             session_id=session_key,
             endpoint=endpoint,
             reason="client_disconnect",
@@ -4249,6 +5599,141 @@ def _release_client_disconnect_dispatch(
             pass
 
     return removed or marker_popped
+
+
+async def _release_completed_dispatch(
+    srv,
+    session_key: str | None,
+    *,
+    served_endpoint: str | None = None,
+    request: Request | None = None,
+) -> bool:
+    """Release a local dispatch lease that outlived its completed request.
+
+    Parent LP-0MVWEZCB0006WPBQ **AC8** — *no post-completion evictions*
+    (LP-0MVWFKI8O001X694).
+
+    The defect (measured 2026-10-31): a request acquired a local dispatch
+    lease, the local attempt ended without a first byte, the provider chain
+    re-routed the request to a remote provider and the request then completed
+    normally — but the local record stayed ``active=True``. Nothing marked it
+    terminal, so the ``no_progress_watchdog`` sweep reclaimed it
+    ``local_dispatch_no_progress_timeout_seconds`` (180 s) later, emitting
+    ``local_eviction reason=tenancy_lease_expired`` / ``local_eviction_after_
+    acceptance reason=no_progress_watchdog`` for a request that **succeeded**.
+    That eviction feeds the local entry-cooldown machinery (the sibling
+    measured-deficit path, parent AC1), so a completed request could poison
+    the whole ``local-qwen3`` route.
+
+    Called from the router's single end-of-request owner
+    (``router._cleanup_after_request``, the same place that decrements the
+    per-request counters), this releases every dispatch record still
+    ``active`` for *session_key* — i.e. any lease whose own endpoint did not
+    receive its end-of-request transition, the shape produced when the
+    request finished on a different endpoint than the one that leased the
+    dispatch.
+
+    Deliberately **not** an eviction path (AC8b): no ``local_eviction``
+    event, no ``local_eviction_after_acceptance`` counter, no
+    ``_record_local_eviction`` KV-snapshot plan, no local entry cooldown and
+    no abandonment annotation. A completed dispatch is normal churn; the
+    abandoned-slot annotation for a *genuinely* abandoned (draining) slot is
+    owned by LP-0MVUTYHG7001S6BM / LP-0MVWFKF4M009AEJ9 and is released from
+    observed-free snapshots there, so this path must not register one.
+    The upstream stream is likewise left alone: this is a lease-lifecycle
+    fix, not a prefill-cancel fix (LP-0MVVEQW5Y00962T2 tracks that).
+
+    Releases, in order: the record (marked ``terminal`` with a
+    ``completed_at`` stamp before deletion, so a record that somehow survives
+    is recognisable by the sweep's guard), the session's
+    ``local_prefill_in_flight`` marker, and the session's slot assignment;
+    then wakes the cross-session contention queue. Emits one distinct
+    ``lease_released session=... reason=request_completed endpoint=...`` line
+    per released record — never ``no_progress_watchdog`` and never
+    ``tenancy_lease_expired``.
+
+    Idempotent: with no active record left the call is a no-op returning
+    ``False`` and logging nothing, so it can never race the endpoint-matched
+    ``_decrement_local_active_queries`` (which has already marked that
+    record inactive on the same completion path).
+
+    Concurrency model: a dispatch record is keyed ``(endpoint, session)``, so
+    the proxy holds at most **one** lease per session (a same-session
+    re-dispatch reuses the record, and sessions are serialised by
+    ``server.session_single_flight_mode`` — ``queue`` by default). At the end
+    of a session's request, an active record for that session therefore has no
+    live request behind it, which is exactly the invariant this release
+    restores; the sibling endpoint-scoped decrement already transitions that
+    same shared record on the same assumption.
+    """
+    if not session_key:
+        return False
+    records = getattr(srv, "local_dispatch_records", None)
+    if not isinstance(records, dict):
+        return False
+    served_key = _dispatch_lease_key(served_endpoint, session_key)
+    released: list[dict] = []
+    try:
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        if lock is None:
+            return False
+        async with lock:
+            for key in list(records.keys()):
+                if key == served_key:
+                    # The endpoint the request completed on already owns this
+                    # record's end-of-request transition; only leftovers are
+                    # ghosts.
+                    continue
+                if _dispatch_key_session_id(key) != session_key:
+                    continue
+                record = records.get(key)
+                if not isinstance(record, dict) or not record.get("active"):
+                    continue
+                record["terminal"] = True
+                record["completed_at"] = time.monotonic()
+                records.pop(key, None)
+                released.append(record)
+    except Exception:
+        return False
+
+    if not released:
+        return False
+
+    # A completed request has no prefill in flight: a leftover marker counts
+    # against the pool's prefill cap until the sweep pops it.
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if markers is not None:
+            markers.pop(session_key, None)
+    except Exception:
+        pass
+
+    for record in released:
+        endpoint = _endpoint_from_record(record)
+        try:
+            srv.logger.info(
+                "lease_released session=%s reason=request_completed "
+                "endpoint=%s",
+                session_key,
+                endpoint or "default",
+                extra=_client_identity_extra(request),
+            )
+        except Exception:
+            pass
+        try:
+            from proxy.session import _free_slot_assignment
+
+            _free_slot_assignment(session_key, endpoint=endpoint)
+        except Exception:
+            pass
+
+    try:
+        from proxy.contention_queue import wake
+
+        await wake(len(released))
+    except Exception:
+        pass
+    return True
 
 
 async def _query_slot_processing(srv, session_id: str, model_name: str | None, endpoint: str | None = None) -> bool:
@@ -4371,6 +5856,14 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 
     Three categories of stale records are cleaned:
 
+    0a. **Completed records** (LP-0MVWFKI8O001X694, parent LP-0MVWEZCB0006WPBQ
+       AC8c) — a record carrying the ``terminal`` / ``completed_at`` marker a
+       completed request stamps on release. The completion path
+       (``_release_completed_dispatch``) normally deletes the record, so this
+       branch is a guard: the record is reaped without an eviction, an
+       eviction counter or a cooldown, logging
+       ``local_dispatch_completed_record_reaped`` once per record.
+
     0. **Active records with no observed progress** (LP-0MUCEFB8E003YVFF) —
        the no-progress watchdog releases any active record whose
        ``last_progress_ts`` is older than
@@ -4422,6 +5915,58 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
         async with srv.local_dispatch_records_lock:
             for sid, record in list(srv.local_dispatch_records.items()):
                 active = record.get("active", False)
+                # LP-0MVWFKI8O001X694 (parent LP-0MVWEZCB0006WPBQ AC8c):
+                # belt-and-braces guard. A completed dispatch is released at
+                # completion time (``_release_completed_dispatch``), so a
+                # record carrying the terminal marker here means the release
+                # was missed. Reap it WITHOUT an eviction, an eviction counter
+                # or a cooldown, and log once per record with a distinct token
+                # so such a miss is diagnosable without any new polling.
+                # ``local_active_queries`` is deliberately not decremented: the
+                # completion path is the single owner of the per-request
+                # decrements (see ``_release_client_disconnect_dispatch``), and
+                # a second decrement would release another session's capacity.
+                if record.get("terminal") or record.get("completed_at") is not None:
+                    session_key = _dispatch_key_session_id(sid)
+                    endpoint_from_record = _endpoint_from_record(record)
+                    try:
+                        age_s = max(
+                            0.0,
+                            float(now) - float(record.get("completed_at", now) or now),
+                        )
+                    except Exception:
+                        age_s = 0.0
+                    del srv.local_dispatch_records[sid]
+                    removed += 1
+                    try:
+                        srv.logger.warning(
+                            "local_dispatch_completed_record_reaped "
+                            "session=%s reason=completed_record_in_sweep "
+                            "endpoint=%s age_s=%.1f → completed dispatch "
+                            "record outlived its request; released without "
+                            "eviction",
+                            session_key if session_key else "unknown",
+                            endpoint_from_record or "default",
+                            age_s,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        from proxy.session import _free_slot_assignment
+
+                        _free_slot_assignment(
+                            session_key, endpoint=endpoint_from_record
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        _p = getattr(srv, "local_prefill_in_flight", None)
+                        if _p is not None and session_key in _p:
+                            _p.pop(session_key, None)
+                    except Exception:
+                        pass
+                    continue
+
                 # LP-0MUCEFB8E003YVFF: no-progress watchdog. Runs on every
                 # active record regardless of ``expires_at`` — a wedged
                 # record's lease may be far in the future (adaptive lease),
@@ -4613,10 +6158,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     stream_cm = current.pop("stream_cm", None)
                     # AC1 (LP-0MVRMI5HK00558TB): resolve the slot identity while
                     # the assignment still exists, so the abandonment recorded
-                    # after the release below is attributable to a slot.
-                    orphan_slot_id = _abandoned_slot_lookup(
+                    # after the release below is attributable to a slot (or to
+                    # an endpoint-wide entry when it cannot be resolved,
+                    # LP-0MVUVHAQP001IRKK).
+                    orphan_identity = _resolve_abandoned_slot_identity(
                         _dispatch_key_session_id(sid),
-                        _endpoint_from_record(record),
+                        endpoint=_endpoint_from_record(record),
+                        record=record,
                     )
                     del srv.local_dispatch_records[sid]
                     try:
@@ -4665,9 +6213,11 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # AC1 (LP-0MVRMI5HK00558TB): the sweep abandoned this
                     # dispatch and cancelled its upstream stream above; record
                     # the slot so a backend that has not released it yet is
-                    # annotated "busy, not ours".
-                    _record_abandoned_slot(
-                        orphan_slot_id,
+                    # annotated "busy, not ours" — endpoint-wide when the
+                    # identity was unresolvable (LP-0MVUVHAQP001IRKK).
+                    _record_abandoned_identity(
+                        srv,
+                        orphan_identity,
                         session_id=_dispatch_key_session_id(sid),
                         endpoint=_endpoint_from_record(record),
                         reason="orphan_cleanup",
@@ -4740,11 +6290,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 endpoint=endpoint_from_record,
             )
             # AC1 (LP-0MVRMI5HK00558TB): the watchdog abandoned this dispatch.
-            # Capture the slot identity before the assignment is freed, then
-            # record it so a slot the backend has not released yet is
-            # annotated "busy, not ours" instead of reading as live work.
-            watchdog_slot_id = _abandoned_slot_lookup(
-                session_key, endpoint_from_record
+            # Resolve the slot identity before the assignment is freed (the
+            # record's pin first, then the assignment), then record it so a slot
+            # the backend has not released yet is annotated "busy, not ours"
+            # instead of reading as live work. An unresolvable identity records
+            # the endpoint-wide entry (LP-0MVUVHAQP001IRKK).
+            watchdog_identity = _resolve_abandoned_slot_identity(
+                session_key,
+                endpoint=endpoint_from_record,
+                record=released_record,
             )
             try:
                 from proxy.session import _free_slot_assignment
@@ -4754,8 +6308,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 )
             except Exception:
                 pass
-            _record_abandoned_slot(
-                watchdog_slot_id,
+            _record_abandoned_identity(
+                srv,
+                watchdog_identity,
                 session_id=session_key,
                 endpoint=endpoint_from_record,
                 reason="no_progress_watchdog",
@@ -5965,6 +7520,30 @@ _CHILD_PORT_FALLBACK_WARN_INTERVAL = 300.0
 _last_child_port_fallback_warn_ts = 0.0
 """Monotonic timestamp of the last child-port fallback warning (throttle)."""
 
+_router_model_ids_snapshot: dict[str, Any] = {}
+"""Cached router ``/models`` id snapshot (LP-0MVU7ZZIA0092AXW).
+
+Keys: ``ids`` (``list[str]``), ``solo`` (the sole non-embed id, or ``None``),
+``at`` (``time.monotonic()`` fetch time) and ``key`` (router port,
+llama-server pid, ``srv.current_model``). A changed key (restart or model
+switch) invalidates it; :func:`ensure_router_model_ids` refreshes it when the
+TTL (:func:`_child_port_cache_ttl`, mirroring the child-port cache) expires.
+"""
+
+_child_model_signal_cache: dict[Any, tuple[str | None, float]] = {}
+"""Cached live child-port signal *model id* per (pid, current_model, log path).
+
+Resolution reads the 1 MiB log tail only on a miss; caching it with the
+child-port TTL keeps a cold ``srv.current_model`` from re-reading the log on
+every ``/slots`` poll (LP-0MVU7ZZIA0092AXW).
+"""
+
+_last_model_last_resort_warn_ts = 0.0
+"""Monotonic timestamp of the last 'last resort model id' warning (throttle)."""
+
+_last_model_resolution: dict[str, Any] = {}
+"""The most recent ``(model, source)`` resolution, for diagnostics/logging."""
+
 
 def _is_sparse_log(log_path: Path) -> bool:
     """Return True when *log_path* is sparse/NUL-padded/empty (logrotate).
@@ -6027,16 +7606,17 @@ def _read_log_window(log_path: Path, *, tail: bool, window: int) -> str:
         return ""
 
 
-def _last_matching_port(
+def _last_matching_signal(
     text: str, target_model: str | None, pattern: re.Pattern[str]
-) -> int | None:
-    """Return the port on the *last* line of *text* matching *pattern*.
+) -> tuple[str, int] | None:
+    """Return the ``(model, port)`` of the *last* line matching *pattern*.
 
     The last match wins so a restart / child re-spawn (which appends a newer
     line) is picked up. When *target_model* is given only an exact
     case-insensitive model match is accepted; otherwise a non-embed model is
     preferred over an embed one (the first spawn line is ``mxbai-embed`` —
-    LP-0MTP1FQXH004JYEF).
+    LP-0MTP1FQXH004JYEF). The model id travels with the port so callers can
+    resolve the router's own model name (LP-0MVU7ZZIA0092AXW).
     """
     if not text:
         return None
@@ -6055,14 +7635,22 @@ def _last_matching_port(
     if not matches:
         return None
     if want is not None:
-        filtered = [p for n, p in matches if n.lower() == want]
+        filtered = [match for match in matches if match[0].lower() == want]
         if filtered:
             return filtered[-1]
         return None
-    non_embed = [(n, p) for n, p in matches if "embed" not in n.lower()]
+    non_embed = [match for match in matches if "embed" not in match[0].lower()]
     if non_embed:
-        return non_embed[-1][1]
-    return matches[-1][1]
+        return non_embed[-1]
+    return matches[-1]
+
+
+def _last_matching_port(
+    text: str, target_model: str | None, pattern: re.Pattern[str]
+) -> int | None:
+    """Return only the port from :func:`_last_matching_signal` (back-compat)."""
+    signal = _last_matching_signal(text, target_model, pattern)
+    return signal[1] if signal is not None else None
 
 
 def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
@@ -6082,26 +7670,44 @@ def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
     return _last_matching_port(text, target_model, _SPAWN_RE)
 
 
-def _scan_proxy_request_ports(
+def _scan_proxy_request_signal(
     log_path: Path, target_model: str | None
-) -> int | None:
-    """Scan the tail of one log file for the *live* child-port signal.
+) -> tuple[str, int] | None:
+    """Scan the tail of one log file for the *live* child-port ``(model, port)``.
 
-    Returns the port from the last ``proxying request to model <model> on port
-    <port>`` line in the tail window — the rotation-proof source introduced by
+    Returns the last ``proxying request to model <model> on port <port>`` line
+    in the tail window — the rotation-proof source introduced by
     LP-0MVP7525P008RXMF AC1. Unlike the startup spawn line this keeps being
     written for the whole life of the process, so it survives logrotate.
     """
     text = _read_log_window(
         log_path, tail=True, window=_CHILD_PORT_TAIL_SCAN_BYTES
     )
-    return _last_matching_port(text, target_model, _PROXY_REQUEST_RE)
+    return _last_matching_signal(text, target_model, _PROXY_REQUEST_RE)
 
 
-def _scan_child_port_signals(
+def _scan_proxy_request_ports(
     log_path: Path, target_model: str | None
 ) -> int | None:
-    """Return the newest child-port signal in a single log file.
+    """Port from :func:`_scan_proxy_request_signal` (back-compat)."""
+    signal = _scan_proxy_request_signal(log_path, target_model)
+    return signal[1] if signal is not None else None
+
+
+def _scan_spawn_signal(
+    log_path: Path, target_model: str | None
+) -> tuple[str, int] | None:
+    """Scan the head of one log file for the startup spawn ``(model, port)``."""
+    text = _read_log_window(
+        log_path, tail=False, window=_CHILD_PORT_HEAD_SCAN_BYTES
+    )
+    return _last_matching_signal(text, target_model, _SPAWN_RE)
+
+
+def _scan_child_port_signal(
+    log_path: Path, target_model: str | None
+) -> tuple[str, int] | None:
+    """Return the newest ``(model, port)`` child-port signal in a log file.
 
     Tail first (live ``proxying request ... on port`` lines — newer than
     anything in the head window and present even when the startup spawn line
@@ -6109,10 +7715,24 @@ def _scan_child_port_signals(
     writes it before any request is proxied, so the very first polls after a
     restart still resolve — documented risk of the live source).
     """
-    port = _scan_proxy_request_ports(log_path, target_model)
-    if port is not None:
-        return port
-    return _scan_spawn_ports(log_path, target_model)
+    signal = _scan_proxy_request_signal(log_path, target_model)
+    if signal is not None:
+        return signal
+    return _scan_spawn_signal(log_path, target_model)
+
+
+def _scan_child_signal_model_name(log_path: Path) -> str | None:
+    """Newest non-embed child-port signal's model id (live source first)."""
+    signal = _scan_child_port_signal(log_path, None)
+    return signal[0] if signal is not None else None
+
+
+def _scan_child_port_signals(
+    log_path: Path, target_model: str | None
+) -> int | None:
+    """Return only the port from :func:`_scan_child_port_signal`."""
+    signal = _scan_child_port_signal(log_path, target_model)
+    return signal[1] if signal is not None else None
 
 
 def _rotated_log_candidates(log_path: Path) -> list[Path]:
@@ -6156,6 +7776,236 @@ def _remember_child_port(cache_key: Any, port: int, now: float) -> int:
     return int(port)
 
 
+LAST_RESORT_MODEL_ID = "Qwen3"
+"""The documented **last-resort** model id (LP-0MVU7ZZIA0092AXW).
+
+Routers report model ids as presets (``Qwen3``, ``Qwen3-32B``, ``Qwen2.5-7B``,
+``Qwen/Qwen3-Coder-Next-GGUF:Q5_K_M``, …), so no single literal is universally
+resolvable. This value is used only when no ``srv.current_model``, no live
+child-port log signal and no cached anything is available; the fallback is
+logged (see :func:`_warn_model_last_resort`) rather than applied silently.
+"""
+
+
+def _router_port_for(srv) -> int:
+    """Return the configured router port (``server.llama_server_port``)."""
+    cfg = getattr(srv, "config", None)
+    server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}
+    try:
+        return int(server_cfg.get("llama_server_port", 8080) or 8080)
+    except (TypeError, ValueError):
+        return 8080
+
+
+def _router_models_snapshot_key(srv) -> tuple[Any, Any, Any]:
+    """Identity of the ``/models`` snapshot: (port, llama-server pid, model)."""
+    proc = getattr(srv, "llama_process", None)
+    pid = getattr(proc, "pid", None) if proc is not None else None
+    return (_router_port_for(srv), pid, getattr(srv, "current_model", None))
+
+
+def _non_embed_model_ids(ids: list[str]) -> list[str]:
+    """Router ids that are not embedding models."""
+    return [mid for mid in ids if "embed" not in str(mid).lower()]
+
+
+def _router_models_snapshot_meta(srv) -> tuple[list[str], str | None]:
+    """Return ``(ids, solo)`` from the cached ``/models`` snapshot.
+
+    The snapshot is keyed by router port + llama-server pid + current model so
+    a restart or a model switch invalidates it. The *refresh* is driven by
+    :func:`ensure_router_model_ids` (async); this sync read never blocks on an
+    HTTP round trip, so the hot ``/slots`` discovery path stays cheap.
+    """
+    snapshot = _router_model_ids_snapshot
+    if not snapshot:
+        return [], None
+    if snapshot.get("key") != _router_models_snapshot_key(srv):
+        snapshot.clear()
+        return [], None
+    ids = list(snapshot.get("ids") or [])
+    solo = snapshot.get("solo")
+    return ids, solo if isinstance(solo, str) else None
+
+
+def _cached_router_model_ids(srv) -> list[str]:
+    """Cached ``/models`` ids for *srv* (empty when absent/stale/restarted)."""
+    ids, _solo = _router_models_snapshot_meta(srv)
+    return ids
+
+
+async def ensure_router_model_ids(srv) -> list[str]:
+    """Refresh the cached router ``/models`` id snapshot when it is stale.
+
+    Reuses the existing lifecycle helpers: ``srv.router_list_models()`` (the
+    server module binds it from :mod:`proxy.lifecycle`) and
+    :func:`proxy.lifecycle._extract_router_model_ids`. The fetch is skipped
+    when the snapshot is fresh (TTL = :func:`_child_port_cache_ttl`, mirroring
+    the child-port cache), and when *srv* exposes no lister (unit-test stubs),
+    so the hot ``/slots`` path costs **zero** ``/models`` requests once warm
+    (LP-0MVU7ZZIA0092AXW).
+    """
+    ids, _solo = _router_models_snapshot_meta(srv)
+    if _router_model_ids_snapshot:
+        at = float(_router_model_ids_snapshot.get("at", 0.0) or 0.0)
+        if time.monotonic() - at < _child_port_cache_ttl():
+            return ids
+    lister = getattr(srv, "router_list_models", None)
+    if not callable(lister):
+        return ids
+    try:
+        payload = await lister()
+    except Exception:
+        return ids
+    try:
+        from proxy.lifecycle import _extract_router_model_ids
+
+        fetched = _extract_router_model_ids(payload)
+    except Exception:
+        fetched = []
+    non_embed = _non_embed_model_ids(fetched)
+    solo = non_embed[0] if len(non_embed) == 1 else None
+    _router_model_ids_snapshot.clear()
+    _router_model_ids_snapshot.update(
+        {
+            "ids": list(fetched),
+            "solo": solo,
+            "at": time.monotonic(),
+            "key": _router_models_snapshot_key(srv),
+        }
+    )
+    return list(fetched)
+
+
+def _match_model_preset(candidate: str | None, ids: list[str]) -> str | None:
+    """Case-insensitive match of *candidate* against router model ids.
+
+    Presets are not one universal name: the router may report the alias
+    ``Qwen3`` while ``/models`` lists ``Qwen3-32B`` (or the reverse), so an
+    exact case-insensitive match wins, then an alias/preset prefix match
+    (``qwen3`` ↔ ``Qwen3-32B``). Returns the router's spelling of the id.
+    """
+    want = str(candidate or "").strip().lower()
+    if not want:
+        return None
+    for mid in ids:
+        if str(mid).strip().lower() == want:
+            return str(mid)
+    for mid in ids:
+        low = str(mid).strip().lower()
+        if low.startswith(want) or want.startswith(low):
+            return str(mid)
+    return None
+
+
+def _warn_model_last_resort(srv) -> None:
+    """Log (throttled) the fallback to :data:`LAST_RESORT_MODEL_ID`."""
+    global _last_model_last_resort_warn_ts
+    now = time.monotonic()
+    if now - _last_model_last_resort_warn_ts < _CHILD_PORT_FALLBACK_WARN_INTERVAL:
+        return
+    _last_model_last_resort_warn_ts = now
+    try:
+        srv.logger.warning(
+            "slots_model_resolution_last_resort: no srv.current_model, no "
+            "router /models id and no child-port log signal; falling back to "
+            f"the documented last_resort id {LAST_RESORT_MODEL_ID!r} "
+            "(LP-0MVU7ZZIA0092AXW)"
+        )
+    except Exception:
+        pass
+
+
+def _remember_model_resolution(model: str, source: str) -> None:
+    """Record the last resolution for diagnostics/logging."""
+    _last_model_resolution.clear()
+    _last_model_resolution.update({"model": model, "source": source})
+
+
+def _cached_child_signal_model(srv, log_path: Path) -> str | None:
+    """Newest child-port signal's model id, cached with the child-port TTL."""
+    proc = getattr(srv, "llama_process", None)
+    pid = getattr(proc, "pid", None) if proc is not None else None
+    key = (pid, getattr(srv, "current_model", None), str(log_path))
+    now = time.monotonic()
+    entry = _child_model_signal_cache.get(key)
+    if isinstance(entry, tuple) and len(entry) == 2:
+        model, at = entry
+        if now - float(at) < _child_port_cache_ttl():
+            return model
+    model = _scan_child_signal_model_name(log_path)
+    _child_model_signal_cache[key] = (model, now)
+    return model
+
+
+def resolve_local_model_id(srv, model: str | None = None) -> tuple[str, str]:
+    """Resolve the model id a proxy ``/slots`` query must send.
+
+    Order (LP-0MVU7ZZIA0092AXW AC2): explicit *model* → ``srv.current_model`` →
+    the sole non-embed ``/models`` preset (unambiguous) → the live child-port
+    log signal canonicalised against the ``/models`` ids (case-insensitive) →
+    the log signal verbatim (it is the id the router itself reports, so it is
+    resolvable by definition) → :data:`LAST_RESORT_MODEL_ID` as a *logged*
+    last resort.
+
+    Returns ``(model_id, source)``; *source* is one of ``explicit``,
+    ``current_model``, ``models_snapshot``, ``log_signal+models_snapshot``,
+    ``log_signal`` or ``last_resort``.
+    """
+    explicit = str(model).strip() if model is not None else ""
+    if explicit:
+        _remember_model_resolution(explicit, "explicit")
+        return explicit, "explicit"
+    current = getattr(srv, "current_model", None)
+    current = str(current).strip() if current is not None else ""
+    if current:
+        _remember_model_resolution(current, "current_model")
+        return current, "current_model"
+    ids, solo = _router_models_snapshot_meta(srv)
+    if solo:
+        _remember_model_resolution(solo, "models_snapshot")
+        return solo, "models_snapshot"
+    signal = _cached_child_signal_model(srv, _llama_log_path(srv))
+    if signal:
+        matched = _match_model_preset(signal, ids)
+        if matched:
+            _remember_model_resolution(matched, "log_signal+models_snapshot")
+            return matched, "log_signal+models_snapshot"
+        _remember_model_resolution(signal, "log_signal")
+        return signal, "log_signal"
+    non_embed = _non_embed_model_ids(ids)
+    if non_embed:
+        preferred = (
+            _match_model_preset(LAST_RESORT_MODEL_ID, non_embed) or non_embed[0]
+        )
+        _remember_model_resolution(preferred, "models_snapshot")
+        return preferred, "models_snapshot"
+    _warn_model_last_resort(srv)
+    _remember_model_resolution(LAST_RESORT_MODEL_ID, "last_resort")
+    return LAST_RESORT_MODEL_ID, "last_resort"
+
+
+def _scan_child_port_with_alias(log_path: Path, target: str) -> int | None:
+    """Scan for *target*'s child port, tolerating a preset/alias mismatch.
+
+    The resolved id may be the ``/models`` preset (``Qwen3-32B``) while the log
+    only names the alias the router reported (``Qwen3``); when the direct scan
+    finds nothing, retry with the newest signal model if it canonicalises to
+    *target*.
+    """
+    port = _scan_child_port_signals(log_path, target)
+    if port is not None:
+        return port
+    alias = _scan_child_signal_model_name(log_path)
+    if (
+        alias
+        and alias.strip().lower() != str(target).strip().lower()
+        and _match_model_preset(alias, [str(target)])
+    ):
+        return _scan_child_port_signals(log_path, alias)
+    return None
+
+
 def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     """Discover the local model child port from the llama-server log.
 
@@ -6171,9 +8021,13 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     Args:
         srv: Server module / namespace with ``llama_process.pid`` and
             ``log_dir`` / ``current_model``.
-        model: Optional target model name to filter by (e.g. ``"Qwen3"``).
-            When ``None`` the function uses ``srv.current_model`` or
-            ``"Qwen3"`` as the target. Matching is case-insensitive.
+        model: Optional target model name to filter by (e.g. ``"Qwen3-32B"``).
+            When ``None`` the id is resolved by
+            :func:`resolve_local_model_id` (``srv.current_model`` → ``/models``
+            preset → live child-port log signal → a *logged*
+            :data:`LAST_RESORT_MODEL_ID`). Matching is case-insensitive, and a
+            preset/alias mismatch (``Qwen3-32B`` vs the log's ``Qwen3``) still
+            resolves the port via :func:`_scan_child_port_with_alias`.
             Passing the wrong model previously returned the embed child port
             (first spawn line ``mxbai-embed``) — LP-0MTP1FQXH004JYEF.
 
@@ -6196,11 +8050,10 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
         pid = getattr(proc, "pid", None) if proc is not None else None
         if pid is None:
             return None
-        # Resolve the target model: explicit arg wins, then current_model.
-        target = (model or getattr(srv, "current_model", None) or "Qwen3")
-        target = str(target).strip() if target is not None else "Qwen3"
-        if not target:
-            target = "Qwen3"
+        # Resolve the target model id: explicit arg → srv.current_model → the
+        # router /models preset → the live log signal (canonicalised) → a
+        # *logged* last resort (LP-0MVU7ZZIA0092AXW — never a silent "Qwen3").
+        target, _model_source = resolve_local_model_id(srv, model)
         cache_key = (int(pid), target.lower())
         log_path = _llama_log_path(srv)
         now = time.monotonic()
@@ -6222,7 +8075,7 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
             # log tail reflects the newest mapping. If no newer signal exists
             # we keep serving the last known-good port instead of regressing
             # to the router (LP-0MVP7525P008RXMF AC1 — sticky positive).
-            fresh = _scan_child_port_signals(log_path, target)
+            fresh = _scan_child_port_with_alias(log_path, target)
             if fresh is not None:
                 return _remember_child_port(cache_key, fresh, now)
             _child_port_cache_at[cache_key] = now
@@ -6242,7 +8095,7 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
         #    (the 2026-10-26 production log had 38,761 of them and zero spawn
         #    lines — the exact shape that previously pinned None for the whole
         #    pid lifetime). LP-0MVP7525P008RXMF AC1.
-        port = _scan_child_port_signals(log_path, target)
+        port = _scan_child_port_with_alias(log_path, target)
         if port is not None:
             return _remember_child_port(cache_key, port, now)
         # Primary had real content but no matching child-port signal for this
@@ -6260,7 +8113,7 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
         # no matching signal; a missing file already returned above.
         try:
             for cand in _rotated_log_candidates(log_path)[:8]:
-                cand_port = _scan_child_port_signals(cand, target)
+                cand_port = _scan_child_port_with_alias(cand, target)
                 if cand_port is not None:
                     return _remember_child_port(cache_key, cand_port, now)
         except Exception:
@@ -6309,9 +8162,10 @@ def _warn_child_port_fallback(srv, model: str | None, router_port: int) -> None:
     if now - _last_child_port_fallback_warn_ts < _CHILD_PORT_FALLBACK_WARN_INTERVAL:
         return
     _last_child_port_fallback_warn_ts = now
+    resolved_model, model_source = resolve_local_model_id(srv, model)
     message = (
         "slots_child_port_unavailable: no model child port discovered for "
-        f"model={model or getattr(srv, 'current_model', None) or 'unknown'}; "
+        f"model={resolved_model} (source={model_source}); "
         f"falling back to router port {router_port} — every proxy-initiated "
         "/slots poll will traverse the router and can 500 during giant "
         "prefills (LP-0MVP7525P008RXMF AC3)"
@@ -6421,8 +8275,13 @@ async def _check_slot_availability(
         return None
 
     try:
-        slot_model = (
-            slot_model_name or model_name or srv.current_model or "Qwen3"
+        # Warm the cached /models id snapshot on the async dispatch path (the
+        # sync discovery path never blocks on HTTP) and resolve the id so the
+        # `?model=` component is always a router-resolvable preset
+        # (LP-0MVU7ZZIA0092AXW AC2).
+        await ensure_router_model_ids(srv)
+        slot_model, _model_source = resolve_local_model_id(
+            srv, slot_model_name or model_name
         )
         # LP-0MVP7525P008RXMF AC2: single shared resolution path — a
         # *local* endpoint (the router) is rewritten to the discovered child

@@ -18,12 +18,14 @@ is one row of :data:`_EXIT_ROWS`, and every row asserts the same two outcomes:
 - ``local-only`` ⇒ HTTP 429, ``X-Local-Route: refused``,
   ``X-Local-Fallback-Reason: <token>``, and **no upstream call at all** (a
   refused request is neither dispatched locally nor moved remote);
-- ``prefer-local`` and an absent header ⇒ today's remote dispatch, with no
+- ``remote-ok`` (the default, and an absent header) ⇒ today's remote
+  dispatch, with no
   refusal and no refusal body (AC3 byte-compatibility).
 
-The structural counter-case closes the loop: ``remote-ok`` still strips local
-entries from the chain, and an all-local chain under ``remote-ok`` still
-answers today's exhaustion response.
+The structural counter-case closes the loop: no preference strips local entries
+from the chain (LP-0MVUH9OYZ007GMWF AC1 — ``remote-ok`` means "local allowed,
+remote acceptable"), so a remote-less chain under ``remote-ok`` is served
+locally rather than answered with the exhaustion response.
 
 Rows are pinned, not the prose: nothing here asserts the human-readable
 ``error``/``detail`` text — the stable ``code``/header contract is what clients
@@ -60,6 +62,12 @@ tiers (``calls == ["remote"]``, 200, no local-capacity 429) — the boundary tha
 removed the incident's "All providers exhausted" dead end. Both wire spellings
 (the ``local-only`` alias and ``local-preferred``) are asserted per row, and the
 two post-dispatch rows prove the pin also holds *after* a local dispatch failed.
+
+Every row now also asserts the refusal body's verdict, including the free-slot
+direct path (``admission_guard_free_slot``): LP-0MVNTJJGX00375VQ routed that
+branch through the one pin-local refusal builder, so the admission-reject /
+exhaustion payload no longer answers a pinned request and the row's former
+``_VERDICT_NOT_APPLICABLE`` skip is gone (LP-0MVSS435600370D6's deliverable).
 """
 
 from __future__ import annotations
@@ -99,8 +107,11 @@ REMOTE_PROVIDER_NAME = "remote-fallback"
 
 LOCAL_ONLY = "local-only"
 LOCAL_PREFERRED = "local-preferred"
+#: Retired by LP-0MVUH9PUU005HVS4: kept here only so the matrix can assert the
+#: loud ``400`` (it is no longer a policy row).
 PREFER_LOCAL = "prefer-local"
-REMOTE_OK = "remote-ok"
+NON_PINNED = "remote-ok"
+REMOTE_OK = NON_PINNED
 
 
 class _DummyRequest:
@@ -585,11 +596,15 @@ def test_matrix_has_exactly_one_row_per_local_route_exit():
 # AC1 + AC2: a pin-local client is NEVER moved to a paid provider
 # ---------------------------------------------------------------------------
 
-#: Both wire spellings of the pin-local intent. ``local-only`` is accepted as a
-#: deprecated alias and normalised to ``local-preferred`` by
-#: ``admission_reserve.parse_preference()``, so every row must behave
-#: identically for both — asserted, not assumed (parent AC5).
-PIN_LOCAL_PREFERENCES = (LOCAL_ONLY, LOCAL_PREFERRED)
+#: The one live wire spelling of the pin-local intent.
+#:
+#: ``local-only`` used to be the second spelling (a deprecated alias normalised
+#: to ``local-preferred``); it is **retired** by LP-0MVUH9PAZ002UAPA and is now
+#: answered with a stable ``400`` **before** any of these rows run, so it can no
+#: longer be parametrised here. Its rejection is pinned by
+#: ``test_retired_local_only_is_a_400_before_any_local_exit`` below and by the
+#: vocabulary contract in ``test_local_preference_vocabulary_v2.py``.
+PIN_LOCAL_PREFERENCES = (LOCAL_PREFERRED,)
 
 #: Rows whose exit is temporal (waiting can help): the pin holds and the
 #: request is refused instead of being promoted.
@@ -1009,15 +1024,6 @@ async def test_pin_verdict_comes_only_from_the_shared_capacity_helper():
 # AC1 (LP-0MVSMRT5R009EKP9): the refusal body reports the row's verdict
 # ---------------------------------------------------------------------------
 
-#: Exits whose 429 is the admission-reject/exhausted payload
-#: (``_build_local_admission_reject_response``) rather than the pin-local
-#: refusal builder. That payload is owned by LP-0MVNTJJGX00375VQ and is
-#: explicitly outside the wiring slice (LP-0MVSMINPR006SWT6 boundaries), so it
-#: carries no verdict yet. The row still states its verdict so the follow-up
-#: (LP-0MVSS435600370D6) that wires that payload can promote it here by
-#: deleting this entry.
-_VERDICT_NOT_APPLICABLE = frozenset({"admission_guard_free_slot"})
-
 #: Rows that no longer produce a refusal body at all: the pin slice
 #: (LP-0MVSLZY470051ZB2 AC4) declines the pin for a ``too_large`` verdict, so
 #: those requests are served remotely instead of being refused.
@@ -1027,15 +1033,12 @@ _VERDICT_PARAMS = [
         id=row.trigger,
         marks=pytest.mark.skip(
             reason=(
-                "no refusal body on this row: the free-slot direct path uses "
-                "the admission-reject/exhausted payload (verdict wiring owned "
-                "by LP-0MVSS435600370D6), and a too-large exit is promoted to "
+                "no refusal body on this row: a too-large exit is promoted to "
                 "the remote tiers instead of refused (LP-0MVSLZY470051ZB2 AC4)"
             )
         ),
     )
-    if row.trigger in _VERDICT_NOT_APPLICABLE
-    or row.expected_verdict == admission_reserve.CAPACITY_TOO_LARGE
+    if row.expected_verdict == admission_reserve.CAPACITY_TOO_LARGE
     else pytest.param(row, id=row.trigger)
     for row in _EXIT_ROWS
 ]
@@ -1072,27 +1075,28 @@ async def test_refusal_body_reports_the_row_verdict(row: _ExitRow, preference: s
 
 
 # ---------------------------------------------------------------------------
-# AC3: prefer-local (and no header) ⇒ today's remote fall-through, unchanged
+# AC3: remote-ok (and no header) ⇒ today's remote fall-through, unchanged
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("row", _EXIT_ROWS, ids=[r.trigger for r in _EXIT_ROWS])
-@pytest.mark.parametrize("preference", [PREFER_LOCAL, None], ids=["header", "absent"])
-async def test_prefer_local_keeps_todays_remote_fall_through(
+@pytest.mark.parametrize("preference", [NON_PINNED, None], ids=["header", "absent"])
+async def test_non_pinned_keeps_todays_remote_fall_through(
     row: _ExitRow, preference: str | None
 ):
     """Every exit: the pre-existing remote dispatch happens, with no refusal.
 
     This is the byte-compatibility half of the contract (AC3): enforcing
     ``local-only`` must not turn the default client's fall-through into a
-    refusal.
+    refusal. Since LP-0MVUH9PUU005HVS4 the default (and the only non-pin-local
+    value) is ``remote-ok``; ``prefer-local`` is retired with a ``400``.
     """
     result, calls = await _issue(row, preference)
 
     expected = ["local", "remote"] if row.local_response is not None else ["remote"]
     assert calls == expected, (
-        f"{row.exit_description}: prefer-local must fall through to the next "
+        f"{row.exit_description}: remote-ok must fall through to the next "
         f"provider exactly as today (dispatched={calls}, expected={expected})"
     )
     assert result.status_code == 200, (
@@ -1107,23 +1111,25 @@ async def test_prefer_local_keeps_todays_remote_fall_through(
 
 
 # ---------------------------------------------------------------------------
-# Regression: remote-ok is enforced structurally and stays as it is
+# Regression: no preference strips local entries (LP-0MVUH9OYZ007GMWF AC1)
 # ---------------------------------------------------------------------------
 
 
-def test_remote_ok_still_strips_local_entries():
-    """AC5: ``remote-ok`` removes local entries; the other two keep the chain."""
+def test_no_preference_strips_local_entries():
+    """AC1: only a capacity verdict strips; a preference value never does.
+
+    ``remote-ok`` used to remove every local entry, which is the opposite of
+    what the value means ("local allowed, remote acceptable"). Its name is
+    historic, so this row is what stops a future reader restoring the strip.
+    """
     chain = [
         {"name": LOCAL_PROVIDER_NAME, "type": "local", "llama_model": "Qwen3"},
         {"name": REMOTE_PROVIDER_NAME, "type": "remote",
          "endpoint": "https://api.example.com/v1"},
     ]
 
-    assert apply_local_preference(chain, REMOTE_OK) == [chain[1]], (
-        "remote-ok must strip every local entry from the chain"
-    )
-    assert apply_local_preference(chain, PREFER_LOCAL) == chain, (
-        "prefer-local keeps the chain intact (its fall-through is the contract)"
+    assert apply_local_preference(chain, REMOTE_OK) == chain, (
+        "remote-ok must keep the local entry in the chain"
     )
     assert apply_local_preference(chain, LOCAL_ONLY) == chain, (
         "local-only keeps the chain intact so the refusal can report the truth"
@@ -1131,11 +1137,12 @@ def test_remote_ok_still_strips_local_entries():
 
 
 @pytest.mark.asyncio
-async def test_remote_ok_with_no_remote_entry_returns_todays_exhaustion():
-    """AC5: an all-local chain under ``remote-ok`` exhausts, it does not refuse.
+async def test_remote_ok_with_no_remote_entry_serves_locally():
+    """AC1/AC3: an all-local chain under ``remote-ok`` is served locally.
 
-    ``remote-ok`` is filtered structurally (never a 429 refusal): the chain
-    becomes genuinely empty and the pre-existing exhaustion path answers.
+    A preference may never empty a chain: filtering the only local entry out
+    would manufacture an empty chain and answer "all providers exhausted" to a
+    model that can serve the request perfectly well locally.
     """
     calls: list[str] = []
 
@@ -1166,11 +1173,15 @@ async def test_remote_ok_with_no_remote_entry_returns_todays_exhaustion():
             {"provider_cooldown_seconds": 60, "server": {"session_slot_pool_size": 1}},
         )
 
-    assert calls == [], "remote-ok: the local route is never attempted"
-    assert result.status_code == 503, (
-        f"an empty chain exhausts as today, got {result.status_code}"
+    assert calls == ["local"], (
+        f"remote-ok: the local route serves a remote-less chain, got {calls}"
     )
-    assert json.loads(result.body).get("code") == provider.EXHAUSTION_CODE_ALL
+    assert result.status_code == 200, (
+        f"an empty chain must never be manufactured from a preference, got "
+        f"{result.status_code}"
+    )
+    assert result.headers.get("X-Local-Route") == "local"
+    assert json.loads(result.body).get("code") != provider.EXHAUSTION_CODE_ALL
 
 
 # ---------------------------------------------------------------------------
@@ -1180,15 +1191,18 @@ async def test_remote_ok_with_no_remote_entry_returns_todays_exhaustion():
 
 @pytest.mark.asyncio
 async def test_remote_fallback_cycle_enforces_the_local_only_choke_point():
-    """The other dispatch cycle refuses too; prefer-local keeps its fall.
+    """The other dispatch cycle refuses too; remote-ok keeps its fall.
 
     ``proxy_with_fallback`` always runs the local+remote cycle, so a remote-
     only model takes ``proxy_with_remote_fallback`` — the second dispatch
     cycle the choke point must cover (LP-0MVRMC1L3006F0F3 AC ``both dispatch
-    cycles are covered``). Its chain has no local entry, so ``local-only``
-    answers the ``local_only_no_local_route`` refusal before any remote
-    dispatch, while the default client still completes remotely with
-    ``X-Local-Route: remote``.
+    cycles are covered``). Its chain has no local entry, so the live pin-local
+    value (``local-preferred``) answers the ``local_only_no_local_route``
+    refusal before any remote dispatch, while the default client still
+    completes remotely with ``X-Local-Route: remote``. The retired
+    ``local-only`` spelling never reaches this cycle at all: it is a ``400``
+    before routing (``local-only-retired-is-a-400-before-routing``), and so is
+    ``prefer-local`` (``prefer-local-retired-is-a-400-before-routing``).
     """
     calls: list[str] = []
 
@@ -1216,9 +1230,9 @@ async def test_remote_fallback_cycle_enforces_the_local_only_choke_point():
                 config,
             )
 
-    refused = await _issue(LOCAL_ONLY)
+    refused = await _issue(LOCAL_PREFERRED)
     assert calls == [], (
-        "local-only must refuse before the first remote dispatch "
+        "a pin-local request must refuse before the first remote dispatch "
         f"(dispatched={calls})"
     )
     assert refused.status_code == 429, f"got {refused.status_code}"
@@ -1227,9 +1241,9 @@ async def test_remote_fallback_cycle_enforces_the_local_only_choke_point():
         "local_only_no_local_route"
     ), "a remote-only chain has no local route; the refusal must say so"
 
-    served = await _issue(PREFER_LOCAL)
+    served = await _issue(NON_PINNED)
     assert calls == ["remote"], (
-        "prefer-local keeps today's remote dispatch on the remote-only cycle "
+        "remote-ok keeps today's remote dispatch on the remote-only cycle "
         f"(dispatched={calls})"
     )
     assert served.status_code == 200, f"got {served.status_code}"
@@ -1296,7 +1310,7 @@ async def test_local_only_still_serves_a_compaction_rescued_local_dispatch():
         _estimate_patches(PROMPT_TOKENS),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(headers={"X-Local-Preference": LOCAL_ONLY}),
+            _DummyRequest(headers={"X-Local-Preference": LOCAL_PREFERRED}),
             "v1/chat/completions",
             _model_config(_EXIT_ROWS[0]),
             _config(_EXIT_ROWS[0]),
@@ -1643,10 +1657,10 @@ async def test_every_row_logs_exactly_one_outcome_line(
 # sections above; the matrix is the cross-cutting summary, so a red parameter
 # names the behaviour that broke rather than an implementation detail (AC4).
 #
-# Two baseline rows (an absent header and ``prefer-local`` on a healthy local
-# route) additionally assert *byte-compatibility*: a client that never asked
-# for pin-local behaviour keeps today's response shape, with no ``retryable``
-# or ``verdict`` field invented for it (parent AC5).
+# Two baseline rows (an absent header and ``remote-ok`` — the default — on a
+# healthy local route) additionally assert *byte-compatibility*: a client that
+# never asked for pin-local behaviour keeps today's response shape, with no
+# ``retryable`` or ``verdict`` field invented for it (parent AC5).
 # ---------------------------------------------------------------------------
 
 #: Pseudo-trigger for the healthy route: a local entry, a free slot, no exit at
@@ -1693,17 +1707,12 @@ class _BehaviourMatrixRow:
     #: here is deferrable, so its retry story is asserted in the test).
     expected_refusal_reason: str | None = None
     expected_verdict: str | None = None
+    #: Machine-readable body ``code`` the row must carry (a retired value is
+    #: the one non-refusal rejection this matrix pins).
+    expected_code: str | None = None
 
 
 _BEHAVIOUR_MATRIX = (
-    pytest.param(
-        _BehaviourMatrixRow(
-            behaviour="prefer-local-free-slot-serves-local",
-            preference=PREFER_LOCAL,
-            expected_dispatches=("local",),
-        ),
-        id="prefer-local-free-slot-serves-local",
-    ),
     pytest.param(
         _BehaviourMatrixRow(
             behaviour="absent-free-slot-serves-local",
@@ -1714,25 +1723,26 @@ _BEHAVIOUR_MATRIX = (
     ),
     pytest.param(
         _BehaviourMatrixRow(
-            behaviour="prefer-local-busy-deferrable-falls-through-remote",
-            preference=PREFER_LOCAL,
+            # The second observable of the new default: local is busy, so the
+            # request steps straight to the next provider — no queue, no
+            # deferral, no local-capacity refusal (parent AC20).
+            behaviour="remote-ok-busy-falls-through-remote-without-queueing",
+            preference=REMOTE_OK,
             exit_trigger="chain_cooldown",
             concurrency=(1, 1),
             expected_route="remote",
             expected_provider=REMOTE_PROVIDER_NAME,
             expected_dispatches=("remote",),
         ),
-        id="prefer-local-busy-deferrable-falls-through-remote",
+        id="remote-ok-busy-falls-through-remote-without-queueing",
     ),
     pytest.param(
         _BehaviourMatrixRow(
-            behaviour="remote-ok-free-slot-strips-local",
+            behaviour="remote-ok-free-slot-serves-local",
             preference=REMOTE_OK,
-            expected_route="remote",
-            expected_provider=REMOTE_PROVIDER_NAME,
-            expected_dispatches=("remote",),
+            expected_dispatches=("local",),
         ),
-        id="remote-ok-free-slot-strips-local",
+        id="remote-ok-free-slot-serves-local",
     ),
     pytest.param(
         _BehaviourMatrixRow(
@@ -1770,17 +1780,36 @@ _BEHAVIOUR_MATRIX = (
     ),
     pytest.param(
         _BehaviourMatrixRow(
-            behaviour="local-only-legacy-busy-deferrable-refuses",
+            # The retired spelling is rejected outright, whatever the slot
+            # state: it is not a policy the proxy still honours, so there is
+            # no route, no refusal reason and no dispatch (LP-0MVUH9PAZ002UAPA
+            # AC1). A ``free`` slot is the sharpest fixture — the request would
+            # otherwise have been served locally, so the row proves the 400 is
+            # the retirement and not a capacity or chain decision.
+            behaviour="local-only-retired-is-a-400-before-routing",
             preference=LOCAL_ONLY,
-            exit_trigger="queue_wait_expiry",
-            expected_status=429,
-            expected_route="refused",
+            expected_status=400,
+            expected_route=None,
             expected_provider=None,
             expected_dispatches=(),
-            expected_refusal_reason="fallback_after_queue",
-            expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
+            expected_code=admission_reserve.RETIRED_PREFERENCE_CODE,
         ),
-        id="local-only-legacy-busy-deferrable-refuses",
+        id="local-only-retired-is-a-400-before-routing",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            # The second retirement (LP-0MVUH9PUU005HVS4 AC2/parent AC14):
+            # ``prefer-local`` asked to *wait*; the new default does not, so it
+            # is a loud ``400`` rather than a silent reinterpretation.
+            behaviour="prefer-local-retired-is-a-400-before-routing",
+            preference=PREFER_LOCAL,
+            expected_status=400,
+            expected_route=None,
+            expected_provider=None,
+            expected_dispatches=(),
+            expected_code=admission_reserve.RETIRED_PREFERENCE_CODE,
+        ),
+        id="prefer-local-retired-is-a-400-before-routing",
     ),
     pytest.param(
         _BehaviourMatrixRow(
@@ -1854,10 +1883,11 @@ async def test_each_matrix_row_serves_or_refuses_as_the_preference_matrix_says(
         f"{row.behaviour}: expected HTTP {row.expected_status}, got "
         f"{result.status_code}"
     )
-    assert result.headers.get("X-Local-Route") == row.expected_route, (
-        f"{row.behaviour}: expected X-Local-Route={row.expected_route!r}, got "
-        f"{result.headers.get('X-Local-Route')!r}"
-    )
+    if row.expected_route is not None:
+        assert result.headers.get("X-Local-Route") == row.expected_route, (
+            f"{row.behaviour}: expected X-Local-Route={row.expected_route!r}, "
+            f"got {result.headers.get('X-Local-Route')!r}"
+        )
     assert result.headers.get("X-Provider") == row.expected_provider, (
         f"{row.behaviour}: expected X-Provider={row.expected_provider!r}, got "
         f"{result.headers.get('X-Provider')!r}"
@@ -1885,6 +1915,11 @@ async def test_each_matrix_row_serves_or_refuses_as_the_preference_matrix_says(
             f"{row.behaviour}: a served request must not carry the "
             f"local-capacity refusal code"
         )
+        if row.expected_code is not None:
+            assert body.get("code") == row.expected_code, (
+                f"{row.behaviour}: expected body code "
+                f"{row.expected_code!r}, got {body.get('code')!r}"
+            )
     else:
         assert body.get("reason") == row.expected_refusal_reason, (
             f"{row.behaviour}: refusal reason must be "
@@ -1917,7 +1952,10 @@ async def test_each_matrix_row_serves_or_refuses_as_the_preference_matrix_says(
         for record in caplog.records
         if _DEPRECATION_MARKER in record.getMessage()
     ]
-    expected_deprecations = 1 if row.preference == LOCAL_ONLY else 0
+    # No row sends a deprecated alias any more: the last one (``local-only``)
+    # is retired and rejected outright, so every row expects zero deprecation
+    # lines (LP-0MVUH9PAZ002UAPA).
+    expected_deprecations = 0
     assert len(deprecations) == expected_deprecations, (
         f"{row.behaviour}: expected {expected_deprecations} deprecation line(s) "
         f"for preference {row.preference!r}, got {deprecations!r}"
@@ -1935,14 +1973,14 @@ def test_behaviour_matrix_covers_every_documented_behaviour():
     ids = [param.id for param in _BEHAVIOUR_MATRIX]
     assert len(ids) == len(set(ids)), f"duplicate behaviour rows: {ids}"
     assert set(ids) == {
-        "prefer-local-free-slot-serves-local",
         "absent-free-slot-serves-local",
-        "prefer-local-busy-deferrable-falls-through-remote",
-        "remote-ok-free-slot-strips-local",
+        "remote-ok-free-slot-serves-local",
+        "remote-ok-busy-falls-through-remote-without-queueing",
         "local-preferred-free-slot-serves-local",
         "local-preferred-busy-deferrable-refuses",
         "local-preferred-busy-too-large-promotes-remote",
-        "local-only-legacy-busy-deferrable-refuses",
+        "local-only-retired-is-a-400-before-routing",
+        "prefer-local-retired-is-a-400-before-routing",
         "local-preferred-remote-less-chain-still-defers",
     }, "a behaviour matrix row is missing from (or unexpected in) the table"
 

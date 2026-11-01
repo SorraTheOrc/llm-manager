@@ -942,6 +942,26 @@ async def save_evicted_session_snapshot(
     return report
 
 
+def _eviction_sidecar_source(
+    session_id: str | None, model: str | None
+) -> tuple[int, list[str]] | None:
+    """Return the recorded prefix available to pair an eviction save.
+
+    ``None`` when the session has no trustworthy recorded prefix: the eviction
+    path has no request body, so there is no honest token count and no message
+    fingerprint to store. Extracted so the write path resolves it in one place
+    (LP-0MVVI8TEU006KTOZ). Never raises.
+    """
+    if not session_id or not model:
+        return None
+    try:
+        from proxy.provider import get_recorded_prompt_prefix
+
+        return get_recorded_prompt_prefix(model, session_id)
+    except Exception:
+        return None
+
+
 def _write_eviction_sidecar(
     session_id: str | None,
     model: str | None,
@@ -964,10 +984,9 @@ def _write_eviction_sidecar(
     if not session_id or not model or not slot_filename:
         return
     try:
-        from proxy.provider import get_recorded_prompt_prefix
         from proxy.slot_cache_ratio import write_slot_ratio_sidecar
 
-        recorded = get_recorded_prompt_prefix(model, session_id)
+        recorded = _eviction_sidecar_source(session_id, model)
         if recorded is None:
             return
         cached_tokens, fingerprints = recorded
@@ -1080,9 +1099,23 @@ def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> None:
 
     When *endpoint* is None (legacy single-server mode), the first matching
     assignment is released for backward compatibility.
+
+    Releasing the assignment is also where a slot changes hands, so the
+    session's measured prefill is forgotten with it (LP-0MVT2QFAP0082BKR AC
+    slot release/reassignment): the next owner of that slot must never inherit
+    the previous tenant's prefix size as a numeric reuse ratio. The clear is
+    unconditional and idempotent — the measurement is only ever valid while
+    the session still owns a slot, and the routed model is not known here, so
+    every model's entry for the session goes. Fail-open: clearing never raises.
     """
     if not session_id:
         return
+    try:
+        from proxy.measured_prefill import clear_measured_prefill
+
+        clear_measured_prefill(None, session_id)
+    except Exception:
+        pass
     ep = endpoint or ""
     for key, owner in list(_slot_owners.items()):
         if owner == session_id and (
@@ -1212,19 +1245,19 @@ def _build_slot_context(
     - the slot is in circuit-breaker cooldown after repeated save/restore
       failures.
 
-    When *endpoint* is provided, the slot save directory is derived
-    per-endpoint under the global ``session_slot_save_path`` root using a
-    ``{host}-{port}`` subdirectory so different llama-server instances never
-    collide (LP-0MRPILSMW004T4H8).
+    When *endpoint* is provided the save/restore still targets that specific
+    llama-server instance (LP-0MRPILSMW004T4H8), but the snapshot path is the
+    shared ``session_slot_save_path`` root. llama-server accepts only a bare
+    filename (``fs_validate_filename(..., allow_subdirs=False)``) and writes
+    it under its own ``--slot-save-path``; a ``{host}-{port}`` subdirectory on
+    the proxy side would therefore separate the snapshot from its sidecar and
+    make every restore short-circuit (LP-0MVVI8TEU006KTOZ).
 
     When ``session_slot_timeout_per_token_seconds`` is configured, the
     returned timeout scales with the estimated context size, capped at
     ``session_slot_max_timeout_seconds``.
     """
     slot_path = server_config.get("session_slot_save_path")
-    if slot_path and endpoint:
-        host, port = _endpoint_host_port(endpoint)
-        slot_path = str(Path(slot_path) / f"{host}-{port}")
     slot_pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
     slot_timeout = float(server_config.get("session_slot_timeout_seconds", 3.0) or 3.0)
     slot_dir = _ensure_slot_dir(slot_path)
@@ -1954,13 +1987,38 @@ def _resolve_session_id_header(
     3. ``X-Client-Request-Id``
     4. ``X-Session-Affinity``
 
+    Header lookup is case-insensitive **by construction**: Starlette's
+    ``Headers`` already is, but a plain dict (in-process callers, test doubles,
+    a hand-built request) is not, so a lowercase miss falls back to a
+    case-insensitive scan. Without that, the same request resolves a session
+    id through the HTTP stack and loses it through an in-process caller — which
+    silently disables every per-session behaviour keyed on it (the bounded
+    deferral budget, LP-0MVUH9PL0005PW90).
+
     Returns ``(session_id, source_header_name)``.
     """
     for header_name in ("x-session-id", "session_id", "x-client-request-id", "x-session-affinity"):
         value = headers.get(header_name)
+        if not value:
+            value = _case_insensitive_header_value(headers, header_name)
         if value:
             return value, header_name
     return None, None
+
+
+def _case_insensitive_header_value(headers: dict, header_name: str):
+    """``headers[header_name]`` ignoring key case (plain-dict tolerant)."""
+    try:
+        items = headers.items()
+    except Exception:  # pragma: no cover - exotic header containers
+        return None
+    try:
+        for key, value in items:
+            if str(key).lower() == header_name and value:
+                return value
+    except Exception:  # pragma: no cover - exotic header containers
+        return None
+    return None
 
 
 def _log_session_header_resolution(

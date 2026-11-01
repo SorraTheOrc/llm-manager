@@ -19,7 +19,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
+import proxy.metrics as metrics
 from proxy import cold_start
 from proxy.disconnect_reaper import DisconnectReaperMiddleware
 from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
@@ -160,6 +160,11 @@ _dispatch_cleanup_task: asyncio.Task | None = None
 # The recorder prunes on startup (immediately) and then on an interval.
 _recording_prune_task: asyncio.Task | None = None
 
+# Slot-occupancy sampler task (LP-0MVT1O0VG00905EL). Started in the lifespan
+# only when prometheus_client is importable, so a proxy without the optional
+# client does not poll /slots for metrics nobody can scrape.
+slot_metrics_task: asyncio.Task | None = None
+
 
 # Lazy self-import helper returns this module (avoids circular imports)
 def _srv():
@@ -214,16 +219,27 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # session owns BEFORE the release frees the assignments (the release
         # below pops the records, the markers and the slot registry entries).
         from proxy.router_helpers import (
-            _abandoned_slot_lookup,
             _close_stream_cm,
-            _record_abandoned_slot,
+            _record_abandoned_identity,
+            _resolve_abandoned_slot_identity,
             _spawn_detached_release,
         )
 
-        abandoned_slots: list[tuple[int | None, str | None]] = []
+        abandoned_slots = []
         for record_endpoint, _record in released_records:
             abandoned_slots.append(
-                (_abandoned_slot_lookup(session_id, record_endpoint), record_endpoint)
+                (
+                    # Resolve the identity while the assignment still exists;
+                    # the record's pin is preferred, and an unresolvable one is
+                    # recorded endpoint-wide rather than dropped
+                    # (LP-0MVUVHAQP001IRKK).
+                    _resolve_abandoned_slot_identity(
+                        session_id,
+                        endpoint=record_endpoint,
+                        record=_record,
+                    ),
+                    record_endpoint,
+                )
             )
         # ``_release_local_dispatch`` holds no upstream handle (it pops the
         # record off the registry), so the pinned ``stream_cm`` — the only
@@ -245,9 +261,10 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # annotated "busy, not ours" instead of reading as live work.
         for stream_cm in upstream_streams:
             _spawn_detached_release(_close_stream_cm(stream_cm))
-        for slot_id, record_endpoint in abandoned_slots:
-            _record_abandoned_slot(
-                slot_id,
+        for identity, record_endpoint in abandoned_slots:
+            _record_abandoned_identity(
+                _srv,
+                identity,
                 session_id=session_id,
                 endpoint=record_endpoint,
                 reason="session_evicted",
@@ -1099,6 +1116,51 @@ def _startup_start_dispatch_cleanup():
             logger.warning(f"Failed to start dispatch lease cleanup task: {e}")
 
 
+def _startup_launch_slot_metrics_sampler():
+    """Start the slot-occupancy sampler for the Prometheus surface.
+
+    Publishes ``llama_slots_total`` / ``llama_slots_busy`` /
+    ``llama_slot_busy{slot}`` / ``llama_slots_in_flight_tasks`` and the
+    ``llama_slots_sample_timestamp_seconds`` heartbeat on ``/metrics``
+    (LP-0MVT1O0VG00905EL), so "the GPU drew 115 W" can be attributed to
+    llama-server work.
+
+    Only started when ``prometheus_client`` is importable (``metrics._enabled``):
+    without the client the gauges are no-ops, so polling ``/slots`` every
+    interval would add load for series nobody can scrape. Skips creation when a
+    sampler is already running, and never blocks startup — a failure is logged
+    and leaves the task unset.
+    """
+    global slot_metrics_task
+    if slot_metrics_task is not None:
+        return
+    try:
+        if not metrics._enabled:
+            logger.info(
+                "Slot occupancy sampler not started: prometheus_client is not "
+                "installed"
+            )
+            return
+        from proxy.observability import _slot_metrics_loop
+
+        loop = asyncio.get_running_loop()
+        slot_metrics_task = loop.create_task(_slot_metrics_loop())
+    except Exception as e:
+        logger.warning("Failed to start the slot occupancy sampler: %s", e)
+        slot_metrics_task = None
+
+
+def _shutdown_stop_slot_metrics_sampler():
+    """Cancel the slot-occupancy sampler task."""
+    global slot_metrics_task
+    if slot_metrics_task is not None:
+        try:
+            slot_metrics_task.cancel()
+        except Exception:
+            pass
+        slot_metrics_task = None
+
+
 def _startup_launch_recording_prune():
     """Start the session-recording retention prune task (non-blocking).
 
@@ -1352,6 +1414,15 @@ async def lifespan(app: FastAPI):
     # Startup phase
     # ------------------------------------------------------------------ #
     _startup_config_logging()
+    # AC17 (LP-0MVUH9PUU005HVS4): name the active X-Local-Preference vocabulary,
+    # its default and the retired values so a deploy can be proven from
+    # proxy.log alone. One line per process (the helper is idempotent).
+    try:
+        from proxy import admission_reserve as _pref_vocab
+
+        _pref_vocab.log_vocabulary_banner()
+    except Exception:  # pragma: no cover - a banner must never block startup
+        pass
     _startup_initialize_backend_state()
     _startup_create_http_client(config)
     _startup_create_remote_http_client(config)
@@ -1367,6 +1438,7 @@ async def lifespan(app: FastAPI):
     _startup_launch_disconnect_reaper()
     _startup_launch_recording_prune()
     _startup_launch_quota_poller()
+    _startup_launch_slot_metrics_sampler()
 
     # Record the monotonic start time for the startup-ramp gate.
     global PROXY_START_TIME
@@ -1386,6 +1458,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down LLama Proxy Server")
     _shutdown_stop_session_cleanup()
     _shutdown_stop_recording_prune()
+    _shutdown_stop_slot_metrics_sampler()
     await _shutdown_cleanup_tasks()
     await _shutdown_quota_poller()
     _shutdown_tts_server()
@@ -1403,6 +1476,15 @@ app = FastAPI(
 
 # Register the CLOSE-WAIT disconnect-reaper middleware (LP-0MSNM9UCC002CHYU).
 app.add_middleware(DisconnectReaperMiddleware)
+
+# Register the downstream write-stall guard (LP-0MVWZ9CH6006NW1H). Added AFTER
+# the reaper so it is the OUTERMOST wrapper: it must see every ``send`` —
+# including the responses the inner middleware stack renders during unwinding.
+# The reaper handles a client that has gone; this handles a client that is
+# still connected but has stopped reading, which is_disconnected() never sees.
+from proxy.client_stall_guard import ClientStallGuardMiddleware  # noqa: E402
+
+app.add_middleware(ClientStallGuardMiddleware)
 
 # Include handlers from the extracted handlers module
 from . import handlers  # noqa: E402

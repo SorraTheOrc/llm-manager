@@ -134,6 +134,18 @@ RUN_LIVE_TTS=1 python3 -m pytest proxy/tests/test_tts_integration.py -v
 Without the env var each module prints a SKIP notice. The default `pytest` run
 never executes these tests.
 
+**Not every `start-proxy.sh` test is opt-in.** The sandboxed pytest module
+`tests/test_start_proxy_restart_signature.py` *is* collected by the default
+suite: it runs a copy of `proxy/scripts/start-proxy.sh` inside a temp tree
+(so `REPO_ROOT` is sandbox-local) with an isolated `$HOME`, an ephemeral port,
+stubbed `pkill`/`fuser`/`ss`/`netstat`, and a fake interpreter that intercepts
+the final `exec … -m uvicorn`. That lets it pin the shell-level `--restart`
+preserve-vs-restart decision (signature match preserves llama-server, a
+config change or an unusable signature restarts it, `--keep-llama-server` wins
+over the hash) behaviourally, without ever touching the live proxy,
+llama-server, TTS server or ports 8000/8080/8081. The bare `tests/*.sh`
+harnesses listed above stay opt-in and are not run by default `pytest`.
+
 The embeddings integration tests (`test_embeddings_integration.py`) poll the
 proxy until the embeddings alias answers with a 200 instead of relying on a
 single tight-timeout request, and use generous health-check timeouts, so a

@@ -100,9 +100,10 @@ RE_FALLBACK = re.compile(
 )
 # Fallback evidence appended after ``reason=`` (LP-0MVMBMSWR0036RES):
 # ``session=<uuid|unknown> attempt=<n>``, plus ``limit=``/``remaining=``/
-# ``waited=`` when the reason is budget-driven (``rate_limited*``). Absent on
-# pre-change rotated logs, in which case every field degrades to ``None`` and
-# the legacy nearest-line attribution heuristic still applies.
+# ``waited=`` when the reason is budget-driven
+# (``provider_budget_exhausted*``). Absent on pre-change rotated logs, in which
+# case every field degrades to ``None`` and the legacy nearest-line attribution
+# heuristic still applies.
 RE_FALLBACK_ATTEMPT = re.compile(r"\battempt=(\d+)")
 RE_FALLBACK_BUDGET_LIMIT = re.compile(r"\blimit=(\d+)")
 RE_FALLBACK_BUDGET_REMAINING = re.compile(r"\bremaining=(\d+)")
@@ -204,10 +205,48 @@ RE_GUARD_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
 # (LP-0MVGDUVGE0024YAI) published. ETA is ``None`` when the estimate failed
 # fail-open; both fields are absent on pre-change schema lines.
 RE_STATUS_PREFILL_ETA = re.compile(r"\bprefill_eta_seconds=([\d.]+|None)")
-RE_STATUS_CAPACITY_HINT = re.compile(r"\bcapacity_hint=([a-z_]+)")
+# Calibration context appended to the poll line (LP-0MVSD5RJW008F1IB AC6): the
+# reference prompt size the published bound costed, whether the pricing was
+# calibrated, the rate bucket it was priced from and that window's sample
+# count, plus the cache state the bound assumes. All are absent on pre-change
+# lines and stay ``None`` (never a fabricated default) there, so the metric can
+# tell which reference size produced each published number.
+RE_STATUS_PREFILL_KIND = re.compile(r"\bprefill_eta_kind=([A-Za-z_]+)")
+RE_STATUS_ASSUMED_CACHED_RATIO = re.compile(
+    r"\bprefill_eta_assumed_cached_ratio=([\d.]+|None)"
+)
+RE_STATUS_REFERENCE_TOKENS = re.compile(r"\bprefill_eta_reference_tokens=(\d+|None)")
+RE_STATUS_PREFILL_SAMPLES = re.compile(r"\bprefill_eta_samples=(\d+)")
+RE_STATUS_PREFILL_CALIBRATED = re.compile(
+    r"\bprefill_eta_calibrated=(true|false)"
+)
+RE_STATUS_PREFILL_RATE_BUCKET = re.compile(r"\bprefill_eta_rate_bucket=([A-Za-z_]+)")
+RE_STATUS_CAPACITY_HINT = re.compile(r"\bcapacity_hint=([^\s]+)")
 RE_STATUS_SCHEMA_VERSION = re.compile(r"\bstatus_schema_version=(\d+)")
 RE_STATUS_AVAILABLE_SLOTS = re.compile(r"\bavailable_slots=(\d+)")
 RE_STATUS_TOTAL_SLOTS = re.compile(r"\btotal_slots=(\d+)")
+# Freshness of the served status payload (LP-0MVU8O4EL005IYP9 AC1.2):
+# ``slots_stale`` is the union flag (counts *or* per-slot detail served from
+# cache because the fresh ``/slots`` query failed), ``slots_detail_stale`` the
+# per-source flag for the detail half. Both are emitted at schema >= 2 and are
+# absent on schema-1 lines, where each stays ``None`` (never a fabricated
+# ``false`` — an absent field must not be counted as a fresh poll).
+RE_STATUS_SLOTS_STALE = re.compile(r"\bslots_stale=(true|false)")
+RE_STATUS_SLOTS_DETAIL_STALE = re.compile(r"\bslots_detail_stale=(true|false)")
+# Response latency of the poll (``proxy/proxy/handlers.py``): the elapsed time
+# the status handler spent serving the request, including a timed-out
+# ``/slots`` query. Absent on pre-change lines, so ``None`` there.
+RE_STATUS_LATENCY_MS = re.compile(r"\blatency_ms=(\d+)")
+# Live local work at poll time (LP-0MVU8O9OC005YQU1 AC2.1): schema 3 carries
+# ``local_in_flight_requests`` — the authoritative count derived from live
+# dispatch records — while every schema (2 and 3) carries the
+# ``local_active_query`` / ``active_query`` flags the pre-fix
+# false-``saturated`` incident was measured on. All three are absent on
+# pre-change lines and stay ``None`` there (never a fabricated ``false``, which
+# would claim the poll had *checked* and found no live work).
+RE_STATUS_LOCAL_IN_FLIGHT = re.compile(r"\blocal_in_flight_requests=(\d+)")
+RE_STATUS_LOCAL_ACTIVE_QUERY = re.compile(r"\blocal_active_query=(true|false)")
+RE_STATUS_ACTIVE_QUERY = re.compile(r"\bactive_query=(true|false)")
 
 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): the proxy emits
 # ``routing_idle_admit provider=... model=... reason=economic_bypass_idle
@@ -228,6 +267,14 @@ RE_N_PAST_ACTUAL = re.compile(r"\bn_past_actual=(\d+|none)\b")
 RE_REUSE_RATIO = re.compile(r"\breuse_ratio=([\d.]+|none)\b")
 RE_SLOT_OWNER_SESSION = re.compile(r"\bslot_owner_session=(\S+)")
 RE_RESIDENCY_SOURCE = re.compile(r"\bresidency_source=([A-Za-z_]+)")
+# Measurement provenance (LP-0MVT2PY3J00077W6 grammar, LP-0MVT2Q1SD009JLKD
+# vocabulary, LP-0MVT2QHMU0008F2V parsing): additive field emitted immediately
+# after ``residency_source=``. Exactly one closed-vocabulary value per line:
+# ``measured`` or ``unavailable:<reason>`` (``no_slot``,
+# ``no_prior_measurement``, ``stale_view``, ``capture_disabled``). The value is
+# parsed verbatim — never collapsed to the old ambiguous ``none`` — and is
+# ``None`` on lines predating the field (old log files).
+RE_MEASUREMENT = re.compile(r"\bmeasurement=([A-Za-z_:]+)")
 RE_TENANT_LIMIT = re.compile(r"\btenants=(\d+|none)\b")
 RE_TENANT_OCCUPANTS = re.compile(r"\boccupants=(\d+)")
 RE_EVICTION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
@@ -293,7 +340,8 @@ ROUTING_IDLE_ADMIT = "routing_idle_admit"
 # ``routing_resident_prefix provider=local model=... decision=<verdict>
 # n_past_actual=<n|none> estimated_tokens=<n> reuse_ratio=<f|none>
 # slot_owner_session=<id|none> residency_source=<measured|session_slot|
-# non_resident|unknown> min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
+# non_resident|unknown> measurement=<measured|unavailable:<reason>>
+# min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
 # once per admission decision. ``decision`` is one of ``admit``,
 # ``resident_prefix_insufficient``, ``tenant_limit`` (plus
 # ``large_context_bypass`` for a live-priced cold miss). The fail-open path
@@ -352,15 +400,48 @@ COMPACTION_CHURN = "compaction_churn"
 # ``context_too_large``. Rotated logs (6-hourly rotation, 90-day retention)
 # still contain the legacy value, so it is normalized here so downstream
 # analysis treats both spellings as the same reason.
+#
+# ``rate_limited*`` was the pre-LP-0MVMBM8YS003Y2JG name for the proxy's own
+# per-provider request-budget skip. It was renamed because operators and
+# tooling misread it as an upstream rate-limit rejection (an HTTP 429 from the
+# provider), when it is in fact a pre-flight budget decision made by
+# ``provider_budget.py`` on a healthy provider. The proxy still emits none of
+# the old spelling; rotated logs do, so every variant suffix
+# (``_after_wait`` / ``_waiters`` / ``_disconnect`` / ``_waited``) is
+# normalized by prefix so one window never reports both spellings.
 CONTEXT_TOO_LARGE = "context_too_large"
 LEGACY_WARM_CACHE_BYPASS = "warm_cache_bypass"
+PROVIDER_BUDGET_EXHAUSTED = "provider_budget_exhausted"
+LEGACY_RATE_LIMITED = "rate_limited"
+
+#: Prefix renames: legacy prefix -> current prefix. The suffix after the prefix
+#: is preserved, so variant names keep meaning.
+_LEGACY_REASON_PREFIX_RENAMES = {
+    LEGACY_RATE_LIMITED: PROVIDER_BUDGET_EXHAUSTED,
+}
 
 
 def _normalize_reason(reason: str | None) -> str | None:
     """Map legacy reason values to their current names."""
     if reason == LEGACY_WARM_CACHE_BYPASS:
         return CONTEXT_TOO_LARGE
+    if not reason:
+        return reason
+    for legacy, current in _LEGACY_REASON_PREFIX_RENAMES.items():
+        if reason == legacy or reason.startswith(f"{legacy}_"):
+            return current + reason[len(legacy):]
     return reason
+
+
+def is_provider_budget_reason(reason: str | None) -> bool:
+    """Whether *reason* is the proxy's own per-provider request-budget skip.
+
+    Covers every variant (``provider_budget_exhausted`` +
+    ``_after_wait`` / ``_waiters`` / ``_disconnect``) and is applied to
+    already-normalized reasons, so legacy ``rate_limited*`` logs match too
+    (LP-0MVMBM8YS003Y2JG AC3/AC4).
+    """
+    return bool(reason) and reason.startswith(PROVIDER_BUDGET_EXHAUSTED)
 
 # Error-line prefixes (WARNING level structured lines the parser recognizes).
 STREAM_ERROR = "Stream error:"
@@ -552,7 +633,8 @@ class LogEvent:
     # Fallback evidence (LP-0MVMBMSWR0036RES, ``fallback`` kind only):
     # ``attempt_index`` is the per-session fallback ordinal parsed from
     # ``attempt=``; ``budget_limit``/``budget_remaining``/``budget_waited``
-    # carry the budget snapshot emitted with a ``rate_limited*`` reason.
+    # carry the budget snapshot emitted with a ``provider_budget_exhausted*``
+    # reason (legacy ``rate_limited*`` lines are normalized at parse time).
     # All ``None`` on pre-change lines (and on every other kind).
     attempt_index: int | None = None
     budget_limit: int | None = None
@@ -656,6 +738,33 @@ class LogEvent:
     status_schema_version: int | None = None
     available_slots: int | None = None
     total_slots: int | None = None
+    # Calibration context of the published bound (LP-0MVSD5RJW008F1IB AC6):
+    # the reference prompt size, whether the coefficients were calibrated, the
+    # rate bucket and its sample count, and the cache state the bound assumes.
+    # ``None`` on lines predating the fields — never a fabricated default.
+    prefill_eta_reference_tokens: int | None = None
+    prefill_eta_calibrated: bool | None = None
+    prefill_eta_rate_bucket: str | None = None
+    prefill_eta_samples: int | None = None
+    prefill_eta_kind: str | None = None
+    prefill_eta_assumed_cached_ratio: float | None = None
+    # Status-payload freshness and response latency (LP-0MVU8O4EL005IYP9 AC1.2):
+    # ``slots_stale`` (the union flag) and ``slots_detail_stale`` (the per-source
+    # detail half) are tri-state — ``None`` on schema-1 lines that predate the
+    # fields, which is why an absent field is excluded from the stale-rate
+    # denominator instead of being counted as fresh. ``latency_ms`` is the
+    # handler's own response latency (``None`` when the line predates it).
+    slots_stale: bool | None = None
+    slots_detail_stale: bool | None = None
+    latency_ms: int | None = None
+    # Live local work at poll time (LP-0MVU8O9OC005YQU1 AC2.1): the
+    # authoritative schema-3 ``local_in_flight_requests`` count and the
+    # ``local_active_query`` / ``active_query`` flags that are the schema-2
+    # fallback. All three are ``None`` on lines predating the fields, so the
+    # shared live-work rule can tell "absent" from "checked, none running".
+    local_in_flight_requests: int | None = None
+    local_active_query: bool | None = None
+    active_query: bool | None = None
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J, ``idle_admit`` kind):
     # the idle age at admission and the configured threshold. Populated on
     # ``idle_admit`` events only.
@@ -672,6 +781,11 @@ class LogEvent:
     reuse_ratio: float | None = None
     slot_owner_session: str | None = None
     residency_source: str | None = None
+    # Measurement provenance (LP-0MVT2QHMU0008F2V AC4/AC2): the additive
+    # ``measurement=`` value in its closed vocabulary (``measured`` or
+    # ``unavailable:<reason>``), parsed verbatim. ``None`` when the line
+    # predates the field — old logs are never reclassified.
+    measurement: str | None = None
     tenant_limit: int | None = None
     tenant_occupants: int | None = None
     # Eviction evidence (LP-0MVN1IQTF0037WTG AC6, ``local_eviction`` kind): the
@@ -743,6 +857,19 @@ def _int(pattern: re.Pattern, text: str) -> int | None:
         return int(token)
     except ValueError:
         return None
+
+
+def _bool(pattern: re.Pattern, text: str) -> bool | None:
+    """Tri-state boolean extraction for a ``key=true|false`` field.
+
+    ``None`` means the field is absent (a pre-change line), which callers must
+    keep distinct from ``False`` — an absent freshness field is not a fresh
+    poll (LP-0MVU8O4EL005IYP9 AC1.2).
+    """
+    token = _first(pattern, text)
+    if token is None:
+        return None
+    return token == "true"
 
 
 def _session_from(text: str) -> str | None:
@@ -1155,6 +1282,10 @@ def parse_log_line(line: str) -> LogEvent | None:
             contended_samples=_int(RE_GUARD_CONTENDED_SAMPLES, msg),
             eta_occupancy_s=_first(RE_GUARD_ETA_OCCUPANCY, msg),
             new_tokens=_int(RE_GUARD_NEW_TOKENS, msg),
+            # The pricing policy on the decision line (``reject`` / ``observe``
+            # / ``off``): the matched prefill-ETA accuracy splits a rollout
+            # window by it (LP-0MVSD5RJW008F1IB AC1).
+            policy=_first(RE_CONTENTION_POLICY, msg),
         )
     if msg.startswith(STATUS_REQUEST):
         # "status_request active_query=false available_slots=2
@@ -1165,6 +1296,7 @@ def parse_log_line(line: str) -> LogEvent | None:
         # truthful capacity hint. ``prefill_eta_seconds=None`` is meaningful
         # (estimate unavailable — fail-open), never a zero cost.
         eta = _float(RE_STATUS_PREFILL_ETA, msg)
+        calibrated = _first(RE_STATUS_PREFILL_CALIBRATED, msg)
         return LogEvent(
             STATUS_REQUEST,
             ts,
@@ -1173,6 +1305,32 @@ def parse_log_line(line: str) -> LogEvent | None:
             status_schema_version=_int(RE_STATUS_SCHEMA_VERSION, msg),
             available_slots=_int(RE_STATUS_AVAILABLE_SLOTS, msg),
             total_slots=_int(RE_STATUS_TOTAL_SLOTS, msg),
+            # Calibration context (LP-0MVSD5RJW008F1IB AC6): additive fields;
+            # absent on pre-change lines, where each stays ``None``.
+            prefill_eta_reference_tokens=_int(
+                RE_STATUS_REFERENCE_TOKENS, msg
+            ),
+            prefill_eta_calibrated=(
+                None if calibrated is None else calibrated == "true"
+            ),
+            prefill_eta_rate_bucket=_first(
+                RE_STATUS_PREFILL_RATE_BUCKET, msg
+            ),
+            prefill_eta_samples=_int(RE_STATUS_PREFILL_SAMPLES, msg),
+            prefill_eta_kind=_first(RE_STATUS_PREFILL_KIND, msg),
+            prefill_eta_assumed_cached_ratio=_float(
+                RE_STATUS_ASSUMED_CACHED_RATIO, msg
+            ),
+            # Payload freshness and latency (LP-0MVU8O4EL005IYP9 AC1.2):
+            # additive fields, ``None`` on lines predating them.
+            slots_stale=_bool(RE_STATUS_SLOTS_STALE, msg),
+            slots_detail_stale=_bool(RE_STATUS_SLOTS_DETAIL_STALE, msg),
+            latency_ms=_int(RE_STATUS_LATENCY_MS, msg),
+            # Live local work (LP-0MVU8O9OC005YQU1 AC2.1): additive fields,
+            # ``None`` on lines predating them.
+            local_in_flight_requests=_int(RE_STATUS_LOCAL_IN_FLIGHT, msg),
+            local_active_query=_bool(RE_STATUS_LOCAL_ACTIVE_QUERY, msg),
+            active_query=_bool(RE_STATUS_ACTIVE_QUERY, msg),
         )
     if msg.startswith(ROUTING_RESIDENT_PREFIX):
         # "routing_resident_prefix provider=local model=Qwen3 decision=admit
@@ -1201,6 +1359,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             ),
             slot_owner_session=None if not owner or owner == "none" else owner,
             residency_source=_first(RE_RESIDENCY_SOURCE, msg),
+            measurement=_first(RE_MEASUREMENT, msg),
             tenant_limit=(
                 int(_first(RE_TENANT_LIMIT, msg))
                 if _first(RE_TENANT_LIMIT, msg)

@@ -586,9 +586,9 @@ retrying into it:
   after which the session counts as new again.
 
 Skips log `Provider budget exhausted: skipping provider=<p> limit=<n>
-remaining=<n> reason=rate_limited …` and appear in the exhaustion
-`diagnostics` as `status: "rate_limited"`; a waited dispatch records
-`status: "rate_limited_waited"` with `elapsed_wait_seconds`. An entry without
+remaining=<n> reason=provider_budget_exhausted …` and appear in the exhaustion
+`diagnostics` as `status: "provider_budget_exhausted"`; a waited dispatch records
+`status: "provider_budget_exhausted_waited"` with `elapsed_wait_seconds`. An entry without
 `rate_limit_rpm` is never gated (behaviour unchanged).
 
 ```yaml
@@ -902,11 +902,23 @@ every turn) routed remote invisibly turn after turn.
 #### All Providers Exhausted
 
 When all providers are exhausted:
-- **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 with a JSON body `{"error": "All providers exhausted", "code": "all_slots_exhausted", "message": "Model server busy: 0/<total_slots> slots available. Retry later."}` (no `Retry-After` header).
+- **Slot exhaustion** (all providers were local and had no slots): Returns HTTP 429 with a JSON body `{"error": "All providers exhausted", "code": "all_slots_exhausted", "message": "Model server busy: 0/<total_slots> slots available. Retry later.", "retryable": true, "retry_after": <seconds>, "retry_at": "<RFC 3339 UTC>"}` plus a matching `Retry-After` header. The delay is the measured remaining service owed by the live occupant(s) when one is observable, otherwise `server.slot_unavailable_retry_after` (default `5` s, the knob the router-level slot `503` also advertises); it is floored at 1 s and capped by `server.max_retry_after_seconds`. The timer also bounds a chain hold (`min(chain_hold_seconds, retry_after)`) instead of the legacy full hold (LP-0MVUXY1CL005KWCC).
 - **Other errors**: Returns HTTP 503 with a JSON body containing `error: "All providers exhausted"`, a stable `code`, and `retry_after`.
 - **Time-window exhaustion**: When every provider is skipped *solely* because its `available_times` window excludes the current UTC time (no cooldown, no provider actually tried), the 503 is distinguishable by `code: "outside_time_window"`; the window-specific prose lives in `detail`, while `error` stays the client-recognised `"All providers exhausted"`. The `diagnostics` entries carry `status: "outside_time_window"`. Mixed cases (a provider in cooldown, a usage-limit quarantine, or an error plus a time-window skip) keep the generic `code: "all_exhausted"` response, but the `diagnostics` still include the `outside_time_window` entries so the cause is visible (LP-0MU56ZM0K005F69G).
 
 The response contract is **additive-only**: the legacy `error` prose is retained for older clients, the stable `code` discriminator is what new clients should key on, and `retry_after` / the `Retry-After` header, `unavailable_providers` and `diagnostics` remain present where available.
+
+**Not exhaustion: a pin-local admission refusal (LP-0MVNTJJGX00375VQ).** A
+request pinned to the local route (`X-Local-Preference: local-only` /
+`local-preferred`) that the local capacity guard refuses is a
+**capacity/intent** outcome, not an exhausted chain: no remote provider is
+consulted, so both pin-local refusal paths answer HTTP 429 with
+`error: "Local admission refused"` and `code: "local_admission_reject"` —
+never `"All providers exhausted"`. The exhaustion prose and the
+`all_exhausted` / `outside_time_window` / `all_slots_exhausted` codes stay
+reserved for a chain that really did exhaust (where a `prefer-local` request
+that the guard refused *and* whose remaining chain is exhausted still receives
+`code: "local_admission_reject"` with the retained exhaustion prose).
 
 ##### Client-facing retry-timer cap (LP-0MV0MM5R60025XZE)
 
@@ -992,7 +1004,7 @@ hint.
 | Outside `available_times` window | `outside_time_window` | — (window-skipped) | `Skipping provider=<p>: outside its available_times window (UTC)` |
 | Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending (account=…, window=<rolling\|weekly\|monthly\|unknown>, …)` / `usage_limit_reset=` on the exhaustion line |
 | Local slot held by another session | `local_lease_active` / `fallback_after_queue` | — | `local_dispatch_denied session=… owner=… active=…` |
-| Free-tier request budget exhausted (`rate_limit_rpm`) | `rate_limited` / `rate_limited_waited` | — | `Provider budget exhausted: skipping provider=<p> limit=<n> remaining=<n> reason=rate_limited …` |
+| Free-tier request budget exhausted (`rate_limit_rpm`) | `provider_budget_exhausted` / `provider_budget_exhausted_waited` | — | `Provider budget exhausted: skipping provider=<p> limit=<n> remaining=<n> reason=provider_budget_exhausted …` |
 | Prompt context above the entry's `max_context_tokens` | `provider_context_exceeded` | — | `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded …` |
 | All local slots busy (slot exhaustion) | `slot_exhaustion` | — | `Model server busy: 0/N slots available` (429) |
 | Provider / brand cooldown | `http_exception` / `empty_response` / etc. | `<name or brand>: <seconds>` | `marking provider unavailable` / `unavailable={…}` on the exhaustion line |
@@ -1001,7 +1013,7 @@ hint.
 
 1. **Read the `code`** in the 503 body (or the `Retry-After` header). `all_exhausted` → generic; `outside_time_window` → the schedule is the sole cause; `all_slots_exhausted` → local slot exhaustion (429).
 2. **Check `diagnostics`** for the dominant `status` values and `unavailable_providers` for cooldown/quarantine seconds. A `usage_limit_reset` entry with hours of `reset_in` is a quota block, not a schedule gap.
-3. **Check the `Retry-After` header**: it is the computed time until the soonest real availability (window edge / usage reset / cooldown), bounded by `server.max_retry_after_seconds` (default `3600` s). To read the unbounded true wait, use `diagnostics` (`reset_in`/`reset_at`) and `unavailable_providers` (see the retry-timer cap above).
+3. **Check the `Retry-After` header**: it is the computed time until the soonest real availability (window edge / usage reset / cooldown), bounded by `server.max_retry_after_seconds` (default `3600` s). The slot-exhaustion `429` (`all_slots_exhausted`) carries the same header/body pair, bounded the same way, from the measured occupant remainder or `server.slot_unavailable_retry_after`. To read the unbounded true wait, use `diagnostics` (`reset_in`/`reset_at`) and `unavailable_providers` (see the retry-timer cap above).
 4. **In `proxy.log`**, follow the `routing_check` / `routing_skip_local` / `compaction_bypass_eval` lines for the session; each carries the model, estimate, cached ratio and — for held requests — `chain_hold_cycle=N`.
 5. **Distinguish a hold cycle from new demand**: a line with `chain_hold_cycle>0` belongs to one held request being retried, not a new client request. `proxy-usage-analysis` should exclude those from demand counts (LP-0MUIEO6IP0030CT3).
 
@@ -1061,6 +1073,27 @@ saturation kinds are distinguishable in observability.
   the no-progress watchdog, orphan cleanup, session eviction and adaptive
   expiry. Numbers and rationale: `docs/dev/idle-window-measurements.md`;
   design note: `docs/dev/slot-management-design.md` §9.2.
+- **Idle admission is priced against prefill feasibility** (LP-0MVRCLPVI0057116):
+  the idle override is the *last rung* of the admission ladder, so it consults
+  the shared `prefill_eta.evaluate_admission` guard — the flat
+  `local_cold_prefill_budget_tokens` cap plus the wait, prefill-deadline and
+  `local_admission_guard_budget_safety_fraction × deadline` bounds — before it
+  admits a `large_context_bypass`. A prompt the guard refuses keeps the
+  economic remote fallback and is logged as `routing_idle_admit_refused ...
+  reason=prefill_budget_exceeded|eta_exceeds_budget|
+  prefill_eta_exceeds_safety_budget`; it is never dispatched and then cancelled
+  at the deadline. The guard knobs are read per dispatch, so
+  `POST /admin/reload-config` retunes it without a restart; the physical
+  `context_too_large` cap and the `local_lease_active` dispatch gate stay
+  non-overridable. Post-fix window (2026-10-26 00:00 → 2026-10-30 06:00):
+  7,567 pre-dispatch refusals and 57 admissions, of which 6 reached a first
+  byte; the 30 still cancelled at the deadline were all warm/small prompts
+  (`new_tokens` 40–21,021) starved with zero progress behind a competing
+  prefill — the separate zero-progress head-of-line residual
+  LP-0MVO8H7VQ003B12I, not a pricing failure. Decision (LP-0MVJXGSEG0045IAF):
+  keep the flag on with the eligibility fix, not `enable_by_default` until a
+  clean no-deadline-abort window after that residual fix. Numbers:
+  `docs/dev/idle-window-measurements.md`.
 
 Behavior:
 - **Streaming requests** (`stream: true`) receive periodic SSE comment lines
@@ -2125,8 +2158,10 @@ Response:
 | `slots_stale`             | `bool`        | The served slot counts **or** per-slot detail came from the last-known cache. |
 | `slots_detail_stale`      | `bool`        | The per-slot detail (and therefore `capacity_hint` input) is cached.       |
 | `slot_counts_stale`       | `bool`        | The `available_slots` / `total_slots` pair is cached.                      |
-| `local_abandoned_slots`   | `int`         | Slots annotated `abandoned` — dispatches the proxy gave up on that llama-server has not released yet (LP-0MVRMI5HK00558TB). |
-| `status_schema_version`   | `int`         | Payload schema version (currently `4`).                                    |
+| `local_abandoned_slots`   | `int`         | Slots annotated `abandoned` — dispatches the proxy gave up on that llama-server has not released yet (LP-0MVRMI5HK00558TB). The count is **endpoint-wide aware**: an abandonment recorded without a resolvable slot identity (or whose recorded id no longer matches the draining slot) is stored as one endpoint-wide registry entry and still counts once here, so no abandonment the proxy gave up on is invisible (LP-0MVUVHB1V006HA5I, LP-0MVUVHAQP001IRKK). |
+| `slots[].abandoned`      | `bool`        | `true` when the proxy gave up on the dispatch occupying this slot and llama-server has not released it yet; always paired with `abandonment_reason` (`prefill_deadline`, `session_evicted`, `no_progress_watchdog`, `client_disconnect`, `orphan_cleanup`, `measured_cache_deficit`), `abandoned_session_id` and `abandoned_at_seconds_ago` so a ghost is never a bare boolean (LP-0MVRMI5HK00558TB). |
+| `slots[].abandoned_scope` | `string \| null` | Which registry entry produced a slot's `abandoned` annotation: `"slot"` (the slot's own recorded identity matched), `"endpoint"` (an endpoint-wide entry applied to a processing slot that no lease **and** no live dispatch record owns — i.e. a draining ghost), or `null` when the slot is not abandoned. Additive within `status_schema_version` 4 (LP-0MVUVHB1V006HA5I). |
+| `status_schema_version`   | `int`         | Payload schema version (currently `5`; the abandonment fields in this table are additive within `4` and unchanged by the `5` bump, which added the `local_route_*` fields). |
 
 **Performance:**
 
@@ -2137,9 +2172,22 @@ variable). If the query times out, safe defaults (mostly `false`/`null`) are
 returned and `llama_server_running` is set to `false`.
 
 Local dispatches the proxy abandons (prefill deadline, session eviction,
-no-progress watchdog, client disconnect) are cancelled upstream where a handle
-exists and otherwise reported per slot as `abandoned` with its reason and
-session, so a ghost llama-server is still finishing never reads as live work.
+no-progress watchdog, client disconnect, orphan sweep, measured cache deficit)
+are cancelled upstream where a handle exists and otherwise reported per slot as
+`abandoned` with its reason, session and `abandoned_scope`, so a ghost
+llama-server is still finishing never reads as live work. Every abandonment
+records an identity that can match the slot it gave up on, or an **endpoint-wide**
+entry that matches a draining slot on that endpoint only while no lease and no
+live dispatch record owns it — so a release with no resolvable slot id is still
+annotatable, and live work is still reported `saturated`. The entry is cleared
+when a fresh `/slots` snapshot reports the slot free and is TTL-bounded (900 s)
+regardless. `scripts/capacity_signal_verification.py` counts a
+`measured_cache_deficit` release as an abandonment event; that widens the
+attribution baseline (the historical 247-poll / 12-poll counts used the
+narrower reason set), which every report states explicitly. Details in
+[docs/per-slot-status-verification.md](docs/per-slot-status-verification.md#abandoned-work-lp-0mvr5hk00558tb-ac1)
+and
+[docs/routing.md](docs/routing.md#abandoned-local-dispatches-lp-0mvr5hk00558tb-ac1).
 The post-deadline prefill-thrash cooldown is scoped to the **(session, prompt
 fingerprint)** that actually failed and is released as soon as a fresh snapshot
 proves the GPU free, so it never vetoes an unrelated prompt on an idle GPU while
@@ -2197,6 +2245,68 @@ stayed at 79.61 %, because that build predated the child-port resolver
 (`f58e8964`) — the polling budget, not the capacity signal, drove that rate.
 Figures, per-poll attribution and the re-derivation commands are in the
 [per-slot status contract](docs/per-slot-status-verification.md).
+
+#### Model resolution rule
+
+Every proxy-initiated `/slots` query sends an explicit `?model=` — the query
+helpers append it unconditionally, so a model-less request is unreachable
+(fenced by the guard test, see below). The id is resolved from the router's
+`/models` ids/presets by `resolve_local_model_id()`
+(`proxy/proxy/router_helpers.py`), in this order:
+
+1. **Explicit caller model** — a model the caller already knows (e.g. the
+   embed child `mxbai-embed`) is used verbatim (`source=explicit`).
+2. **`srv.current_model`** — the model the proxy itself loaded/manages
+   (`source=current_model`).
+3. **Sole non-embed `/models` preset** — when `GET /models` lists exactly one
+   non-embedding id, that id is used. Router ids are *presets*, never assumed:
+   `Qwen3`, `Qwen3-32B`, `Qwen2.5-7B`, `Qwen/Qwen3-Coder-Next-GGUF:Q5_K_M`, …
+   (`source=models_snapshot`).
+4. **Live child-port log signal, canonicalised** — the model named by the
+   newest `proxying request to model <model> on port <port>` line is matched
+   case-insensitively against the `/models` ids, so the emitted `?model=` is
+   the router's own spelling even when the log only names an alias
+   (`Qwen3` → `Qwen3-32B`, ``source=log_signal+models_snapshot``).
+5. **Live child-port log signal verbatim** — that signal is the id the router
+   itself reported, so it is resolvable by definition
+   (`source=log_signal`).
+6. **`"Qwen3"` as a logged last resort** (`LAST_RESORT_MODEL_ID`) — used only
+   when nothing above exists; the fallback is never silent, logging
+   `slots_model_resolution_last_resort: ...` (throttled) (`source=last_resort`).
+
+The sole-preset `/models` match (rule 3) deliberately precedes the live log
+signal: when `/models` names exactly one non-embed model there is nothing to
+disambiguate, while the log signal is still used both to canonicalise a preset
+alias (rule 4) and, absent `/models`, verbatim (rule 5).
+
+The `/models` snapshot is fetched once per llama-server pid/model and cached
+with the same TTL as the child-port cache; the sync discovery path never
+blocks on HTTP (`ensure_router_model_ids()` warms the cache on the async
+dispatch path). The resolved **id** and the resolved **port** are independent:
+a preset alias mismatch (`Qwen3-32B` vs the log's `Qwen3`) still resolves the
+child port, so every query targets the discovered child port and never
+traverses the router under load.
+
+**Router `/slots` HTTP 400 classes.** The router answers `GET /slots` with a
+400 in three situations, and only the third is expected:
+
+| Class | `?model=` sent | Meaning | Action |
+|---|---|---|---|
+| **Missing** | none | Proxy defect: a construction site forgot the parameter | Fenced by the guard test — a model-less `/slots` URL fails the suite |
+| **Unknown / unresolvable** | an id/preset the router does not list | Proxy defect: the id was not resolved from `/models` | Fix the resolution — the id must come from rules 1–5 above |
+| **Unloaded** | a valid id whose model has no live instance (idle unload, preload window) | Expected truth: the router's definitive "model absent" answer | Fail open — cached counts are not substituted (`slots_failure_is_definitive_model_absent`) |
+
+The rule is enforced by
+[`proxy/tests/test_slots_model_param_guard.py`](tests/test_slots_model_param_guard.py)
+(a static fence: every `/slots` URL carries `?model=` inline or is extended by
+an unconditional appender) and the resolution order by
+[`proxy/tests/test_slots_model_id_resolution.py`](tests/test_slots_model_id_resolution.py).
+Per-query attribution of individual router 400s (a caller tag plus a
+`http_400` failure metric on the detail/progress paths) is deferred to
+LP-0MVTDMXXH005D5D5: llama.cpp's router access line omits the query string, so
+a historical 400 cannot be attributed from `llama-server.log`. The full class
+split and its triage commands are in
+[docs/dev/slots-500-triage.md](../docs/dev/slots-500-triage.md).
 
 #### List Models
 ```bash
@@ -2297,6 +2407,55 @@ session=... progress=... buffer=...s`.
 Anonymous/non-explicit sessions do **not** receive the prefill-progress
 extension; they rely on the adaptive token-estimate lease
 (LP-0MSEHMMBK0062ZPI).
+
+#### Post-deadline local dispatch gate (terminal detour + thrash cooldown)
+
+When a local dispatch is cancelled by the prefill deadline
+(`prefill_deadline_exceeded`, backstop `local_prefill_deadline_seconds`,
+default 120), the proxy makes two guarantees so the gate recovers in minutes
+instead of holding other sessions for the incident's ~6 min (LP-0MVSAMN14001DMTY
+fix, verified by LP-0MVSAMS5O006OAIS):
+
+1. **Terminal for the request.** The cancellation marks the *request* object,
+   so that same request can never re-acquire a fresh dispatch lease after the
+   release (the 2026-10-26 re-dispatch that re-armed a lease ~150 ms later). A
+   concurrent request from the same session is unaffected.
+2. **Session cooldown.** The session is kept off local for the same prompt for
+   `local_prefill_thrash_cooldown_seconds` (default 120 since 2026-10-31,
+   `LP-0MVWC8JCG007GAPW`; was 600). The gate is enforced
+   at every local-dispatch **acquisition choke point** — `proxy_to_local`
+   before any local resource is acquired and `_try_acquire_local_dispatch`
+   before the lease record is created — so paths that bypass the provider
+   chain (in-request retries, `ui.py` direct dispatch) are covered too.
+
+Both refusals return the retryable **503 `backend_error`** shape (never
+`local_lease_active`/`no_slots_available`, which would make the client queue
+for a slot the gate refuses to grant).
+
+**Rollback knobs** (`server.*` in `proxy/config.yaml`):
+
+| Knob | Default | Rollback meaning |
+|---|---|---|
+| `local_prefill_thrash_cooldown_seconds` | `120` | **`0` disables** the thrash cooldown entirely — restores pre-fix behaviour (no arming, no `routing_skip_local reason=prefill_thrash_cooldown`, no early clear). Reduced from 600 s on 2026-10-31 (`LP-0MVWC8JCG007GAPW`) so a pin-local session's cold-prefix abort costs 2 minutes, not 10; interim until the benefit gate (`LP-0MVWBD91Z004U135`) lands. |
+| `local_prefill_thrash_recovery_fraction` | `0.9` | Size gate on the cooldown's early clear — `0` restores clear-on-any-success (the measured bug). |
+
+Deprecated knobs are not re-tuned without fresh evidence
+(`local_cold_prefill_budget_tokens 25000` etc. remain as deployed).
+
+**Reading the evidence lines in `proxy.log`:**
+
+- `routing_skip_local ... reason=prefill_thrash_cooldown cooldown_remaining=Ns`
+  — the session's post-deadline window is armed for this prompt; the chain
+  falls through to the next provider. `entry=router_dispatch` /
+  `entry=lease_acquire` name which choke point refused.
+- `routing_skip_local ... reason=post_deadline_terminal` — this *request* was
+  already cancelled by the deadline; local is terminal for it.
+- `lease_released ... reason=prefill_deadline` — a cancelled dispatch released
+  its lease (0.0 s is the healthy shape; a long gap is the wedge signature).
+- `local_dispatch_denied session=... owner=... active=...` — a competing
+  session held the gate; classify by the owner's hold duration (the AC bound
+  is <=300 s of unproductive hold, `scripts/prefill_recovery_verification.py
+  --measure`).
 
 #### Automatic Counter Recovery
 
@@ -2828,6 +2987,18 @@ To avoid llama-server invalidating KV checkpoints between turns, the proxy can
 restore and save slot snapshots on each request. This requires llama-server to
 run with `--slot-save-path` pointing at the same path.
 
+**Snapshot directory (LP-0MVVI8TEU006KTOZ).** Snapshots live directly in
+`session_slot_save_path`: llama-server's slot endpoint accepts only a bare
+filename (`fs_validate_filename(..., allow_subdirs=False)`) and writes it under
+its own `--slot-save-path`. The proxy therefore keeps the `slot_<session>.bin`
+snapshot, its `.ratio.json` sidecar and the restore existence check in that
+same directory, even when the request targets a specific `endpoint`. An older
+per-endpoint `{host}-{port}/` layout is still read/retired for compatibility,
+but nothing writes there any more: the divergence it caused (snapshot in the
+root, sidecar in the subdirectory) made every seed report `missing_sidecar` and
+no restore ever run. Point every local llama-server's `--slot-save-path` at
+`session_slot_save_path`.
+
 Config keys:
 - `server.session_slot_save_path` — directory for slot snapshot files
 - `server.session_slot_pool_size` — number of slots; should match llama-server `--parallel`
@@ -2934,7 +3105,7 @@ and systemd service setup is documented in [monitoring/README.md](../monitoring/
 - **Llama memory**: Warning at 75% of 90GB; critical at 90GB — `monitoring/llama_memory_alerts.yaml`.
 - **Proxy 5xx errors**: Critical alert when `rate(proxy_http_errors_total{endpoint="/v1/chat/completions",status="5xx"}[5m]) > 5` for 5 minutes — `monitoring/proxy_5xx_alerts.yaml`.
 
-A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json` with panels for llama-server RSS, models loaded, and proxy 5xx error rate.
+A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json` with panels for llama-server RSS, models loaded, proxy 5xx error rate, and GPU memory (GTT — where models live — plus the ~1 GiB VRAM carve-out, both from `gpu-metrics.service` via node_exporter's textfile collector).
 
 ### Deploying Prometheus and Grafana
 
@@ -3101,8 +3272,13 @@ to prevent disk-space exhaustion:
   (`--keep-recent`, default: `3`)
 - Delete each snapshot's `.ratio.json` routing sidecar with the snapshot, and
   prune orphan sidecars whose snapshot is gone — the scan covers the cache root
-  **and** the per-endpoint `{host}-{port}/` subdirectories
-  (LP-0MVK0E80C009HUQC)
+  **and** any legacy per-endpoint `{host}-{port}/` subdirectories
+  (LP-0MVK0E80C009HUQC, LP-0MVVI8TEU006KTOZ)
+- Never delete anything newer than **1 day** (`--min-age-days`, default: `1`):
+  the size rule protects recent snapshots and the orphan sweep protects recent
+  sidecars, keeping them and reporting them as kept in the summary. Aged
+  orphans are still pruned, and `--min-age-days 0` disables this protection
+  (LP-0MVUJBFRL005VDNA)
 
 **Usage:**
 

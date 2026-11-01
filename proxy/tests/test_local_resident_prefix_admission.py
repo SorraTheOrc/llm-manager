@@ -35,13 +35,16 @@ path (LP-0MUXTW4MD003TVIC), no sleeps: every matrix cell is a pure call.
 
 from __future__ import annotations
 
+import re
 import time
 
+import proxy.measured_prefill as measured_prefill
 import proxy.observability as observability
 import proxy.provider as provider
 import proxy.router_helpers as router_helpers
 import proxy.session as session_registry
 import pytest
+from proxy.measured_prefill import MeasuredPrefill
 
 # The 2026-10-24 divergence fixture: a 49,103-token prompt whose slot reported
 # n_past=738 (≈1.5 % reusable) while the sidecar prediction said 0.99.
@@ -55,6 +58,21 @@ SKIP_TENANT_LIMIT = "tenant_limit"
 
 PENDING_VIEW = "pending LP-0MVN4L7AG003PC80 (shared residency view)"
 PENDING_GATE = "pending LP-0MVN4L7KT003XUBA (resident-prefix gate / live pricing)"
+
+#: Model the ladder is driven with (``_gate``); the measurement store is keyed
+#: ``(model, session)``, so the constant is part of the pin.
+MODEL = "Qwen3"
+#: A measured dispatch smaller than the prompt: the rung must report
+#: ``min(total, estimated_tokens) / estimated_tokens`` (≈0.61), not the 1.0
+#: sentinel, so this fixture distinguishes a real measurement from the guess.
+MEASURED_TOTAL = 30_000
+
+#: ``measurement=`` values from the parent's closed vocabulary (AC2).
+MEASUREMENT_MEASURED = "measured"
+MEASUREMENT_NO_SLOT = "unavailable:no_slot"
+MEASUREMENT_NO_PRIOR = "unavailable:no_prior_measurement"
+MEASUREMENT_STALE_VIEW = "unavailable:stale_view"
+MEASUREMENT_CAPTURE_DISABLED = "unavailable:capture_disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +110,34 @@ def _reset_residency_state():
     session_registry._slot_owners.clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_measured_prefill_state():
+    """Keep the in-process measurement store isolated between tests.
+
+    The store is the third documented measurement source the admission rung
+    reads (``proxy.measured_prefill``); it is process-global, so every test in
+    this module starts and ends with it empty.
+    """
+    measured_prefill.reset_measured_prefill()
+    yield
+    measured_prefill.reset_measured_prefill()
+
+
+def _prime_measurement(
+    total: int = MEASURED_TOTAL,
+    *,
+    cache: int = 0,
+    model: str = MODEL,
+    session: str = "sess-a",
+) -> None:
+    """Record a prior measured dispatch for ``(model, session)``."""
+    measured_prefill.set_measured_prefill(
+        model,
+        session,
+        MeasuredPrefill(total=total, cache=cache, processed=0, time_ms=1234.0),
+    )
+
+
 def _slot(slot_id: int, context_tokens: int | None, *, processing: bool = True) -> dict:
     return {
         "slot_id": slot_id,
@@ -117,6 +163,7 @@ def _view(*, slots=None, owners=None, age: float = 0.5, monkeypatch=None):
 def _gate(
     *,
     session_id: str = "sess-a",
+    model_name: str = MODEL,
     estimated_tokens: int = EST_TOKENS,
     min_ratio: float = 0.5,
     predicted_ratio: float = 0.0,
@@ -131,7 +178,7 @@ def _gate(
             provider, "expected_cached_ratio", lambda *a, **k: predicted_ratio
         )
     return provider._should_skip_local(
-        "Qwen3",
+        model_name,
         session_id,
         {"messages": []},
         cold_threshold,
@@ -1236,6 +1283,9 @@ def test_admission_decision_logging_is_parseable(caplog, monkeypatch):
     assert event.reuse_ratio == pytest.approx(1.0)
     assert event.slot_owner_session == "sess-a"
     assert event.residency_source == "measured"
+    # LP-0MVT2PY3J00077W6: provenance is auditable — a live measurement says
+    # so, in the additive field that follows ``residency_source=``.
+    assert _measurement_field(caplog) == MEASUREMENT_MEASURED
 
 
 def test_evicted_denial_logging_is_parseable(caplog, monkeypatch):
@@ -1708,3 +1758,654 @@ def test_lifetime_ceiling_releases_a_lease_that_keeps_reporting_progress():
     # Inside the ceiling the same well-refreshed lease stays live.
     record["started_at"] = now - 899.0
     assert router_helpers._watchdog_no_progress(srv, "sess-a", record) is False
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVT2PB6U007PKD1 — admission-time measurement (parent AC3 (i)–(iv))
+#
+# The parent defect (LP-0MVRZXPH70025ZNR) is that the deployed llama.cpp b8782
+# build reports no per-slot ``context_tokens``, so rung 1 of
+# ``resolve_resident_prefix`` is unreachable in production and every
+# ``routing_resident_prefix`` line logs ``n_past_actual=none`` /
+# ``reuse_ratio=none``. The fix measures from the in-process
+# ``proxy.measured_prefill`` store (llama-server's own ``prompt_progress``
+# ``total`` for the session's last dispatch) and labels every non-measurement
+# with a closed ``measurement=`` reason instead of a bare ``none``.
+#
+# These pins are red-first: they are marked ``xfail(strict=True)`` and each
+# marker names the implementation child that turns it green, so the tree stays
+# green for the dev-push gate while the behaviour is pinned before any
+# production code changes.
+# ---------------------------------------------------------------------------
+
+
+def _measurement_field(caplog, needle: str = "routing_resident_prefix") -> str | None:
+    """The ``measurement=`` value on the first caught decision line.
+
+    Read from the raw message rather than ``log_parser``: the log grammar
+    consumer (``measurement=`` parsing and the report breakdown) is pinned by
+    the sibling test item LP-0MVT2PF1C008LAPB, while these tests pin the
+    admission behaviour and provenance.
+    """
+    record = next(r for r in caplog.records if needle in r.getMessage())
+    match = re.search(r"\bmeasurement=(\S+)", record.getMessage())
+    return match.group(1) if match else None
+
+
+def test_session_slot_admission_uses_the_last_measured_dispatch(caplog, monkeypatch):
+    """AC3(i): ownership + a prior measurement ⇒ a *numeric* reusable prefix.
+
+    The slot reports no ``context_tokens`` (the deployed b8782 case), so the
+    ladder must consult the ``(model, session)`` measurement store and report
+    the last dispatch's ``total`` as ``n_past_actual`` with
+    ``reuse_ratio = min(total, estimated_tokens) / estimated_tokens``. The
+    internal 1.0 gate sentinel must not be logged as if it were measured.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+
+    # The store is an in-process measurement source: the rung must not reach
+    # for ``/slots`` (llama-server holds it >15 s while prefilling, so an
+    # upstream query on the admission path is forbidden — LP-0MUXTW4MD003TVIC).
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("/slots must not be queried on the admission path")
+
+    monkeypatch.setattr(observability, "_query_slots_detail", _boom)
+    monkeypatch.setattr(observability, "_query_slots_progress", _boom)
+
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == "admit"
+    assert event.residency_source == "measured_last_dispatch"
+    assert event.n_past_actual == MEASURED_TOTAL
+    assert event.reuse_ratio == pytest.approx(
+        min(MEASURED_TOTAL, EST_TOKENS) / EST_TOKENS
+    )
+    assert _measurement_field(caplog) == MEASUREMENT_MEASURED
+
+
+def test_session_slot_admission_without_a_measurement_is_labelled(
+    caplog, monkeypatch
+):
+    """AC3(ii): a resident admission with no prior measurement is explicit.
+
+    The session owns its slot but nothing has been captured for the pair, so
+    the decision must carry ``measurement=unavailable:no_prior_measurement``
+    and ``reuse_ratio=none`` — never a numeric ratio (the 1.0 sentinel is an
+    internal gate value, not a measurement).
+    """
+    import logging
+
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == "session_slot"
+    assert event.decision == "admit"
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None
+    assert _measurement_field(caplog) == MEASUREMENT_NO_PRIOR
+
+
+def test_non_resident_decision_is_labelled_no_slot(caplog, monkeypatch):
+    """AC3(iii): a non-resident decision is labelled ``unavailable:no_slot``.
+
+    A fresh view shows the pool holding another session's prefix, so this
+    session's reusable prefix is genuinely unmeasurable — not zero. A
+    measurement left over from an earlier residency must not be reused either
+    (the stale-measurement failure mode the parent exists to fix), and the
+    LP-0MVNPZY22008B536 guarantee still holds: no fabricated
+    ``reuse_ratio=0.0000``.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL, session="sess-a")
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, predicted_ratio=0.99, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == "non_resident"
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None, "a non-measurement must not be logged as 0.0"
+    assert _measurement_field(caplog) == MEASUREMENT_NO_SLOT
+    record = next(
+        r for r in caplog.records if "routing_resident_prefix" in r.getMessage()
+    )
+    assert "reuse_ratio=0.0000" not in record.getMessage()
+
+
+def test_eviction_invalidates_a_stored_measurement(caplog, monkeypatch):
+    """AC3(iv) eviction: a reclaimed slot's measurement is not reused.
+
+    ``_record_local_eviction`` is the single reclaim chokepoint, so clearing
+    the measurement there covers every eviction reason. The slot registry
+    still names the session afterwards here, which is exactly the
+    stale-measurement case: ownership alone must not resurrect the old
+    dispatch's ``total`` as a numeric ratio.
+
+    The chokepoint knows the session but not the routed model name, so the
+    clear is model-agnostic: a measurement stored under *any* model for the
+    session must go (a partial clear would leave an orphan the next dispatch
+    could read as warm).
+    """
+    import logging
+
+    from proxy import admission_events
+
+    _prime_measurement(MEASURED_TOTAL)
+    _prime_measurement(MEASURED_TOTAL, model="Qwen3-Next")
+    srv = _SrvStub()
+    router_helpers._record_local_eviction(
+        srv,
+        "sess-a",
+        reason=admission_events.EVICTION_RESIDENT_PREFIX_EVICTED,
+        endpoint=None,
+    )
+
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is None
+    assert measured_prefill.get_measured_prefill("Qwen3-Next", "sess-a") is None
+
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        _gate(view=view, monkeypatch=monkeypatch)
+
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None
+    assert (_measurement_field(caplog) or "").startswith("unavailable:")
+
+
+def test_slot_reassignment_invalidates_only_that_sessions_measurement():
+    """AC3(iv) slot reassignment: freeing a slot forgets its measurement.
+
+    ``session._free_slot_assignment`` is where a slot changes hands, so the
+    measurement for that session must go with it — otherwise the next owner's
+    decision would read the previous tenant's prompt size. Other sessions'
+    measurements are untouched (the clear is session-scoped, not a reset), and
+    the clear is model-agnostic because the release path does not know which
+    model the session was routed under.
+    """
+    _prime_measurement(MEASURED_TOTAL, session="sess-a")
+    _prime_measurement(MEASURED_TOTAL, model="Qwen3-Next", session="sess-a")
+    _prime_measurement(MEASURED_TOTAL, session="sess-b")
+
+    session_registry._free_slot_assignment("sess-a")
+
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is None
+    assert measured_prefill.get_measured_prefill("Qwen3-Next", "sess-a") is None
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-b") is not None
+
+
+def test_model_switch_does_not_reuse_the_previous_models_measurement(caplog, monkeypatch):
+    """AC3(iv) model switch: the measurement is scoped to the model.
+
+    The store key is ``(model, session)``, so a switch must leave the new model
+    unmeasured. The owning model is checked first: that control is what makes
+    this a red-first pin (today neither model reports a numeric ratio), and it
+    stops a "always none" implementation from satisfying the switched case.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL, model=MODEL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        _gate(view=view, monkeypatch=monkeypatch)
+
+    owned = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert owned.n_past_actual == MEASURED_TOTAL
+    assert owned.residency_source == "measured_last_dispatch"
+
+    caplog.clear()
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        _gate(model_name="Qwen3-Next", view=view, monkeypatch=monkeypatch)
+
+    switched = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert switched.n_past_actual is None
+    assert switched.reuse_ratio is None
+    assert _measurement_field(caplog) == MEASUREMENT_NO_PRIOR
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVT2Q1SD009JLKD — the closed unmeasured-reason vocabulary
+#
+# A decision that *cannot* be measured must say **why**, so "the ladder cannot
+# measure" (no prior measurement / capture rolled back) is distinguishable from
+# "there is no slot to measure" (no_slot) and from "the residency view is
+# absent or stale" (stale_view). Every ``routing_resident_prefix`` line carries
+# exactly one ``measurement=`` value drawn from module-level constants, with
+# deterministic precedence:
+#
+#   measured  >  capture_disabled  >  no_prior_measurement  >  no_slot  >  stale_view
+#
+# ``measured`` always wins (a measurement needs no reason); for a slot-owning
+# session the capture rollback wins over a missing prior measurement; ``no_slot``
+# needs a *fresh* view (otherwise the honest answer is ``stale_view``).
+# ---------------------------------------------------------------------------
+
+#: Every vocabulary value paired with the trigger that produces it. The table
+#: is also the coverage statement checked below: the implementation may not add
+#: (or drop) a reason without extending this table.
+VOCABULARY_TRIGGERS = (
+    ("measured_live_slot", MEASUREMENT_MEASURED),
+    ("measured_last_dispatch", MEASUREMENT_MEASURED),
+    ("capture_disabled", MEASUREMENT_CAPTURE_DISABLED),
+    ("no_prior_measurement", MEASUREMENT_NO_PRIOR),
+    ("no_slot", MEASUREMENT_NO_SLOT),
+    ("stale_view", MEASUREMENT_STALE_VIEW),
+)
+
+
+def _run_vocabulary_trigger(case, caplog, monkeypatch):
+    """Install the state *case* names and run one admission decision."""
+    import logging
+
+    if case == "capture_disabled":
+        import proxy.server as server_module
+
+        # The documented rollback: capture is off, so a slot-owning session
+        # must say *why* it has no measurement (capture, not absence).
+        monkeypatch.setattr(
+            server_module,
+            "config",
+            {"server": {"local_measured_cache_abort_enabled": 0}},
+        )
+        _prime_measurement(MEASURED_TOTAL)
+        view = _view(
+            slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+        )
+        kwargs = {}
+    elif case == "no_prior_measurement":
+        view = _view(
+            slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+        )
+        kwargs = {}
+    elif case == "measured_last_dispatch":
+        _prime_measurement(MEASURED_TOTAL)
+        view = _view(
+            slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+        )
+        kwargs = {}
+    elif case == "measured_live_slot":
+        view = _view(
+            slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+        )
+        kwargs = {}
+    elif case == "no_slot":
+        _prime_measurement(MEASURED_TOTAL, session="sess-a")
+        view = _view(
+            slots=[_slot(0, EST_TOKENS)],
+            owners={("", 0): "sess-other"},
+            monkeypatch=monkeypatch,
+        )
+        kwargs = {"predicted_ratio": 0.99}
+    elif case == "stale_view":
+        from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+        # No fresh snapshot and no ownership: the residency view is absent, so
+        # the honest reason is staleness, not "no slot".
+        view = _view(
+            slots=[_slot(0, EST_TOKENS)],
+            owners={},
+            age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+            monkeypatch=monkeypatch,
+        )
+        kwargs = {"predicted_ratio": 0.0}
+    else:  # pragma: no cover - the table above is exhaustive
+        raise AssertionError(f"unhandled vocabulary trigger: {case}")
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        _gate(view=view, monkeypatch=monkeypatch, **kwargs)
+
+
+@pytest.mark.parametrize("case,expected", VOCABULARY_TRIGGERS)
+def test_every_vocabulary_value_has_exactly_one_trigger(
+    case, expected, caplog, monkeypatch
+):
+    """AC2: each decision logs exactly one closed-vocabulary reason (AC2).
+
+    One admission per trigger: the line must carry exactly one
+    ``measurement=`` token (never zero, never two) and its value must be the
+    constant the trigger stands for.
+    """
+    _run_vocabulary_trigger(case, caplog, monkeypatch)
+
+    message = next(
+        r.getMessage()
+        for r in caplog.records
+        if "routing_resident_prefix" in r.getMessage()
+    )
+    assert message.count("measurement=") == 1
+    assert _measurement_field(caplog) == expected
+
+
+def test_vocabulary_table_covers_the_closed_vocabulary():
+    """The table above exercises every constant the provider may emit.
+
+    A new value in ``provider.MEASUREMENT_VOCABULARY`` without a trigger here
+    (or a trigger for a value the provider cannot emit) fails, so the
+    vocabulary cannot silently widen.
+    """
+    assert {expected for _, expected in VOCABULARY_TRIGGERS} == set(
+        provider.MEASUREMENT_VOCABULARY
+    )
+
+
+def test_capture_rollback_wins_over_a_missing_prior_measurement(monkeypatch):
+    """Precedence: for a slot owner, ``capture_disabled`` beats ``no_prior``.
+
+    With capture on, the same state reports ``no_prior_measurement``; with the
+    rollback off it must report ``capture_disabled``, so an operator can tell
+    "the feature is off" from "no dispatch was ever measured".
+    """
+    import logging
+
+    enabled = provider.measurement_reason(
+        provider.RESIDENCY_SOURCE_SESSION_SLOT, view_known=True, capture_enabled=True
+    )
+    disabled = provider.measurement_reason(
+        provider.RESIDENCY_SOURCE_SESSION_SLOT, view_known=True, capture_enabled=False
+    )
+
+    assert enabled == MEASUREMENT_NO_PRIOR
+    assert disabled == MEASUREMENT_CAPTURE_DISABLED
+    # A measured source is never re-labelled by the rollback switch.
+    assert (
+        provider.measurement_reason(
+            provider.RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
+            view_known=True,
+            capture_enabled=False,
+        )
+        == MEASUREMENT_MEASURED
+    )
+    # And a fresh view with no slot is a *measured* zero prefix, never
+    # ``stale_view``; only an absent/stale view reports staleness.
+    assert (
+        provider.measurement_reason(
+            provider.RESIDENCY_SOURCE_NON_RESIDENT, view_known=True
+        )
+        == MEASUREMENT_NO_SLOT
+    )
+    assert (
+        provider.measurement_reason(
+            provider.RESIDENCY_SOURCE_UNKNOWN, view_known=False
+        )
+        == MEASUREMENT_STALE_VIEW
+    )
+
+
+def test_tenancy_decision_without_residency_facts_is_still_labelled(
+    caplog, monkeypatch
+):
+    """A decision logged without residency facts still carries one reason.
+
+    With the residency gate disabled (``local_resident_prefix_min_ratio: 0``)
+    the tenancy rung logs with ``facts=None``. The line must still carry
+    exactly one vocabulary value instead of no provenance at all:
+    ``unavailable:stale_view`` — no fresh residency view informed it.
+    """
+    import logging
+
+    _install_tenancy(["sess-a", "sess-b"])
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate_with_tenancy(
+            session_id="sess-c",
+            view=_view(slots=[], owners={}, monkeypatch=monkeypatch),
+            min_ratio=0.0,
+            monkeypatch=monkeypatch,
+        )
+
+    assert skip is True
+    assert reason == SKIP_TENANT_LIMIT
+    message = next(
+        r.getMessage()
+        for r in caplog.records
+        if "routing_resident_prefix" in r.getMessage()
+    )
+    assert message.count("measurement=") == 1
+    assert _measurement_field(caplog) == MEASUREMENT_STALE_VIEW
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVT2PY3J00077W6 — the measured-last-dispatch rung's guard rails
+#
+# The rung is the only place a *measurement* (rather than the ownership
+# sentinel) drives the gate, so its guards are pinned one by one: it may only
+# fire for a session that still owns a slot, only while capture is enabled,
+# only for a usable ``total``, and never by raising into the request path.
+# Anything else must degrade to the pre-change ``session_slot`` behaviour.
+# ---------------------------------------------------------------------------
+
+
+def _assert_degraded_to_session_slot(
+    caplog, *, measurement: str = MEASUREMENT_NO_PRIOR
+) -> None:
+    """The rung did not fire: ownership only, no fabricated measurement.
+
+    The decision still carries exactly one closed-vocabulary ``measurement=``
+    reason (LP-0MVT2Q1SD009JLKD): ``unavailable:no_prior_measurement`` when
+    nothing was captured for the pair, ``unavailable:capture_disabled`` when
+    the capture rollback is off.
+    """
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == "session_slot"
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None
+    assert _measurement_field(caplog) == measurement
+
+
+@pytest.mark.parametrize(
+    "total",
+    [None, 0, -1, float("nan"), float("inf")],
+    ids=["none", "zero", "negative", "nan", "inf"],
+)
+def test_unusable_measured_total_degrades_to_session_slot(
+    caplog, monkeypatch, total
+):
+    """AC fail-open: ``None``/``0``/non-finite totals are not measurements."""
+    import logging
+
+    measured_prefill.set_measured_prefill(
+        MODEL,
+        "sess-a",
+        MeasuredPrefill(total=total, cache=None, processed=None, time_ms=None),
+    )
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    _assert_degraded_to_session_slot(caplog)
+
+
+def test_measured_rung_is_not_used_when_the_session_owns_no_slot(
+    caplog, monkeypatch
+):
+    """Ownership is the guard: a stale measurement must not resurrect a ratio.
+
+    The session has a captured dispatch but the pool now holds another
+    session's prefix, so the ladder must report the fresh-view non-resident
+    measurement fact rather than the stale ``total``.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL, session="sess-a")
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == "non_resident"
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None
+
+
+def test_measured_rung_is_guarded_by_the_capture_rollback(caplog, monkeypatch):
+    """The feature switch restores the pre-change rung end to end."""
+    import logging
+
+    import proxy.server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "config",
+        {"server": {"local_measured_cache_abort_enabled": 0}},
+    )
+    _prime_measurement(MEASURED_TOTAL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    _assert_degraded_to_session_slot(
+        caplog, measurement=MEASUREMENT_CAPTURE_DISABLED
+    )
+
+
+def test_measured_rung_degrades_when_the_store_raises(caplog, monkeypatch):
+    """An unreadable store is "no measurement", never a request-path error."""
+    import logging
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(measured_prefill, "get_measured_prefill", _boom)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    _assert_degraded_to_session_slot(caplog)
+
+
+def test_measured_rung_degrades_when_the_config_cannot_be_read(
+    caplog, monkeypatch
+):
+    """An unreadable config falls back to today's rung, not to a measurement.
+
+    The rollback switch cannot be read, so capture resolves to *not enabled*
+    (the pre-change behaviour) — and the line says so with
+    ``unavailable:capture_disabled`` rather than claiming nothing was measured.
+    """
+    import logging
+
+    import proxy.server as server_module
+
+    class _BrokenConfig(dict):
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(server_module, "config", _BrokenConfig())
+    _prime_measurement(MEASURED_TOTAL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    _assert_degraded_to_session_slot(
+        caplog, measurement=MEASUREMENT_CAPTURE_DISABLED
+    )
+
+
+def test_grown_prompt_is_denied_on_the_measured_ratio(caplog, monkeypatch):
+    """A grown prompt's *measured* reuse is below the gate ⇒ deny (AC4 rule (a)).
+
+    ``MEASURED_TOTAL`` is 30k against a 100k prompt (ratio 0.30 < 0.5), so the
+    decision is a denial with a numeric ratio — the signal AC4 rule (a) needs
+    and that the ownership sentinel (implicit ratio 1.0) could never produce.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(
+            view=view, estimated_tokens=100_000, cold_threshold=60_000,
+            monkeypatch=monkeypatch,
+        )
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == SKIP_RESIDENT_PREFIX
+    assert event.residency_source == "measured_last_dispatch"
+    assert event.n_past_actual == MEASURED_TOTAL
+    assert event.reuse_ratio == pytest.approx(MEASURED_TOTAL / 100_000)
+    assert _measurement_field(caplog) == MEASUREMENT_MEASURED
+
+
+def test_pricing_uses_the_measured_prefix_not_the_ownership_sentinel(
+    caplog, monkeypatch
+):
+    """AC: pricing reads ``min(n_past_actual, estimated_tokens)`` reusable.
+
+    The measured dispatch only explains 30k of a 49k prompt, so 19k new tokens
+    exceed a 10k cold cap and local is bypassed. The old ``session_slot``
+    rung's implicit "everything is reusable" assumption would have priced this
+    at zero new tokens and admitted it.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, cold_threshold=10_000, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == "large_context_bypass"
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == "large_context_bypass"
+    assert event.n_past_actual == MEASURED_TOTAL
+    assert event.reuse_ratio == pytest.approx(MEASURED_TOTAL / EST_TOKENS)

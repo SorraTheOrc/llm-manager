@@ -1,0 +1,1150 @@
+{
+  "meta": {
+    "tool": "scripts/idle_admit_impact.py",
+    "work_item": "LP-0MVGHXD59008UOUD",
+    "feature_work_item": "LP-0MVGD9Z8Z0055Y5J",
+    "generated_at": "2026-10-31T10:44:09",
+    "log_dir": "/var/log/llama-proxy",
+    "files": [
+      "proxy.log",
+      "proxy.log-2026-10-25_00.gz",
+      "proxy.log-2026-10-26_00.gz",
+      "proxy.log-2026-10-27_00.gz",
+      "proxy.log-2026-10-28_00.gz",
+      "proxy.log-2026-10-29_00.gz",
+      "proxy.log-2026-10-30_00.gz",
+      "proxy.log-2026-10-31_00",
+      "proxy.log.2026-10-24_00.gz",
+      "proxy.log.2026-10-24_000838.gz",
+      "proxy.log.2026-10-24_003357.gz",
+      "proxy.log.2026-10-24_10.gz",
+      "proxy.log.2026-10-24_103459.gz",
+      "proxy.log.2026-10-24_17.gz",
+      "proxy.log.2026-10-24_173748.gz",
+      "proxy.log.2026-10-24_22.gz",
+      "proxy.log.2026-10-25_04.gz",
+      "proxy.log.2026-10-25_11.gz",
+      "proxy.log.2026-10-25_110154.gz",
+      "proxy.log.2026-10-25_112120.gz",
+      "proxy.log.2026-10-25_114648.gz",
+      "proxy.log.2026-10-25_185727.gz",
+      "proxy.log.2026-10-25_201658.gz",
+      "proxy.log.2026-10-25_211804.gz",
+      "proxy.log.2026-10-26_00.gz",
+      "proxy.log.2026-10-26_002432.gz",
+      "proxy.log.2026-10-26_102256.gz",
+      "proxy.log.2026-10-26_131429.gz",
+      "proxy.log.2026-10-26_171647.gz",
+      "proxy.log.2026-10-26_21.gz",
+      "proxy.log.2026-10-26_210137.gz",
+      "proxy.log.2026-10-27_03.gz",
+      "proxy.log.2026-10-27_093307.gz",
+      "proxy.log.2026-10-27_10.gz",
+      "proxy.log.2026-10-27_101607.gz",
+      "proxy.log.2026-10-27_16.gz",
+      "proxy.log.2026-10-27_22.gz",
+      "proxy.log.2026-10-28_04.gz",
+      "proxy.log.2026-10-28_10.gz",
+      "proxy.log.2026-10-28_16.gz",
+      "proxy.log.2026-10-29_00.gz",
+      "proxy.log.2026-10-29_001015.gz",
+      "proxy.log.2026-10-29_06.gz",
+      "proxy.log.2026-10-29_125828.gz",
+      "proxy.log.2026-10-29_14.gz",
+      "proxy.log.2026-10-29_140921.gz",
+      "proxy.log.2026-10-29_20.gz",
+      "proxy.log.2026-10-30_02",
+      "proxy.log.2026-10-30_10",
+      "proxy.log.2026-10-30_103503",
+      "proxy.log.2026-10-30_16",
+      "proxy.log.2026-10-30_231043",
+      "proxy.log.2026-10-31_00",
+      "proxy.log.2026-10-31_003749",
+      "proxy.log.2026-10-31_004152"
+    ],
+    "before": {
+      "start": "2026-10-22 21:48:00",
+      "end": "2026-10-25 23:00:00"
+    },
+    "after": {
+      "start": "2026-10-25 23:00:00",
+      "end": "2026-10-31 10:00:00"
+    },
+    "deployed_at": "2026-10-22 21:48:00",
+    "label": "override live: pre-eligibility-fix vs post-fix (LP-0MVRCLPVI0057116)",
+    "notes": "Second window pair, added for LP-0MVGHXD59008UOUD AC2/AC4. The window of record (2026-10-22 21:48 -> 2026-10-23 21:48 vs the 24 h before) has 0 idle-admitted conversions and no priority=-instrumented before side, so AC2 and AC4 are unmeasurable there (see idle-window-measurement-2026-10-22-to-2026-10-23.json). Both windows here are post-deploy: the override has been live since 2026-10-22 21:48 and the priority=/estimated_tokens= instrumentation shipped with it, while the eligibility fix of LP-0MVRCLPVI0057116 went live at 2026-10-25 23:00 \u2014 so this pair measures AC2 (idle-admitted vs non-idle, per bucket, with sample counts) and AC4 (interactive tier, before/after + prefill-overlap evidence) on data where a comparison exists. AC1/AC3 of record remain the 2026-10-22->23 window. Parser correction: routing_idle_admit_refused (admit-time prefill-feasibility refusal) is a separate event and is no longer counted as a routing_idle_admit admission.",
+    "interactive_priority": "high",
+    "correlation_window_seconds": 60.0,
+    "idle_threshold_seconds": 60.0,
+    "min_lease_samples": 5,
+    "bucket_edges": [
+      16384,
+      32768,
+      65536,
+      131072
+    ],
+    "window_closed": true,
+    "lease_gate_work_item": "LP-0MVK35HBI003SB3Z",
+    "lease_gate_parent_work_item": "LP-0MVK16GME007EYUW"
+  },
+  "windows": {
+    "before": {
+      "ac1": {
+        "local_idle_admit": 117,
+        "local_idle_admit_refused": 558,
+        "idle_admit_refused_by_reason": {
+          "prefill_budget_exceeded": 537,
+          "prefill_eta_exceeds_safety_budget": 14,
+          "eta_exceeds_budget": 7
+        },
+        "local_streams": 817,
+        "remote_streams": 32588,
+        "local_serve_share_pct": 2.45,
+        "large_context_bypass": 3373,
+        "remote_fallback_events": 30772,
+        "fallback_by_reason": {
+          "rate_limited": 20684,
+          "provider_context_exceeded": 4649,
+          "prefill_thrash_cooldown": 1255,
+          "large_context_bypass": 1016,
+          "context_too_large": 977,
+          "local_admission_guard": 828,
+          "resident_prefix_insufficient": 733,
+          "local_concurrency_limit": 170,
+          "HTTP 503": 123,
+          "ReadTimeout": 95,
+          "stall_after_reasoning": 69,
+          "local_lease_active": 55,
+          "empty_response": 33,
+          "fallback_after_queue": 33,
+          "tenant_limit": 22,
+          "ConnectError": 10,
+          "HTTP 400": 8,
+          "ConnectTimeout": 4,
+          "ReadError": 3,
+          "HTTPException 503": 3,
+          "usage_limit_reset": 1,
+          "HTTP 429": 1
+        },
+        "local_dispatch_denied": 1475,
+        "local_dispatch_events": 815,
+        "local_prefill_slot_seconds": 8814.9,
+        "timeout_events": 146
+      },
+      "ac2": {
+        "idle_admitted_sample_counts": {
+          "idle_admit_events": 117,
+          "paired_local_dispatches": 1,
+          "unpaired_admits": 116
+        },
+        "idle_admitted_first_byte_ms": {
+          "n": 1,
+          "p50_ms": 40568.2,
+          "p90_ms": 40568.2,
+          "max_ms": 40568.2,
+          "sum_slot_seconds": 40.6
+        },
+        "idle_admitted_service_ms": {
+          "n": 1,
+          "p50_ms": 40566.2,
+          "p90_ms": 40566.2,
+          "max_ms": 40566.2,
+          "sum_slot_seconds": 40.6
+        },
+        "non_idle_first_byte_ms": {
+          "n": 814,
+          "p50_ms": 3442.6,
+          "p90_ms": 28915.8,
+          "max_ms": 119437.3,
+          "sum_slot_seconds": 8774.9
+        },
+        "non_idle_service_ms": {
+          "n": 814,
+          "p50_ms": 3442.1,
+          "p90_ms": 28914.7,
+          "max_ms": 119436.4,
+          "sum_slot_seconds": 8774.4
+        },
+        "bucket_edges": [
+          16384,
+          32768,
+          65536,
+          131072
+        ],
+        "by_bucket": {
+          "0-16384": {
+            "bucket_edges": "0-16384",
+            "idle": {
+              "n": 0,
+              "first_byte_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              },
+              "service_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              }
+            },
+            "non_idle": {
+              "n": 465,
+              "first_byte_ms": {
+                "n": 465,
+                "p50_ms": 3111.1,
+                "p90_ms": 22081.4,
+                "max_ms": 49648.5,
+                "sum_slot_seconds": 3164.1
+              },
+              "service_ms": {
+                "n": 465,
+                "p50_ms": 3110.7,
+                "p90_ms": 22080.7,
+                "max_ms": 49647.7,
+                "sum_slot_seconds": 3163.9
+              }
+            }
+          },
+          "16384-32768": {
+            "bucket_edges": "16384-32768",
+            "idle": {
+              "n": 0,
+              "first_byte_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              },
+              "service_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              }
+            },
+            "non_idle": {
+              "n": 283,
+              "first_byte_ms": {
+                "n": 283,
+                "p50_ms": 3789.9,
+                "p90_ms": 64151.9,
+                "max_ms": 119437.3,
+                "sum_slot_seconds": 4810.2
+              },
+              "service_ms": {
+                "n": 283,
+                "p50_ms": 3789.2,
+                "p90_ms": 64151.3,
+                "max_ms": 119436.4,
+                "sum_slot_seconds": 4809.9
+              }
+            }
+          },
+          "32768-65536": {
+            "bucket_edges": "32768-65536",
+            "idle": {
+              "n": 0,
+              "first_byte_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              },
+              "service_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              }
+            },
+            "non_idle": {
+              "n": 61,
+              "first_byte_ms": {
+                "n": 61,
+                "p50_ms": 7476.9,
+                "p90_ms": 28545.2,
+                "max_ms": 93745.7,
+                "sum_slot_seconds": 723.9
+              },
+              "service_ms": {
+                "n": 61,
+                "p50_ms": 7475.7,
+                "p90_ms": 28544.0,
+                "max_ms": 93744.2,
+                "sum_slot_seconds": 723.9
+              }
+            }
+          },
+          "65536-131072": {
+            "bucket_edges": "65536-131072",
+            "idle": {
+              "n": 1,
+              "first_byte_ms": {
+                "n": 1,
+                "p50_ms": 40568.2,
+                "p90_ms": 40568.2,
+                "max_ms": 40568.2,
+                "sum_slot_seconds": 40.6
+              },
+              "service_ms": {
+                "n": 1,
+                "p50_ms": 40566.2,
+                "p90_ms": 40566.2,
+                "max_ms": 40566.2,
+                "sum_slot_seconds": 40.6
+              }
+            },
+            "non_idle": {
+              "n": 5,
+              "first_byte_ms": {
+                "n": 5,
+                "p50_ms": 5083.1,
+                "p90_ms": 34984.6,
+                "max_ms": 40081.8,
+                "sum_slot_seconds": 76.7
+              },
+              "service_ms": {
+                "n": 5,
+                "p50_ms": 5080.6,
+                "p90_ms": 34982.2,
+                "max_ms": 40079.4,
+                "sum_slot_seconds": 76.7
+              }
+            }
+          }
+        },
+        "expected_trade": "Idle-admitted prompts are served on an otherwise idle GPU and are expected to show higher first-byte latency and slot-seconds than non-idle dispatches in the same bucket; that cost is the trade for not paying a remote provider."
+      },
+      "ac3": {
+        "local_dispatch_denied": 1475,
+        "timeout_events": 146,
+        "timeouts_attributed_to_idle_admit": [],
+        "timeouts_coincident_with_idle_admit": [
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-24 13:18:16.398000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-24 13:18:22.658000"
+          },
+          {
+            "reason": "ConnectTimeout",
+            "ts": "2026-10-24 13:32:59.351000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-24 13:38:15.600000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-24 13:57:14.483000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-24 14:08:31.005000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-24 16:01:39.246000"
+          }
+        ],
+        "timeouts_unrelated": 139,
+        "correlation_window_seconds": 60.0,
+        "attribution_limit": "Timeout lines that carry no session id (e.g. 'slot_save failed ... error=ReadTimeout', or a 'Fallback triggered' line from a rotated log predating LP-0MVMBMSWR0036RES's session= field) cannot be attributed per request; they are reported as coincident only when they fall inside the correlation window of an idle-admitted request. Session-bearing fallback lines are matched exactly."
+      },
+      "ac4": {
+        "interactive_priority": "high",
+        "by_priority": {
+          "high": {
+            "n": 63,
+            "first_byte_ms": {
+              "n": 63,
+              "p50_ms": 16161.5,
+              "p90_ms": 74058.2,
+              "max_ms": 119325.6,
+              "sum_slot_seconds": 1748.4
+            }
+          },
+          "low": {
+            "n": 315,
+            "first_byte_ms": {
+              "n": 315,
+              "p50_ms": 2658.7,
+              "p90_ms": 20858.1,
+              "max_ms": 93745.7,
+              "sum_slot_seconds": 2523.5
+            }
+          },
+          "medium": {
+            "n": 436,
+            "first_byte_ms": {
+              "n": 436,
+              "p50_ms": 3571.9,
+              "p90_ms": 31175.1,
+              "max_ms": 119437.3,
+              "sum_slot_seconds": 4503.0
+            }
+          }
+        },
+        "idle_admitted_by_priority": {
+          "high": 1
+        },
+        "semantics": "by_priority covers non-idle dispatches only (the control); idle_admitted_by_priority counts the admits at each tier (the treatment).",
+        "overlap": {
+          "interactive_priority": "high",
+          "interactive_samples": 63,
+          "interactive_samples_overlapped": 1,
+          "idle_prefills_with_interval": 1,
+          "idle_admits_without_interval": 116,
+          "same_tier_prefills": 1,
+          "cross_tier_prefills": 0,
+          "same_tier": [
+            {
+              "admit_session": "herdr-1792855549-1279638-9172",
+              "admit_at": "2026-10-24 21:17:11.683000",
+              "prefill_start": "2026-10-24 21:17:52.568000",
+              "prefill_end": "2026-10-24 21:18:33.134200",
+              "priority": "high",
+              "interactive_sessions": [
+                "herdr-1792855549-1279638-9172"
+              ]
+            }
+          ],
+          "cross_tier": [],
+          "semantics": "An idle-admitted prefill is in flight from its dispatch for dispatch_to_first_byte_ms (slot-held service time); an interactive-tier dispatch starting inside that interval is the causal evidence AC4 asks for. same_tier/cross_tier describe the ADMITTING request's priority, not the harmed one."
+        },
+        "interactive": {
+          "n": 63,
+          "p50_ms": 16161.5,
+          "p90_ms": 74058.2,
+          "max_ms": 119325.6,
+          "sum_slot_seconds": 1748.4
+        }
+      },
+      "lease_gate": {
+        "refusals": 1475,
+        "cold_start_refusals": 0,
+        "samples": 1475,
+        "unattributed_refusals": 0,
+        "min_samples": 5,
+        "attribution_status": "ok",
+        "attribution_rule": "Every `local_dispatch_denied` line with `cold_start=False` is a `local_lease_active` refusal. The `active=` field on that line decides the shape: `active=0` \u2192 shape A (no active record at all, so the pool is held only by inactive cooldown leases \u2014 the owner finished and its record is reserved for the base cooldown); `active>=1` \u2192 shape B (an `active` record exists). Shape B is corroborated, not assumed: the owner's earliest `lease_released` inside 900 s of the refusal says whether the record had no work behind it (`no_progress_watchdog`, `orphan_cleanup`, `idle_timeout`), was a long silent prefill (`prefill_deadline`), or was genuinely working (a completion/disconnect reason); `status_request` lines that name the owner with `local_active_query=false` confirm an idle owner. Buckets are counted in that precedence order, so each refusal lands in exactly one.",
+        "refusals_by_active": {
+          "active_0": 0,
+          "active_positive": 1475,
+          "unknown": 0
+        },
+        "shape_a": {
+          "label": "inactive cooldown lease (owner finished; record reserved for its session for the base cooldown)",
+          "count": 0,
+          "pct": 0.0,
+          "owner_release_groups": {}
+        },
+        "shape_b": {
+          "label": "`active` record with no GPU work behind it (wedged/abandoned stream or a long silent prefill)",
+          "count": 1475,
+          "pct": 100.0,
+          "no_work_behind_it": 606,
+          "silent_prefill": 751,
+          "owner_working": 4,
+          "unconfirmed": 114,
+          "by_evidence": {
+            "no_progress_watchdog": 413,
+            "orphan_cleanup": 0,
+            "adaptive_expiry": 193,
+            "status_idle_owner": 0,
+            "prefill_deadline": 751,
+            "owner_working": 4,
+            "unconfirmed": 114
+          }
+        },
+        "contention_queue": {
+          "dispatch": 267,
+          "fallback_after_queue": 366
+        },
+        "top_owners": [
+          {
+            "owner": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+            "refusals": 67,
+            "shape_a": 0,
+            "shape_b": 67
+          },
+          {
+            "owner": "herdr-1792897931-4117323-15482",
+            "refusals": 38,
+            "shape_a": 0,
+            "shape_b": 38
+          },
+          {
+            "owner": "herdr-1792944752-2930681-2754",
+            "refusals": 37,
+            "shape_a": 0,
+            "shape_b": 37
+          },
+          {
+            "owner": "herdr-1792898133-4135054-5857",
+            "refusals": 36,
+            "shape_a": 0,
+            "shape_b": 36
+          },
+          {
+            "owner": "herdr-1792855549-1279638-9172",
+            "refusals": 34,
+            "shape_a": 0,
+            "shape_b": 34
+          }
+        ],
+        "headline": "1475 attributable `local_lease_active` refusal(s): shape A 0 (0.0 %), shape B 1475 (100.0 %). Shape B evidence: no work behind it 606, silent prefill 751, owner working 4, unconfirmed 114. Contention queue: converted 267 to local, fell through 366."
+      },
+      "lease_released": {
+        "total": 1372,
+        "by_reason": {
+          "prefill_deadline": 779,
+          "session_evicted": 256,
+          "idle_timeout": 198,
+          "no_progress_watchdog": 126,
+          "non_explicit": 7,
+          "client_disconnect": 4,
+          "history_mismatch": 2
+        },
+        "by_group": {
+          "adaptive_expiry": 977,
+          "session_evicted": 256,
+          "no_progress_watchdog": 126,
+          "client_disconnect": 11,
+          "other": 2
+        },
+        "groups_documented": [
+          "no_progress_watchdog",
+          "adaptive_expiry",
+          "explicit_release"
+        ]
+      },
+      "lease_status": {
+        "samples": 50411,
+        "local_active_query_true": 34137,
+        "local_active_query_false": 16274,
+        "owner_lease_remaining_seconds_p50": 26.2,
+        "owner_lease_remaining_seconds_max": 1497.7,
+        "prefill_in_flight_samples": 22701
+      },
+      "event_counts": {
+        "local_dispatch": 815,
+        "stream_finished": 33405,
+        "fallback": 30772,
+        "routing_skip": 15155,
+        "routing_check": 19123,
+        "idle_admit": 117,
+        "idle_admit_refused": 558,
+        "dispatch_denied": 1475,
+        "lease_released": 1372,
+        "status_request": 50411,
+        "contention_queue": 864,
+        "timeout": 146
+      },
+      "counterfactual": {
+        "approximation": true,
+        "idle_threshold_seconds": 60.0,
+        "measured_bypasses": 3373,
+        "eligible_bypasses": 2971,
+        "eligible_pct_of_bypasses": 88.1,
+        "idle_gap_p50_seconds": 1249.6,
+        "idle_gap_p90_seconds": 5931.2,
+        "note": "Approximation from log-derived local activity; the proxy's real guard also refuses while anything is leased, queued or prefilling, so the true fire count is <= eligible_bypasses."
+      },
+      "start": "2026-10-22 21:48:00",
+      "end": "2026-10-25 23:00:00",
+      "hours": 73.2
+    },
+    "after": {
+      "ac1": {
+        "local_idle_admit": 76,
+        "local_idle_admit_refused": 9186,
+        "idle_admit_refused_by_reason": {
+          "prefill_budget_exceeded": 8895,
+          "eta_exceeds_budget": 202,
+          "prefill_eta_exceeds_safety_budget": 89
+        },
+        "local_streams": 3775,
+        "remote_streams": 100391,
+        "local_serve_share_pct": 3.62,
+        "large_context_bypass": 7438,
+        "remote_fallback_events": 71867,
+        "fallback_by_reason": {
+          "rate_limited": 30191,
+          "resident_prefix_insufficient": 13093,
+          "context_too_large": 9685,
+          "provider_context_exceeded": 6076,
+          "local_admission_guard": 4467,
+          "large_context_bypass": 4167,
+          "local_concurrency_limit": 1050,
+          "prefill_thrash_cooldown": 847,
+          "HTTP 429": 568,
+          "local_lease_active": 301,
+          "tenant_limit": 263,
+          "empty_response": 257,
+          "HTTP 503": 246,
+          "ReadTimeout": 163,
+          "stall_after_reasoning": 140,
+          "fallback_after_queue": 136,
+          "provider_budget_exhausted": 135,
+          "HTTP 400": 21,
+          "ConnectError": 19,
+          "ReadError": 12,
+          "HTTPException 503": 7,
+          "usage_limit_reset": 7,
+          "ConnectTimeout": 6,
+          "HTTP 499": 4,
+          "unknown": 3,
+          "HTTP 403": 2,
+          "WriteTimeout": 1
+        },
+        "local_dispatch_denied": 1855,
+        "local_dispatch_events": 3757,
+        "local_prefill_slot_seconds": 36250.8,
+        "timeout_events": 641
+      },
+      "ac2": {
+        "idle_admitted_sample_counts": {
+          "idle_admit_events": 76,
+          "paired_local_dispatches": 7,
+          "unpaired_admits": 69
+        },
+        "idle_admitted_first_byte_ms": {
+          "n": 7,
+          "p50_ms": 26193.9,
+          "p90_ms": 42941.2,
+          "max_ms": 46602.9,
+          "sum_slot_seconds": 151.0
+        },
+        "idle_admitted_service_ms": {
+          "n": 7,
+          "p50_ms": 26192.4,
+          "p90_ms": 42939.5,
+          "max_ms": 46601.2,
+          "sum_slot_seconds": 151.0
+        },
+        "non_idle_first_byte_ms": {
+          "n": 3750,
+          "p50_ms": 3279.9,
+          "p90_ms": 25671.3,
+          "max_ms": 127571.0,
+          "sum_slot_seconds": 36116.7
+        },
+        "non_idle_service_ms": {
+          "n": 3750,
+          "p50_ms": 3276.6,
+          "p90_ms": 25670.6,
+          "max_ms": 127570.0,
+          "sum_slot_seconds": 36099.8
+        },
+        "bucket_edges": [
+          16384,
+          32768,
+          65536,
+          131072
+        ],
+        "by_bucket": {
+          "0-16384": {
+            "bucket_edges": "0-16384",
+            "idle": {
+              "n": 0,
+              "first_byte_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              },
+              "service_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              }
+            },
+            "non_idle": {
+              "n": 2133,
+              "first_byte_ms": {
+                "n": 2133,
+                "p50_ms": 2946.0,
+                "p90_ms": 16300.1,
+                "max_ms": 112660.5,
+                "sum_slot_seconds": 13530.2
+              },
+              "service_ms": {
+                "n": 2133,
+                "p50_ms": 2945.7,
+                "p90_ms": 16299.8,
+                "max_ms": 112660.2,
+                "sum_slot_seconds": 13529.3
+              }
+            }
+          },
+          "16384-32768": {
+            "bucket_edges": "16384-32768",
+            "idle": {
+              "n": 0,
+              "first_byte_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              },
+              "service_ms": {
+                "n": 0,
+                "p50_ms": 0.0,
+                "p90_ms": 0.0,
+                "max_ms": 0.0,
+                "sum_slot_seconds": 0.0
+              }
+            },
+            "non_idle": {
+              "n": 1312,
+              "first_byte_ms": {
+                "n": 1312,
+                "p50_ms": 4352.8,
+                "p90_ms": 51684.2,
+                "max_ms": 124815.2,
+                "sum_slot_seconds": 18488.8
+              },
+              "service_ms": {
+                "n": 1312,
+                "p50_ms": 4352.0,
+                "p90_ms": 51683.2,
+                "max_ms": 124814.2,
+                "sum_slot_seconds": 18473.3
+              }
+            }
+          },
+          "32768-65536": {
+            "bucket_edges": "32768-65536",
+            "idle": {
+              "n": 5,
+              "first_byte_ms": {
+                "n": 5,
+                "p50_ms": 26193.9,
+                "p90_ms": 44161.7,
+                "max_ms": 46602.9,
+                "sum_slot_seconds": 115.3
+              },
+              "service_ms": {
+                "n": 5,
+                "p50_ms": 26192.4,
+                "p90_ms": 44160.0,
+                "max_ms": 46601.2,
+                "sum_slot_seconds": 115.3
+              }
+            },
+            "non_idle": {
+              "n": 272,
+              "first_byte_ms": {
+                "n": 272,
+                "p50_ms": 4795.2,
+                "p90_ms": 35547.2,
+                "max_ms": 127571.0,
+                "sum_slot_seconds": 3988.6
+              },
+              "service_ms": {
+                "n": 272,
+                "p50_ms": 4794.0,
+                "p90_ms": 35546.2,
+                "max_ms": 127570.0,
+                "sum_slot_seconds": 3988.2
+              }
+            }
+          },
+          "65536-131072": {
+            "bucket_edges": "65536-131072",
+            "idle": {
+              "n": 2,
+              "first_byte_ms": {
+                "n": 2,
+                "p50_ms": 17850.8,
+                "p90_ms": 29275.7,
+                "max_ms": 32131.9,
+                "sum_slot_seconds": 35.7
+              },
+              "service_ms": {
+                "n": 2,
+                "p50_ms": 17848.6,
+                "p90_ms": 29273.3,
+                "max_ms": 32129.5,
+                "sum_slot_seconds": 35.7
+              }
+            },
+            "non_idle": {
+              "n": 33,
+              "first_byte_ms": {
+                "n": 33,
+                "p50_ms": 2225.6,
+                "p90_ms": 5405.4,
+                "max_ms": 22523.5,
+                "sum_slot_seconds": 109.0
+              },
+              "service_ms": {
+                "n": 33,
+                "p50_ms": 2223.5,
+                "p90_ms": 5403.3,
+                "max_ms": 22521.4,
+                "sum_slot_seconds": 109.0
+              }
+            }
+          }
+        },
+        "expected_trade": "Idle-admitted prompts are served on an otherwise idle GPU and are expected to show higher first-byte latency and slot-seconds than non-idle dispatches in the same bucket; that cost is the trade for not paying a remote provider."
+      },
+      "ac3": {
+        "local_dispatch_denied": 1855,
+        "timeout_events": 641,
+        "timeouts_attributed_to_idle_admit": [],
+        "timeouts_coincident_with_idle_admit": [
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-29 04:02:25.702000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-29 04:13:35.007000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-29 10:16:46.015000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-29 22:03:51.980000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-29 22:04:45"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-30 10:58:00.057000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-30 13:49:43.156000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-30 15:10:05.872000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-30 18:48:37.735000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-30 18:48:53.274000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-30 18:49:08.808000"
+          },
+          {
+            "reason": "ReadTimeout",
+            "ts": "2026-10-30 19:02:14.499000"
+          }
+        ],
+        "timeouts_unrelated": 629,
+        "correlation_window_seconds": 60.0,
+        "attribution_limit": "Timeout lines that carry no session id (e.g. 'slot_save failed ... error=ReadTimeout', or a 'Fallback triggered' line from a rotated log predating LP-0MVMBMSWR0036RES's session= field) cannot be attributed per request; they are reported as coincident only when they fall inside the correlation window of an idle-admitted request. Session-bearing fallback lines are matched exactly."
+      },
+      "ac4": {
+        "interactive_priority": "high",
+        "by_priority": {
+          "high": {
+            "n": 648,
+            "first_byte_ms": {
+              "n": 648,
+              "p50_ms": 3589.1,
+              "p90_ms": 43526.6,
+              "max_ms": 124815.2,
+              "sum_slot_seconds": 9231.4
+            }
+          },
+          "low": {
+            "n": 758,
+            "first_byte_ms": {
+              "n": 758,
+              "p50_ms": 3177.0,
+              "p90_ms": 20378.1,
+              "max_ms": 117024.0,
+              "sum_slot_seconds": 6216.0
+            }
+          },
+          "medium": {
+            "n": 2344,
+            "first_byte_ms": {
+              "n": 2344,
+              "p50_ms": 3294.6,
+              "p90_ms": 22308.6,
+              "max_ms": 127571.0,
+              "sum_slot_seconds": 20669.3
+            }
+          }
+        },
+        "idle_admitted_by_priority": {
+          "medium": 4,
+          "high": 2,
+          "low": 1
+        },
+        "semantics": "by_priority covers non-idle dispatches only (the control); idle_admitted_by_priority counts the admits at each tier (the treatment).",
+        "overlap": {
+          "interactive_priority": "high",
+          "interactive_samples": 648,
+          "interactive_samples_overlapped": 0,
+          "idle_prefills_with_interval": 7,
+          "idle_admits_without_interval": 69,
+          "same_tier_prefills": 2,
+          "cross_tier_prefills": 5,
+          "same_tier": [],
+          "cross_tier": [],
+          "semantics": "An idle-admitted prefill is in flight from its dispatch for dispatch_to_first_byte_ms (slot-held service time); an interactive-tier dispatch starting inside that interval is the causal evidence AC4 asks for. same_tier/cross_tier describe the ADMITTING request's priority, not the harmed one."
+        },
+        "interactive": {
+          "n": 648,
+          "p50_ms": 3589.1,
+          "p90_ms": 43526.6,
+          "max_ms": 124815.2,
+          "sum_slot_seconds": 9231.4
+        }
+      },
+      "lease_gate": {
+        "refusals": 1855,
+        "cold_start_refusals": 0,
+        "samples": 1855,
+        "unattributed_refusals": 0,
+        "min_samples": 5,
+        "attribution_status": "ok",
+        "attribution_rule": "Every `local_dispatch_denied` line with `cold_start=False` is a `local_lease_active` refusal. The `active=` field on that line decides the shape: `active=0` \u2192 shape A (no active record at all, so the pool is held only by inactive cooldown leases \u2014 the owner finished and its record is reserved for the base cooldown); `active>=1` \u2192 shape B (an `active` record exists). Shape B is corroborated, not assumed: the owner's earliest `lease_released` inside 900 s of the refusal says whether the record had no work behind it (`no_progress_watchdog`, `orphan_cleanup`, `idle_timeout`), was a long silent prefill (`prefill_deadline`), or was genuinely working (a completion/disconnect reason); `status_request` lines that name the owner with `local_active_query=false` confirm an idle owner. Buckets are counted in that precedence order, so each refusal lands in exactly one.",
+        "refusals_by_active": {
+          "active_0": 0,
+          "active_positive": 1855,
+          "unknown": 0
+        },
+        "shape_a": {
+          "label": "inactive cooldown lease (owner finished; record reserved for its session for the base cooldown)",
+          "count": 0,
+          "pct": 0.0,
+          "owner_release_groups": {}
+        },
+        "shape_b": {
+          "label": "`active` record with no GPU work behind it (wedged/abandoned stream or a long silent prefill)",
+          "count": 1855,
+          "pct": 100.0,
+          "no_work_behind_it": 1163,
+          "silent_prefill": 373,
+          "owner_working": 6,
+          "unconfirmed": 313,
+          "by_evidence": {
+            "no_progress_watchdog": 743,
+            "orphan_cleanup": 0,
+            "adaptive_expiry": 405,
+            "status_idle_owner": 15,
+            "prefill_deadline": 373,
+            "owner_working": 6,
+            "unconfirmed": 313
+          }
+        },
+        "contention_queue": {
+          "dispatch": 513,
+          "fallback_after_queue": 565
+        },
+        "top_owners": [
+          {
+            "owner": "audit-RISE-0MVPY83CA00335W3-parent-76889081",
+            "refusals": 61,
+            "shape_a": 0,
+            "shape_b": 61
+          },
+          {
+            "owner": "herdr-1793062615-1640678-14118",
+            "refusals": 59,
+            "shape_a": 0,
+            "shape_b": 59
+          },
+          {
+            "owner": "herdr-1793059386-1021847-12191",
+            "refusals": 43,
+            "shape_a": 0,
+            "shape_b": 43
+          },
+          {
+            "owner": "herdr-1793058245-848073-21106",
+            "refusals": 34,
+            "shape_a": 0,
+            "shape_b": 34
+          },
+          {
+            "owner": "herdr-1793019031-3363896-26838",
+            "refusals": 26,
+            "shape_a": 0,
+            "shape_b": 26
+          }
+        ],
+        "headline": "1855 attributable `local_lease_active` refusal(s): shape A 0 (0.0 %), shape B 1855 (100.0 %). Shape B evidence: no work behind it 1163, silent prefill 373, owner working 6, unconfirmed 313. Contention queue: converted 513 to local, fell through 565."
+      },
+      "lease_released": {
+        "total": 2598,
+        "by_reason": {
+          "measured_cache_deficit": 713,
+          "idle_timeout": 618,
+          "session_evicted": 556,
+          "prefill_deadline": 439,
+          "no_progress_watchdog": 238,
+          "client_disconnect": 16,
+          "non_explicit": 14,
+          "history_mismatch": 2,
+          "orphan_cleanup": 2
+        },
+        "by_group": {
+          "adaptive_expiry": 1057,
+          "other": 715,
+          "session_evicted": 556,
+          "no_progress_watchdog": 238,
+          "client_disconnect": 30,
+          "orphan_cleanup": 2
+        },
+        "groups_documented": [
+          "no_progress_watchdog",
+          "adaptive_expiry",
+          "explicit_release"
+        ]
+      },
+      "lease_status": {
+        "samples": 114646,
+        "local_active_query_true": 58238,
+        "local_active_query_false": 56408,
+        "owner_lease_remaining_seconds_p50": 27.0,
+        "owner_lease_remaining_seconds_max": 1488.6,
+        "prefill_in_flight_samples": 82212
+      },
+      "event_counts": {
+        "local_dispatch": 3757,
+        "stream_finished": 104166,
+        "fallback": 71867,
+        "routing_skip": 44815,
+        "routing_check": 55349,
+        "idle_admit": 76,
+        "idle_admit_refused": 9186,
+        "dispatch_denied": 1855,
+        "lease_released": 2598,
+        "status_request": 114646,
+        "contention_queue": 1551,
+        "timeout": 641
+      },
+      "counterfactual": {
+        "approximation": true,
+        "idle_threshold_seconds": 60.0,
+        "measured_bypasses": 7438,
+        "eligible_bypasses": 6355,
+        "eligible_pct_of_bypasses": 85.4,
+        "idle_gap_p50_seconds": 395.1,
+        "idle_gap_p90_seconds": 1718.6,
+        "note": "Approximation from log-derived local activity; the proxy's real guard also refuses while anything is leased, queued or prefilling, so the true fire count is <= eligible_bypasses."
+      },
+      "start": "2026-10-25 23:00:00",
+      "end": "2026-10-31 10:00:00",
+      "hours": 131.0
+    }
+  },
+  "verdict": {
+    "verdict": "PASS",
+    "checks": [
+      {
+        "target": "AC1: post-deploy window is >= 24 h",
+        "observed_hours": 131.0,
+        "pass": true
+      },
+      {
+        "target": "AC1: local_idle_admit events observed in the post-deploy window",
+        "observed": 76,
+        "pass": true
+      },
+      {
+        "target": "AC2: idle-admitted dispatches paired with their dispatch event",
+        "observed": 7,
+        "measurable": true,
+        "idle_admits": 76,
+        "unpaired_admits": 69,
+        "non_idle_samples": 3750,
+        "pass": true
+      },
+      {
+        "target": "AC3: local_dispatch_denied per bypass+fallback event does not increase (<= 5%)",
+        "observed_pct_change": -29.7,
+        "before_per_hour": 20.2,
+        "after_per_hour": 14.2,
+        "normalised_pct_change": -45.9,
+        "before_per_event": 0.0432,
+        "after_per_event": 0.0234,
+        "before_events": 34145,
+        "after_events": 79305,
+        "pass": true
+      },
+      {
+        "target": "AC3: zero timeouts attributable to idle-admitted requests",
+        "observed": 0,
+        "pass": true
+      },
+      {
+        "target": "AC4: high-priority first byte within 10% p50/p90",
+        "observed_p50_pct_change": -77.8,
+        "observed_p90_pct_change": -41.2,
+        "measurable": true,
+        "before": {
+          "n": 63,
+          "p50_ms": 16161.5,
+          "p90_ms": 74058.2,
+          "max_ms": 119325.6,
+          "sum_slot_seconds": 1748.4
+        },
+        "after": {
+          "n": 648,
+          "p50_ms": 3589.1,
+          "p90_ms": 43526.6,
+          "max_ms": 124815.2,
+          "sum_slot_seconds": 9231.4
+        },
+        "pass": true
+      },
+      {
+        "target": "AC1 (LP-0MVK16GME007EYUW): lease-gate refusals attributable (>= 5 samples)",
+        "observed": 1855,
+        "shape_a": 0,
+        "shape_b": 1855,
+        "pass": true
+      }
+    ],
+    "notes": [
+      "69 idle_admit event(s) had no local dispatch event inside the correlation window (possible: fallback after admission, or a restart mid-request).",
+      "AC2 trade: idle-admitted prefill p50 26192.4 ms (n=7) vs non-idle 3276.6 ms (n=3750); slot-seconds 151.0 vs 36099.8.",
+      "12 timeout event(s) carry no session id and fall inside the correlation window of an idle-admitted request: coincident, not attributable (see ac3.attribution_limit).",
+      "Lease-gate refusals: 1855 attributable `local_lease_active` refusal(s): shape A 0 (0.0 %), shape B 1855 (100.0 %). Shape B evidence: no work behind it 1163, silent prefill 373, owner working 6, unconfirmed 313. Contention queue: converted 513 to local, fell through 565. (shape A = inactive cooldown lease, shape B = `active` record with no work behind it; of the 1855 shape-B refusals, 1163 had no work behind it, 373 were silent prefills, 6 were genuinely working owners and 313 lacked corroborating evidence).",
+      "All measurement checks passed; AC5 resolves to a tuning follow-up (see verdict.recommendation.follow_up)."
+    ],
+    "recommendation": {
+      "decision": "tune",
+      "fallback_reduction_pct": -30.5,
+      "local_serve_share_delta_pct_points": 1.17,
+      "reasons": [
+        "remote fallback reduction -30.5% is below the 2.0% materiality bar"
+      ],
+      "follow_up": "Record the tuning in a follow-up work item: raise `server.local_idle_admit_seconds` progressively and re-measure until the bypass-to-local conversion is material."
+    }
+  }
+}

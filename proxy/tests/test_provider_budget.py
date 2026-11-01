@@ -204,7 +204,7 @@ async def test_new_session_over_budget_never_waits(sleeps):
     decision = await acquire_provider_budget(cfg, config, session_id="new-b")
 
     assert not decision.allowed
-    assert decision.reason == "rate_limited"
+    assert decision.reason == "provider_budget_exhausted"
     assert decision.waited_seconds == 0.0
     assert sleeps == [], "a new session must never sleep waiting for capacity"
 
@@ -237,7 +237,7 @@ async def test_skip_log_names_limit_remaining_and_reason(caplog):
     assert FREE_ENTRY in text
     assert "limit=1" in text
     assert "remaining=0" in text
-    assert "reason=rate_limited" in text
+    assert "reason=provider_budget_exhausted" in text
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +274,7 @@ async def test_affinity_session_passes_through_after_wait_cap(sleeps):
     decision = await acquire_provider_budget(cfg, config, session_id="busy")
 
     assert not decision.allowed
-    assert decision.reason == "rate_limited_after_wait"
+    assert decision.reason == "provider_budget_exhausted_after_wait"
     assert decision.waited_seconds <= 5.0
     assert sum(sleeps) == pytest.approx(5.0, abs=0.1)
 
@@ -299,7 +299,7 @@ async def test_wait_aborts_on_client_disconnect():
     elapsed = time.time() - started
 
     assert not decision.allowed
-    assert decision.reason == "rate_limited_disconnect"
+    assert decision.reason == "provider_budget_exhausted_disconnect"
     assert elapsed < 5.0, "disconnect must abort the wait promptly"
 
 
@@ -333,7 +333,7 @@ async def test_waiter_depth_cap_denies_extra_waiters(monkeypatch, clock):
     try:
         decision = await acquire_provider_budget(cfg, config, session_id="third")
         assert not decision.allowed
-        assert decision.reason == "rate_limited_waiters"
+        assert decision.reason == "provider_budget_exhausted_waiters"
     finally:
         release.set()
         await waiter
@@ -626,7 +626,7 @@ async def test_reserve_limits_new_sessions_but_not_in_progress_sessions():
 
     blocked = await acquire_provider_budget(cfg, config, session_id="new-blocked")
     assert not blocked.allowed, "the 8th new-session dispatch must be refused (3 slots reserved)"
-    assert blocked.reason == "rate_limited"
+    assert blocked.reason == "provider_budget_exhausted"
     assert blocked.effective_limit == 7
     assert blocked.reserve_slots == 3
 
@@ -637,7 +637,7 @@ async def test_reserve_limits_new_sessions_but_not_in_progress_sessions():
 
     exhausted = await acquire_provider_budget(cfg, config, session_id="veteran")
     assert not exhausted.allowed
-    assert exhausted.reason == "rate_limited_after_wait"
+    assert exhausted.reason == "provider_budget_exhausted_after_wait"
 
 
 @pytest.mark.asyncio
@@ -685,7 +685,7 @@ async def test_wait_cap_defaults_to_15_seconds(clock, sleeps):
     # succeed: the request must give up at the cap and pass through.
     decision = await acquire_provider_budget(cfg, config, session_id="busy")
     assert not decision.allowed
-    assert decision.reason == "rate_limited_after_wait"
+    assert decision.reason == "provider_budget_exhausted_after_wait"
     assert decision.waited_seconds == pytest.approx(15.0)
     assert sleeps and all(w <= 15.0 for w in sleeps)
 
@@ -720,7 +720,7 @@ async def test_in_progress_session_passes_through_when_cap_expires(clock, sleeps
 
     decision = await acquire_provider_budget(cfg, config, session_id="busy")
     assert not decision.allowed
-    assert decision.reason == "rate_limited_after_wait"
+    assert decision.reason == "provider_budget_exhausted_after_wait"
     assert decision.waited_seconds <= 5.0
 
 
@@ -920,7 +920,7 @@ async def test_model_budget_wait_max_seconds_is_honoured(clock, sleeps):
     decision = await acquire_provider_budget(entry, config, session_id="busy", model_config=model)
 
     assert not decision.allowed
-    assert decision.reason == "rate_limited_after_wait"
+    assert decision.reason == "provider_budget_exhausted_after_wait"
     assert decision.waited_seconds == pytest.approx(4.0)
     assert sum(sleeps) == pytest.approx(4.0, abs=0.1)
 
@@ -942,7 +942,7 @@ async def test_model_budget_max_waiters_is_honoured():
     decision = await acquire_provider_budget(entry, config, session_id="busy", model_config=model)
 
     assert not decision.allowed
-    assert decision.reason == "rate_limited_waiters"
+    assert decision.reason == "provider_budget_exhausted_waiters"
 
 
 @pytest.mark.asyncio
@@ -973,7 +973,7 @@ async def test_model_budget_affinity_ttl_is_honoured(clock, sleeps):
         entry, config, session_id="plan-1", model_config=plan
     )
     assert not plan_decision.allowed
-    assert plan_decision.reason == "rate_limited"
+    assert plan_decision.reason == "provider_budget_exhausted"
     assert sleeps == [], "the 60 s model TTL must have expired plan-1's affinity"
 
     # code-1 is still in progress -> waits for capacity.
@@ -981,7 +981,7 @@ async def test_model_budget_affinity_ttl_is_honoured(clock, sleeps):
         entry, config, session_id="code-1", model_config=code
     )
     assert not code_decision.allowed
-    assert code_decision.reason == "rate_limited_after_wait"
+    assert code_decision.reason == "provider_budget_exhausted_after_wait"
     assert code_decision.waited_seconds > 0.0
 
 
@@ -1029,14 +1029,14 @@ async def test_no_budget_blocks_keep_todays_decisions_and_log_lines(caplog):
     assert (denied.reserve_slots, denied.effective_limit, denied.reason) == (
         3,
         7,
-        "rate_limited",
+        "provider_budget_exhausted",
     )
     skip_lines = [
         r.getMessage() for r in caplog.records if "Provider budget exhausted" in r.getMessage()
     ]
     assert skip_lines[-1] == (
         "Provider budget exhausted: skipping provider=test-free-tier limit=7 reserve=3 "
-        "remaining=3 reason=rate_limited session_affinity=false session=abcdefgh"
+        "remaining=3 reason=provider_budget_exhausted session_affinity=false session=abcdefgh"
     ), "the shipped-config log line must not change"
 
 
@@ -1158,7 +1158,7 @@ async def test_source_layer_is_visible_in_the_skip_log(caplog):
 def test_budget_diagnostics_are_empty_without_a_model_block():
     """AC6: unchanged behaviour when no model/entry layer contributed a value."""
     decision = provider_budget.BudgetDecision(
-        allowed=False, reason="rate_limited", reserve_slots=3, effective_limit=7
+        allowed=False, reason="provider_budget_exhausted", reserve_slots=3, effective_limit=7
     )
     assert provider._budget_diagnostics(decision) == {}
 
@@ -1183,11 +1183,11 @@ async def test_attempt_diagnostics_carry_the_budget_source_layer():
 
     assert first.status_code == 200
     payload = json.loads(blocked.body)
-    rate_limited = [
-        attempt for attempt in payload["diagnostics"] if attempt.get("status") == "rate_limited"
+    provider_budget_exhausted = [
+        attempt for attempt in payload["diagnostics"] if attempt.get("status") == "provider_budget_exhausted"
     ]
-    assert rate_limited, f"expected a rate_limited attempt, got {payload['diagnostics']}"
-    assert rate_limited[0]["budget_source"] == "reserve_ratio@model"
+    assert provider_budget_exhausted, f"expected a provider_budget_exhausted attempt, got {payload['diagnostics']}"
+    assert provider_budget_exhausted[0]["budget_source"] == "reserve_ratio@model"
 
 
 @pytest.mark.asyncio

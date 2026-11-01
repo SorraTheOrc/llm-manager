@@ -51,6 +51,43 @@ with guidance. Structured churn/compaction logging is the sibling logging
 child's scope; this module reports ``compacted_over_budget`` (or
 ``backstop_*`` reasons) so the dispatcher can escalate.
 
+Local→remote boundary trigger (LP-0MVTDU6Y1004ZCGX):
+  A *second*, independently gated trigger — ``decide_boundary_compaction``
+  — answers a different question from ``decide_session_compaction``: not
+  "is this session too big for the slot" but "is this session leaving the
+  local model for a remote provider after having been served locally".
+  It fires **only** when all four hold: the provider about to be dispatched
+  is ``type: remote``, the session store records at least one prior
+  locally-served turn (``Session.locally_served_turns`` — a recorded
+  signal, never a live slot assignment), the estimated token count is
+  strictly above the minimum-size guard
+  (``server.remote_boundary_compaction_min_tokens``), and the independent
+  knob ``server.remote_boundary_compaction`` is enabled. The knob ships
+  **off** and is deliberately independent of ``compaction_trigger_ratio``:
+  it neither reads nor re-enables assembly-time compaction (the
+  operator's 2026-09-17 decision). The helper is pure — it makes no
+  dispatch change of its own; the remote-dispatch hook consumes its
+  verdict.
+
+  Fail-open contract for that trigger (parent AC4): when boundary
+  compaction cannot run, the outgoing history is left byte-identical and
+  the request still dispatches remote. The skip is logged at **WARNING**
+  with one stable reason token — ``boundary_no_slot`` (session holds no
+  local slot), ``boundary_slot_unavailable`` (pinned slot unreachable),
+  ``boundary_summarizer_failed`` (pinned call raised / returned blank /
+  ``EmptySummary``) or ``boundary_below_guard`` (estimate did not exceed
+  ``server.remote_boundary_compaction_min_tokens``). There is **no remote
+  summariser fallback**: the ``models.compact`` chain is not consulted for
+  this path (parent Appendix Q3) — skipping is the whole failure policy.
+
+  Slot-reuse KV caveat: the summarisation runs on the session's *own*
+  local slot (``id_slot`` pinned by
+  ``compaction_summarizer.build_slot_pinned_summarizer``), which is
+  disposable only because the session is leaving the local model.
+  Prefilling that prompt overwrites the slot's KV cache; the caller must
+  release the session's local dispatch lease immediately afterwards, so
+  the destroyed KV is never reused by that session.
+
 Summary lifecycle (R5, LP-0MTTPXIIX005Y0Z9):
   1. CREATION — a session with no prior summary (``extract_previous_summary``
      returns None) is summarised with the full SUMMARIZATION_PROMPT; the
@@ -694,6 +731,268 @@ def decide_session_compaction(
     plan["dry_run"] = False
     plan["applied"] = plan["action"] == "compact"
     return plan
+
+
+def decide_boundary_compaction(
+    *,
+    provider_type: str | None,
+    has_local_provenance: bool,
+    estimated_tokens: int,
+    config: dict,
+) -> dict[str, Any]:
+    """Decide whether to compact a session at the local→remote boundary.
+
+    Pure decision helper (LP-0MVTDU6Y1004ZCGX) for the parent feature
+    "compact before moving from local to remote"
+    (LP-0MVRBQBDF0037OZ5). It is evaluated by the remote-dispatch hook
+    *before* the remote request is sent; this module makes no dispatch
+    change of its own.
+
+    The decision fires **only** when every gate holds:
+
+    1. ``provider_type`` is ``remote`` — a local dispatch is never
+       compacted at the boundary (its KV cache is still useful).
+    2. ``has_local_provenance`` is True — the session store records at
+       least one prior locally-served turn
+       (``SessionManager.has_local_provenance``). Provenance is a recorded
+       counter, never a live slot assignment, so a released, evicted or
+       save/restored slot does not disqualify a session.
+    3. ``estimated_tokens`` is strictly greater than the minimum-size
+       guard (``server.remote_boundary_compaction_min_tokens``, default
+       20 000) — trivial sessions are left alone.
+    4. The independent knob ``server.remote_boundary_compaction`` is
+       enabled (default ``False``). It does not read or re-enable the
+       assembly-time ``compaction_trigger_ratio``.
+
+    Args:
+        provider_type: Type of the provider about to be dispatched
+            (``"remote"`` / ``"local"``; compared case-insensitively).
+        has_local_provenance: Whether the session store records a prior
+            locally-served turn.
+        estimated_tokens: Estimated token count of the outgoing history.
+        config: Proxy configuration (flat or nested ``server`` dict).
+
+    Returns:
+        A dict with:
+
+        - should_compact: True only when all four gates hold.
+        - reason: machine-readable token — ``boundary_compact``,
+          ``boundary_disabled``, ``boundary_not_remote``,
+          ``boundary_no_local_provenance`` or ``boundary_below_guard``.
+        - est_before: the estimate the decision was made on.
+        - guard_tokens: the resolved minimum-size guard.
+        - enabled: the resolved knob value.
+    """
+    # Lazy import: provider imports this module for routing integration, so a
+    # module-level import would be circular (same pattern as
+    # ``compaction_trigger_tokens``).
+    from proxy.provider import compaction_config
+
+    cfg = compaction_config(config)
+    enabled = bool(cfg["remote_boundary_compaction"])
+    guard_tokens = int(cfg["remote_boundary_compaction_min_tokens"])
+    est_before = int(estimated_tokens)
+
+    result: dict[str, Any] = {
+        "should_compact": False,
+        "reason": None,
+        "est_before": est_before,
+        "guard_tokens": guard_tokens,
+        "enabled": enabled,
+    }
+
+    if not enabled:
+        result["reason"] = "boundary_disabled"
+    elif str(provider_type or "").strip().lower() != "remote":
+        result["reason"] = "boundary_not_remote"
+    elif not has_local_provenance:
+        result["reason"] = "boundary_no_local_provenance"
+    elif est_before <= guard_tokens:
+        result["reason"] = "boundary_below_guard"
+    else:
+        result["should_compact"] = True
+        result["reason"] = "boundary_compact"
+    return result
+
+
+def plan_boundary_compaction_span(
+    messages: list[dict[str, Any]],
+    *,
+    mode: str = "fast",
+    estimate_tokens: TokenEstimator | None = None,
+) -> dict[str, Any]:
+    """Select what a local→remote boundary compaction folds and keeps.
+
+    First half of the boundary planning pair (parent LP-0MVRBQBDF0037OZ5,
+    consumed by ``proxy.router_helpers.evaluate_boundary_compaction``).
+
+    The retention/window rules are identical to ``plan_session_compaction``
+    (system prompts + the very first user prompt kept verbatim, whole recent
+    turns kept while the estimate stays within the mode target, the rest
+    folded into one summary) — but the *trigger* is different, so the
+    planner cannot be reused directly: ``plan_session_compaction`` gates on
+    ``compaction_trigger_ratio``, which ships at ``0`` (assembly-time
+    compaction deliberately disabled, LP-0MU61IRVC003RRN6). Boundary
+    compaction has its own independent knob
+    (``server.remote_boundary_compaction``) and decides via
+    ``decide_boundary_compaction`` before calling this helper.
+
+    This half is deliberately pure and synchronous so the caller can hand
+    ``middle_messages`` to the slot-pinned summariser (whose lease release
+    must happen before the remote dispatch) and then assemble the compacted
+    list with :func:`apply_boundary_compaction_summary`.
+
+    Args:
+        messages: The outgoing history (OpenAI-style role/content).
+        mode: Compaction budget — ``fast``/``medium``/``high`` → the 38 000
+            target, ``low``/``cheap`` (and unknown) → the conservative
+            30 000 target.
+        estimate_tokens: Estimator over a full message list; defaults to the
+            module heuristic (production passes the routing estimator).
+
+    Returns:
+        A dict with ``action`` (``"plan"`` | ``"noop"``), ``reason``,
+        ``retained`` (verbatim retention set), ``recent`` (kept whole turns),
+        ``middle_messages`` (turns to summarise), ``turns_to_summarize``,
+        ``estimated_before``, ``target_tokens`` and ``previous_summary``.
+    """
+    est = estimate_tokens or estimate_session_tokens
+    target = compaction_target_tokens(mode)
+    span: dict[str, Any] = {
+        "mode": mode,
+        "action": "noop",
+        "reason": None,
+        "retained": [],
+        "recent": [],
+        "middle_messages": [],
+        "turns_to_summarize": 0,
+        "estimated_before": int(est(messages) or 0),
+        "target_tokens": target,
+        "previous_summary": None,
+    }
+    if not messages:
+        span["reason"] = "no_messages"
+        return span
+
+    # Retention set: all system prompts + the very first user prompt,
+    # verbatim (the invariant shared with plan_session_compaction).
+    system_msgs = [m for m in messages if m.get("role") == _SYSTEM_ROLE]
+    first_user_idx = next(
+        (i for i, m in enumerate(messages) if m.get("role") == _USER_ROLE),
+        None,
+    )
+    if first_user_idx is None:
+        span["reason"] = "no_user_message"
+        return span
+    first_user_msg = messages[first_user_idx]
+
+    turns = pair_turns(messages[first_user_idx + 1 :])
+    if not turns:
+        span["reason"] = "no_turns_to_compact"
+        return span
+
+    retained = list(system_msgs) + [first_user_msg]
+    placeholder = _summary_message("")
+    accepted: list[list[dict[str, Any]]] = []
+    for turn in reversed(turns):
+        candidate = list(retained) + [placeholder]
+        for kept in accepted:
+            candidate.extend(kept)
+        candidate.extend(turn)
+        if est(candidate) <= target:
+            accepted.append(turn)
+        else:
+            break
+    recent = accepted[::-1]
+
+    middle_turns = turns[: len(turns) - len(recent)]
+    middle_messages = [
+        m for turn in middle_turns for m in turn
+        if not _is_compaction_summary_message(m)
+    ]
+    if not middle_messages:
+        # Everything fits in the recent window — folding nothing adds no
+        # value and would only pay the summariser latency.
+        span["reason"] = "no_turns_to_summarize"
+        span["retained"] = retained
+        span["recent"] = recent
+        return span
+
+    span.update(
+        action="plan",
+        reason="boundary_span_selected",
+        retained=retained,
+        recent=recent,
+        middle_messages=middle_messages,
+        turns_to_summarize=len(middle_turns),
+        previous_summary=extract_previous_summary(messages),
+    )
+    return span
+
+
+def apply_boundary_compaction_summary(
+    span: dict[str, Any],
+    summary_text: str,
+    *,
+    estimate_tokens: TokenEstimator | None = None,
+) -> dict[str, Any]:
+    """Assemble the compacted history from a boundary summary.
+
+    Second half of the boundary planning pair: takes the span selected by
+    :func:`plan_boundary_compaction_span` and the summary the slot-pinned
+    summariser produced, and returns the list the remote dispatcher sends.
+
+    A blank / non-string summary — including the fail-open
+    :class:`EmptySummary` sentinel — is never injected (an empty marker would
+    silently drop the folded turns): the result is ``action="noop"`` with
+    ``reason="empty_summary"`` so the caller leaves the outgoing body
+    byte-identical and logs the skip.
+
+    Args:
+        span: Result of :func:`plan_boundary_compaction_span`.
+        summary_text: Summary produced for ``span["middle_messages"]``.
+        estimate_tokens: Estimator over a full message list; defaults to the
+            module heuristic.
+
+    Returns:
+        A dict with ``action`` (``"compact"`` | ``"noop"``), ``reason``,
+        ``messages`` (compacted list, or ``None``), ``summary_text``,
+        ``estimated_before``, ``estimated_after``, ``turns_summarized`` and
+        ``recent_turns_kept``.
+    """
+    est = estimate_tokens or estimate_session_tokens
+    out: dict[str, Any] = {
+        "action": "noop",
+        "reason": None,
+        "messages": None,
+        "summary_text": None,
+        "estimated_before": int(span.get("estimated_before", 0) or 0),
+        "estimated_after": int(span.get("estimated_before", 0) or 0),
+        "turns_summarized": 0,
+        "recent_turns_kept": 0,
+    }
+    if span.get("action") != "plan":
+        out["reason"] = span.get("reason") or "no_span"
+        return out
+    if not isinstance(summary_text, str) or not summary_text.strip():
+        out["reason"] = "empty_summary"
+        return out
+
+    compacted = (
+        list(span["retained"])
+        + [_summary_message(summary_text)]
+        + [m for turn in span["recent"] for m in turn]
+    )
+    out.update(
+        action="compact",
+        reason="boundary_compacted",
+        messages=compacted,
+        summary_text=summary_text,
+        estimated_after=int(est(compacted) or 0),
+        turns_summarized=int(span.get("turns_to_summarize", 0) or 0),
+        recent_turns_kept=len(span["recent"]),
+    )
+    return out
 
 
 def plan_session_compaction(

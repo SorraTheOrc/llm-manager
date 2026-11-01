@@ -35,11 +35,45 @@
 # node_hwmon_chip_names on chip_name="amdgpu" rather than by a host-specific
 # chip id, so the rule works on any node_exporter target exposing an AMD GPU.
 #
+# OUR WORK VS ANY WORK
+# --------------------
+# Two definitions live here, deliberately:
+#
+#   gpu:computing:bool            power >= 90 W            (any GPU consumer)
+#   gpu:computing_workload:bool    power >= 90 W AND >= 1 busy llama slot
+#                                                          (our local model's
+#                                                           work)
+#
+# Power alone cannot tell our streams from another process drawing the GPU, so
+# the combined rule is the one definition of "the GPU is doing our local model's
+# work" shared by the CLI, the alerts and ad-hoc PromQL. The power-only series is
+# kept unchanged so the two definitions can be compared side by side ("how much
+# compute power did we own?").
+#
+# THE JOIN TRAP: the two inputs come from DIFFERENT scrape jobs. The power series
+# carries instance="localhost:9100" (node_exporter, job="node-exporter") and
+# llama_slots_busy carries instance="localhost:8000" (the llama-proxy). A naive
+# `and` / `on(instance)` join matches NOTHING and the rule silently yields no
+# series at all — which reads as "unknown" forever, or as "never computing" in a
+# dashboard. The join is therefore label-agnostic (`on()`), and the slot side is
+# reduced to a single `>= bool 1` flag so the recorded series keeps the power
+# series' labels (instance="localhost:9100", job="node-exporter").
+#
+# GAP BEHAVIOUR: when llama_slots_busy is absent (sampler down, proxy down) or
+# the power series is absent (node_exporter down) the combined rule records NO
+# SERIES — never 0. Absence is "unknown"; 0 means "idle". Collapsing the two
+# would make an unsampled window look like idle time and quietly understate (or
+# overstate) utilisation. Consumers must treat a missing series as unknown, not
+# as zero.
+#
 # QUERIES THESE RULES ENABLE
 # --------------------------
 #   avg_over_time(gpu:computing:bool[2h])      computing-time fraction (0..1)
 #   gpu:power_watts:avg5m                      smoothed power for dashboards
 #   sum_over_time(gpu:computing:bool[24h:15s]) * 15   computing seconds
+#   avg_over_time(gpu:computing_workload:bool[2h])    share of time the GPU was
+#                                                     doing OUR work (0..1, and
+#                                                     absent => unknown)
 #
 # Validation: `promtool check rules monitoring/gpu_compute_rules.yaml` and the
 # behavioural unit tests in monitoring/tests/gpu_rules_test.yml
@@ -64,6 +98,29 @@ groups:
       # drop idle samples (overstating utilisation).
       - record: gpu:computing:bool
         expr: gpu:power_watts:amdgpu >= bool 90
+
+      # 1 while the GPU is drawing compute-level power AND at least one
+      # llama-server slot is processing — i.e. the GPU is doing OUR local
+      # model's work, not just some other consumer's work.
+      #
+      # `on()` (empty label set) is required: the power series comes from the
+      # node-exporter job (instance="localhost:9100") and llama_slots_busy from
+      # the llama-proxy job (instance="localhost:8000"), so matching on any
+      # label — including the default full label set — would join nothing and
+      # record no series at all. `group_left()` keeps that explicit and leaves
+      # the recorded series carrying the power series' labels.
+      #
+      # `>= bool 1` on the slot side turns the busy count into 0/1 without
+      # dropping it: without `bool`, the comparison would filter instead of
+      # yielding 0, and a 0 busy-slot sample would make the multiplication
+      # produce no series rather than 0 (turning "idle" into "unknown"). When
+      # llama_slots_busy is absent the whole expression yields nothing, which is
+      # the intended "unknown" — never 0.
+      - record: gpu:computing_workload:bool
+        expr: |
+          gpu:computing:bool
+            * on() group_left()
+              (llama_slots_busy >= bool 1)
 
       # Smoothed power for dashboards/trend graphs.
       - record: gpu:power_watts:avg5m

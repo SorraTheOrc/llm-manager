@@ -72,9 +72,9 @@ def _budget_skip_attempts(limit: int = MEASURED_LIMIT) -> list[dict]:
         {
             "provider": FREE_ENTRY,
             "type": "remote",
-            "status": "rate_limited",
+            "status": "provider_budget_exhausted",
             "status_code": 429,
-            "reason": "rate_limited",
+            "reason": "provider_budget_exhausted",
             "limit_rpm": limit,
             "effective_limit": limit - MEASURED_RESERVE,
             "reserve_slots": MEASURED_RESERVE,
@@ -166,8 +166,8 @@ async def test_budget_skip_rollover_uses_earliest_freeing_provider():
             {
                 "provider": second,
                 "type": "remote",
-                "status": "rate_limited",
-                "reason": "rate_limited",
+                "status": "provider_budget_exhausted",
+                "reason": "provider_budget_exhausted",
                 "limit_rpm": 2,
                 "effective_limit": 2,
                 "remaining": 0,
@@ -386,7 +386,7 @@ def test_budget_derivation_ignores_free_capacity_and_non_budget_attempts():
 
 
 @pytest.mark.asyncio
-async def test_rate_limited_waited_attempt_is_not_a_blocker():
+async def test_provider_budget_exhausted_waited_attempt_is_not_a_blocker():
     """An attempt that waited then dispatched is not a budget blocker."""
     await _fill_window()
     assert (
@@ -394,7 +394,7 @@ async def test_rate_limited_waited_attempt_is_not_a_blocker():
             [
                 {
                     "provider": FREE_ENTRY,
-                    "status": "rate_limited_waited",
+                    "status": "provider_budget_exhausted_waited",
                     "reason": "allowed_after_wait",
                     "limit_rpm": MEASURED_LIMIT,
                     "effective_limit": MEASURED_LIMIT,

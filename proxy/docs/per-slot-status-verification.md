@@ -154,13 +154,22 @@ ignores the new fields behaves exactly as before (contract test:
 (LP-0MVKSXR4P001V0CM) adds stale-detail reconciliation of `capacity_hint` and
 truthful in-flight accounting. v4 (LP-0MVRMI5HK00558TB) adds the abandoned-work
 annotation, the `abandoned_busy` hint value and the top-level
-`local_abandoned_slots` count.
+`local_abandoned_slots` count; v4 additionally carries the `abandoned_scope`
+discriminator and can annotate a draining slot from an **endpoint-wide**
+registry entry when the release could not resolve a slot identity
+(LP-0MVUVHB1V006HA5I / LP-0MVUVHAQP001IRKK). That is an additive widening of
+*which* abandonments are annotatable — no field is removed or reinterpreted, so
+the abandonment change kept `status_schema_version` at `4`. The payload version
+is now `5` (`LP-0MVWFKIKJ005XHAY` added the read-only `local_route_available` /
+`local_route_reason` / `local_route_cooldown_remaining_s` fields, see
+[routing.md](routing.md#the-published-route-fields-status_schema_version-5));
+every field described below is unchanged by that bump.
 
 ## Payload (new fields)
 
 ```json
 {
-  "status_schema_version": 4,
+  "status_schema_version": 5,
   "total_slots": 2,
   "available_slots": 0,
   "contention_queue_depth": 3,          // existing, elsewhere in the payload
@@ -178,13 +187,14 @@ annotation, the `abandoned_busy` hint value and the top-level
      "lease_state": "generating", "phase": "prefill",
      "prefill_eta_seconds": 187.0, "abandoned": false,
      "abandonment_reason": null, "abandoned_session_id": null,
-     "abandoned_at_seconds_ago": null},
+     "abandoned_at_seconds_ago": null, "abandoned_scope": null},
     {"slot_id": 1, "is_processing": true, "n_decoded": 41,
      "context_tokens": 4096, "owner_session_id": null,
      "lease_state": "generating", "phase": "decode",
      "prefill_eta_seconds": null, "abandoned": true,
-     "abandonment_reason": "prefill_deadline",
-     "abandoned_session_id": "herdr-…", "abandoned_at_seconds_ago": 12.4}
+     "abandonment_reason": "measured_cache_deficit",
+     "abandoned_session_id": "herdr-…", "abandoned_at_seconds_ago": 12.4,
+     "abandoned_scope": "endpoint"}
   ]
 }
 ```
@@ -197,14 +207,19 @@ Per-slot fields (all additive):
 | `lease_state` | `"generating" \| "idle_leased" \| "free"` | `generating` whenever `is_processing` is true (never `free` while a prefill or decode is in flight); `idle_leased` when not processing but a live lease still reserves it; `free` otherwise. |
 | `phase` | `"prefill" \| "decode" \| null` | Inferred proxy-side (see below); `null` when the slot is not processing. |
 | `context_tokens` | `int \| null` | Prompt progress (`max(n_past, n_prompt_tokens_processed)`) when the llama.cpp build reports it, else `null`. |
-| `prefill_eta_seconds` | `float \| null` | Shared calibrated prefill cost of the slot's loaded context, only for a slot in `prefill`; `null` otherwise or when not computable. |
-| `abandoned` | `bool` | `true` when the proxy gave up on the dispatch occupying this slot (see [Abandoned work](#abandoned-work-lp-0mvr5hk00558tb-ac1)) and llama-server has not released it yet. Always present. |
+| `prefill_eta_seconds` | `float \| null` | Shared calibrated prefill cost of the slot's loaded context, only for a slot in `prefill`; `null` otherwise or when not computable. It is a **cache-cold** estimate (`cached_ratio = 0.0`), labelled by `prefill_eta_kind` / `prefill_eta_assumed_cached_ratio` (LP-0MVSD5RJW008F1IB). |
+| `prefill_eta_kind` | `"reference_cold_bound"` | Discriminator: the ETA is a cache-cold bound, not a per-request estimate. |
+| `prefill_eta_assumed_cached_ratio` | `0.0` | The cache state the ETA assumes: nothing served from the prompt cache. |
+| `abandoned` | `bool` | `true` when the proxy gave up on the dispatch occupying this slot (see [Abandoned work](#abandoned-work-lp-0mvr5hk00558tb-ac1)) and llama-server has not released it yet — matched either by this slot's own registry entry or, for a draining ghost with no live owner, by an endpoint-wide entry. Always present. |
 | `abandonment_reason` | `str \| null` | Which abandonment gave the slot up: `prefill_deadline`, `session_evicted`, `no_progress_watchdog`, `client_disconnect` (also `orphan_cleanup` / `measured_cache_deficit` from the sweep and the early abort). `null` when `abandoned` is `false`. |
 | `abandoned_session_id` | `str \| null` | The session that was abandoned (the slot's own identity is already `slot_id`). `null` when `abandoned` is `false`. |
 | `abandoned_at_seconds_ago` | `float \| null` | Age of the abandonment, so a consumer can reason about how long a ghost may persist (the registry TTL is 900 s). |
+| `abandoned_scope` | `"slot" \| "endpoint" \| null` | Which registry entry produced the annotation: `"slot"` when the slot's own recorded identity matched, `"endpoint"` when an endpoint-wide entry (an abandonment recorded without a resolvable slot id, or one whose recorded id no longer matched the draining slot) was applied behind the no-live-owner guard, `null` when the slot is not abandoned (LP-0MVUVHB1V006HA5I). |
 
 Top-level fields: `capacity_hint`, `prefill_budget_seconds`,
-`local_abandoned_slots` (count of `abandoned: true` slots),
+`local_abandoned_slots` (count of `abandoned: true` slots — including slots
+annotated from an endpoint-wide entry, so an abandonment that could not name a
+slot is still counted and reported rather than dropped),
 `status_schema_version` (plus the existing `prefill_eta_seconds` /
 `queue_eta_seconds`).
 
@@ -300,7 +315,9 @@ Two mechanisms now apply, per reason (details and the log lines are in
    prefill, so the ghost window is short rather than the whole prefill.
 2. **Annotate what remains.** The abandoned slot identity (endpoint, slot,
    session, reason, timestamp) is recorded in-process with a 900 s TTL, and the
-   status payload publishes it. A slot the backend has not released yet is then
+   status payload publishes it. An abandonment that cannot name a slot is
+   recorded as an endpoint-wide entry instead of being dropped (see below). A
+   slot the backend has not released yet is then
    *busy, not ours*: `capacity_hint` is `abandoned_busy` — **never**
    `saturated` (that must keep meaning live, proxy-owned decode work) and
    **never** `idle` (a busy-but-abandoned pool folded into `idle` would admit a
@@ -309,6 +326,95 @@ Two mechanisms now apply, per reason (details and the log lines are in
 The annotation is explicit and attributable (slot identity + reason + session),
 never a blanket discount of llama-server processing: a fresh snapshot whose
 slots are genuinely live still reports `saturated`.
+
+### Registry entries: slot-scoped and endpoint-wide
+
+The registry (`_abandoned_slots` in `proxy/proxy/router_helpers.py`) is
+in-process and keyed `(endpoint, key)` — it resets with the routing state it
+describes. An abandonment is recorded as **one of two scopes**:
+
+| `scope` | Key | Recorded when | Matched to |
+|---|---|---|---|
+| `slot` | the slot id | the release resolved a real slot identity | that slot only (exact endpoint first, then the legacy/default label, then any endpoint carrying that id) |
+| `endpoint` | `ABANDONED_SLOT_ENDPOINT_WIDE` (`-1`) | the release could **not** resolve a slot identity, **or** the resolved id did not match the slot the backend reported for the session | any *processing* slot on the endpoint that no lease and no live dispatch record owns |
+
+The sentinel is a negative `int` on purpose: llama-server slot ids are always
+non-negative, so an endpoint-wide entry can never collide with a real slot, and
+keeping it an `int` preserves the registry's `tuple[str, int]` key contract.
+There is at most **one** endpoint-wide entry per endpoint, so the registry can
+never hold more entries than the pool size plus one — re-abandoning refreshes
+the entry instead of adding another.
+
+Identity is resolved **before** the assignment is freed, in precedence order
+(explicit slot id → the dispatch record's `slot_id` pinned at admission → the
+live session assignment), and the provenance is logged as
+`slot_source=explicit|assignment|endpoint_wide` on every
+`abandoned_slot_recorded` line. The resolved id is re-verified against the slot
+llama-server reports for that session; a mismatch logs
+`abandoned_slot_mismatch recorded_slot=… observed_slot=…` and records the
+endpoint-wide entry **in addition to** the exact one, so the "attributable but
+unmatched" shape is diagnosable from production logs instead of silent
+(LP-0MVUVHAQP001IRKK).
+
+The status builder matches in order
+(`annotate_slots_for_status`, `proxy/proxy/observability.py`):
+
+1. the slot's own registry entry → `abandoned_scope="slot"`;
+2. the endpoint-wide entry, applied **only** to a slot with
+   `is_processing: true` and `owner_session_id: null` — i.e. no dispatch lease
+   **and** no live dispatch record → `abandoned_scope="endpoint"`;
+3. otherwise no annotation (`abandoned_scope: null`).
+
+Step 2's guard is the whole safety argument: an endpoint-wide entry names no
+slot, so it may only describe a *draining ghost*. A slot a live dispatch record
+still owns keeps reporting `saturated`, which is why the truthful-status
+contract of LP-0MVKSXR4P001V0CM is not weakened. The annotation is read-only
+status decoration: it never frees or acquires capacity, never decrements a
+counter and never creates a lease.
+
+### Clearing, TTL and freshness
+
+An entry is dropped when the backend **disproves** it, and only on fresh
+evidence: a fresh (`slots_detail_stale=false`) snapshot that reports a slot
+`is_processing: false` clears that slot's entries, and a fresh snapshot with
+**nothing** processing clears the endpoint-wide entry. A *stale* snapshot is a
+fossil of a past request and clears nothing, and a snapshot that reports no
+slots at all (no model, server down) annotates and clears nothing — omitting a
+slot id is not evidence about that slot. Clearing is registry hygiene only:
+no lease is released and no capacity counter moves.
+
+The 900 s TTL (`DEFAULT_ABANDONED_SLOT_TTL_SECONDS`) is the backstop that keeps
+the annotation bounded even if the backend never reports the slot free: it is
+comfortably longer than the 90 s prefill deadline and the 180 s no-progress
+watchdog, so an entry outlives the window in which its ghost can still be seen
+processing, and it is lazily pruned on read (no timer task). Re-recording the
+same slot or endpoint refreshes the window, so a slot abandoned twice does not
+expire from the first event.
+
+### Why a draining-only pool never reads `saturated`
+
+`compute_capacity_hint()` rule 0 returns `abandoned_busy` when no slot is free
+and **no generating slot is live**. With every abandonment now attributable —
+by slot id, by a re-verified id, or endpoint-wide behind the no-live-owner
+guard — a pool whose only work is draining can no longer present a single live
+generating slot, so it reads `abandoned_busy`, never `saturated` and never
+`idle`.
+
+### Attribution in the measurement tool
+
+`scripts/capacity_signal_verification.py` counts a lease release as an
+abandonment event only for its `_ABANDON_REASONS` set. The set was widened to
+include `measured_cache_deficit` (imported from `proxy.measured_cache_abort`,
+so the two cannot drift): that release gives up on a dispatch while
+llama-server keeps working on it, exactly like the deadline, watchdog and
+eviction reasons, and leaving it out is what made 5 of the 12 residual polls
+below unattributable (LP-0MVUVHBD40067FE3).
+
+**Baseline effect.** The published historical counts — 247 polls / 2.12 % (pre-
+fix baseline) and 12 polls / 0.11 % (post-fix residual) — were computed with
+the narrower four-reason set. A widened tally is therefore not directly
+comparable with them; every report the tool emits states this discontinuity
+explicitly rather than silently re-basing the numbers.
 
 The table is authoritative only while the served `/slots` detail is **fresh**.
 When `slots_detail_stale` is true, the cached `is_processing`/`phase` describe
@@ -372,6 +478,10 @@ optional per-slot `owner_session_id`; extend them to also read:
 - `slots[].abandoned` / `abandonment_reason` / `abandoned_session_id` and the
   top-level `local_abandoned_slots` (LP-0MVRMI5HK00558TB) — for reporting and
   for distinguishing a ghost from live work without re-deriving it.
+  `slots[].abandoned_scope` (`"slot"` | `"endpoint"` | `null`) says whether the
+  slot's own identity matched or the annotation came from the endpoint-wide
+  entry, i.e. whether the ghost's identity could be resolved at release time
+  (LP-0MVUVHB1V006HA5I).
 - `prefill_budget_seconds` — the admission guard's budget, so the dispatcher
   paces to the same number the proxy enforces.
 
@@ -387,6 +497,18 @@ it would admit a dispatch behind a ghost and lengthen the tail.
 
 All of these are optional: the existing `is_processing` / `n_decoded` /
 `available_slots` reads keep working unchanged (AC1).
+
+`available_slots` and `capacity_hint` answer different questions and their pair
+can read `available_slots: 1` with `capacity_hint: saturated`. `available_slots`
+counts the slots llama-server reports as **not processing**; the hint classifies
+**admission capacity**, and a slot held by a post-stream lease is
+`idle_leased` — not capacity for a newcomer — while another slot decodes (626 of
+the 1,283 `saturated` polls in a direct scan of that window's status log; the
+tool's own filtered count is 1,307). A dispatcher that needs
+the engine verdict reads `capacity_hint` (keyed on `lease_state`), not the raw
+slot count; `slot_counts_stale` additionally flags a count served from the
+last-known cache
+([triage of the residual](#the-12-poll-residual-2026-10-29-night-lp-0mvt2kw5a008x037)).
 
 ## Post-fix measurement (2026-10-24 20:00 → 2026-10-25 07:00, Europe/Dublin)
 
@@ -471,4 +593,170 @@ durable surface). The two surfaces agree where they overlap:
   those figures have no nightly counterpart to compare against. Adding them is
   a change under `.pi/skills/proxy-usage-analysis/` (agent infrastructure, out
   of scope here) and is recorded as a follow-up rather than made silently.
+
+## Post-fix re-measurements (12 h and 24 h, LP-0MVLNBCTN0084MT0)
+
+Two further windows were measured with the same tool to judge the `< 5 %`
+`slots_stale` target on a build that contains the child-port resolver
+(`f58e8964`, 2026-10-26 12:51 UTC) instead of the router-serialised polling path
+measured above.
+
+| Window (local) | Build | Polls | `slots_stale` | `saturated` w/o live work | herdr downtime dispatches |
+|---|---|---|---|---|---|
+| 2026-10-24 20:00 → 10-25 07:00 (night) | `56a3a28a`/`2d2b6b51` (router path) | 11,654 | 9,278 (79.61 %) | 247 (2.12 %) | 5 |
+| 2026-10-28 09:30 → 21:30 (12 h) | + `f58e8964` | 10,817 | 5,832 (53.92 %) | 116 (1.07 %) | 21 (rolling log; durable 21) |
+| 2026-10-29 01:00 → 10-30 01:00 (24 h) | + `f58e8964`, HEAD `b12a0299` | 26,019 | **7,698 (29.59 %)** | **70 (0.27 %)** | **81 (durable trail)** |
+
+What the 24 h window says:
+
+1. **`slots_stale` still misses the `< 5 %` target (29.59 %), but it is now a
+   latency measurement rather than a router artefact.** 77 % of the residual
+   stale polls were served from cache after a refresh lasting longer than the
+   budget (`STATUS_QUERY_TIMEOUT` 1.0 s detail / 2.0 s counts): ≥ 5 s 2,063,
+   2–5 s 3,888, 1–2 s 1,637, < 1 s 110. The source split is unchanged in
+   character — detail cache 7,224, counts cache 474, unknown 0. Removing the
+   router roughly halved the rate (79.61 % → 53.92 %) and the resolver build
+   roughly halved it again (→ 29.59 %); the remainder belongs to the `/slots`
+   read path under load and is carried forward as LP-0MVVCO1N7004TNGY.
+2. **False saturation is now rare and still fully attributable.** 70 polls
+   (0.27 % of polls, 2.13 % of `saturated` polls) reported `saturated` with no
+   live local work, down from 247; 65 are attributed to an abandonment or
+   restart within the preceding 600 s (`prefill_deadline` 27,
+   `no_progress_watchdog` 20, `session_evicted` 18) and 5 remain unattributable
+   from the proxy log. The cache-time reconciliation contract above is intact:
+   no stale poll produced `saturated`.
+3. **Dispatch recovery is met.** 81 durable herdr downtime dispatches in the
+   24 h window (target ≥ 10; kinds `plan` 31, `audit` 18, `intake` 18,
+   `implement` 13, `effort-and-risk` 1; 53 distinct items). The rolling
+   `.worklog/downtime-dispatches.log` retains only the last 100 rows and does
+   **not** cover a 24 h window — audit the durable comment trail instead.
+4. **Two proxy restarts occurred inside the window** (2026-10-29 12:58:34 and
+   14:09:25); coverage was still `covered` with no internal gaps. Neither
+   restart changed the qualitative result.
+
+Re-derivation: `~/proxy-usage-reports/2026-10-29_24h-remeasure/` (`SUMMARY.md`,
+`measurement.json` / `measurement.txt`, `saturated_without_live_work_attribution.csv`,
+`downtime-dispatches-durable.csv`, `provenance.json`, `run_remeasure.py`):
+
+```bash
+python3 scripts/capacity_signal_verification.py \
+  --since '2026-10-29 01:00' --until '2026-10-30 01:00' --window-closed \
+  --label 24h-remeasure --limit 250 --json \
+  --write-artifacts ~/proxy-usage-reports/2026-10-29_24h-remeasure
+# or: python3 ~/proxy-usage-reports/2026-10-29_24h-remeasure/run_remeasure.py
+```
+
+### Measurement disposition (LP-0MVLNBCTN0084MT0)
+
+What each acceptance criterion of the measurement item stands on, so the
+numbers above can be read against the item that produced them rather than in
+isolation. The measurement, attribution and documentation deliverables are
+delivered on `dev`; the `< 5 %` target itself is a `/slots` read-path target
+that outlived the fixed evidence window and is owned by a follow-up item.
+
+| AC | Disposition | Evidence |
+|---|---|---|
+| AC1 `slots_stale` < 5 % of polls, `saturated` only with live work | **Missed — accepted as a documented miss** (producer decision, 2026-10-30) | 24 h: 7,698 / 26,019 stale (29.59 %), 70 `saturated`-without-live-work polls. Night: 9,278 / 11,654 (79.61 %), 247. The residual is a `/slots` refresh-latency defect (77 % of residual stale polls refreshed in > 2 s against the 1.0 s detail / 2.0 s counts budgets) carried forward to **LP-0MVVCO1N7004TNGY**. |
+| AC2 herdr downtime dispatches ≥ 10/night, same queue | **Met** | 81 durable `herdr-downtime` dispatches in the 24 h window against a target of 10, on the unchanged `own-backlog` queue — `downtime-dispatches-durable.csv`. |
+| AC3 residual stale polls attributable in the nightly usage report | **Met in the measurement artifacts; nightly counterpart tracked separately** | 100 % of stale polls attributed by cache source (detail 7,224 / counts 474 / unknown 0) and 65 of 70 false-`saturated` polls attributed within a 600 s lookback, in `SUMMARY.md` and `saturated_without_live_work_attribution.csv`. The 05:00 nightly generator publishes no stale metric, so the nightly counterpart is owned by **LP-0MVRMHY0F007RWA0** (additive change under `.pi/skills/proxy-usage-analysis/**`, producer-authorised). |
+| AC4 numbers reported on LP-0MVKSXR4P001V0CM | **Met** | Comment `LP-C0MVVCR6FO008R0DG` on the fix item, plus the same numbers on LP-0MVSTQT8V002SPRZ. |
+| AC5 reproducible/validated | **Met** | `scripts/capacity_signal_verification.py` docstring derivation plus the commands above; the 24 h run reproduces every figure in the table. |
+| AC6 documentation reflects the post-fix findings | **Met** | This section; `proxy/README.md`'s measured-effect note. The nightly-report omission is the LP-0MVRMHY0F007RWA0 gap recorded under AC3. |
+| AC7 full suite green | **Met** | Changed-scope validation at `finish`, then the dev-push pre-push gate runs the full suite on the pushed commit. |
+
+Trend across the three measured windows, same tool and semantics: 79.61 %
+(router-serialised `/slots`, `56a3a28a`/`2d2b6b51`) → 53.92 % (+ child-port
+resolver `f58e8964`) → 29.59 % (same build, 24 h cycle). False `saturated`
+falls in step (2.12 % → 1.07 % → 0.27 % of polls), and no stale poll produced
+`saturated` in any window, so the cache-time reconciliation contract above
+still holds.
+
+## The 12-poll residual (2026-10-29 night, LP-0MVT2KW5A008X037)
+
+One further comparable night (2026-10-29 20:00 → 2026-10-30 07:00, the first
+window entirely inside the post-deploy uptime) took the false-saturation
+residual to **12 polls / 0.11 %** from the 247 / 2.12 % baseline — a 95.1 %
+reduction and not quite zero. Artifacts:
+`~/proxy-usage-reports/2026-10-29_night-post-deploy/` (`REPORT.md`,
+`saturated_without_live_work_attribution.csv`). Every remaining violation has
+**fresh** slot detail (`slots_detail_stale=false`), so none of them is a
+cache-reconciliation miss; the same tool and window length were used for both
+sides.
+
+| Episode (local) | Polls | Attribution | Release → poll gap |
+|---|---|---|---|
+| 2026-10-30 06:57:36 | 3 (inside one second) | none — nearest release `measured_cache_deficit`, 31 s earlier | 31 s |
+| 2026-10-30 06:01:20–21 | 2 | none | — |
+| 2026-10-29 20:19:25 | 1 | `session_evicted` | 295 s |
+| 2026-10-29 20:35:03 | 1 | `prefill_deadline` | 14 s |
+| 2026-10-29 23:36:23 | 2 | `no_progress_watchdog` | 182 s |
+| 2026-10-29 23:47:30–31 | 2 | `prefill_deadline` | 48 s |
+| 2026-10-30 01:43:11 | 1 | `session_evicted` | 520 s |
+
+That is 7 attributable and 5 unattributable polls, and they are **two shapes
+of the same annotation gap**, not a liveness defect:
+
+1. **Attributable but unmatched (7 polls).** An abandonment whose cancel
+   succeeded left a slot still `is_processing` while the registry carried no
+   entry the status builder could match — `local_abandoned_slots=0` on every
+   one of them. The recorded identity (or its endpoint label) did not line up
+   with the slot llama-server kept draining. Fixed by pinning the slot id at
+   admission, re-verifying it against the slot the backend reports, and
+   falling back to the endpoint-wide entry on a mismatch
+   (`slot_source=` / `abandoned_slot_mismatch` now make the answer readable
+   from the logs).
+2. **Unattributable (5 polls).** A release with no slot identity at all —
+   notably `measured_cache_deficit`, which used to pass neither a slot id nor
+   an upstream stream — so no entry could name the slot. Fixed by (a) every
+   release path recording either an exact identity or the endpoint-wide entry
+   (an abandonment is never silently dropped) and (b) the measurement tool
+   counting `measured_cache_deficit` as an abandonment reason.
+
+Both shapes are what the endpoint-wide entry plus the no-live-owner guard
+exist to close: the draining slot has no lease and no live dispatch record, so
+it is annotated `abandoned_scope="endpoint"`, and a pool occupied only by such
+ghosts reads `abandoned_busy` rather than `saturated`.
+
+Two observations on the residual table were **not claimed as causes** and were
+triaged by the follow-on item `LP-0MVUVHCAP004V0JI`; neither is fixed by this
+change:
+
+1. **`available_slots=1` alongside `saturated` (06:01:20 and 01:43:11).**
+   Reproduced. It is not one defect: the two fields measure different things,
+   and one of the two rows was counts-stale.
+   - *01:43:11*: fresh counts **and** fresh detail, and the shape is common —
+     626 of the 1,283 `saturated` polls in that window carried
+     `available_slots>0`.
+     The streaming dispatch finished at 01:43:10, its 30 s lease was renewed at
+     01:43:10.6, so the backend-freed slot was `idle_leased` (reserved, not
+     capacity for a newcomer) while the other slot was processing. On that
+     (pre-fix) build the freed slot also kept its abandonment annotation — the
+     pre-fix no-clear-on-free behaviour that clearing/TTL above now removes —
+     so `local_abandoned_slots` was non-zero. With the shipped fix the
+     unannotated processing slot is matched by the endpoint-wide entry and the
+     poll reads `abandoned_busy`; the `available_slots`/`capacity_hint` pairing
+     itself is documented behaviour and is pinned by
+     `test_available_slots_free_while_hint_saturated_for_leased_slot`.
+   - *06:01:20*: `slots_stale=true` with `slots_detail_stale=false`, i.e.
+     `slot_counts_stale=true` — the counts were served from the last-known
+     cache (89 of the 144 counts-stale polls that night reported
+     `available_slots>0`, 54 of them `saturated`) while the hint came from fresh
+     detail. The handler reconciles `available_slots` only when *detail* is
+     stale, never when *counts* are, so the pair can disagree. Disclosed by
+     `slot_counts_stale`; recorded as `discovered-from:LP-0MVUTYHG7001S6BM` and
+     not changed here.
+2. **`latency_ms=3355` with `slots_detail_stale=false` (06:57:36).**
+   **Not reproduced as a distinct defect.** `latency_ms` is the whole poll, not
+   the `/slots` detail budget: the handler issues up to three sequential bounded
+   queries (`query_llama_status` 1 s, counts 2 s, detail 1 s → 4 s envelope), so
+   3,355 ms is inside the envelope. That second also produced three concurrent
+   polls (3,355 / 856 / 26 ms) — the leader fetched and the two followers reused
+   the single-flight payload — and `slots_detail_stale=false` truthfully says the
+   detail query returned 200 within its own budget.
+
+The next measurement of this residual (a comparable night on the build that
+contains the endpoint-wide annotation) is a separate operational run; the
+history above is the baseline it is read against, with the widened
+`_ABANDON_REASONS` set noted as a discontinuity.
+
 

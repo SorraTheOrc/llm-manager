@@ -404,7 +404,7 @@ def test_snapshot_from_usage_parses_iso_z_and_offsets():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["rate_limited", "exceeded", "exhausted", "anything"])
+@pytest.mark.parametrize("status", ["provider_budget_exhausted", "exceeded", "exhausted", "anything"])
 async def test_non_ok_window_status_is_blocking(clock, status):
     """AC2b: any status other than ``ok`` is conservatively exhausted."""
     transport = _FakeTransport(

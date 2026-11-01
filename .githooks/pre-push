@@ -1,5 +1,5 @@
 #!/bin/sh
-# worklog:pre-push-hook:v3
+# worklog:pre-push-hook:v4
 # 1. Enforce branch naming policy: block pushes to protected branches.
 # 2. Context-budget regression gate (F6, SA-0MSLK7XNZ00366YY): fail the push
 #    when the startup context surface exceeds committed thresholds.
@@ -10,12 +10,20 @@
 #    at this dev-push integration gate — SA-0MVECQUGF0064U81). The runner is
 #    resolved repo-local first, then the global pi skill install, because this
 #    repo ships no repo-local skill/ tree.
+# 3a. Pushed-commit guard (LP-0MVSJUM3O003C0H9, v4): the gate only ever
+#    measures the tree it is about to push. Before the suite runs, the gated
+#    ref's `local_sha` is compared with the gate tree's HEAD and the tree is
+#    required to be clean, so a stale or dirty checkout can never produce a
+#    green gate that is evidence about a different tree. Refusals are loud,
+#    name the pushed commit, the checked-out HEAD, the tree path and the
+#    recovery step.
 # 4. Auto-sync Worklog data before pushing (committed hooks).
 #
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
 # Set CONTEXT_BUDGET_SKIP=1 to bypass the context-budget gate (not recommended).
-# Set TEST_SCOPE_SKIP=1 to bypass the full-suite gate (not recommended).
+# Set TEST_SCOPE_SKIP=1 to bypass the full-suite gate (and its pushed-commit
+# guard; not recommended).
 #
 # Installed (and verified) by scripts/install_git_hooks.sh; see
 # docs/dev/git-hooks.md.
@@ -77,12 +85,24 @@ fi
 #   <local_ref> <local_sha> <remote_ref> <remote_sha>
 # Read every line ONCE (stdin is consumed by the first reader) and capture the
 # push targets used by both the test gate and the worklog sync below.
+#
+# For the gated refs (dev/main) the pushed commit is retained too: the gate is
+# only evidence about the commit it actually pushes, so the sha is verified
+# against the tree that would be measured (see the pushed-commit guard below).
+# Deletion pushes carry the all-zero sha — no commit to verify — and are not
+# recorded.
 need_full_suite=0
 skip_worklog_sync=0
+gated_ref_shas=""
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "$remote_ref" ] || continue
   case "$remote_ref" in
-    refs/heads/dev|refs/heads/main) need_full_suite=1 ;;
+    refs/heads/dev|refs/heads/main)
+      need_full_suite=1
+      case "$local_sha" in
+        ''|*[!0]*) gated_ref_shas="$gated_ref_shas $remote_ref=$local_sha" ;;
+      esac
+      ;;
     refs/worklog/data) skip_worklog_sync=1 ;;
   esac
 done
@@ -133,6 +153,68 @@ mirror_suite_cache() {
 # runs are never full-suite evidence, so the gate always runs scope=full.
 if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+  # ── pushed-commit guard (fail closed) ─────────────────────────────────────
+  # A green run of the tree in $repo_root is only evidence about the pushed
+  # commit when that tree *is* the pushed commit: same HEAD, nothing
+  # uncommitted. Otherwise the runner would fingerprint (and cache) a
+  # different tree, and the push would report green without the pushed commit
+  # ever having been verified (LP-0MVSJUM3O003C0H9, v4).
+  if [ -n "$gated_ref_shas" ]; then
+    gate_head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)"
+    if [ -z "$repo_root" ] || [ -z "$gate_head" ]; then
+      echo "ERROR: pre-push gate cannot resolve the tree it would measure." >&2
+      echo "  git rev-parse --show-toplevel in $PWD returned no usable checkout." >&2
+      echo "  Push a dev/main ref from a checkout, or set TEST_SCOPE_SKIP=1 (not recommended)." >&2
+      exit 1
+    fi
+
+    for entry in $gated_ref_shas; do
+      pushed_ref="${entry%%=*}"
+      pushed_sha="${entry#*=}"
+      if [ "$pushed_sha" != "$gate_head" ]; then
+        {
+          echo "ERROR: pre-push gate refuses this push: the tree it would measure is not the pushed commit."
+          echo "  pushed commit  ($pushed_ref): $pushed_sha"
+          echo "  checked-out HEAD:            $gate_head"
+          echo "  gate tree:                   $repo_root"
+          echo "  A full-suite run here would verify a different tree, so the push is refused"
+          echo "  before the suite runs."
+          echo "  Recovery: bring the main checkout to the pushed commit and re-run"
+          echo "            'implement.py finish' (steps 5-6 fast-forward it for exactly this"
+          echo "            reason), or verify the commit in a worktree that is checked out at"
+          echo "            $pushed_sha and push from there."
+          echo "  Escape hatch (explicit, not recommended): TEST_SCOPE_SKIP=1 or git push --no-verify."
+        } >&2
+        exit 1
+      fi
+    done
+
+    # Same commit, but a dirty tree can never carry the pushed commit's clean
+    # fingerprint: the cached green entry keyed to that dirty state would not
+    # be evidence about the pushed commit. .worklog/ is gitignored in this
+    # repo, so worklog churn does not trip this check.
+    dirty_status="$(git -C "$repo_root" status --porcelain 2>/dev/null || true)"
+    if [ -n "$dirty_status" ]; then
+      dirty_count="$(printf '%s\n' "$dirty_status" | wc -l | tr -d ' ')"
+      {
+        echo "ERROR: pre-push gate refuses this push: the gate tree is dirty at the pushed commit."
+        echo "  pushed commit: $gate_head"
+        echo "  gate tree:     $repo_root"
+        echo "  $dirty_count path(s) uncommitted, first 10:"
+        printf '%s\n' "$dirty_status" | sed -n '1,10p' | sed 's/^/    /'
+        echo "  A full-suite run here fingerprints the dirty state, so a green result"
+        echo "  would not be evidence about the pushed commit; the push is refused"
+        echo "  before the suite runs."
+        echo "  Recovery: stash or commit the changes in the main checkout (never discard"
+        echo "            someone else's work), then re-run 'implement.py finish', or verify"
+        echo "            the commit in a clean worktree checked out at $gate_head and push from there."
+        echo "  Escape hatch (explicit, not recommended): TEST_SCOPE_SKIP=1 or git push --no-verify."
+      } >&2
+      exit 1
+    fi
+  fi
+
   runner=""
   if [ -n "$repo_root" ] && [ -f "$repo_root/skill/test/scripts/run_tests.py" ]; then
     runner="$repo_root/skill/test/scripts/run_tests.py"

@@ -202,7 +202,7 @@ class TestCitationsStillResolve:
     #: (relative path, 1-based line, needle that must be present on that line)
     CITATIONS: tuple[tuple[str, int, str], ...] = (
         # 1 — pool size exported as --parallel
-        ("proxy/config.yaml", 1680, "session_slot_pool_size: 2"),
+        ("proxy/config.yaml", 1753, "session_slot_pool_size: 2"),
         ("proxy/proxy/lifecycle.py", 1604, "LLAMA_PARALLEL"),
         ("start-llama.sh", 239, "LLAMA_PARALLEL:=1"),
         ("start-llama.sh", 252, "--parallel"),
@@ -210,38 +210,38 @@ class TestCitationsStillResolve:
         ("start-llama.sh", 511, "-np"),
         ("start-llama.sh", 514, "--parallel"),
         # 2/3 — per-slot context + routing clamp
-        ("proxy/proxy/provider.py", 1779, "_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096"),
-        ("proxy/proxy/provider.py", 1788, "def effective_per_slot_threshold"),
-        ("proxy/proxy/provider.py", 1900, "def _effective_large_context_thresholds"),
-        ("proxy/proxy/provider.py", 1943, "effective_per_slot_threshold"),
-        ("proxy/proxy/provider.py", 2107, "effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 1881, "_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096"),
+        ("proxy/proxy/provider.py", 1890, "def effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 2002, "def _effective_large_context_thresholds"),
+        ("proxy/proxy/provider.py", 2045, "effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 2209, "effective_per_slot_threshold"),
         # 4 — persistence cap derived from the same clamp
-        ("proxy/proxy/provider.py", 2064, "def compute_hard_routing_cap"),
-        ("proxy/proxy/session.py", 1229, "effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 2166, "def compute_hard_routing_cap"),
+        ("proxy/proxy/session.py", 1305, "effective_per_slot_threshold"),
         # 5 — dispatch-lease cap
         ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
-        ("proxy/proxy/router.py", 1397, "_try_acquire_local_dispatch"),
-        ("proxy/proxy/router_helpers.py", 3263, "async def _try_acquire_local_dispatch"),
-        ("proxy/proxy/provider.py", 6127, "session_slot_pool_size"),
+        ("proxy/proxy/router.py", 1519, "_try_acquire_local_dispatch"),
+        ("proxy/proxy/router_helpers.py", 3915, "async def _try_acquire_local_dispatch"),
+        ("proxy/proxy/provider.py", 6464, "session_slot_pool_size"),
         # 6 — slot-ID space
-        ("proxy/proxy/session.py", 1000, "def _slot_id_for_session"),
+        ("proxy/proxy/session.py", 1062, "def _slot_id_for_session"),
         # 7 — persistence on/off gate + eviction planner
         ("proxy/proxy/session.py", 488, "def _slot_persistence_enabled"),
-        ("proxy/proxy/session.py", 1185, "session_slot_pool_size"),
+        ("proxy/proxy/session.py", 1261, "session_slot_pool_size"),
         ("proxy/proxy/session.py", 848, "def plan_eviction_snapshot"),
         # 8 — tenancy default
-        ("proxy/proxy/router_helpers.py", 2929, "def _default_tenants"),
+        ("proxy/proxy/router_helpers.py", 3566, "def _default_tenants"),
         ("proxy/config.yaml", 1373, "session_slot_pool_size"),
         ("proxy/config.yaml", 1381, "local_session_tenants: 2"),
         # 9 — capacity admission + status fail-open
         ("proxy/proxy/capacity_admission.py", 124, "def _slots"),
-        ("proxy/proxy/handlers.py", 426, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 656, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 702, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 829, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 442, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 714, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 760, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 890, "session_slot_pool_size"),
         # geometry-independent retention + per-session snapshot filenames
-        ("proxy/proxy/session.py", 1126, "def _slot_filename_for_session"),
-        ("proxy/proxy/session.py", 1128, "slot_{safe_id}.bin"),
+        ("proxy/proxy/session.py", 1202, "def _slot_filename_for_session"),
+        ("proxy/proxy/session.py", 1204, "slot_{safe_id}.bin"),
         ("scripts/cleanup-slot-cache.sh", 27, "MAX_AGE_DAYS=7"),
         ("scripts/cleanup-slot-cache.sh", 28, "MAX_SIZE_GB=20"),
         # persistence suppression gates named in the bake-off metrics

@@ -16,6 +16,17 @@ Extended by LP-0MVP7525P008RXMF (child-port discovery observability):
   be discovered (the previously silent regression that made the rank-1
   direct-polling fix inert).
 
+Extended by LP-0MVT1O0VG00905EL (slot occupancy, parent LP-0MVNWUEY8008XM6W):
+- llama_slots_total (gauge) — slots reported by the last successful sample
+- llama_slots_busy (gauge) — slots with ``is_processing`` true
+- llama_slot_busy{slot="<id>"} (gauge, 1 = processing) — per-slot state
+- llama_slots_in_flight_tasks (gauge) — slots processing a task that has an
+  assigned ``id_task`` (falls back to the ``is_processing`` count on builds that
+  publish no ``id_task``)
+- llama_slots_sample_timestamp_seconds (gauge) — heartbeat, so the *age* of the
+  last successful sample is queryable and a stalled sampler is not mistaken for
+  idle slots
+
 Extended by LP-0MVF7KQED005TG9Z (quota observability surface):
 - quota_rolling_percent{account,entry} (gauge)
 - quota_weekly_percent{account,entry} (gauge)
@@ -82,6 +93,16 @@ llama_slots_query_failures_total = None
 # hidden by `except Exception: pass` (weeks of silent router 500s) now surfaces
 # as an alert/trend instead.
 llama_slots_child_port_fallbacks_total = None
+# Slot occupancy (LP-0MVT1O0VG00905EL). Power/VRAM/GTT already reach Prometheus
+# through node_exporter, but nothing published llama-server *workload*, so "the
+# GPU drew 115 W" could not be attributed to llama-server. These gauges carry
+# the workload half; the per-slot label set is cleaned up on every publish so a
+# restarted backend leaves no ghost ``slot=`` series.
+llama_slots_total = None
+llama_slots_busy = None
+llama_slot_busy = None
+llama_slots_in_flight_tasks = None
+llama_slots_sample_timestamp_seconds = None
 # Remote-stream watchdog terminations (LP-0MSVP7ZML003XZTJ): a remote
 # stream terminated by the max-duration or activity-timeout watchdog (a
 # "connected but idle" upstream that never goes silent). Counts by reason
@@ -165,6 +186,38 @@ if _enabled:
             'Proxy /slots queries falling back to the router port because no '
             'model child port could be discovered, by reason',
             ['reason'],
+        )
+        # Slot occupancy (LP-0MVT1O0VG00905EL). Deliberately no ``slot=`` label
+        # on the aggregate gauges: one series each keeps the cardinality flat
+        # while the per-slot state stays available on llama_slot_busy.
+        llama_slots_total = Gauge(
+            'llama_slots_total',
+            'llama-server slots reported by the last successful /slots sample',
+        )
+        llama_slots_busy = Gauge(
+            'llama_slots_busy',
+            'llama-server slots processing a task in the last successful /slots '
+            'sample',
+        )
+        llama_slot_busy = Gauge(
+            'llama_slot_busy',
+            'Per-slot busy state from the last successful /slots sample '
+            '(1 = processing a task)',
+            ['slot'],
+        )
+        llama_slots_in_flight_tasks = Gauge(
+            'llama_slots_in_flight_tasks',
+            'llama-server slots processing a task with an assigned id in the last '
+            'successful /slots sample (count of is_processing AND id_task >= 0 '
+            'when the build publishes id_task, else the count of is_processing '
+            'slots — an idle slot keeps the previous task id, so a bare '
+            'id_task >= 0 test overstates in-flight work)',
+        )
+        llama_slots_sample_timestamp_seconds = Gauge(
+            'llama_slots_sample_timestamp_seconds',
+            'Unix timestamp of the last *successful* /slots occupancy sample '
+            '(its age makes a stalled sampler visible; a failed query does not '
+            'advance it)',
         )
         llama_remote_stream_terminated_total = Counter(
             'llama_remote_stream_terminated_total',
@@ -379,6 +432,182 @@ def record_slots_child_port_fallback(reason: str):
         llama_slots_child_port_fallbacks_total.labels(reason=reason).inc()
     except Exception:
         pass
+
+
+#: Per-slot label values currently published on ``llama_slot_busy``.
+#:
+#: A Prometheus labelled gauge keeps a child series for every label value it has
+#: ever been given, so a llama-server restart that drops a slot would leave a
+#: ghost ``slot="3"`` reporting its final value forever. Tracking the published
+#: values lets :func:`record_slot_occupancy` remove the ones that disappeared.
+_slot_busy_labelvalues: set[str] = set()
+
+
+def summarise_slot_occupancy(payload: list, *, sampled_at: float) -> dict:
+    """Derive the slot-occupancy snapshot from one ``/slots`` payload.
+
+    Args:
+        payload: The parsed ``/slots`` list — one entry per slot, as returned by
+            the coalesced fetch path (``observability._fetch_slots_payload``).
+            **Must** be a list: a non-list body is a caller bug (usually a
+            failure that was not classified as one), and turning it into
+            "zero slots" is exactly the trap this metric exists to avoid.
+        sampled_at: Unix timestamp of the successful sample, published verbatim
+            as ``llama_slots_sample_timestamp_seconds``.
+
+    Returns:
+        ``{"total_slots": int, "busy_slots": int, "in_flight_tasks": int,
+        "slots": [{"slot_id": int, "busy": bool}], "sampled_at": float}``.
+
+    ``busy_slots`` counts ``is_processing`` entries. ``in_flight_tasks`` counts
+    entries that are *both* processing and report an assigned task
+    (``is_processing`` **and** ``id_task >= 0``); when the build publishes no
+    ``id_task`` at all it falls back to the ``is_processing`` count, which is the
+    only per-slot liveness signal such a build exposes.
+
+    The conjunction is not pedantry — it was measured on this host (2026-10-31):
+    the deployed llama.cpp build **does** publish ``id_task`` for the Qwen3 child,
+    but an *idle* slot keeps the id of the last task it ran (observed slot 1 with
+    ``is_processing: false, id_task: 20026`` next to a processing slot with
+    ``id_task: 24207``). Counting ``id_task >= 0`` alone therefore reported two
+    in-flight tasks while only one slot was working. The sentinel
+    ``id_task: -1`` and any idle slot are excluded either way.
+
+    Raises:
+        TypeError: when *payload* is not a list.
+    """
+    if not isinstance(payload, list):
+        raise TypeError(
+            f"slot occupancy needs a /slots list payload, got {type(payload).__name__}"
+        )
+
+    slots: list[dict] = []
+    busy_slots = 0
+    in_flight = 0
+    publishes_id_task = any(
+        isinstance(entry, dict) and "id_task" in entry for entry in payload
+    )
+    for index, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            continue
+        busy = bool(entry.get("is_processing", False))
+        slots.append({"slot_id": entry.get("id", index), "busy": busy})
+        if busy:
+            busy_slots += 1
+        if publishes_id_task:
+            id_task = entry.get("id_task")
+            if busy and isinstance(id_task, int) and id_task >= 0:
+                in_flight += 1
+        elif busy:
+            in_flight += 1
+
+    return {
+        "total_slots": len(slots),
+        "busy_slots": busy_slots,
+        "in_flight_tasks": in_flight,
+        "slots": slots,
+        "sampled_at": float(sampled_at),
+    }
+
+
+def record_slot_occupancy(snapshot: dict | None) -> bool:
+    """Publish one slot-occupancy snapshot onto the Prometheus gauges.
+
+    Args:
+        snapshot: A :func:`summarise_slot_occupancy` result, or ``None`` when
+            the sample failed (``/slots`` error, timeout, unparseable body).
+
+    Returns:
+        ``True`` when the snapshot was published, ``False`` when nothing was
+        written (``None`` snapshot, metrics disabled, or the client library is
+        absent).
+
+    **A failed sample writes no gauge at all.** That is the core requirement
+    (LP-0MVT1O0VG00905EL): reporting ``llama_slots_busy 0`` for a query that
+    never answered would look exactly like an idle GPU, so on failure every
+    series keeps its previous value — including the heartbeat
+    ``llama_slots_sample_timestamp_seconds``, whose age is what makes the gap
+    queryable. The failure itself stays visible through
+    ``llama_slots_query_failures_total{reason=...}``, which the sampler
+    increments before it calls this function.
+
+    Per-slot series for slots absent from the new snapshot are removed, so a
+    restarted llama-server cannot leave ghost ``slot=`` label values behind.
+
+    Best-effort and never raises: a metrics failure must not break the sampler.
+    """
+    if not _enabled or not isinstance(snapshot, dict):
+        return False
+    gauges = (
+        llama_slots_total,
+        llama_slots_busy,
+        llama_slot_busy,
+        llama_slots_in_flight_tasks,
+        llama_slots_sample_timestamp_seconds,
+    )
+    if any(gauge is None for gauge in gauges):
+        return False
+    try:
+        llama_slots_total.set(int(snapshot.get("total_slots") or 0))
+        llama_slots_busy.set(int(snapshot.get("busy_slots") or 0))
+        llama_slots_in_flight_tasks.set(int(snapshot.get("in_flight_tasks") or 0))
+        llama_slots_sample_timestamp_seconds.set(
+            float(snapshot.get("sampled_at") or 0.0)
+        )
+
+        current: set[str] = set()
+        for slot in snapshot.get("slots") or []:
+            if not isinstance(slot, dict):
+                continue
+            label = str(slot.get("slot_id"))
+            current.add(label)
+            llama_slot_busy.labels(slot=label).set(1.0 if slot.get("busy") else 0.0)
+
+        for stale in _slot_busy_labelvalues - current:
+            try:
+                llama_slot_busy.remove(stale)
+            except Exception:
+                # Already gone (or never registered) — nothing to clean up.
+                pass
+        _slot_busy_labelvalues.clear()
+        _slot_busy_labelvalues.update(current)
+        return True
+    except Exception:
+        # Best-effort: never propagate metric errors into the sampler.
+        return False
+
+
+def reset_slot_occupancy_gauges() -> None:
+    """Clear the slot-occupancy gauges and their per-slot label tracking.
+
+    The published label set is process-global, so a test that publishes slots
+    0..3 would otherwise look like a slot disappearance to the next case.
+    Mirrors ``observability.reset_slots_poll_cache()``; nothing in production
+    calls it — the proxy only ever publishes forward for its lifetime.
+    """
+    global _slot_busy_labelvalues
+    tracked = _slot_busy_labelvalues
+    _slot_busy_labelvalues = set()
+    if not _enabled:
+        return
+    if llama_slot_busy is not None:
+        for label in tracked:
+            try:
+                llama_slot_busy.remove(label)
+            except Exception:
+                pass
+    for gauge in (
+        llama_slots_total,
+        llama_slots_busy,
+        llama_slots_in_flight_tasks,
+        llama_slots_sample_timestamp_seconds,
+    ):
+        if gauge is None:
+            continue
+        try:
+            gauge.set(0.0)
+        except Exception:
+            pass
 
 
 def record_remote_stream_terminated(reason: str):

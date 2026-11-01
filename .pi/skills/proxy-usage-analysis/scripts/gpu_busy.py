@@ -19,14 +19,21 @@ evaluated at ``evaluation_interval = 15 s``.  The 15 s cadence is
 comfortably finer than the workload timescales (median decode 2.4 s, worst
 prefill 108 s), so sub-15-second sampling adds no value.
 
-Why this is more accurate than the log-derived busy figure
-----------------------------------------------------------
-The report's log-based ``BusyStats`` measures *slot occupancy* from proxy
-events (``dispatch → finish``), which includes time queued and excludes any
-GPU work the proxy did not log.  The power-based fraction here measures when
-the *hardware* actually drew compute-level power, from the 15 s hwmon series,
-so it is independent of proxy logging gaps and of how the proxy accounts for
-its own slots.
+What this measures — and what it is not
+---------------------------------------
+The decision figure for local model utilisation is the report's log-based
+``local_busy`` (``BusyStats``, ``dispatch → finish``): it measures *slot
+occupancy* from proxy events, i.e. the work the proxy actually served. This
+module measures something different — when the *hardware* actually drew
+compute-level power, from the 15 s hwmon series — independent of proxy
+logging gaps and of how the proxy accounts for its own slots.
+
+That makes this **supplementary hardware telemetry, not a local-utilisation
+signal**: it counts GPU work outside the proxy's slot accounting (other
+workloads, non-local requests) and misses proxy-served work during log gaps,
+so it can read far higher or lower than ``local_busy``. Use it for hardware
+questions — was the GPU computing at all? what did it draw? — never as the
+local busy figure.
 """
 
 from __future__ import annotations
@@ -50,8 +57,9 @@ class GpuBusyResult:
     The ``computing_fraction`` is ``avg_over_time(gpu:computing:bool[Nh])`` —
     the fraction of the window during which the GPU drew ≥ 90 W (the
     recording-rule threshold that matches the proxy's wedge detector).
-    It is the authoritative hardware-side busy measure, complementing the
-    log-based ``BusyStats`` that measures slot occupancy from proxy logs.
+    This is supplementary hardware telemetry, **not** a local-utilisation
+    signal: decisions use the log-derived ``local_busy`` (``dispatch →
+    finish``) slot occupancy, of which this is a hardware-side complement.
 
     ``smoothed_power_values`` carries the ``gpu:power_watts:avg5m`` trace
     (1-min samples, derived from the 15-s raw series via a 5-min rolling

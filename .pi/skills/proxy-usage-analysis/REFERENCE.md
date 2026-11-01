@@ -5,6 +5,14 @@ inputs, report outputs, the report interpretation guide, and known
 limitations. The skill itself is a thin, CLI-focused wrapper — see
 [SKILL.md](SKILL.md) for invocation, options, and the daily cron.
 
+> **Slot geometry.** The report's slot figures follow the live
+> `server.session_slot_pool_size` (shipped value 2; there is no fixed 2-slot
+> assumption anywhere in the analysis). What changes — and what does not —
+> when that value goes to 1 is analysed in
+> [`docs/dev/single-slot-impact.md`](../../../docs/dev/single-slot-impact.md)
+> (LP-0MVTF26NP003KXKJ), which includes this report's own metric catalogue in
+> its inventory (§3.5) and its metrics-gap list (§6).
+
 ## Inputs
 
 - Log source (read-only): `/var/log/llama-proxy/proxy.log` plus rotated
@@ -91,10 +99,25 @@ Outputs written to:
   with `reason`, `context_at_fallback` and `context_at_fallback_source`…}],
   "notes": {"sessions_with_fallback": N,
   "declined_before_local_turn": N, "context_fallback_sessions": N,
-  "context_fallback_before_local_turn": N, "rate_limited_sessions": N}}`.
+  "context_fallback_before_local_turn": N, "provider_budget_exhausted_sessions": N}}`.
   A `% local turns` of 100 means the session never used remote; a null
   `context_at_fallback` means the logs carried no token evidence (the report
   renders `n/a`, never an estimate).
+- `--json` summary field `engine_cross_check` — the engine cross-check
+  (LP-0MVNWULLI006ZYXX): proxy-inferred phase slot-time vs llama-server's own
+  summed per-task eval durations. `{"unit": "slot-seconds",
+  "engine_metric": "sum of per-task eval durations (slot-seconds, not
+  wall-clock)", "metric_caveat": str, "interpretation": str,
+  "window_approximation": str, "threshold_pct": f,
+  "threshold_enabled": bool, "status": "ok"|"partial"|"unavailable",
+  "prefill": {"phase", "proxy_slot_seconds", "proxy_samples",
+  "proxy_streams", "engine_seconds", "engine_samples", "delta_seconds",
+  "delta_pct", "available", "reason", "divergent"}, "decode": {…same…},
+  "available_phases": [phase], "divergent_phases": [phase],
+  "engine_unavailable_reasons": [str]}`. `delta` is proxy − engine and
+  `delta_pct` is of the engine figure; an unavailable phase carries `null`
+  deltas plus a named `reason` — never `0`/`100`. Additive: every pre-existing
+  key is unchanged.
 - `--json` summary field `provider_context_skips` — provider context-ceiling
   skips (LP-0MVMBM1Y3001TPRT): `{"total": N, "share_of_skips": f,
   "standard": N, "low": N, "by_provider": {provider: count},
@@ -172,17 +195,87 @@ Outputs written to:
     (`matches_reality` / `does_not_match_reality` / `inconclusive`: the signal
     does not match when ≥50% of attributed denials fired with the pool measured
     idle).
-  - `prefill_eta_error` — M3: predicted `prefill_eta_seconds` (from
-    `status_request` polls) vs observed llama-server `prompt eval time`
-    durations, quantile-matched: `predicted` / `observed` (`samples`, `p50`,
-    `p90`), `error_p50` / `error_p90` (predicted − observed, seconds),
-    `relative_error_p50_pct` / `relative_error_p90_pct`, `tolerance_pct` (25)
-    and `verdict` (`matches_reality` within tolerance, `over_predicts` /
-    `under_predicts`, `inconclusive` when either side has no samples).
+  - `prefill_eta_error` — M3: two comparisons, because a cache-cold bound and
+    a per-request estimate answer different questions
+    (LP-0MVSD5RJW008F1IB). The pre-existing keys keep their names and shapes
+    for trend continuity; `comparison` (`bound_vs_served_remainder`) states
+    which comparison `verdict` describes.
+    - **bound vs served remainder** — predicted `prefill_eta_seconds` (from
+      `status_request` polls) vs observed llama-server `prompt eval time`
+      durations, quantile-matched: `predicted` / `observed` (`samples`, `p50`,
+      `p90`), `error_p50` / `error_p90` (predicted − observed, seconds),
+      `relative_error_p50_pct` / `relative_error_p90_pct`, `tolerance_pct`
+      (25, reported for continuity but **not** applied to this comparison),
+      `bound` (`verdict`, `holds`, `predicted_p50`, `observed_p90`,
+      `observed_samples`, `min_samples` 30, `margin_seconds`) and `verdict` =
+      `bound_holds` when the served p90 ≤ the published p50, `bound_violated`
+      otherwise, `inconclusive` below 30 observed dispatches. The old
+      two-sided `over_predicts` / `under_predicts` wording is **gone** for this
+      comparison: a cross-population comparison cannot score calibration.
+    - **matched per-dispatch accuracy** — `matched`: predicted = the ETA the
+      admission guard priced for that dispatch (`eta_prefill_s`), observed =
+      the same dispatch's `dispatch_to_first_byte_ms`, joined on `session=`.
+      Entries: `pairs`, `dispatches`, `unmatched_dispatches`,
+      `admitted_pairs` / `observe_pairs` (mutually exclusive: an ordinary
+      admitted dispatch, or an observe-policy would-be refusal — note the
+      log's `enforced` token means "the refusal was applied", so `policy=`
+      decides the split), `enforced_refusals` (guard records dropped because
+      the refusal really fired: that request never dispatched, so it cannot be
+      the owner of a first byte), `predicted_p50` / `predicted_p90`,
+      `observed_p50` / `observed_p90`, `relative_error_p50_pct` /
+      `relative_error_p90_pct` (percentiles of the per-pair relative error),
+      `tolerance_pct` (25) and `verdict` (`matches_reality` within tolerance,
+      `over_predicts` / `under_predicts`, `inconclusive` with no pairs). Only
+      matched pairs are scored; a dispatch whose guard logged no priced ETA
+      (inert/uncalibrated, or an inactive observe-mode decision) is counted as
+      unmatched and never folded in.
   - `status_capacity_hint` — the same `capacity_hint` distribution as a
     top-level key (`{idle: n, prefill_bound: n, saturated: n}`), so
     `jq .status_capacity_hint` answers "what did the payload claim while the
     denials happened?" without parsing Markdown.
+- **Local capacity signals key (LP-0MVU8O4EL005IYP9).** One additive key
+  mirrors the **Local capacity signals** section, so automation reads exactly
+  what the Markdown shows. The pre-existing count-only keys are **unchanged**
+  by it: `status_capacity_hint` (the payload's own claim over the denial
+  window) and `denial_attribution.capacity_hint` keep their current meaning,
+  and the new block below is an addition beside them, not a replacement.
+  - `capacity_signals.slots_stale` — `{status_polls, count, denominator, rate,
+    target, passed}`: the status-poll count, the polls with
+    `slots_stale=true`, the denominator (polls that carry the `slots_stale`
+    field — schema-1 polls are excluded, never counted as fresh), the rate,
+    the configured target (`--stale-rate-target`, default `0.05`) and the
+    strict `rate < target` verdict. `passed` is `null` when the window has no
+    status polls: the Markdown section is omitted then, so a consumer must not
+    read a silent `true` as an all-clear. The derivation and the target check
+    are shared with `scripts/capacity_signal_verification.py`
+    (`scripts/lib/capacity_signals.py`), and status polls use the reference
+    tool's half-open `[window_start, window_end)` window while every other
+    section keeps its historical closed interval.
+  - `capacity_signals.capacity_hint` (LP-0MVU8O9OC005YQU1) — `{status_polls,
+    counts, shares}`: the `capacity_hint` histogram over status polls and each
+    token's share of them. Every token keeps its own row — a new claim name, a
+    case variant or `unknown` for an unreadable value is never dropped or
+    re-bucketed — so a vocabulary change is visible in the JSON the night it
+    lands.
+  - `capacity_signals.saturated_without_live_work` (LP-0MVU8O9OC005YQU1) —
+    `{saturated, count, rate_of_polls, rate_of_saturated}`: the
+    `capacity_hint=saturated` polls that report no live local work
+    (`local_in_flight_requests > 0` authoritative at schema 3, else the
+    `local_active_query` / `active_query` fallback), with its share of all
+    polls and of `saturated` polls. The rule and the tallies are the shared
+    `scripts/lib/capacity_signals.py` implementation, so this key and
+    `scripts/capacity_signal_verification.py` publish identical figures.
+  - `capacity_signals.targets` / `capacity_signals.all_targets_met` — one
+    entry per capacity target (`name`, `target`, `observed`, `passed`), the
+    list the section's one-line verdict names, and the aggregate outcome
+    (`null` when the window has no status polls, matching
+    `slots_stale.passed`).
+  - `capacity_signals.coverage` (LP-0MVU8O9OC005YQU1) — `{covered,
+    window_start_gap_seconds, window_end_gap_seconds, max_gap_seconds}`: the
+    span of the observed polls against the report window. When the retained
+    logs do not reach both edges (1 h tolerance) the section labels the
+    figures a **partial** measurement instead of letting a truncated
+    retention window read as a complete night.
 - **Contended-pricing split keys (LP-0MVS9YKHL007UBBZ, parent
   LP-0MVS8T6F4006DGG3).** Two additive keys split the same
   `local_admission_reject` / `local_admission_admit` verdicts, so a regression
@@ -216,8 +309,8 @@ Outputs written to:
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
   columns), a **Total tokens** section (Input / Output / Total counts and
-  % share, with fast/cheap and by-model breakdowns; see [Total tokens](#total-tokens)
-  below), fallback-reason and routing-skip breakdowns, a **Provider context
+  % share, with fast/cheap and by-model breakdowns; see [Total
+  tokens](#interpreting-the-report) below), fallback-reason and routing-skip breakdowns, a **Provider context
   skips** section (`routing_skip_provider_context` events rendered only when
   the window has them: count, % of all skip events, Standard/Low split,
   provider/type breakdown and the `limit` ceiling each provider hit, plus the
@@ -280,10 +373,27 @@ Outputs written to:
   window has a denial or status poll): M1 per-hour denial attribution by
   derived pool state plus the guard-reason and `capacity_hint` splits; M2 the
   window's denials-per-hour and busy fraction compared with the pre-change
-  baseline (2,641 denials / 24 h at 29.3% busy); M3 predicted-vs-observed
-  prefill duration at p50/p90 with the signed and relative error; and one
-  explicit matches/does-not-match-reality verdict for the denial signal and
-  one for the prefill ETA), then
+  baseline (2,641 denials / 24 h at 29.3% busy); M3 the quantile-matched
+  *bound vs served remainder* comparison at p50/p90 with the one-sided
+  `bound_holds` / `bound_violated` verdict, and M3b the *matched per-dispatch*
+  accuracy (guard ETA → that dispatch's first byte); and one explicit
+  matches/does-not-match-reality verdict for the denial signal and one for the
+  cache-cold bound), then
+  **Local capacity signals** (LP-0MVU8O4EL005IYP9, omitted when the window has
+  no status polls): the `slots_stale` stale-poll rate for the window — status
+  polls, polls with `slots_stale=true`, the schema-aware denominator, the rate,
+  the configurable target (`--stale-rate-target`, default < 5 %) and an
+  explicit met/unmet outcome, with the excluded schema-1 poll count stated —
+  plus (LP-0MVU8O9OC005YQU1) the `capacity_hint` distribution with counts and
+  shares (an unexpected token keeps its own row), the
+  `saturated`-without-live-work count with its share of polls and of
+  `saturated` polls, a one-line verdict naming each missed target, and the
+  retained-log coverage caveat that labels a truncated window **partial** —
+  derived by the same implementation as
+  `scripts/capacity_signal_verification.py` and exposed as
+  `--json`'s `capacity_signals` block (`slots_stale`, `capacity_hint`,
+  `saturated_without_live_work`, `targets`, `coverage`,
+  `all_targets_met`), then
   **Admission verdicts by rate bucket and prompt band** (LP-0MVS9YKHL007UBBZ,
   when the window has any `local_admission_guard` decision): the admit/reject
   verdicts split by the pricing `rate_bucket` (`contended` / `solitary` /
@@ -294,6 +404,16 @@ Outputs written to:
   vs decode first byte → finish, each as slot-seconds and % of combined phase
   slot time summing to 100%, with p10/p50/p90/max per phase and unknown-stream
   counts; the `--json` summary exposes it as `local_busy.prefill_vs_decode`),
+  **Engine cross-check** (LP-0MVNWULLI006ZYXX: the proxy-inferred prefill /
+  decode slot-seconds compared against llama-server's own summed per-task eval
+  durations — `prompt eval time` and `eval time` — with the absolute delta and
+  the delta as a percentage of the engine figure, the explicit slot-seconds
+  (not wall-clock, not comparable with `busy_seconds`) caveat, the window
+  boundedness caveat, and an `Unavailable — <phase>: <reason>` note when the
+  engine or proxy samples are missing; a phase above
+  `local_engine_cross_check_threshold_pct` raises a warning recommendation and
+  the `--json` summary exposes it as the additive top-level
+  `engine_cross_check` key),
   **Time to first
   token** (p10 / median / p90 of dispatch → first-token latency, split into
   **Total / Fast / Cheap** rows using the same three-tier fast/cheap bucketing
@@ -529,7 +649,7 @@ entry is a local runtime edit, not a committed artifact.
    - `limit=` / `remaining=` / `waited=` are the budget snapshot
      (`provider_budget.BudgetDecision`: `limit_rpm`, `remaining`,
      `waited_seconds`) and are emitted **only** when the reason is
-     budget-driven (`rate_limited*`). The decision itself is unchanged.
+     budget-driven (`provider_budget_exhausted*`). The decision itself is unchanged.
    - All evidence fields trail `reason=`, so pre-change rotated logs (no
      evidence fields) still parse: every evidence field degrades to `None`.
      Consumers that anchored `reason=` to end-of-line were updated in the same
@@ -657,6 +777,23 @@ entry is a local runtime edit, not a committed artifact.
    unattributed blank (a window with no local traffic prints a named "no
    local traffic" reason). The same split is in the JSON summary at
    `local_busy.prefill_vs_decode`.
+   **Engine cross-check** (LP-0MVNWULLI006ZYXX) validates that split against the
+   engine's own accounting: `SpeedStats.engine_seconds` sums the
+   Qwen3-attributed, in-window `prompt eval time` / `eval time` durations
+   (produced inside the same attribution loop as the speed percentiles, so the
+   port rules are inherited verbatim) and the `## Engine cross-check` section
+   compares them with `PrefillStats.total_seconds` / `DecodeStats.total_seconds`
+   — absolute delta and percentage of the engine figure. Both sides are
+   **sums of per-task durations (slot-seconds)**, never wall-clock, so neither
+   is comparable with `BusyStats.busy_seconds` / `busy_pct` (a merged union)
+   and no arithmetic mixes them. A phase with no engine samples (or no proxy
+   samples) renders an explicit `Unavailable — <phase>: <reason>` note reusing
+   the parser's named diagnostics, with `null` deltas in JSON — never a
+   fabricated `0` or `100 %`. A phase whose absolute percentage delta exceeds
+   `local_engine_cross_check_threshold_pct` (default 25 %, `0` disables) raises
+   a warning recommendation (`medium`, `high` at twice the threshold). The
+   JSON summary carries the whole comparison under the additive top-level
+   `engine_cross_check` key.
 5. **Fast/cheap bucketing** — a session is bucketed by the **profile active
    at its first in-window stream**, from three sources in precedence order
    (LP-0MVKSXXIR006OBI2):
@@ -675,6 +812,10 @@ entry is a local runtime edit, not a committed artifact.
       config profile (`config-fast.yaml`: 3 slots @ 131072; `config-cheap.yaml`:
       2 slots @ 262144) — the CSV `slots`/`ctx_size` columns and the report's
       per-slot context figures reflect the profile that was actually active.
+      These are ARCHIVED windows: the per-mode profiles are retired
+      (LP-0MVDT94F0003VHUA), so current windows use the single
+      `session_slot_pool_size` value instead, and a single-slot deployment
+      would report 1 slot rather than 2 — the report has no fixed slot count.
       This source **wins** whenever the logs carry the evidence, so archived
       windows keep their historical attribution.
    2. **Priority window** (the current deployment) — the fast/cheap mode
@@ -783,7 +924,13 @@ entry is a local runtime edit, not a committed artifact.
    `eval_lines_total`, `eval_lines_matched`, `file_diagnostics`, and
    `empty_window_reasons` when the window is empty). The per-session CSV
    `decode_tok_s` column is derived from proxy.log instead (local completion
-   tokens ÷ local active span) and stays empty when not derivable.
+   tokens ÷ local active span) and stays empty when not derivable. The same
+   attribution loop also sums the per-kind **engine seconds**
+   (`SpeedStats.engine_seconds`, from `prompt_eval_seconds` /
+   `decode_seconds`) for the `## Engine cross-check` section
+   (LP-0MVNWULLI006ZYXX) — the engine's own per-task duration totals, summed
+   (never wall-clock) and therefore comparable with the proxy's phase
+   slot-seconds but not with `busy_seconds`.
 
 ### Local token reporting and the cold-cache cap
 
@@ -857,7 +1004,9 @@ proxy logs (the dispatch → finish slot union). Alongside them, when Prometheus
 is reachable, the report adds a **GPU busy — power-based (hardware)** row and
 exposes the same data under `--json`'s `gpu_busy` key. This is the
 **authoritative hardware-side** busy fraction and does **not** depend on the
-proxy's stream-lifecycle logging.
+proxy's stream-lifecycle logging — but it is **not** the local model
+utilisation figure: decisions use the log-derived `local_busy` (see
+[Which busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
 
 Why power rather than `gpu_busy_percent`: on this Strix Halo APU that counter
 **saturates at ~20 W** — it responds to load within seconds but reads ~100 % for
@@ -887,11 +1036,53 @@ accuracy.
   `gpu:power_watts:avg5m` trace at 1-minute resolution, derived from the 15 s
   raw series by a 5-minute rolling average, for warm-up/cooldown context.
 
-Reading it against the log-based figure: the log union measures *slot
-occupancy* (including queued time and excluding any work the proxy did not
-log); the power figure measures when the *hardware* actually computed. A
-persistent gap between them usually means log gaps, unfinished streams, or GPU
-work outside the proxy's slot accounting.
+#### Which busy figure is authoritative for decisions
+
+**Decisions use the log-derived `local_busy` figure** — the
+`Busy time — upper bound (dispatch → finish)` row and `--json`'s `local_busy`
+key (the dispatch → finish slot union defined under
+[How it works](#how-it-works) step 4). Gates, alerts and threshold
+comparisons quote *that* number: it is the only figure measuring
+**proxy-served** local work (slot occupancy, queued time included), so it is
+what "how busy was the local model?" means when deciding whether local
+capacity is contended (e.g. the `> 60 %` local-busy gate).
+
+**Prefer `gpu_busy` for hardware questions only** — was the GPU computing at
+all, is another workload using it, is it power/thermally limited. The row is
+**hardware activity, not local model utilisation**: it counts any GPU draw
+≥ 90 W (other workloads, requests the proxy never served) and misses
+proxy-served work during log gaps, so it must never be presented as the local
+utilisation figure, and no gate or alert may quote it as the busy %.
+
+The two figures legitimately diverge by design — see [Why the two figures
+diverge](#why-the-two-figures-diverge) for the causes (single source; not
+repeated here).
+
+#### Why the two figures diverge
+
+The log union measures *slot occupancy* (including queued time and excluding
+any work the proxy did not log); the power figure measures when the
+*hardware* actually computed. A persistent gap between them usually means log
+gaps, unfinished streams, or GPU work outside the proxy's slot accounting, so
+the same window can legitimately report `local_busy` 12.6 % next to a
+power-based 39.3 % — and only the former answers whether local capacity was
+contended.
+
+## Legacy reason normalisation
+
+The parser maps legacy reason spellings to their current names so historical and
+current windows report one label (``_normalize_reason`` in
+``log_parser.py``):
+
+| Legacy (rotated logs) | Current |
+|---|---|
+| `warm_cache_bypass` | `context_too_large` |
+| `rate_limited` (prefix) | `provider_budget_exhausted` (variant suffixes preserved: `_after_wait`, `_waiters`, `_disconnect`, `_waited`) |
+
+`rate_limited*` was renamed to `provider_budget_exhausted*`
+(LP-0MVMBM8YS003Y2JG) because operators and tooling misread it as an upstream
+rate-limit rejection; it is the proxy's own pre-flight request-budget skip on a
+healthy provider (see [Interpreting the report](#interpreting-the-report)).
 
 ## Interpreting the report
 
@@ -912,6 +1103,12 @@ work outside the proxy's slot accounting.
     estimated context exceeds the per-slot hard cap → consider raising
     local ctx-size (`models.ini`) or
     `local_large_context_warm_cache_threshold`.
+  - `provider_budget_exhausted` (legacy `rate_limited*` in rotated logs
+    predating LP-0MVMBM8YS003Y2JG) → the proxy's own per-provider RPM
+    budget (`rate_limit_rpm`) was exhausted before dispatch, so the request
+    passed to the next provider. It is *pacing, not an upstream 429* → if
+    the volume is unwanted, raise that entry's `rate_limit_rpm` or reorder
+    the chain (raising `models.ini` ctx-size does NOT help).
   - `HTTP 4xx/5xx`, `empty_response`, timeouts → remote provider issues
     (credentials, rate limits) — not slot-related.
 - **Provider context skips** (`routing_skip_provider_context`): a remote
@@ -942,13 +1139,29 @@ work outside the proxy's slot accounting.
   least one local slot occupied **from dispatch to finish** (prefill +
   decode, LP-0MVJN9H2I00116FP); the retained decode-only figure is its
   labelled lower bound, and a stream with no first-byte line never inflates
-  it. The **Prefill vs decode** section then splits the *phase* slot time
+  it. This is the **decision figure** — gates and alerts quote it, not the
+  power-based `gpu_busy` row (see [Which busy figure is authoritative for
+  decisions](#which-busy-figure-is-authoritative-for-decisions)). The **Prefill vs decode** section then splits the *phase* slot time
   into prefill (dispatch → first byte) and decode (first byte → finish) as
   slot-seconds and as a share of combined phase slot time (always 100%
   together, LP-0MVJNDOUU0059MMO) — read it for where slot time goes (prefill
   rarely dominates at 46% local occupancy, but it does on large cold
   prompts), not for window occupancy: phase slot-seconds sum per-stream
-  durations and are not comparable with the wall-clock busy %. A low busy % with high fallback volume
+  durations and are not comparable with the wall-clock busy %. **Engine
+  cross-check** then validates that phase split against llama-server's own
+  per-task eval durations (LP-0MVNWULLI006ZYXX). Read a divergence as a
+  *direction*, not a defect: **proxy above engine** means the proxy accounted
+  for phase time the engine never (fully) performed (queueing, retries,
+  cancelled work), while **engine above proxy** means unattributed local
+  traffic (unlogged or partially-logged streams, or eval lines whose proxy
+  events fell outside the window). Two caveats always apply: (a) both figures
+  are sums of durations (slot-seconds), never wall-clock, so neither is
+  comparable with `busy_seconds`/`busy_pct`; and (b) llama-server lines carry
+  no timestamps, so a window much shorter than the live `llama-server.log`
+  compares an in-window proxy figure against the file's whole span and shows
+  engine ≫ proxy as a windowing artefact. Absolute percentage deltas above
+  `local_engine_cross_check_threshold_pct` (default 25 %, `0` disables) raise a
+  warning recommendation. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
   fallback reasons), not that local is underprovisioned. The **Summary by
   hour** table at the top of the report shows per-hour busy % and per-hour
@@ -1107,18 +1320,37 @@ work outside the proxy's slot accounting.
   majority, ±30 s covers 68.5%, ±60 s 73.9%, ±120 s 82.9%. 60 s is the widest
   bound that stays inside one contention burst; the remainder is reported as
   `unattributed` rather than borrowed from a stale earlier burst.
-- **Prefill ETA is compared at matched quantiles, not per dispatch
-  (LP-0MVGR2OXT0096OGK M3).** llama-server eval-timing lines carry no per-line
-  timestamp (the parser assigns one file-mtime timestamp per log file), so a
-  `prefill_eta_seconds` poll cannot be paired with the specific `prompt eval`
-  it predicted. `prefill_eta_error` therefore compares the p50/p90 of the
-  prediction distribution against the p50/p90 of the observed durations. The
-  prediction is the cache-cold *reference-prompt* cost, so systematic
-  over-prediction is expected when the reference prompt is larger than the
-  median served prompt; read it as "does the published ETA reflect the typical
-  real prefill a dispatcher will face", not as a per-request calibration
-  score.
+- **Prefill ETA is a bound, compared to the served remainder at matched
+  quantiles (LP-0MVGR2OXT0096OGK M3, rescoped by LP-0MVSD5RJW008F1IB).**
+  llama-server eval-timing lines carry no per-line timestamp (the parser
+  assigns one file-mtime timestamp per log file), so a `prefill_eta_seconds`
+  poll cannot be paired with the specific `prompt eval` it predicted.
+  `prefill_eta_error` therefore compares the p50/p90 of the prediction
+  distribution against the p50/p90 of the observed durations. The prediction is
+  the cache-cold *reference-prompt* cost while the observation is the *uncached
+  remainder* of mostly-warm prompts, so a wide gap is expected by construction
+  and is **not evidence of a calibration defect**. The verdict is therefore
+  one-sided (`bound_holds` / `bound_violated` / `inconclusive`: does the served
+  p90 stay within the published p50 bound?), and the calibration question is
+  answered separately by `prefill_eta_error.matched`, which joins the guard's
+  priced ETA to the same dispatch's `dispatch_to_first_byte_ms` via `session=`
+  and applies the 25 % tolerance. A window with no guard records (inert guard,
+  or pre-change logs) reports the matched figure as `inconclusive` with
+  `unmatched_dispatches` counted — never as a fabricated match.
 
+- **Engine eval timings are summed, never placed in time
+  (LP-0MVNWULLI006ZYXX).** llama-server writes no per-line timestamps
+  (`grep -cE "[0-9]{2}:[0-9]{2}:[0-9]{2}" llama-server.log` → 0), so the
+  `## Engine cross-check` figures are **sums of per-task durations** and cannot
+  be turned into a time series, an hour, or a wall-clock union. Two
+  consequences follow: the totals are comparable with the proxy's phase
+  **slot-seconds** but never with `busy_seconds`/`busy_pct`; and window
+  attribution is per file — a whole log file counts if its last write falls in
+  the window, so a window shorter than the live `llama-server.log` yields an
+  engine total that covers more than the window (engine ≫ proxy, a windowing
+  artefact rather than unattributed traffic). Deriving wall-clock GPU busy time
+  from these logs is impossible by construction and is out of scope (the
+  power-based `gpu_busy` telemetry covers hardware utilisation).
 - **Hold-cycle re-emissions are excluded from local-skip demand counters
   (LP-0MUIEO6IP0030CT3).** A held request re-emitted across chain-hold
   cycles (`chain_hold_cycle>0`) counts once (its cycle-0 occurrence) in the
@@ -1147,7 +1379,7 @@ work outside the proxy's slot accounting.
   with no fallback line but `local_dispatch_denied` evidence is labelled
   `lease_denied` (`reason=local_lease_active`) — a lease/concurrency refusal,
   not an inherited spill. Before this change a session with no fallback line of
-  its own inherited an unrelated neighbour's `rate_limited` within the 60s
+  its own inherited an unrelated neighbour's `provider_budget_exhausted` within the 60s
   window (11 of 26 clean local-using sessions in the 2026-10-23/24 window were
   mislabelled that way).
 - **Per-turn attribution is exact where `turn=` ids exist
@@ -1244,9 +1476,14 @@ work outside the proxy's slot accounting.
   summary's context column is computed over the sessions that have a value,
   so its sample count can be smaller than the covered-session count — the
   section states both.
-- **`rate_limited` is budget pacing, not an upstream 429.** The reason comes
-  from `provider_budget.py`'s own per-provider RPM accounting: the configured
-  `rate_limit_rpm` window for that provider entry is exhausted, so the request
-  passes to the next provider immediately. Upstream HTTP 429 responses are a
-  different signal and surface as `upstream_http_error status=429` events, not
-  as `rate_limited` fallbacks.
+- **`provider_budget_exhausted` is budget pacing, not an upstream 429.** The
+  reason comes from `provider_budget.py`'s own per-provider RPM accounting:
+  the configured `rate_limit_rpm` window for that provider entry is exhausted,
+  so the request passes to the next provider immediately. Upstream HTTP 429
+  responses are a different signal and surface as `upstream_http_error
+  status=429` events, not as `provider_budget_exhausted` fallbacks. The name
+  was renamed from `rate_limited` (LP-0MVMBM8YS003Y2JG) precisely so the two
+  can never be conflated; rotated logs carrying the pre-rename spelling are
+  normalized to the new one by the parser (see the
+  [Legacy reason normalisation](#legacy-reason-normalisation) section), so a window spanning
+  the rename still reports one row.

@@ -52,7 +52,8 @@ Options:
 | `--start` / `--end` | — | Explicit ISO window (`YYYY-MM-DD HH:MM:SS`); overrides `--hours` |
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — with `computing_fraction`, `busy_pct`, `smoothed_power` from Prometheus power data — `local_prefill`, and `local_busy.prefill_vs_decode`) |
+| `--stale-rate-target` | `0.05` | Target share of status polls allowed to report `slots_stale=true`; drives the **Local capacity signals** section's met/unmet outcome and `--json`'s `capacity_signals.slots_stale.passed`. Mirrors `scripts/capacity_signal_verification.py --stale-rate-target` |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 
 ## Daily cadence (05:00 cron)
@@ -103,6 +104,63 @@ is down the row is omitted and `--json`'s `gpu_busy` is `null` — the report
 never fails. Full pipeline and rationale:
 [monitoring/README.md](../../../monitoring/README.md) and
 [REFERENCE.md](REFERENCE.md#gpu-busy-time-from-power-prometheus).
+
+**This row is hardware activity, not local model utilisation.** It counts any
+GPU draw ≥ 90 W — including work the proxy never served — and misses
+proxy-served work during log gaps, so it must never be read (or quoted) as the
+local model utilisation figure. **Decisions use the log-derived `local_busy`**
+(the `dispatch → finish` slot union: the report's `Busy time — upper bound
+(dispatch → finish)` row and `--json`'s `local_busy` key); quote `gpu_busy`
+only for hardware questions (was the GPU computing at all, thermals, power
+draw). The decision rule, the preference rule and the causes of the gap:
+[REFERENCE.md § Which busy figure is authoritative for decisions](REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
+
+## Engine cross-check (slot-time vs llama-server eval timings)
+
+The **Engine cross-check** section (LP-0MVNWULLI006ZYXX) independently
+validates the report's most consequential local figures: the proxy-inferred
+prefill/decode slot-seconds from **Prefill vs decode** are compared against
+llama-server's own per-task eval timings — summed `prompt eval time` seconds
+vs proxy prefill slot-seconds, and summed `eval time` seconds vs proxy decode
+slot-seconds — each with the absolute delta and the delta as a percentage of
+the engine figure. Engine seconds come from the same Qwen3-port attributed,
+in-window eval lines that feed **Decode speed** / **Prompt eval speed**, so the
+port-attribution rules (spawn-line port, `mxbai-embed` excluded, ambiguous
+multi-port files skipped) are reused, never reimplemented.
+
+**Metric types (read this before comparing anything).** Both figures are
+**slot-seconds** — sums of durations, i.e. total phase work, not wall-clock.
+They are therefore *not* comparable with the wall-clock `busy_seconds` /
+`busy_pct` union in **Local model utilization**, and no arithmetic in the
+report mixes the two. Engine lines carry no timestamps, so the engine total
+can only be summed; the section also states that a window much shorter than
+the live `llama-server.log` compares an in-window proxy figure against the
+file's whole span (engine ≫ proxy is then a windowing artefact).
+
+**Interpreting a divergence.** A non-zero delta is expected — the proxy counts
+per-stream phases plus its own queueing, retries and cancellations, the engine
+counts per-task eval calls. Direction is the signal:
+
+- **proxy above engine** — queueing, retries or cancelled work: phase time the
+  proxy accounted for that the engine never (fully) performed;
+- **engine above proxy** — unattributed local traffic (unlogged or
+  partially-logged streams, or eval lines whose proxy events fell outside the
+  window).
+
+**Threshold.** A phase whose **absolute** percentage delta exceeds
+`local_engine_cross_check_threshold_pct` (in `proxy/config.yaml`, default
+**25.0 %**, `0` disables) raises a warning recommendation — `medium`, escalated
+to `high` at twice the threshold. The default exists because the structural
+per-stream vs per-task skew is normal; only a large divergence signals an
+accounting problem. Fractional values are supported (the loader coerces the
+scalar as a float).
+
+**Honest degradation.** When the llama logs are absent, unreadable, or carry no
+Qwen3-attributed eval lines for the window, the section renders an explicit
+`Unavailable — <phase>: <reason>` note (reusing the parser's named
+`verbosity/build` / `rotation` / `attribution failure` diagnostics) with `-`
+deltas — never a misleading `0` or `100 %`. `--json` exposes the same
+comparison additively under `engine_cross_check`.
 
 ## Post-acceptance evictions (alert threshold + triage rule)
 
@@ -169,13 +227,109 @@ exposes the same numbers under `denial_attribution`, `prefill_eta_error` and
   per-hour busy% (from `BusyStats`) sit beside the denials, and the
   window's denials-per-hour / busy fraction are compared with the pre-change
   baseline (2,641 denials / 24 h at 29.3% busy).
-- **M3 (prefill ETA accuracy).** `prefill_eta_error` compares the
-  `prefill_eta_seconds` published on `status_request` polls against the
-  llama-server `prompt eval time` durations at matched p50/p90 quantiles,
-  with signed/relative error and a `matches_reality` / `over_predicts` /
-  `under_predicts` / `inconclusive` verdict (llama-server lines carry no
-  per-line timestamps, so per-dispatch pairing is impossible — see
-  REFERENCE.md Limitations).
+- **M3 (prefill ETA accuracy).** `prefill_eta_error` answers two questions
+  (LP-0MVSD5RJW008F1IB): (a) *did the published cache-cold reference bound
+  hold?* — the quantile-matched bound vs served-remainder comparison, with a
+  one-sided `bound_holds` / `bound_violated` / `inconclusive` verdict; and
+  (b) *was the per-request pricing right?* — the `matched` figure, which joins
+  the admission guard's priced ETA to the **same** dispatch's
+  `dispatch_to_first_byte_ms` via `session=` and applies the 25 % tolerance
+  (`matches_reality` / `over_predicts` / `under_predicts` / `inconclusive`).
+  A wide predicted−observed gap in (a) is expected by construction and is not
+  evidence of a calibration defect (llama-server lines carry no per-line
+  timestamps, so the quantile comparison cannot pair 1:1 — see REFERENCE.md
+  Limitations).
+
+## Local capacity signals (LP-0MVU8O4EL005IYP9)
+
+The report renders a **Local capacity signals** section immediately after
+**Local contention prediction vs reality**, publishing the `slots_stale`
+(stale-poll) rate for the report's own window so polling-path health is
+visible nightly without running `scripts/capacity_signal_verification.py` by
+hand and cross-checking two surfaces:
+
+- **`slots_stale` — stale-poll rate vs target.** The status-poll count
+  (`status_request` lines carrying `capacity_hint=`), the polls with
+  `slots_stale=true`, the rate, the configured target (default < 5 %) and an
+  explicit **met** / **unmet** outcome. The denominator is the polls that
+  carry the `slots_stale` field at all: a schema-1 poll has no freshness field
+  and is **excluded from the rate**, never counted as fresh (the excluded
+  count is stated in the section). `slots_stale` means the served slot counts
+  *or* the per-slot detail came from the last-known cache because the fresh
+  `/slots` query failed — a **polling-path** signal, not a capacity verdict,
+  and only comparable between nights measured on the same build.
+- **Configurable target.** `--stale-rate-target` (default `0.05`) overrides
+  it for both the rendered outcome and the `--json` verdict, so the cron line
+  can carry a new target without a code change.
+- **`capacity_hint` distribution and `saturated`-without-live-work.** Every
+  observed hint token (and an unexpected one — a new claim name, or `unknown`
+  for an unreadable value) is listed with its count **and** share of status
+  polls; nothing is dropped or re-bucketed, so a vocabulary change is visible
+  the night it lands. The violations table reports `capacity_hint=saturated`
+  polls with **no** live local work, with both shares (of all polls and of
+  `saturated` polls). Live work is the shared rule: `local_in_flight_requests
+  > 0` (schema 3, authoritative) or the `local_active_query` /
+  `active_query` flags (schema-2 fallback). A one-line verdict names each
+  missed target explicitly.
+- **Coverage caveat.** The section states the span of the polls it measured;
+  when the retained logs do not reach both edges of the window it labels the
+  figures a **partial** measurement (`--json`:
+  `capacity_signals.coverage`) instead of letting a truncated retention
+  window read as a complete night.
+- **Shared derivation.** The status-poll detection, field extraction, the
+  denominator, the rate and the target check live once, in
+  `scripts/lib/capacity_signals.py`, and are imported by both this skill
+  (through `scripts/capacity_signals.py`, a documented path-based shim) and
+  `scripts/capacity_signal_verification.py` — the two surfaces cannot
+  disagree. Status polls are aggregated with the reference tool's half-open
+  `[window_start, window_end)` window, so a poll exactly at the window end
+  belongs to the next night.
+- **Standalone equivalent.** For an ad-hoc window — or to cross-check a night
+  — run the same derivation without the rest of the report:
+  `python3 scripts/capacity_signal_verification.py --since '<start>' --until
+  '<end>' --window-closed --json`. Its docstring ("Derivation of every emitted
+  figure") and the module docstring of `scripts/lib/capacity_signals.py` are
+  the **source of truth** for the wording used above; the two must never
+  describe the same rule differently.
+- **Unattended safety.** The section is **omitted** (no heading, no zero-fill)
+  when the window has no status polls, so an empty window — or a log directory
+  with no logs at all — renders a clean report and the 05:00 cron exits 0. In
+  that case `--json` reports `capacity_signals.slots_stale.passed: null`
+  rather than a misleading `true`. The capacity-signal work added **no
+  network call, no LLM call and no interactive prompt** to the pipeline: the
+  figures are derived from the same log lines the report already parses, and
+  the optional Prometheus GPU row keeps its pre-existing best-effort
+  behaviour (fail-soft, never a cron failure).
+
+### Overriding the stale-rate target on the cron line
+
+`--stale-rate-target` is the only knob: it changes the rendered met/unmet
+outcome **and** `--json`'s `capacity_signals.slots_stale.passed` /
+`capacity_signals.targets`, so a new target needs no code change. Put it on the
+cron line (the daily job otherwise uses the `0.05` default):
+
+```cron
+0 5 * * * cd /home/rgardler/projects/llm && python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py --stale-rate-target 0.10 >> ~/proxy-usage-reports/cron.log 2>&1
+```
+
+Equivalently, for a one-off re-run over an arbitrary window, pass the same flag
+together with `--start` / `--end`:
+
+```bash
+cd /home/rgardler/projects/llm
+python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+  --start '2026-10-24 20:00:00' --end '2026-10-25 07:00:00' \
+  --output-dir ~/proxy-usage-reports/recheck --stale-rate-target 0.10 --json
+```
+
+`--json` exposes the same figures under `capacity_signals.slots_stale`
+(`status_polls`, `count`, `denominator`, `rate`, `target`, `passed`), plus
+`capacity_signals.capacity_hint` (`status_polls`, `counts`, `shares`),
+`capacity_signals.saturated_without_live_work` (`saturated`, `count`,
+`rate_of_polls`, `rate_of_saturated`), `capacity_signals.targets` (each
+check's `name`, `target`, `observed`, `passed`), `capacity_signals.coverage`
+(`covered`, the two edge gaps, `max_gap_seconds`) and
+`capacity_signals.all_targets_met` (`null` on a window with no polls).
 
 ## Local-turn coverage (LP-0MVM93DE6009JGBU)
 
@@ -208,7 +362,8 @@ per-session CSVs.
 Interpretation notes the section prints itself when the data applies:
 context-size fallbacks are `estimated_tokens` threshold decisions (they fire
 only after a prompt grows past the cold/warm thresholds, not on a session's
-first message) and `rate_limited` is the proxy's own per-provider RPM budget
+first message) and `provider_budget_exhausted` is the proxy's own per-provider
+RPM budget
 pacing (`provider_budget.py`), **not** an upstream HTTP 429 — those surface as
 `upstream_http_error status=429` events.
 

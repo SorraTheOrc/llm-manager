@@ -25,6 +25,11 @@ Design constraints (from the work item):
 - The verdict comes from ``prefill_eta`` — this module never duplicates ETA
   maths. ``busy_slots`` / ``in_flight_prefills`` are supplied by the caller so
   the reserve verdict and the guard verdict are identical for identical inputs.
+- One budget, one resolver: the number the verdict is priced against is
+  ``prefill_eta.wait_budget_seconds(config, priority)`` (the contention-queue
+  max wait, 30 s in the shipped config since LP-0MVT1146V007WXA4) — the same
+  number the admission guard compares against. This module holds no budget
+  constant and applies no per-call default.
 - Fail-open: an inert (uncalibrated) guard admits. A refusal requires a
   calibrated verdict against a real budget.
 - Tickets are TTL-bound (default 10 s, capped at 60 s), single-use and
@@ -58,30 +63,134 @@ MAX_RESERVE_TTL_SECONDS = 60
 #: ``local-preferred`` is the **canonical pin-local value**: the client asks
 #: that its request never be moved to a remote provider while local can serve
 #: it (the deferral/timing semantics live outside this vocabulary module).
-#: ``prefer-local`` (the default) may fall through; ``remote-ok`` strips the
-#: local route from the chain.
+#: ``remote-ok`` is the **default**: it keeps the local route and never waits
+#: for it, so it is reached by an absent header and by any unknown value.
+#: ``prefer-local`` is retired (a ``400`` before routing,
+#: LP-0MVUH9PUU005HVS4) and survives only as a
+#: :data:`RETIRED_PREFERENCES` entry.
+#:
+#: ``remote-ok`` is a **historic name** (LP-0MVUH9OYZ007GMWF AC1): it means
+#: *"local allowed, remote acceptable"* — the local entry stays in the chain
+#: and is attempted exactly as a headerless request attempts it, and a request
+#: that cannot be served locally *right now* steps straight to the next
+#: provider without queueing. It does **not** mean "remote only"; no
+#: preference strips the local route from a chain any more (only a
+#: ``CAPACITY_TOO_LARGE`` verdict does).
 PREF_LOCAL_PREFERRED = "local-preferred"
 PREF_PREFER_LOCAL = "prefer-local"
 PREF_REMOTE_OK = "remote-ok"
 
-#: Deployed wire value accepted as a **deprecated alias** of
-#: :data:`PREF_LOCAL_PREFERRED` (LP-0MVSHWYVE005MS16). It stays a first-class
-#: constant — never re-spelled at a call site — so the canonical set and the
-#: alias table cannot drift, and so an un-migrated client is normalised rather
-#: than demoted to ``prefer-local`` (which would let its request go remote).
+#: Deployed wire value **retired** by LP-0MVUH9PAZ002UAPA. It was a deprecated
+#: alias of :data:`PREF_LOCAL_PREFERRED` (LP-0MVSHWYVE005MS16); it is now
+#: withdrawn: an explicit request carrying it is refused with a stable ``400``
+#: (:data:`RETIRED_PREFERENCE_CODE`) instead of being normalised — silently
+#: re-interpreting it would deliver a policy the client did not ask for — and
+#: instead of being resolved to the default, which would let a cost-capped
+#: client be billed without consent (LP-0MVNU2KTK009D4AG). The constant stays
+#: a first-class name so the retired-value table can never drift from it.
 PREF_LOCAL_ONLY = "local-only"
 
-#: ``alias -> canonical value``. :func:`parse_preference` normalises through
-#: this table and logs one deprecation warning per request.
-LEGACY_PREFERENCE_ALIASES = {PREF_LOCAL_ONLY: PREF_LOCAL_PREFERRED}
+#: Stable machine-readable code carried by a retired-value rejection body
+#: (parent AC1). Clients branch on this, not on the prose.
+RETIRED_PREFERENCE_CODE = "local_preference_retired"
 
-VALID_PREFERENCES = (PREF_LOCAL_PREFERRED, PREF_PREFER_LOCAL, PREF_REMOTE_OK)
-DEFAULT_PREFERENCE = PREF_PREFER_LOCAL
+#: ``retired value -> live successors``. The **single** table a rejection body
+#: and its log line are both built from, so the two observability surfaces
+#: cannot drift apart. A retired value is never normalised and never resolved
+#: to :data:`DEFAULT_PREFERENCE` (fail closed).
+RETIRED_PREFERENCES: dict[str, tuple[str, ...]] = {
+    PREF_LOCAL_ONLY: (PREF_LOCAL_PREFERRED,),
+    # ``prefer-local`` was the default until LP-0MVUH9PUU005HVS4. It meant
+    # "wait for local while the request fits", which is now expressed by the
+    # explicit ``local-preferred``; the new default (``remote-ok``) means
+    # "take local only when it is free *right now*". Silently re-interpreting
+    # one as the other would deliver a materially different policy with no
+    # signal — a client relying on the queue wait would start paying for
+    # remote dispatch — so an explicit ``prefer-local`` is a loud 400.
+    PREF_PREFER_LOCAL: (PREF_LOCAL_PREFERRED, PREF_REMOTE_OK),
+}
+
+#: ``alias -> canonical value``. Empty since the last alias was retired
+#: (LP-0MVUH9PAZ002UAPA); kept as the single normalisation seam that
+#: :func:`parse_preference` consults, so a future alias has exactly one place
+#: to live and the removal is directly assertable.
+LEGACY_PREFERENCE_ALIASES: dict[str, str] = {}
+
+#: Exactly two live values (parent AC21): the pin-local intent and the
+#: default. ``prefer-local`` is withdrawn (see
+#: :data:`RETIRED_PREFERENCES`).
+VALID_PREFERENCES = (PREF_LOCAL_PREFERRED, PREF_REMOTE_OK)
+
+#: The default an absent header (and any genuinely unknown value) resolves to.
+#: ``remote-ok`` is the *historic* name for "local allowed, remote acceptable":
+#: the local route is attempted when a slot is free, and when it cannot serve
+#: the request right now the request steps straight to the next provider with
+#: no queueing, no deferral and no local-capacity refusal (parent AC20/AC21).
+DEFAULT_PREFERENCE = PREF_REMOTE_OK
+
+
+class LocalPreferenceRetiredError(ValueError):
+    """A **withdrawn** ``X-Local-Preference`` value was requested.
+
+    Raised by :func:`parse_preference` so the retirement fails *closed*: no
+    caller can silently fall back to a live value for a value the client asked
+    for and the proxy no longer honours. The request entry points convert this
+    into the stable ``400`` built by :func:`retired_preference_body` **before**
+    any routing, queueing, lease or dispatch state is written.
+
+    Attributes:
+        value: The retired value the client sent (normalised: stripped and
+            lower-cased, exactly as the parse site compares it).
+        successors: The live values that replace it, in preference order.
+    """
+
+    def __init__(self, value: str, successors: tuple[str, ...]) -> None:
+        self.value = value
+        self.successors = successors
+        super().__init__(
+            f"X-Local-Preference={value!r} is retired; send "
+            + " or ".join(repr(successor) for successor in successors)
+        )
+
+
+def retired_preference_body(exc: LocalPreferenceRetiredError) -> dict[str, Any]:
+    """Stable JSON body for a retired-value rejection (parent AC1).
+
+    The three keys are the contract a client may branch on: ``error`` (human
+    summary), ``code`` (machine-readable, :data:`RETIRED_PREFERENCE_CODE`) and
+    ``detail``, which names every live successor **and** tells a
+    zero-remote-spend client that the guarantee is a chain property, not a
+    preference value (parent assumption A4).
+    """
+    successors = ", ".join(repr(successor) for successor in exc.successors)
+    return {
+        "error": "X-Local-Preference value is retired",
+        "code": RETIRED_PREFERENCE_CODE,
+        "detail": (
+            f"X-Local-Preference {exc.value!r} is retired and is no longer "
+            f"accepted; send {successors} instead. A client that must never "
+            "spend remote budget should pin a chain with no remote entries "
+            "(e.g. the private model) rather than a preference value."
+        ),
+    }
 
 HEADER_PREFERENCE = "x-local-preference"
 HEADER_RESERVATION = "x-local-reservation"
 HEADER_ROUTE = "X-Local-Route"
 HEADER_FALLBACK_REASON = "X-Local-Fallback-Reason"
+
+#: Marker a local 5xx carries when the router released the dispatch for a
+#: *reason* that says nothing about local's health (LP-0MVWFKESK0005G61). The
+#: value is a canonical token from :data:`LOCAL_FALLBACK_REASON_TOKENS`, so the
+#: fallback loop can defer the one request instead of quarantining the whole
+#: local entry for every session. Additive: the header is absent from every
+#: other backend error, which therefore stays byte-identical.
+HEADER_LOCAL_DISPATCH_REASON = "X-Local-Dispatch-Reason"
+
+#: Attribute carrying the same marker on the response object itself, so a
+#: response whose header was dropped in transit (proxy hop, response rebuild)
+#: stays attributable instead of silently re-enabling the entry quarantine.
+LOCAL_DISPATCH_REASON_ATTR = "local_dispatch_reason"
 
 # ---------------------------------------------------------------------------
 # Canonical local-route-exit reason tokens (LP-0MVRMC1W6003MV3Y AC1)
@@ -104,6 +213,12 @@ HEADER_FALLBACK_REASON = "X-Local-Fallback-Reason"
 #: fallback reason); the lease token names expected local contention; the last
 #: two are the structural refusals used when there was no local route at all
 #: or an exit left no reason behind.
+#: Reason token of a *bounded-deferral* promotion: the session spent its
+#: retryable-refusal budget, so the pin was declined and a remote tier served
+#: the request (LP-0MVUH9PL0005PW90). Distinct from a ``too_large`` promotion,
+#: which means the prompt could never fit local.
+LOCAL_FALLBACK_DEFERRAL_EXHAUSTED = "deferral_refusals_exhausted"
+
 LOCAL_FALLBACK_REASON_TOKENS: frozenset[str] = frozenset(
     {
         # Chain resolution (``_resolve_provider_with_exclusions``).
@@ -113,11 +228,69 @@ LOCAL_FALLBACK_REASON_TOKENS: frozenset[str] = frozenset(
         "outside_available_window",
         # Lease-active continue: expected contention, not a provider failure.
         "local_lease_active",
+        # Reason-scoped local 5xx release (LP-0MVWFKESK0005G61): the measured
+        # cache-deficit abort is a verdict on the *prompt*, not on local's
+        # health, so it is deferred rather than quarantined. Mirrors
+        # ``measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON``.
+        "measured_cache_deficit",
+        # Thrash-gate refusals (LP-0MVXSSYTN001TBW5): the router's post-deadline
+        # local gate refused *this* dispatch either because this very request
+        # already had a local dispatch cancelled post-deadline
+        # (``post_deadline_terminal``) or because the session/prompt is inside
+        # its post-deadline window (``prefill_thrash_cooldown``). Both are
+        # verdicts on the request/prompt, not on local's health, so the 503 they
+        # return joins the non-quarantining deferral set instead of cooling the
+        # whole entry for every session.
+        "post_deadline_terminal",
+        "prefill_thrash_cooldown",
         # Structural refusals.
         "local_only_no_local_route",
         "local_route_unavailable",
+        # Bounded deferral (LP-0MVUH9PL0005PW90): the session spent its
+        # retryable-refusal budget, so the pin is declined and a remote tier
+        # serves the request. Distinct from ``local_route_unavailable`` and
+        # from the ``too_large`` promotion, so client, header and log can all
+        # tell "we stopped waiting for you" from "your prompt cannot fit".
+        LOCAL_FALLBACK_DEFERRAL_EXHAUSTED,
     }
 )
+
+
+def local_dispatch_reason(response: Any) -> str | None:
+    """Return the local-dispatch reason marker carried by *response*, if any.
+
+    The router stamps the marker twice — as
+    :data:`HEADER_LOCAL_DISPATCH_REASON` on the wire and as
+    :data:`LOCAL_DISPATCH_REASON_ATTR` on the response object — so a header lost
+    in transit can never silently re-enable an entry quarantine the reason does
+    not justify. The in-process half is read first.
+
+    Never raises: marker sniffing must not break fallback routing.
+    """
+    try:
+        marker = getattr(response, LOCAL_DISPATCH_REASON_ATTR, None)
+    except Exception:  # pragma: no cover - exotic response stand-ins
+        marker = None
+    if isinstance(marker, str) and marker:
+        return marker
+
+    try:
+        headers = getattr(response, "headers", None) or {}
+    except Exception:  # pragma: no cover - exotic response stand-ins
+        return None
+    try:
+        marker = headers.get(HEADER_LOCAL_DISPATCH_REASON)
+    except Exception:  # pragma: no cover - exotic header containers
+        marker = None
+    if isinstance(marker, str) and marker:
+        return marker
+    try:
+        for key, value in dict(headers).items():
+            if str(key).lower() == HEADER_LOCAL_DISPATCH_REASON.lower():
+                return value if isinstance(value, str) and value else None
+    except Exception:  # pragma: no cover - exotic header containers
+        return None
+    return None
 
 
 def canonical_local_fallback_reason(token: str) -> str:
@@ -646,20 +819,51 @@ def reservation_id_from_headers(headers: Any) -> str | None:
     return None
 
 
+#: Set once when the vocabulary banner has been emitted (AC17: one line only).
+_VOCABULARY_BANNER_LOGGED = False
+
+
+def log_vocabulary_banner() -> None:
+    """Name the live vocabulary, the default and the retirements — once (AC17).
+
+    An operator must be able to prove from ``proxy.log`` which
+    ``X-Local-Preference`` policy the **running** proxy applies: a deploy that
+    ships the code without the intended behaviour is otherwise invisible, and
+    the retired values are exactly what a stale client will trip over. Emitted
+    at most once per process; callers may invoke it at startup and again
+    lazily on the first dispatch (whichever happens first wins).
+    """
+    global _VOCABULARY_BANNER_LOGGED
+    if _VOCABULARY_BANNER_LOGGED:
+        return
+    _VOCABULARY_BANNER_LOGGED = True
+    logger.info(
+        "local_preference_vocabulary default=%s live=%s retired=%s",
+        DEFAULT_PREFERENCE,
+        ",".join(VALID_PREFERENCES),
+        ",".join(sorted(RETIRED_PREFERENCES)),
+    )
+
+
 def parse_preference(headers: Any) -> str:
     """Parse ``X-Local-Preference`` (case-insensitive header names).
 
-    Missing or unknown values fall back to ``prefer-local`` — today's
-    behaviour — so the header is purely additive (AC8).
+    Missing or unknown values fall back to :data:`DEFAULT_PREFERENCE` — the
+    header stays purely additive for anything genuinely unrecognised (AC8).
 
-    The legacy wire value ``local-only`` is normalised to the canonical
-    ``local-preferred`` through :data:`LEGACY_PREFERENCE_ALIASES`, so a
-    deployed client keeps pin-local semantics instead of being demoted to
-    ``prefer-local`` (LP-0MVSHWYVE005MS16 AC1/AC5). Each normalisation logs one
-    ``WARNING`` naming both values; because both call sites cache the parsed
-    value on the request (``request._local_preference``), that is once per
-    request, not once per routing decision (AC2).
+    A **retired** value (:data:`RETIRED_PREFERENCES`) is not additive: it
+    raises :class:`LocalPreferenceRetiredError`, which the request entry points turn
+    into the stable ``400`` of LP-0MVUH9PAZ002UAPA AC1. A retired value is
+    therefore never normalised to a live value and never resolved to the
+    default — both would be silent re-interpretations of an explicit request.
+
+    Remaining aliases (none at present, :data:`LEGACY_PREFERENCE_ALIASES`) are
+    normalised here and log one ``WARNING`` naming both values; because both
+    call sites cache the parsed value on the request
+    (``request._local_preference``), that is once per request, not once per
+    routing decision (AC2).
     """
+    log_vocabulary_banner()
     if not headers:
         return DEFAULT_PREFERENCE
     raw = None
@@ -672,6 +876,10 @@ def parse_preference(headers: Any) -> str:
     if not raw:
         return DEFAULT_PREFERENCE
     requested = str(raw).strip().lower()
+    retired = RETIRED_PREFERENCES.get(requested)
+    if retired is not None:
+        # Fail closed: never a live value, never the default.
+        raise LocalPreferenceRetiredError(requested, retired)
     value = LEGACY_PREFERENCE_ALIASES.get(requested, requested)
     if value in VALID_PREFERENCES:
         if value != requested:
@@ -683,7 +891,12 @@ def parse_preference(headers: Any) -> str:
                 PREF_LOCAL_PREFERRED,
             )
         return value
-    logger.debug(
+    # AC22: a typo must be visible. The header stays additive (an unknown value
+    # still resolves to the default), but at ``WARNING`` — one line per request
+    # (the parse is cached on the request), naming the value received and the
+    # default it resolved to, so ``local-preffered`` is distinguishable from a
+    # client that sent no header at all.
+    logger.warning(
         "unknown X-Local-Preference=%r; using %r", raw, DEFAULT_PREFERENCE
     )
     return DEFAULT_PREFERENCE

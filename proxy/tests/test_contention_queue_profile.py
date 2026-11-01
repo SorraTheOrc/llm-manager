@@ -131,7 +131,7 @@ class TestParseFallbackTriggered:
 
     def test_trailing_evidence_fields_do_not_break_parsing(self):
         """LP-0MVMBMSWR0036RES appended ``session=``/``attempt=`` (and budget
-        fields for ``rate_limited*``) after ``reason=``; the ``reason=``
+        fields for ``provider_budget_exhausted*``) after ``reason=``; the ``reason=``
         extractor is bounded rather than end-anchored, so it still parses."""
         f = m.parse_fallback_triggered(
             fallback_triggered_line(f"{BASE_TS} INFO router.routing:")

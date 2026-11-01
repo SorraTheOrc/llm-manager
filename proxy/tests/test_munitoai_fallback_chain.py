@@ -57,9 +57,11 @@ MUNITOAI_ENTRY = {
     "name": "munitoai",
     "type": "remote",
     "provider": "MunitoAI",
-    # Priority-chain membership (LP-0MVGPZWY0001JD1D): the paid tier never
-    # serves ``low`` — exactly ``[medium, high]`` (LP-0MVF17VP70053JXX AC6).
-    "priorities": ["medium", "high"],
+    # Priority-chain membership (LP-0MVGPZWY0001JD1D): the paid tier serves
+    # ``low`` too since LP-0MVY8REC80097HI0 (previously ``[medium, high]``,
+    # LP-0MVF17VP70053JXX AC6) so low-priority requests keep a paid fallback
+    # when the free tier is quarantined and the opencode accounts exhausted.
+    "priorities": ["low", "medium", "high"],
     "endpoint": "https://api.munito.ai/inference",
     "api_key_env": "MUNITOAI_API_KEY",
     "forward_session_headers": False,

@@ -15,7 +15,7 @@ Contract:
 
 import json
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import proxy.provider as provider
@@ -94,15 +94,33 @@ class TestExhaustionCodes:
         assert body["diagnostics"] == attempts
 
     def test_slot_exhaustion_429_has_stable_code(self):
-        r = provider._build_exhausted_response(
-            all_local_slot_exhaustion=True, total_slots=4
-        )
+        with patch.object(
+            provider, "_local_occupant_prefill_seconds", return_value=0.0
+        ):
+            r = provider._build_exhausted_response(
+                all_local_slot_exhaustion=True, total_slots=4
+            )
         body = json.loads(r.body)
         assert r.status_code == 429
         assert body["error"] == "All providers exhausted"
         assert body["code"] == "all_slots_exhausted"
         assert "slots available" in body["message"]
         assert "0/4" in body["message"]
+
+    def test_slot_exhaustion_429_carries_retry_timing(self):
+        # LP-0MVUXY1CL005KWCC AC1: the last timer-free admission refusal now
+        # answers *when* to retry, using the vocabulary of the other refusals.
+        with patch.object(
+            provider, "_local_occupant_prefill_seconds", return_value=0.0
+        ):
+            r = provider._build_exhausted_response(
+                all_local_slot_exhaustion=True, total_slots=4
+            )
+        body = json.loads(r.body)
+        assert body["retryable"] is True
+        assert body["retry_after"] == 5, "server.slot_unavailable_retry_after default"
+        assert r.headers.get("retry-after") == str(body["retry_after"])
+        assert datetime.fromisoformat(body["retry_at"]).utcoffset() == timedelta(0)
 
     def test_codes_are_module_constants(self):
         assert provider.EXHAUSTION_CODE_ALL == "all_exhausted"

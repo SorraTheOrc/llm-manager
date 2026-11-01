@@ -136,6 +136,23 @@ def _log_lines(logger, level="info") -> list[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@pytest.fixture(autouse=True)
+def _isolate_abandoned_registry():
+    """Isolate the shared abandoned-slot registry around every test here.
+
+    The release paths under test record abandonment entries — endpoint-wide
+    when the slot cannot be resolved (LP-0MVUVHAQP001IRKK) — and leave them
+    live for their TTL. Without isolation those entries leak into later
+    modules in the same pytest process, where the status builder annotates a
+    draining slot from them (LP-0MVUVHB1V006HA5I) and cross-module payload
+    counts break (``test_llama_local_status``). Mirrors the pattern in
+    ``test_abandoned_local_dispatch.py``.
+    """
+    helpers._reset_abandoned_slots()
+    yield
+    helpers._reset_abandoned_slots()
+
+
 @pytest.mark.asyncio
 async def test_deadline_release_deletes_record_and_pops_marker():
     """AC1: the deadline release removes the record, pops the marker and emits

@@ -584,7 +584,10 @@ def _probe_local_serving(
     headers = {
         "Content-Type": "application/json",
         "X-Session-ID": session_id,
-        "X-Local-Preference": "prefer-local",
+        # Pin-local: this scenario verifies local serving/admission, so it must
+        # ask for the wait-for-local policy. ``prefer-local`` is retired (a
+        # ``400`` before routing, LP-0MVUH9PUU005HVS4).
+        "X-Local-Preference": "local-preferred",
     }
     result = {"status": None, "served_local": False, "tokens": 0, "snippet": ""}
     try:
@@ -646,7 +649,8 @@ def run_stall_test(
     common_headers = {
         "Content-Type": "application/json",
         "X-Session-ID": session_id,
-        "X-Local-Preference": "local-only",
+        # Pin-local (was the retired ``local-only`` alias) — see above.
+        "X-Local-Preference": "local-preferred",
     }
     t0 = time.time()
     status_code: str | None = None
