@@ -1438,6 +1438,31 @@ payload kept reporting `available_slots: 2`, `capacity_hint: idle` and
 `llama_server_running: true`; local served 165 streams against 5 707 remote ones
 — **2.8 % local share**.
 
+### The published route fields (`status_schema_version` 5)
+
+Additive since LP-0MVWFKIKJ005XHAY: every existing key keeps its name and
+meaning, and the three fields below describe the *route* rather than the
+*engine*. They are built read-only from the in-process armed state at request
+time; the routing decision never reads them, so there is no behaviour change
+and no new poll.
+
+| Field | Type | Value when nothing is armed | Meaning |
+|-------|------|--------------------------------|---------|
+| `local_route_available` | bool | `true` | Would chain resolution accept the local route right now? `false` means the route is armed and local dispatches will be refused before the engine is even asked. |
+| `local_route_reason` | str or `null` | `null` | Why the route is unavailable, as a canonical routing token: `local_provider_cooldown` (an entry cooldown is armed — the actionable, waitable reason) or `outside_available_window` (every local entry is outside its `available_times` window, which is not a cooldown and therefore carries no countdown). |
+| `local_route_cooldown_remaining_s` | int or `null` | `null` | Seconds until the route becomes usable again — the **shortest** active arm across the eligible local entries. `null` when the route is available, and for a non-cooldown reason (never a fabricated `0`). |
+
+The local entries judged are the ones serving the reported local model
+(`current_model`), so the chat route and the embed route never decide each
+other's availability; a multi-backend model with an armed sibling entry is
+still reported available when any eligible entry is usable. With no local
+entry configured, or unreadable engine state, the payload stays well-formed and
+absent-safe. Note the deliberate split from the engine fields above: a payload
+can legitimately read `available_slots: 2`, `capacity_hint: idle` and
+`local_route_available: false` at the same time — that is exactly the
+2026-10-31 shape, and a dispatcher must gate on the route fields, not on the
+slot counts alone.
+
 Nothing in that window said "the route is armed while the engine is idle". Each
 arm was its own log line, so the episode was diagnosable only by joining
 hundreds of lines after the fact. The detector below emits **one** line for the
@@ -2232,6 +2257,27 @@ the gate declines, nothing else happens: no release, no 503, no detour and no
 cooldown (the arming site sits inside the abort branch and is never reached),
 and the dispatch is served locally.
 
+**Not a provider fault — the detour does not quarantine the entry.** The
+release is a verdict on the *prompt*, not on local's health: the 503 carries
+the `measured_cache_deficit` dispatch-reason marker (on the response header and
+on the in-process attribute, so a lost header cannot silently re-enable the
+quarantine), and the fallback handler **defers** it instead of arming
+`provider_cooldown_seconds` for the `local-qwen3` entry (LP-0MVWFKESK0005G61).
+The attempt record reads `status=local_dispatch_deferral`, no
+`local_provider_cooldown` arm is produced, and every other session keeps its
+local route while the GPU is free. This mirrors the cold-start grace immunity
+([Local cold-start immunity](#local-cold-start-immunity-lp-0mv9unioz009rian)):
+same deferral shape, different reason. Only the aborting session is kept off
+local, by the per-session/per-prompt `local_prefill_thrash_cooldown_seconds`
+window armed before the 503 is returned; an unmarked local 503 outside the
+cold window keeps the entry quarantine unchanged, so `local-qwen3 in cooldown`
+stays trustworthy evidence of a real fault. The slot marker the abort leaves
+behind is not freed by the abort: it is annotated `abandoned_busy` while
+llama-server drains the cancelled prefill and released on the first fresh
+`/slots` snapshot that reports the slot free (see
+[Abandoned local dispatches](#abandoned-local-dispatches-lp-0mvrmi5hk00558tb-ac1))
+— there is no per-reason TTL for this reason.
+
 **Vocabulary.** The gate adds exactly one `detail` token, `within_eta_budget`,
 and no new reason token, no new response header and no refusal body change (the
 refusal surface belongs to `LP-0MVSS435600370D6`). Every value on the decision:
@@ -2587,6 +2633,32 @@ decision honest (a ghost no longer reads as live work), while the ghost itself
 keeps the *free-GPU release* from firing — the GPU really is busy until
 llama-server finishes the cancelled task.
 
+#### Release, not a short TTL, for the deficit reason (LP-0MVWFKF4M009AEJ9)
+
+A deficit-aborted slot is released by the **observed-free** path, not by a
+reason-scoped shortened TTL. The planned 60 s TTL for `measured_cache_deficit`
+was dropped once the release-on-observed-free mechanism landed for every reason
+(LP-0MVUVHB1V006HA5I): an exact release cannot re-open the draining-ghost gap
+(LP-0MVUTYHG7001S6BM), whereas any fixed short window re-opens it whenever a
+drain outlasts the window. What a consumer therefore sees for this reason is:
+
+- immediately after the abort, the slot stays **annotated** —
+  `abandoned_busy`, `abandonment_reason=measured_cache_deficit`,
+  `abandoned_scope="slot"` (or `"endpoint"` when no identity could be
+  resolved) — because llama-server is still computing the cancelled prefill;
+- on the first **fresh** (`stale=false`) `/slots` snapshot that reports the
+  slot not processing, the entry is dropped and `local_abandoned_slots` /
+  `capacity_hint` reflect real capacity on that same poll;
+- a **stale** snapshot never releases anything (a cached
+  `is_processing=false` is a fossil, not proof), so a long drain keeps the
+  annotation until the backend actually disproves it.
+
+`DEFAULT_ABANDONED_SLOT_TTL_SECONDS` (900 s) is only the registry bound that
+keeps a forgotten entry from growing the registry past the pool; it is not the
+release trigger, and no per-reason TTL exists. Pinned end to end by
+`TestDeficitAbortMarkerRelease` in
+`proxy/tests/test_abandoned_local_dispatch.py`.
+
 #### Regression coverage for the prefill-thrash wedge
 
 `proxy/tests/test_prefill_thrash_wedge.py` reproduces the 2026-10-23 02:00-
@@ -2706,6 +2778,24 @@ chain cycle can try local again immediately. The deferral is recorded as a
 still quenches normally. The window is re-armed per restart by
 `cold_start.note_model_loaded()`; router-level concurrent-dispatch gating
 (`local_cold_start_max_concurrent`) is unchanged.
+
+**Reason-scoped sibling: the measured-cache-deficit detour
+(LP-0MVWFKESK0005G61).** The measured cache-deficit early abort (see
+[Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135))
+uses the same deferral shape for a different reason. Its 503 means the router
+released *that dispatch* because the measured prefix deficit proved the prompt
+could not be served inside its own prefill budget — a verdict on the prompt,
+which says nothing about local's health. The 503 therefore carries the
+`measured_cache_deficit` marker and is deferred the same way: recorded as
+`local_dispatch_deferral`, no `provider_cooldown_seconds` entry cooldown, no
+failure-counter bump, and the response's own `Retry-After` returned as the
+hint. The cold-start branch keeps precedence; an unmarked local 503 outside the
+window is still quarantined. The aborting prompt remains refused by the
+per-session/per-prompt `local_prefill_thrash_cooldown_seconds` window (other
+sessions and other prompts are unaffected), so the quarantine removed here is
+only the entry-wide one that starved unrelated sessions. The rollback is the
+detour's own feature flag (`local_measured_cache_abort_enabled: 0`), not a
+change to any knob in this section.
 
 ## Usage-limit reset quarantine (GoUsageLimitError, insufficient_quota)
 

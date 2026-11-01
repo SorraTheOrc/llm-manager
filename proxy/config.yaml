@@ -2222,7 +2222,8 @@ server:
   # cancelled it. During the window that session's local routing skips
   # (``routing_skip_local reason=prefill_thrash_cooldown``,
   # ``cooldown_remaining=Ns``) and the chain reaches the next provider
-  # immediately; OTHER sessions are unaffected (per-session key). The window
+  # immediately; the window is keyed per session AND per prompt fingerprint, so
+  # OTHER sessions (and other prompts of the same session) are unaffected. The window
   # expires lazily, or clears early on a local first byte that is COMPARABLE IN
   # SIZE to the prompt that armed it (see
   # ``local_prefill_thrash_recovery_fraction`` below); this knob is the
@@ -2313,6 +2314,26 @@ server:
   # ``elapsed_s``) and returns the same retryable 503 the deadline returns, so
   # the request detours to the next (remote) provider.
   #
+  # NOT A QUARANTINE (LP-0MVWFKESK0005G61) — the detour is reason-scoped, the
+  # same deferral shape as the cold-start grace immunity elsewhere in this
+  # section (``local_cold_start_grace_seconds``, LP-0MV9UNIOZ009RIAN). A
+  # measured-cache-deficit release is a verdict on THIS PROMPT (its measured
+  # ``prompt_progress`` proved it was re-prefilling far more than admission
+  # priced), not on local's health, so the 503 it returns carries the
+  # ``measured_cache_deficit`` dispatch-reason marker and the fallback handlers
+  # DEFER it exactly as they defer a cold-start 503: no
+  # ``provider_cooldown_seconds`` entry cooldown is applied, the failure
+  # counter is not bumped, and every OTHER session keeps its local route. A
+  # ``Skipping provider=local-qwen3 ... in cooldown
+  # reason=local_provider_cooldown`` line therefore implies a real local fault
+  # (an unmarked 5xx, a post-grace connection error or slot exhaustion), never
+  # this detour. Only the aborting session is kept off local, by the
+  # per-session/per-prompt ``local_prefill_thrash_cooldown_seconds`` window the
+  # router armed before returning the 503; that window stays scoped to one
+  # session and one prompt fingerprint, so other sessions and other prompts are
+  # unaffected. An unmarked local 503 outside the cold window keeps the entry
+  # quarantine unchanged.
+  #
   # The abort needs ALL THREE conditions, in this ENFORCED ORDER:
   #   1. measured deficit ratio ``(total - cache) / total`` >= the ratio floor.
   #      A genuinely warm dispatch shows ``cache >= 0.99 * total`` (ratio
@@ -2375,6 +2396,19 @@ server:
   # client that could have been served inside its budget: no release, no 503,
   # no detour and no cooldown (the arming site sits inside the abort branch and
   # is never reached).
+  #
+  # SLOT LIFECYCLE OF AN ABORTED DISPATCH: the abort does not free capacity.
+  # llama-server keeps computing the cancelled prefill until its next socket
+  # write, so the slot is annotated ``abandoned_busy``
+  # (``abandonment_reason=measured_cache_deficit``) instead of reading as live
+  # work, and that annotation is released on the abort's own release path — the
+  # first FRESH ``/slots`` snapshot reporting the slot free
+  # (LP-0MVUVHB1V006HA5I, pinned end to end for this reason by
+  # LP-0MVWFKF4M009AEJ9). There is deliberately NO shorter per-reason TTL: a
+  # fixed short window re-opens the draining-ghost gap (LP-0MVUTYHG7001S6BM)
+  # whenever a drain outlasts it. ``DEFAULT_ABANDONED_SLOT_TTL_SECONDS``
+  # (900 s, ``proxy/proxy/router_helpers.py``) therefore only bounds the
+  # registry entry; it is not the release trigger.
   #
   # ROLLBACKS — two independent ones:
   #   * COMPARATOR: ``local_prefill_deadline_seconds`` is the gate's budget
