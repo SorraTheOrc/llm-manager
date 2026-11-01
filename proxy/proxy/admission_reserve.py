@@ -213,6 +213,16 @@ LOCAL_FALLBACK_REASON_TOKENS: frozenset[str] = frozenset(
         # health, so it is deferred rather than quarantined. Mirrors
         # ``measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON``.
         "measured_cache_deficit",
+        # Thrash-gate refusals (LP-0MVXSSYTN001TBW5): the router's post-deadline
+        # local gate refused *this* dispatch either because this very request
+        # already had a local dispatch cancelled post-deadline
+        # (``post_deadline_terminal``) or because the session/prompt is inside
+        # its post-deadline window (``prefill_thrash_cooldown``). Both are
+        # verdicts on the request/prompt, not on local's health, so the 503 they
+        # return joins the non-quarantining deferral set instead of cooling the
+        # whole entry for every session.
+        "post_deadline_terminal",
+        "prefill_thrash_cooldown",
         # Structural refusals.
         "local_only_no_local_route",
         "local_route_unavailable",

@@ -1732,7 +1732,8 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
 | Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | refusing | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
 | Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | refusing | `routing_skip_local ... reason=tenant_limit ...` |
-| Router skip: (session, prompt) in post-deadline prefill-thrash cooldown — enforced at provider.py's chain entry **and** at the local dispatch choke points (`proxy_to_local` and `_try_acquire_local_dispatch`) | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` (`entry=router_dispatch` / `entry=lease_acquire` at the choke points) |
+| Router skip: (session, prompt) in post-deadline prefill-thrash cooldown — enforced at provider.py's chain entry **and** at the local dispatch choke points (`proxy_to_local` and `_try_acquire_local_dispatch`). The choke point's refusal is a **deferral**, not a fault: its 503 carries the `prefill_thrash_cooldown` dispatch-reason marker, so the entry is **not** quarantined and other sessions keep their local route (LP-0MVXSSYTN001TBW5) | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` (`entry=router_dispatch` / `entry=lease_acquire` at the choke points) and `Fallback triggered ... reason=prefill_thrash_cooldown` (attempt record `status=local_dispatch_deferral`, no `local_provider_cooldown` arm) |
+| Router skip: this request already had a local dispatch cancelled post-deadline (the request-scoped terminal marker), so local is terminal for it. Enforced at the same choke points as the cooldown row. Request-scoped by construction, so a concurrent request from the same session is unaffected. The refusal is a **deferral** carrying the `post_deadline_terminal` dispatch-reason marker, so the entry is **not** quarantined (LP-0MVXSSYTN001TBW5) | `post_deadline_terminal` | refusing | `routing_skip_local ... reason=post_deadline_terminal ...` (`entry=router_dispatch` / `entry=lease_acquire`) and `Fallback triggered ... reason=post_deadline_terminal` (attempt record `status=local_dispatch_deferral`, no `local_provider_cooldown` arm) |
 | Local dispatch released by the measured cache-deficit guard (`measured_cache_abort`): the measured prefix deficit proved this prompt would re-prefill far more than admission priced, so the accepted dispatch is released in seconds and the request detours to the next provider. It fires only when all three conditions hold — the deficit ratio floor, the token bound **and** the benefit gate (the measured cold ETA exceeds the request's prefill-deadline budget) — so a **pinned** dispatch whose measured ETA fits that budget is never aborted and never reaches this row (see [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135)). The release is a verdict on the prompt, not on local's health: the entry is **not** quarantined, and other sessions keep their local route (LP-0MVWFKESK0005G61) | `measured_cache_deficit` | refusing | `Fallback triggered ... from=<local> to=<next> reason=measured_cache_deficit` (attempt record `status=local_dispatch_deferral`, no `local_provider_cooldown` arm) |
 | Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | refusing | `contention_queue_fallback_after_queue ... preference=...` |
 | Local slots busy and the request did not queue (queue disabled, `high` priority, or a `remote-ok` request, which never waits) | `local_concurrency_limit` | refusing | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
@@ -2800,6 +2801,38 @@ sessions and other prompts are unaffected), so the quarantine removed here is
 only the entry-wide one that starved unrelated sessions. The rollback is the
 detour's own feature flag (`local_measured_cache_abort_enabled: 0`), not a
 change to any knob in this section.
+
+**Reason-scoped sibling: the post-deadline thrash-gate refusals
+(LP-0MVXSSYTN001TBW5).** The router's post-deadline local gate (see the
+`routing_skip_local` exit rows above) returns the same retryable `503` for two
+refusals, and both take this deferral shape for the same reason the deficit
+detour does — they are verdicts on *one request/prompt*, never on local's
+health:
+
+| Gate refusal | Marker / `X-Local-Fallback-Reason` | Meaning |
+|---|---|---|
+| `post_deadline_terminal` | `post_deadline_terminal` | This very request already had a local dispatch cancelled post-deadline; local is terminal for it. Request-scoped, so a concurrent request from the same session is unaffected |
+| `prefill_thrash_cooldown` | `prefill_thrash_cooldown` | The session's post-deadline window is armed for this prompt (`local_prefill_thrash_cooldown_seconds`) |
+
+The refusal `503` carries the reason twice — as `X-Local-Dispatch-Reason` on the
+wire and as an in-process attribute on the response — so the fallback loop
+defers that one request instead of calling
+`mark_provider_unavailable("<local>", provider_cooldown_seconds)`. The attempt
+record reads `status=local_dispatch_deferral` with the gate reason, the
+`Fallback triggered` line names `reason=post_deadline_terminal` /
+`reason=prefill_thrash_cooldown` (never the generic `reason=HTTP 503`), no
+failure counter is bumped, and the refusal's own `Retry-After` is returned as
+the hint. `local_route_starved` therefore sees no arm from these refusals.
+
+Measured why this matters (window 2026-10-31 23:56 → 2026-11-01 12:12, build
+`5d8318e3`): `1 193 of 1 369 (87.1 %)` `local-qwen3 in cooldown` skips belonged
+to bursts whose nearest antecedent was this unmarked gate `503`, and 23 of 41
+cooldown bursts started 0.1–8 s after a `post_deadline_terminal` refusal — one
+neighbour's aborted prompt became a 60 s cross-session outage of the local
+route. The refusing request still detours to the next provider inside the same
+request (unchanged), and genuine local faults (an unmarked local `5xx`, a
+post-grace connection error, slot exhaustion) keep their documented cooldowns:
+the exemption is reason-scoped, never "any `503` from local".
 
 ## Usage-limit reset quarantine (GoUsageLimitError, insufficient_quota)
 

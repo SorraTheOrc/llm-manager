@@ -8045,6 +8045,32 @@ SKIP_REASON_MEASURED_CACHE_DEFICIT = _canonical_local_fallback_reason(
     MEASURED_CACHE_DEFICIT_REASON
 )
 
+#: Thrash-gate refusal tokens (LP-0MVXSSYTN001TBW5): the router's post-deadline
+#: local gate refused this request's dispatch because the request itself is
+#: already terminal for local (``post_deadline_terminal``) or because the
+#: session/prompt is inside its post-deadline window
+#: (``prefill_thrash_cooldown``). Both are verdicts on the request, not on
+#: local's health — a neighbour's aborted prompt must never become a 60 s
+#: entry-wide outage. Spelled as literals here (and in router_helpers, which
+#: owns the gate) because ``router_helpers`` imports ``provider`` lazily: the
+#: drift guard is a test asserting these keys equal the gate's own constants.
+SKIP_REASON_POST_DEADLINE_TERMINAL = _canonical_local_fallback_reason(
+    "post_deadline_terminal"
+)
+SKIP_REASON_PREFILL_THRASH_COOLDOWN = _canonical_local_fallback_reason(
+    "prefill_thrash_cooldown"
+)
+
+#: Local-dispatch markers (``X-Local-Dispatch-Reason``) that name a *deferral*
+#: rather than a local fault, mapped to the skip/canonical reason token the
+#: fallback loop records and logs. The deferral is reason-scoped: a marker that
+#: is absent or not listed here keeps the pre-existing entry quarantine.
+DEFERRABLE_LOCAL_DISPATCH_REASONS: dict[str, str] = {
+    MEASURED_CACHE_DEFICIT_REASON: SKIP_REASON_MEASURED_CACHE_DEFICIT,
+    "post_deadline_terminal": SKIP_REASON_POST_DEADLINE_TERMINAL,
+    "prefill_thrash_cooldown": SKIP_REASON_PREFILL_THRASH_COOLDOWN,
+}
+
 #: Local-route exits whose retry hint is a *real* availability expiry rather
 #: than the ETA formula (LP-0MVQ23B80009OZ9V AC1–AC4). An exit records the
 #: expiry it measured via ``_note_local_fallback_reason(..., retry_after_s=)``;
@@ -8056,7 +8082,7 @@ REAL_EXPIRY_FALLBACK_REASONS = frozenset({
     SKIP_REASON_USAGE_LIMIT_RESET_PENDING,
     SKIP_REASON_OUTSIDE_AVAILABLE_WINDOW,
     SKIP_REASON_LOCAL_LEASE_ACTIVE,
-    "prefill_thrash_cooldown",
+    SKIP_REASON_PREFILL_THRASH_COOLDOWN,
     "fallback_after_queue",
 })
 
@@ -11050,11 +11076,14 @@ def _local_dispatch_deferral_reason(
 ) -> str | None:
     """Return the reason marker when *response* is a deferrable local 503.
 
-    Only a local **503** carrying the measured-cache-deficit marker is
-    deferrable (LP-0MVWFKESK0005G61). The marker names a verdict on the prompt
-    — the measured ``prompt_progress`` proved this dispatch was re-prefilling
-    far more than admission priced, so it was released before it could be
-    served — which says nothing about local's health for any *other* session.
+    Only a local **503** carrying one of
+    :data:`DEFERRABLE_LOCAL_DISPATCH_REASONS` is deferrable. Each marker names a
+    verdict on the *request/prompt* — the measured ``prompt_progress`` proved
+    the dispatch was re-prefilling far more than admission priced
+    (``measured_cache_deficit``), the request already had a local dispatch
+    cancelled post-deadline (``post_deadline_terminal``), or the session/prompt
+    is inside its post-deadline thrash window (``prefill_thrash_cooldown``) —
+    none of which says anything about local's health for any *other* session.
 
     The exemption is **reason-scoped**, never "any 503 from local": an
     unmarked local 503, another status code, or a 503 carrying a different
@@ -11070,9 +11099,9 @@ def _local_dispatch_deferral_reason(
     except Exception:  # pragma: no cover - response stand-ins
         return None
     marker = admission_reserve.local_dispatch_reason(response)
-    if marker == MEASURED_CACHE_DEFICIT_REASON:
-        return SKIP_REASON_MEASURED_CACHE_DEFICIT
-    return None
+    if marker is None:
+        return None
+    return DEFERRABLE_LOCAL_DISPATCH_REASONS.get(marker)
 
 
 def _note_local_route_arm(
@@ -11190,18 +11219,24 @@ def _handle_http_error_with_cooldown(
     surface Retry-After.  Any other status code during the window still
     quarantines normally so genuine faults are not masked.
 
-    Reason-scoped deferral (LP-0MVWFKESK0005G61): a local 503 carrying the
-    measured-cache-deficit marker means the router released *this dispatch*
-    because the measured prefix deficit proved the prompt could not be served
-    in time — not that local is unhealthy. Quarantining the entry starved every
-    other session's ``prefer-local`` work while the GPU idled (measured
-    2026-10-31: 217 arms / 5.5 h, local share 2.8 %). Such a 503 is DEFERRED the
-    same way: recorded as ``local_dispatch_deferral``, no entry cooldown, no
+    Reason-scoped deferral (LP-0MVWFKESK0005G61, extended by
+    LP-0MVXSSYTN001TBW5): a local 503 carrying a marker listed in
+    ``DEFERRABLE_LOCAL_DISPATCH_REASONS`` means the router released or refused
+    *this dispatch* for a reason about the request/prompt — the measured prefix
+    deficit proved the prompt could not be served in time
+    (``measured_cache_deficit``), this request already had a local dispatch
+    cancelled post-deadline (``post_deadline_terminal``), or the session/prompt
+    is inside its post-deadline window (``prefill_thrash_cooldown``) — not that
+    local is unhealthy. Quarantining the entry starved every other session's
+    ``prefer-local`` work while the GPU idled (measured 2026-10-31: 217 arms /
+    5.5 h, local share 2.8 %; then 87.1 % of the 2026-11-01 cooldown skips came
+    from the unmarked thrash-gate 503). Such a 503 is DEFERRED the same way:
+    recorded as ``local_dispatch_deferral``, no entry cooldown, no
     failure-counter bump, and the response's own ``Retry-After`` returned as
-    the hint. The aborting prompt is still refused for the configured
+    the hint. The aborting/refused prompt is still refused for the configured
     ``local_prefill_thrash_cooldown_seconds`` by the per-session/per-prompt
-    window the router armed before returning the 503. The cold-start branch
-    keeps precedence (AC3), and an unmarked 503 is untouched.
+    window. The cold-start branch keeps precedence (AC3), and an unmarked 503
+    is untouched.
 
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
@@ -12565,7 +12600,19 @@ async def _proxy_with_remote_fallback_cycle(
                     attempted_domains.add(_usage_limit_account_key(provider_cfg))
                 else:
                     attempted_domains.add(_failure_domain_key(provider_cfg))
-                fallback_reason = f"HTTP {response.status_code}"
+                # LP-0MVXSSYTN001TBW5 AC5: a deferrable local 503 (measured
+                # cache deficit, post-deadline terminal, thrash window) names
+                # itself on the request and on the fallback line, so the detour
+                # is attributable as its own reason instead of the generic
+                # ``HTTP 503`` a genuine local fault carries.
+                _deferral_reason = _local_dispatch_deferral_reason(
+                    response, provider_type
+                )
+                if _deferral_reason is not None:
+                    _note_local_fallback_reason(request, _deferral_reason)
+                fallback_reason = (
+                    _deferral_reason or f"HTTP {response.status_code}"
+                )
                 prev_provider = provider_name
                 # A bare 429 from a LOCAL backend means "slots busy", so the
                 # exhaustion is reported as slot exhaustion. A 429 from a

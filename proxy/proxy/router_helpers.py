@@ -1774,6 +1774,15 @@ def _reset_prefill_thrash_cooldowns() -> None:
 #: ``Request`` object, so it can never leak across requests or sessions.
 _LOCAL_DISPATCH_TERMINAL_ATTR = "_local_dispatch_post_deadline_ts"
 
+#: The gate's two refusal reasons (LP-0MVXSSYTN001TBW5). Both are canonical
+#: local-route exit tokens (``admission_reserve.LOCAL_FALLBACK_REASON_TOKENS``)
+#: and both are **deferrals**: they say something about *this* request/prompt,
+#: never about local's health. The router stamps them as the 503's
+#: ``X-Local-Dispatch-Reason`` marker so the fallback loop detours the one
+#: request instead of quarantining the whole ``local`` entry for every session.
+LOCAL_GATE_REASON_POST_DEADLINE_TERMINAL = "post_deadline_terminal"
+LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN = "prefill_thrash_cooldown"
+
 
 def _mark_local_dispatch_terminal(request, now=None) -> float | None:
     """Mark *request* as terminal for local dispatch for the rest of its life.
@@ -1860,9 +1869,13 @@ def _local_dispatch_gate(
     terminal_at = _local_dispatch_terminal_at(request)
     if terminal_at is not None:
         _log_local_dispatch_gate_skip(
-            srv, session_key, "post_deadline_terminal", 0.0, entry
+            srv,
+            session_key,
+            LOCAL_GATE_REASON_POST_DEADLINE_TERMINAL,
+            0.0,
+            entry,
         )
-        return (True, "post_deadline_terminal", 0.0)
+        return (True, LOCAL_GATE_REASON_POST_DEADLINE_TERMINAL, 0.0)
     remaining = _prefill_thrash_cooldown_remaining(
         session_key,
         config if config is not None else _server_config_of(srv),
@@ -1870,9 +1883,13 @@ def _local_dispatch_gate(
     )
     if remaining > 0:
         _log_local_dispatch_gate_skip(
-            srv, session_key, "prefill_thrash_cooldown", remaining, entry
+            srv,
+            session_key,
+            LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN,
+            remaining,
+            entry,
         )
-        return (True, "prefill_thrash_cooldown", remaining)
+        return (True, LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN, remaining)
     return (False, "", 0.0)
 
 

@@ -1500,6 +1500,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         return _build_backend_error_response(
             srv, path, session_id, session_created,
             is_delta_request, session_fallback_reason,
+            # LP-0MVXSSYTN001TBW5 AC1: a thrash-gate refusal is a verdict on
+            # *this* request/prompt (already terminal for local, or inside its
+            # post-deadline window), never on local's health. Naming the reason
+            # on the response (header + in-process marker) is what makes the
+            # fallback loop defer this one 503 instead of quarantining the whole
+            # local entry for every session for 60 s.
+            local_dispatch_reason=_local_gate_reason,
         )
 
     # -------------------------------------------------------------------

@@ -71,6 +71,10 @@ DOCUMENTED_EXIT_TOKENS = {
     "resident_prefix_insufficient",
     "tenant_limit",
     "prefill_thrash_cooldown",
+    # Thrash-gate refusal, request-scoped half (LP-0MVXSSYTN001TBW5): this very
+    # request already had a local dispatch cancelled post-deadline, so local is
+    # terminal for it. A deferral, not a fault.
+    "post_deadline_terminal",
     # Reason-scoped local 5xx release (LP-0MVWFKESK0005G61): the measured
     # cache-deficit abort detours the request without quarantining the entry.
     "measured_cache_deficit",
