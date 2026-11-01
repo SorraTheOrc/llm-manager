@@ -1426,6 +1426,93 @@ drops well below the 4,947 baseline, client-visible latency for refused
 requests approaches the remote TTFT baseline instead of ~120 s, local serve
 share stays above 2.6 %, and mid-stream error counts do not increase.
 
+## Local-route starvation detector (LP-0MVWFKIVO007EGDU, parent AC11)
+
+`/llama/local/status` separates the **engine** from the **route**:
+`available_slots` / `capacity_hint` / `llama_server_running` describe the
+former, while `local_route_available` / `local_route_reason` /
+`local_route_cooldown_remaining_s` describe the latter. Both are needed because
+they disagree exactly when it hurts. On 2026-10-31 the `local-qwen3` entry was
+armed **217 times in 5.5 h** (median gap 67 s ≈ the 60 s cooldown TTL) while the
+payload kept reporting `available_slots: 2`, `capacity_hint: idle` and
+`llama_server_running: true`; local served 165 streams against 5 707 remote ones
+— **2.8 % local share**.
+
+Nothing in that window said "the route is armed while the engine is idle". Each
+arm was its own log line, so the episode was diagnosable only by joining
+hundreds of lines after the fact. The detector below emits **one** line for the
+whole episode instead.
+
+### The line
+
+```
+WARNING local_route_starved armed_s=300 window_s=600 armed_fraction=0.50 arms=5 available_slots=2 llama_server_running=true reasons=local_provider_cooldown:3,measured_cache_deficit:2
+```
+
+| Field | Meaning |
+|-------|---------|
+| `armed_s` | Seconds of the rolling window in which the local route was armed (entry-wide cooldown or per-session/per-prompt thrash window). Overlapping arms count once. |
+| `window_s` | Rolling window length (`server.local_route_starvation_window_seconds`, default 600). |
+| `armed_fraction` | `armed_s / window_s`; the line only fires at or above `server.local_route_starvation_min_armed_fraction` (default 0.5). |
+| `arms` | Arm events in the window; at least `server.local_route_starvation_min_arms` (default 2) are required, because one genuine fault is normal traffic. |
+| `available_slots` | Free local slots from the existing coalesced `/slots` sample at emission time — always `> 0`, since a busy engine is not starvation. |
+| `llama_server_running` | Always `true`; the warning never fires with the engine down. |
+| `reasons` | Per-reason arm counts as `token:count`, most frequent first, so the cause is attributable from the one line. |
+
+The `reasons` tokens are the canonical routing vocabulary, never a second
+spelling:
+
+| Token | Armed by | Scope |
+|-------|----------|-------|
+| `local_provider_cooldown` | A `type: local` entry marked unavailable by the fallback error handlers — a local 5xx (other than a deferred measured-cache-deficit 503) or a connection error, outside the cold-start grace window | whole entry |
+| `measured_cache_deficit` | The per-session/per-prompt thrash window armed when the measured cache-deficit guard releases a dispatch early (see the exit table above) | one session + one prompt |
+| `prefill_thrash_cooldown` | The same thrash window, armed by `prefill_deadline_exceeded` | one session + one prompt |
+
+### When it fires
+
+- **State-only, no new polling.** The detector is fed by the existing arm sites
+  (`provider._handle_http_error_with_cooldown`,
+  `provider._handle_connection_error_in_fallback`,
+  `router_helpers._record_prefill_thrash_cooldown`) and is evaluated *on those
+  events* — no timer, no task, no HTTP call, no `/slots` poll of its own.
+- **Only while the engine is healthy.** It reads the same state the status
+  surface publishes: `llama_server_running=true`, a **known**
+  `available_slots > 0`, and not inside the cold-start grace window
+  (`cold_start.is_cold`) — warm-up deferral is expected, never starvation. An
+  unknown slot count (no fresh `/slots` sample) keeps it silent rather than
+  guessing.
+- **Bounded output.** At most one line per 10 minutes
+  (`server.local_route_starvation_throttle_seconds`). A route that stays armed
+  re-warns after the throttle, so a long episode reads as one line per 10
+  minutes instead of a burst.
+- **Never on a single fault.** One arm is not starvation, however long its own
+  cooldown is: `min_arms` is checked before the armed fraction.
+
+### What it never does
+
+- **No routing input.** The tracker is observability only: no routing decision
+  reads it, and it can neither arm, clear nor shorten a cooldown.
+  `local_route_starvation.starvation_snapshot()` exposes the state read-only for
+  tests and tooling; no `/llama/local/status` field is added for it (the
+  `local_route_*` fields above are the published surface).
+- **No capacity arms.** Slot-exhaustion / lease-active refusals are a verdict on
+  capacity, not on the route, so they are not counted — and the healthy-engine
+  condition (`available_slots > 0`) would suppress them in any case.
+
+### Knobs and rollback
+
+Every key is optional and lives in the `server` config section; malformed values
+fall back to the documented default, so a typo can never switch the detector off
+by accident.
+
+```yaml
+local_route_starvation_enabled: true            # 0 disables the detector
+local_route_starvation_window_seconds: 600      # rolling window
+local_route_starvation_min_armed_fraction: 0.5  # sustained share required
+local_route_starvation_min_arms: 2              # one genuine fault stays silent
+local_route_starvation_throttle_seconds: 600    # at most one line per 10 min
+```
+
 ## Local Admission Reservations and Fallback Intent (LP-0MVIKPCSG002B0NL)
 
 Polling `/llama/local/status` and then sending is racy: two clients can observe

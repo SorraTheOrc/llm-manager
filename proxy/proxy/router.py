@@ -130,6 +130,9 @@ from proxy.lifecycle import (  # noqa: E402
     _resolve_slot_model_name,
     _self_healing_response,
 )
+from proxy.local_route_starvation import (  # noqa: E402
+    LOCAL_ROUTE_REASON_PREFILL_THRASH,
+)
 from proxy.measured_cache_abort import (  # noqa: E402
     DETAIL_WITHIN_ETA_BUDGET,
     MEASURED_CACHE_DEFICIT_REASON,
@@ -2166,6 +2169,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 server_config,
                                 tokens=_estimated_tokens,
                                 fingerprint=_client_prompt_fingerprint,
+                                reason=MEASURED_CACHE_DEFICIT_REASON,
                             )
                             if _abort_cooldown_deadline > 0:
                                 srv.logger.info(
@@ -2285,6 +2289,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                             fingerprint=_prefill_thrash_fingerprint(
                                                 body_json
                                             ),
+                                            reason=LOCAL_ROUTE_REASON_PREFILL_THRASH,
                                         )
                                     )
                                     if _prefill_cooldown_deadline > 0:

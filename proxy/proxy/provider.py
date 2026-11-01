@@ -66,6 +66,10 @@ from proxy.admission_reserve import (
     parse_preference,
     retired_preference_body,
 )
+from proxy.local_route_starvation import (
+    LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN,
+    record_local_route_arm,
+)
 from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
 from proxy.observability import _record_backend_signal
 from proxy.priority import (
@@ -11071,6 +11075,32 @@ def _local_dispatch_deferral_reason(
     return None
 
 
+def _note_local_route_arm(
+    provider_type: str,
+    cooldown_seconds: float,
+    config: dict | None = None,
+    reason: str = LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN,
+) -> None:
+    """Feed the local-route starvation detector (LP-0MVWFKIVO007EGDU AC11).
+
+    Called *after* an intended cooldown was applied, so the detector observes
+    the same arming the chain will honour. Observability only: this never
+    changes the cooldown, never touches the failure counter and never raises —
+    a remote arm is ignored entirely (a remote cooldown is not local-route
+    starvation) and so is a zero-length one.
+
+    The measured 2026-10-31 fingerprint (217 arms / 5.5 h, local share 2.8 %)
+    was produced by exactly this path, so the detector is fed from it rather
+    than from a new poll.
+    """
+    if provider_type != "local":
+        return
+    try:
+        record_local_route_arm(reason, cooldown_seconds, config=config)
+    except Exception:  # pragma: no cover - observability must never fail an arm
+        pass
+
+
 def _handle_connection_error_in_fallback(
     exc: Exception,
     provider_name: str,
@@ -11116,6 +11146,7 @@ def _handle_connection_error_in_fallback(
             cooldown = min(backoff, cooldown_seconds)
             _provider_failure_count[provider_name] = count + 1
         mark_provider_unavailable(provider_name, cooldown)
+        _note_local_route_arm(provider_type, cooldown, config=config)
         _record_attempt(
             attempts,
             provider=provider_name,
@@ -11260,6 +11291,7 @@ def _handle_http_error_with_cooldown(
         )
 
     mark_provider_unavailable(provider_name, cooldown)
+    _note_local_route_arm(provider_type, cooldown, config=config)
     attempt_fields: dict[str, Any] = {
         "provider": provider_name,
         "type": provider_type,

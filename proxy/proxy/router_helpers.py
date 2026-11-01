@@ -1488,7 +1488,7 @@ def _get_prefill_thrash_recovery_fraction(config) -> float:
 
 
 def _record_prefill_thrash_cooldown(
-    session_id, config, now=None, tokens=None, fingerprint=None
+    session_id, config, now=None, tokens=None, fingerprint=None, reason=None
 ) -> float:
     """Arm (or re-arm) a cooldown window; return its monotonic deadline.
 
@@ -1510,6 +1510,12 @@ def _record_prefill_thrash_cooldown(
     :func:`_clear_prefill_thrash_cooldown`); when it is absent or not a
     positive integer the window is still armed, but the clear path falls back
     to the fail-open clear-on-any-success behaviour.
+
+    *reason* names the arming cause with a canonical routing token
+    (``prefill_thrash_cooldown`` for the deadline, ``measured_cache_deficit``
+    for the early abort). It is passed to the local-route starvation detector
+    (LP-0MVWFKIVO007EGDU AC11) so a sustained armed window is attributable from
+    one log line; it never changes the window the caller gets back.
     """
     if not session_id:
         return 0.0
@@ -1531,6 +1537,15 @@ def _record_prefill_thrash_cooldown(
         _prefill_thrash_cancel_tokens[key] = size
     else:
         _prefill_thrash_cancel_tokens.pop(key, None)
+    if reason:
+        try:
+            from proxy.local_route_starvation import record_local_route_arm
+
+            # ``_now`` is the same monotonic clock the detector measures its
+            # window on, so the arm lands at the instant the window was armed.
+            record_local_route_arm(reason, seconds, now=_now, config=config)
+        except Exception:  # pragma: no cover - observability only
+            pass
     return deadline
 
 

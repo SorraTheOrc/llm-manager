@@ -2262,6 +2262,37 @@ server:
   local_prefill_thrash_recovery_fraction: 0.9
 
   # -----------------------------------------------------------------------
+  # Local-route starvation detector (LP-0MVWFKIVO007EGDU, parent AC11)
+  # -----------------------------------------------------------------------
+  # One bounded WARNING (``local_route_starved``) when the local route is armed
+  # for a sustained fraction of a rolling window **while the engine is healthy**
+  # (``llama_server_running=true``, a known ``available_slots > 0``, not in the
+  # cold-start grace window). It exists because the 2026-10-31 episode (217 arms
+  # in 5.5 h, median gap 67 s, local share 2.8 %) left no single line saying
+  # "the route is armed while the GPU is idle"; the evidence was spread over
+  # hundreds of arm lines. The line carries per-reason counts in canonical
+  # routing tokens (``local_provider_cooldown``, ``measured_cache_deficit``,
+  # ``prefill_thrash_cooldown``) so the cause is attributable.
+  #
+  # State-only: fed from the existing arm sites and evaluated on those events —
+  # no timer, no task, no poll, and no routing decision ever reads it. See
+  # ``proxy/docs/routing.md`` ("Local-route starvation detector").
+  #
+  # ROLLBACK: set ``local_route_starvation_enabled: 0``. The remaining keys are
+  # optional; each falls back to the documented default when absent or
+  # malformed, so a typo cannot switch the detector off by accident.
+  local_route_starvation_enabled: true
+  # Rolling window the armed fraction is measured over.
+  # local_route_starvation_window_seconds: 600
+  # Sustained share of the window that must be armed before a warning.
+  # local_route_starvation_min_armed_fraction: 0.5
+  # One genuine fault is normal traffic, so a warning needs at least this many
+  # arm events in the window (a single arm never fires, whatever its cooldown).
+  # local_route_starvation_min_arms: 2
+  # At most one warning per this many seconds.
+  # local_route_starvation_throttle_seconds: 600
+
+  # -----------------------------------------------------------------------
   # Measured cache-deficit early abort (LP-0MVR7IN0O000DPXN, parent Option D)
   # -----------------------------------------------------------------------
   # Admission-time warmth is only a PREDICTION: ``routing_resident_prefix``
