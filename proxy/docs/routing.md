@@ -1621,7 +1621,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | refusing | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
 | Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | refusing | `routing_skip_local ... reason=tenant_limit ...` |
 | Router skip: (session, prompt) in post-deadline prefill-thrash cooldown — enforced at provider.py's chain entry **and** at the local dispatch choke points (`proxy_to_local` and `_try_acquire_local_dispatch`) | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` (`entry=router_dispatch` / `entry=lease_acquire` at the choke points) |
-| Local dispatch released by the measured cache-deficit guard (`measured_cache_abort`): the measured prefix deficit proved this prompt would re-prefill far more than admission priced, so the accepted dispatch is released in seconds and the request detours to the next provider. The release is a verdict on the prompt, not on local's health: the entry is **not** quarantined, and other sessions keep their local route (LP-0MVWFKESK0005G61) | `measured_cache_deficit` | refusing | `Fallback triggered ... from=<local> to=<next> reason=measured_cache_deficit` (attempt record `status=local_dispatch_deferral`, no `local_provider_cooldown` arm) |
+| Local dispatch released by the measured cache-deficit guard (`measured_cache_abort`): the measured prefix deficit proved this prompt would re-prefill far more than admission priced, so the accepted dispatch is released in seconds and the request detours to the next provider. It fires only when all three conditions hold — the deficit ratio floor, the token bound **and** the benefit gate (the measured cold ETA exceeds the request's prefill-deadline budget) — so a **pinned** dispatch whose measured ETA fits that budget is never aborted and never reaches this row (see [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135)). The release is a verdict on the prompt, not on local's health: the entry is **not** quarantined, and other sessions keep their local route (LP-0MVWFKESK0005G61) | `measured_cache_deficit` | refusing | `Fallback triggered ... from=<local> to=<next> reason=measured_cache_deficit` (attempt record `status=local_dispatch_deferral`, no `local_provider_cooldown` arm) |
 | Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | refusing | `contention_queue_fallback_after_queue ... preference=...` |
 | Local slots busy and the request did not queue (queue disabled, `high` priority, or a `remote-ok` request, which never waits) | `local_concurrency_limit` | refusing | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
 | Prefill-gate / lease denial (a lease-active 503 after the retry window) | `local_lease_active` | refusing | `contention_queue_fallback_after_queue ... reason=local_lease_active` |
@@ -2073,6 +2073,123 @@ queue deadline. The ordering is asserted at startup by
 admission guard legitimately admitted or races the client's own deadline. It
 is the hard backstop that does not depend on ETA-estimator quality.
 
+#### Measured cache-deficit early abort (LP-0MVR7IN0O000DPXN, benefit gate LP-0MVWBD91Z004U135)
+
+Admission-time warmth is only a *prediction*: `routing_resident_prefix`
+decisions carry `n_past_actual=none`, so a slot owner is admitted at
+`reuse_ratio=1.0` even when llama-server is about to re-prefill the prompt from
+scratch (measured 2026-10-26: 29 of 116 deadline evictions were ~56k prompts
+priced at 17-182 new tokens). With `server.local_measured_cache_abort_enabled`
+on, the proxy asks llama-server for `prompt_progress` inside the SSE stream
+(`return_progress: true` on a **copy** of the client body — the key never
+reaches recorded payloads) and, at the first progress event, compares the
+**measured** compute (`total - cache`) with the admission-priced `new_tokens`.
+When the measurement proves the dispatch is re-prefilling far more than priced,
+the accepted dispatch is released in **seconds** (not at
+`local_prefill_deadline_seconds`), the shared
+`local_eviction_after_acceptance reason=measured_cache_deficit` event records
+the evidence (`total`, `measured_cache`, `priced_new_tokens`, `elapsed_s`), and
+the request receives the same retryable 503 the deadline returns, so it detours
+to the next remote provider.
+
+The abort needs **all three** conditions, in this enforced order:
+
+1. **deficit ratio floor** — `(total - cache) / total >=
+   local_measured_cache_abort_min_deficit_ratio` (shipped **0.25**). A genuine
+   warm dispatch shows `cache >= 0.99 × total` (ratio <= 0.01), so no prompt
+   size and no token bound can ever trip the abort on it.
+2. **token bound** — the measured new tokens exceed the priced `new_tokens` by
+   more than `local_measured_cache_abort_bound_tokens` (shipped **2 000**).
+3. **benefit gate** — the measured deficit priced with the admission guard's
+   own calibrated model (`proxy.prefill_eta.estimate_prefill_seconds` at
+   `cached_ratio=0.0`) **exceeds the request's own prefill-deadline budget**:
+
+   ```text
+   budget_s = local_admission_guard_budget_safety_fraction
+              × local_prefill_deadline_seconds
+            = 0.95 × 120 s = 114 s   (shipped)
+   ```
+
+   falling back to the bare `local_prefill_deadline_seconds` (**120 s**) when
+   the safety fraction is `0` (the "no safety margin" rollback). The
+   comparator comes from `proxy.prefill_eta.prefill_deadline_budget_seconds` —
+   the same helper the admission guard enforces — so the advertised and the
+   enforced threshold cannot drift.
+
+The rule in one line: **abort only when the measured cold ETA exceeds the
+prefill-deadline budget.** An ETA equal to the budget is *within* budget and
+continues. The gate prices the **measured** `total - cache`, never the
+admission-priced `new_tokens`: with the incident's `total=14380 cache=0`,
+`priced_new_tokens=48` the deficit is 14 380 tokens, which measures 56.1 s at
+the shipped rate fit (38.8 s at the host median 371 t/s, 84.6 s at p25) — the
+8.2 s a 49-token price produces is the fake-warm optimism the abort exists to
+correct, so it must never price the gate.
+
+The admission **wait** budget is explicitly **NOT** the comparator. It bounds
+queueing (`budget_seconds`, derived from `contention_queue_max_wait_seconds`,
+shipped **30 s**; the recorded incident carried 60 s) and is already spent by
+the time a dispatch is accepted and prefilling, so
+`local_prefill_deadline_seconds` is what actually cancels it. The choice is
+load-bearing: against a 60 s
+comparator the incident prompt (84.6 s at the host p25 rate) still aborts, i.e.
+the defect survives; against 114 s it continues at every measured rate with
+at least 29 s of margin.
+
+**A pinned dispatch whose measured ETA fits the budget is never aborted.**
+This is the point of the gate. A `local-preferred` (pin-local) request may not
+detour: the contract converts the abort's retryable 503 into a retryable
+`429 Local admission refused` and the abort also arms
+`local_prefill_thrash_cooldown_seconds` (**120 s**), so an unjustified abort is
+a long-lived hard refusal for exactly the client that cannot escape it. When
+the gate declines, nothing else happens: no release, no 503, no detour and no
+cooldown (the arming site sits inside the abort branch and is never reached),
+and the dispatch is served locally.
+
+**Vocabulary.** The gate adds exactly one `detail` token, `within_eta_budget`,
+and no new reason token, no new response header and no refusal body change (the
+refusal surface belongs to `LP-0MVSS435600370D6`). Every value on the decision:
+
+| `detail=` | Verdict | Emitted when |
+|---|---|---|
+| `disabled` | continue | `local_measured_cache_abort_enabled` is `0`/`false`/`off` (the documented feature rollback) |
+| `no_measurement` | continue | no `prompt_progress` measurement, or a field missing |
+| `invalid_measurement` | continue | `total <= 0`, `cache < 0` or `cache > total` |
+| `invalid_priced_new_tokens` | continue | the admission-priced `new_tokens` is absent or malformed |
+| `below_deficit_ratio_floor` | continue | condition 1 failed |
+| `within_bound` | continue | condition 2 failed |
+| `within_eta_budget` | continue | conditions 1-2 passed and the measured ETA fits `budget_s` (the gate's one new token) |
+| `deficit_over_bound` | **abort** | all three conditions passed — `reason=measured_cache_deficit` |
+| `decision_error` | continue | fail-open: an unpriceable deficit, an unusable budget (`budget_s=0`), or any internal error |
+
+**Observability.** Both verdicts are reported on the same
+`measured_cache_abort` line, so a tolerated deficit is explainable from
+`proxy.log` alone:
+
+```text
+# continue (benefit gate declined the abort)
+measured_cache_abort session=<id> model=<model> detail=within_eta_budget total=<n> cache=<n> \
+  measured_new_tokens=<n> priced_new_tokens=<n> deficit_ratio=<r> bound_tokens=<n> \
+  measured_eta_s=<s> budget_s=<s> → measured deficit fits the prefill budget, continuing local dispatch
+
+# abort
+measured_cache_abort session=<id> model=<model> reason=measured_cache_deficit detail=deficit_over_bound \
+  total=<n> cache=<n> measured_new_tokens=<n> priced_new_tokens=<n> deficit_ratio=<r> \
+  bound_tokens=<n> measured_eta_s=<s> budget_s=<s> elapsed_s=<s> → cancelling local dispatch early and detouring to the next provider
+```
+
+`budget_s` is the comparator **actually enforced** (114.0 under the shipped
+config), never the admission wait budget; `measured_eta_s` / `budget_s` render
+`unknown` when the gate did not price the deficit.
+
+**Rollback.** Two independent, value-only rollbacks: set
+`local_measured_cache_abort_enabled: 0` to restore the exact pre-change
+behaviour end to end (no `return_progress` injection, no capture, no early
+release), or retune the comparator's input — `local_prefill_deadline_seconds`
+(and `local_admission_guard_budget_safety_fraction`, which the admission guard
+already enforces; `0` compares against the bare deadline). No code change and
+no restart-ordering constraint beyond the usual process restart. The keys
+themselves are documented in `proxy/config.yaml`.
+
 #### Cold-prefill admission budget (LP-0MVN3KMGI009BZ0D)
 
 A parallel, *measured* cap on what the GPU must actually compute:
@@ -2276,6 +2393,14 @@ Two mechanisms, applied per reason:
 | `no_progress_watchdog` | **Cancel** the record's `stream_cm` (existing, `LP-0MVIQ0FJC000YLX0`) + **annotate** | `lease_released … reason=no_progress_watchdog`, `abandoned_slot_recorded …` |
 | `client_disconnect` | **Cancel** the record's `stream_cm` (existing, `LP-0MVLFVY6K003VYEL`) + **annotate** | `lease_released … reason=client_disconnect`, `abandoned_slot_recorded …` |
 | `orphan_cleanup` / measured cache deficit | **Cancel** + **annotate** (same shared core) | `lease_released … reason=<that reason>` |
+
+A `measured_cache_deficit` abandonment only exists because the benefit gate
+**allowed** the abort: all three conditions held, so the measured cold ETA
+exceeds the request's prefill-deadline budget (`0.95 ×
+local_prefill_deadline_seconds` = 114 s shipped, falling back to the bare
+deadline when the safety fraction is `0`) and waiting could not have succeeded.
+A deficit the gate declines continues the dispatch and abandons nothing (see
+[Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135)).
 
 The cancel is real on this build, not decoration. llama-server aborts at its
 next write to the socket, and `return_progress` guarantees such writes

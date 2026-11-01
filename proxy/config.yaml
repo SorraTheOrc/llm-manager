@@ -2282,23 +2282,81 @@ server:
   # ``elapsed_s``) and returns the same retryable 503 the deadline returns, so
   # the request detours to the next (remote) provider.
   #
-  # The abort needs BOTH conditions, in this order:
+  # The abort needs ALL THREE conditions, in this ENFORCED ORDER:
   #   1. measured deficit ratio ``(total - cache) / total`` >= the ratio floor.
   #      A genuinely warm dispatch shows ``cache >= 0.99 * total`` (ratio
   #      <= 0.01), so no prompt size and no token bound can ever trip it;
   #   2. measured new tokens exceed the priced ``new_tokens`` by more than the
-  #      token bound.
-  # Both bounds are monotone in the safe direction (raising either only makes
-  # an abort less likely). Nothing in the path can raise: a missing/partial/
-  # malformed measurement, a capture or decision error, or a stream that never
-  # emits ``prompt_progress`` all degrade to today's behaviour, including the
-  # full 120 s deadline path (fail open — never a hard local outage).
+  #      token bound;
+  #   3. the BENEFIT GATE: the measured deficit genuinely cannot finish inside
+  #      the request's own prefill-deadline budget (see below).
+  # The three bounds are monotone in the safe direction (raising the ratio
+  # floor or the token bound, or tightening the budget, can only make an abort
+  # less likely). Nothing in the path can raise: a missing/partial/malformed
+  # measurement, a capture or decision error, an unpriceable deficit, an
+  # unusable budget, or a stream that never emits ``prompt_progress`` all
+  # degrade to today's behaviour, including the full 120 s deadline path (fail
+  # open — never a hard local outage).
   #
-  # ROLLBACK: set ``local_measured_cache_abort_enabled: 0``. One value change
-  # restores the exact pre-change behaviour end to end (no ``return_progress``
-  # injection, no measurement capture, no early release; the full deadline
-  # path applies). No code change and no restart-ordering constraint beyond
-  # the usual process restart.
+  # THE BENEFIT GATE (condition 3, LP-0MVWBD91Z004U135). Conditions 1-2 alone
+  # cancel a mid-size cold prompt that local could have served comfortably. The
+  # recorded 2026-10-31 incident measured ``total=14380 cache=0`` against a
+  # priced ``new_tokens=48`` — ratio 1.0, deficit 14 380 > 48 + 2000, so both
+  # fired — yet 14 380 cold tokens cost ~56 s at the shipped rate fit (38.8 s
+  # at the host median of 371 t/s), well inside the request's own budget. The
+  # gate therefore prices the MEASURED deficit ``total - cache`` (never the
+  # admission-priced ``new_tokens`` — pricing the gate from those 48 tokens is
+  # exactly the optimism the abort exists to correct) with the admission
+  # guard's OWN calibrated model (``proxy.prefill_eta.estimate_prefill_seconds``
+  # at ``cached_ratio=0.0``, since a deficit is by definition uncached) and
+  # aborts only when that ETA EXCEEDS:
+  #
+  #   budget_s = local_admission_guard_budget_safety_fraction
+  #              x local_prefill_deadline_seconds
+  #            = 0.95 x 120 s = 114 s (shipped)
+  #
+  # falling back to the bare ``local_prefill_deadline_seconds`` (120 s) when
+  # the fraction is explicitly 0 — the documented "no safety margin" rollback,
+  # not a disabled budget. The comparator is resolved by
+  # ``proxy.prefill_eta.prefill_deadline_budget_seconds``, the SAME helper the
+  # admission guard enforces, so the advertised threshold can never drift from
+  # the enforced one. An ETA that FITS the budget continues the dispatch and is
+  # reported as ``detail=within_eta_budget`` (the gate's only new ``detail``
+  # token) on the ``measured_cache_abort`` line, with ``measured_eta_s`` and
+  # ``budget_s`` naming the numbers compared.
+  #
+  # The admission WAIT budget is explicitly NOT the comparator. It bounds
+  # queueing (``contention_queue_max_wait_seconds``, 30 shipped; the recorded
+  # incident carried 60 s) and it has already been spent by the time a
+  # dispatch is accepted and prefilling — ``local_prefill_deadline_seconds`` is
+  # what actually cancels an accepted prefill. The distinction is not
+  # cosmetic: against a 60 s comparator the incident prompt (84.6 s at the
+  # host p25 rate) still aborts, i.e. the defect survives; against 114 s it
+  # continues at every measured rate with >= 29 s of margin.
+  #
+  # WHY IT MATTERS FOR A PINNED CLIENT: the early abort returns the same
+  # retryable 503 the deadline returns so the request detours to the next
+  # remote provider — but a ``local-preferred`` (pin-local) request may not
+  # detour. The contract turns that detour into a retryable
+  # ``429 Local admission refused``, and the abort also arms
+  # ``local_prefill_thrash_cooldown_seconds`` (120 s), so the refusal is long
+  # lived. An abort the benefit gate declines therefore never refuses a pinned
+  # client that could have been served inside its budget: no release, no 503,
+  # no detour and no cooldown (the arming site sits inside the abort branch and
+  # is never reached).
+  #
+  # ROLLBACKS — two independent ones:
+  #   * COMPARATOR: ``local_prefill_deadline_seconds`` is the gate's budget
+  #     input (together with ``local_admission_guard_budget_safety_fraction``,
+  #     which the admission guard already enforces). There is deliberately no
+  #     gate-specific budget key, so the guard and the abort can never disagree
+  #     about "too slow"; lower the deadline to tighten both, and set the
+  #     fraction to 0 to compare against the bare deadline.
+  #   * FEATURE: set ``local_measured_cache_abort_enabled: 0``. One value
+  #     change restores the exact pre-change behaviour end to end (no
+  #     ``return_progress`` injection, no measurement capture, no early
+  #     release; the full deadline path applies). No code change and no
+  #     restart-ordering constraint beyond the usual process restart.
   #
   # Measurement window: the post-deploy attribution (parent F6) counts this
   # reason separately from ``prefill_deadline`` so the wasted-token reduction
