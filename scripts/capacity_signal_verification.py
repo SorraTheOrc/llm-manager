@@ -123,14 +123,18 @@ its name-encoded hour, ``scripts/lib/proxy_logs.py``).
 ``abandonment_events``
     Local dispatch abandonments inside the window, by reason: a
     ``lease_released reason=<r>`` line where ``<r>`` is one of
-    ``prefill_deadline``, ``session_evicted``, ``no_progress_watchdog`` or
-    ``client_disconnect``. That records the proxy dropping an in-flight local
-    dispatch while llama-server may still be finishing the job — so a *fresh*
-    ``/slots`` snapshot can legitimately report the slot ``is_processing``
-    with no proxy-side record left. Proxy-restart markers are reported the
-    same way (``kind: proxy_restart``) so restart-bounded stale windows can be
-    attributed. ``idle_timeout`` is excluded: it is the normal end of a
-    *completed* stream, not the abandonment of an in-flight one.
+    ``prefill_deadline``, ``session_evicted``, ``no_progress_watchdog``,
+    ``client_disconnect`` or ``measured_cache_deficit``. That records the proxy
+    dropping an in-flight local dispatch while llama-server may still be
+    finishing the job — so a *fresh* ``/slots`` snapshot can legitimately
+    report the slot ``is_processing`` with no proxy-side record left.
+    Proxy-restart markers are reported the same way (``kind:
+    proxy_restart``) so restart-bounded stale windows can be attributed.
+    ``idle_timeout`` is excluded: it is the normal end of a *completed*
+    stream, not the abandonment of an in-flight one. The set was widened with
+    ``measured_cache_deficit`` (LP-0MVUVHBD40067FE3), so every report states
+    that the historical counts were measured with the narrower set and a
+    before/after comparison is not like-for-like.
 
 ``attribution``
     Each violating ``saturated`` poll attributed to the **nearest preceding**
@@ -334,6 +338,21 @@ from lib.proxy_logs import (  # noqa: E402
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_LOG_DIR = Path("/var/log/llama-proxy")
 
+#: ``proxy/`` (not the repository root) is the proxy package root —
+#: ``proxy/proxy/measured_cache_abort.py`` is ``proxy.measured_cache_abort`` —
+#: so it goes on ``sys.path`` exactly as ``scripts/`` does above. The reason
+#: set below references the proxy's own constant rather than a repeated
+#: literal, so the measurement cannot drift from the reason the proxy writes:
+#: a re-typed string is exactly the failure that left the AC4 residual
+#: unmeasurable.
+PROXY_DIR = REPO_ROOT / "proxy"
+if str(PROXY_DIR) not in sys.path:
+    sys.path.insert(0, str(PROXY_DIR))
+
+from proxy.measured_cache_abort import (  # noqa: E402
+    MEASURED_CACHE_DEFICIT_REASON,
+)
+
 
 def _shared_worklog_dir(repo_root: Path) -> Path:
     """The worklog directory shared with the main checkout.
@@ -388,9 +407,33 @@ _LEASE_RELEASED_RE = re.compile(r"\blease_released\b.*\breason=(?P<reason>[a-z_]
 #: later ``/slots`` snapshot can still report the slot as processing.
 #: ``idle_timeout`` is excluded (the normal end of a *completed* stream) and so
 #: is ``non_explicit`` (nothing is known about why it was released).
+#: ``measured_cache_deficit`` belongs beside the deadline, watchdog and eviction
+#: reasons for exactly the same reason they do: the proxy gives up on the
+#: dispatch and releases its record while llama-server keeps working on it, so
+#: a later snapshot can still report the slot busy with nothing the proxy is
+#: waiting for. It is the measured form of the prefill-deadline abort (the
+#: deadline is only exceeded once the comparator has actually measured the
+#: cache deficit), not a normal end of stream — leaving it out is what made 5 of
+#: the 12 residual AC4 polls unattributable (LP-0MVUVHBD40067FE3). The value is
+#: imported from ``proxy.measured_cache_abort`` so the two cannot drift.
 _ABANDON_REASONS = frozenset(
-    {"prefill_deadline", "session_evicted", "no_progress_watchdog",
-     "client_disconnect"}
+    {
+        "prefill_deadline",
+        "session_evicted",
+        "no_progress_watchdog",
+        "client_disconnect",
+        MEASURED_CACHE_DEFICIT_REASON,
+    }
+)
+#: Every report states the baseline discontinuity this widening creates
+#: (LP-0MVUVHBD40067FE3 AC2): the recorded counts were measured while the set
+#: was narrower, so the widened tally is not directly comparable with them.
+_ABANDON_BASELINE_NOTE = (
+    "abandonment reasons are widened with "
+    f"{MEASURED_CACHE_DEFICIT_REASON}: the historical counts "
+    "(247 polls / 2.12 % pre-fix AC1 baseline, 12 polls / 0.11 % post-fix "
+    "AC4 residual) were computed with the narrower four-reason set, so "
+    "before/after comparisons are read knowingly"
 )
 #: Proxy restart markers (the rotation line the proxy writes on startup, plus
 #: uvicorn lifecycle lines) so restart-bounded stale windows can be attributed.
@@ -1247,11 +1290,15 @@ def evaluate(
             "checks": checks,
             "notes": [
                 "requested window is not fully covered — figures below are a "
-                "partial result and must not be reported as a measurement"
+                "partial result and must not be reported as a measurement",
+                _ABANDON_BASELINE_NOTE,
             ],
         }
 
-    notes: list[str] = []
+    # Stated on every path, including a partial one: a reader must never
+    # compare a widened abandonment tally with the recorded narrower-set
+    # counts unknowingly (LP-0MVUVHBD40067FE3 AC2).
+    notes: list[str] = [_ABANDON_BASELINE_NOTE]
     if metrics["status_polls"] == 0:
         notes.append("no status polls in the window (empty window, not an error)")
         return {"verdict": VERDICT_EMPTY, "checks": checks, "notes": notes}

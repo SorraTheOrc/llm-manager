@@ -24,8 +24,11 @@ observable measurement contract without needing the production log directory:
 * the CLI contract: exit 0 for a covered (even empty) window, exit 3 for a
   coverage gap, and the ``--json`` document shape;
 * ``measured_cache_deficit`` as an abandonment reason, so the release the proxy
-  writes when it aborts a fake-warm local dispatch is attributable (red-first:
-  see the marker notes in the ``_ABANDON_REASONS`` section).
+  writes when it aborts a fake-warm local dispatch is attributable (added
+  red-first by LP-0MVUVHAFR0018V21; see the ``_ABANDON_REASONS`` section);
+* the baseline discontinuity the widened reason set creates, stated in the
+  generated report rather than left for the reader to remember
+  (LP-0MVUVHBD40067FE3).
 """
 
 from __future__ import annotations
@@ -1199,13 +1202,13 @@ def test_bulk_eviction_keeps_one_event_per_session(csv, tmp_path):
 # proxy actually writes.
 #
 # Red-first encoding (the repository convention — see the module docstring of
-# ``test_abandoned_local_dispatch.py``): the assertions pinning behaviour that
-# does not exist yet are marked ``pytest.mark.xfail(strict=True)`` so this
-# test-only item lands on ``dev`` with a green suite. The paired implementation
-# item (LP-0MVUVHBD40067FE3) extends ``_ABANDON_REASONS`` and removes the
-# markers; ``strict`` fails the suite as soon as a marked assertion starts
-# passing, so a marker cannot be forgotten. The two control cases run unmarked
-# and pass both before and after the change.
+# ``test_abandoned_local_dispatch.py``): these assertions were added by the
+# test-only item LP-0MVUVHAFR0018V21 marked ``pytest.mark.xfail(strict=True)``
+# against the pre-change set, and the paired implementation item
+# LP-0MVUVHBD40067FE3 extends ``_ABANDON_REASONS`` and removes the markers (the
+# ``strict`` marker fails the suite as soon as a marked assertion starts
+# passing, so it could not be forgotten). The two control cases were never
+# marked and pass before and after the change.
 # ---------------------------------------------------------------------------
 
 #: The four reasons the set carried before this item (the pre-change baseline).
@@ -1233,27 +1236,11 @@ def test_abandon_reasons_keep_the_four_existing_reasons(csv):
     assert set(_PRE_EXISTING_ABANDON_REASONS) <= csv._ABANDON_REASONS
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Red-first (LP-0MVUVHAFR0018V21): _ABANDON_REASONS does not carry "
-        "measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON yet; "
-        "LP-0MVUVHBD40067FE3 removes this marker as it extends the set."
-    ),
-)
 def test_abandon_reasons_include_the_measured_cache_deficit_constant(csv):
     """The set is widened from the proxy's constant, not from a literal copy."""
     assert _measured_cache_deficit_reason() in csv._ABANDON_REASONS
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Red-first (LP-0MVUVHAFR0018V21): a measured_cache_deficit release is "
-        "dropped by analyse_abandonment_events until _ABANDON_REASONS carries "
-        "the reason; LP-0MVUVHBD40067FE3 removes this marker."
-    ),
-)
 def test_measured_cache_deficit_release_attributes_the_saturated_poll(
     csv, tmp_path
 ):
@@ -1336,6 +1323,60 @@ def test_measured_cache_deficit_release_outside_lookback_is_not_attributed(
     assert attribution["by_cause"] == {}
     assert attribution["rows"][0]["cause"] is None
     assert attribution["rows"][0]["evidence_timestamp"] is None
+
+
+#: The historical counts the widened set makes non-comparable, as the report
+#: must quote them (LP-0MVUVHBD40067FE3 AC2): the recorded pre-fix AC1 baseline
+#: (247 polls / 2.12 %) and the post-fix AC4 residual (12 polls / 0.11 %).
+_HISTORICAL_BASELINE_FRAGMENTS = ("247", "2.12 %", "12 polls", "0.11 %")
+
+
+def test_report_states_the_widened_reason_set_and_the_historical_baseline(
+    csv, tmp_path
+):
+    """A report must record the baseline discontinuity, not just the tally.
+
+    The reason set gained ``measured_cache_deficit`` *after* the recorded
+    counts were measured, so the widened tally is not directly comparable with
+    them. Both the rendered report an analyst reads and the JSON notes a
+    downstream consumer reads must say so, quoting the historical counts —
+    otherwise a before/after comparison is read as a like-for-like change.
+    """
+    reason = _measured_cache_deficit_reason()
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason=reason)
+        + status_line(
+            "2026-10-23 00:11:00",
+            hint="saturated",
+            stale="false",
+            detail_stale="false",
+            in_flight=0,
+            available="0",
+        ),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    rendered = csv.render(report)
+    assert "widened" in rendered
+    assert reason in rendered
+    assert "narrower" in rendered
+    for fragment in _HISTORICAL_BASELINE_FRAGMENTS:
+        assert fragment in rendered
+
+    notes = "\n".join(report["verdict"]["notes"])
+    assert "widened" in notes
+    assert reason in notes
+    assert "narrower" in notes
+    for fragment in _HISTORICAL_BASELINE_FRAGMENTS:
+        assert fragment in notes
 
 
 # ---------------------------------------------------------------------------
