@@ -25,10 +25,19 @@ its own reason instead of the ordinary idle-stall retry path.
 Tests cover: max-duration expiry, activity expiry (heartbeats flowing but no
 content), normal streams unaffected, idle-stall retry still retries when
 within budgets, and the termination metric.
+
+LP-0MVX0NEM7003HRW3: every watchdog budget is derived from a single injectable
+monotonic clock (``_handle_remote_streaming(clock=...)``, default
+``time.monotonic``). The activity-progress assertions inject ``FakeClock``
+instead of relying on wall-clock elapsed time: a host under load can starve the
+event loop so that a real ``time.monotonic()`` read crosses a budget between two
+awaits, which used to surface as a spurious ``stream_activity_timeout`` on a
+stream that was delivering content the whole time.
 """
 
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx
@@ -77,6 +86,112 @@ class HangAfterChunksIterator:
         if not self._chunks:
             await asyncio.Event().wait()
         return self._chunks.pop(0)
+
+
+class FakeClock:
+    """Deterministic monotonic clock for watchdog tests (LP-0MVX0NEM7003HRW3).
+
+    Injected as ``_handle_remote_streaming(clock=...)`` so elapsed watchdog
+    time is driven explicitly by the test (or by the upstream iterator) rather
+    than read from the wall clock. That keeps the activity-progress assertions
+    independent of host load: a starved event loop can no longer make a read
+    look like an activity-budget expiry.
+
+    ``start`` is deliberately explicit, because the anchor decides what a
+    regression to wall-clock time would look like:
+
+    - a test proving that *content progress resets a budget* anchors it at
+      ``time.monotonic()`` and then advances it explicitly, so injected
+      progress is always ahead of any stray wall-clock read — a regression that
+      reads the real clock trips the budget instead of silently looking
+      "newer";
+    - a test proving that a *classification* uses the injected clock anchors it
+      at ``0.0``, far behind real monotonic time, so consulting the wall clock
+      would expire the budget and fail the assertion.
+    """
+
+    def __init__(self, start: float):
+        self._now = start
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> float:
+        self._now += seconds
+        return self._now
+
+
+class ClockAdvancingContentIterator:
+    """Yields content chunks while advancing an injected clock.
+
+    Each chunk represents *real elapsed stream time*: the per-chunk gap stays
+    below the activity budget while the total elapsed time exceeds it, so only
+    a watchdog that resets its activity timer on every content-bearing chunk
+    lets the stream finish.
+    """
+
+    def __init__(self, chunks, clock, seconds_per_chunk):
+        self._chunks = list(chunks)
+        self._clock = clock
+        self._step = seconds_per_chunk
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            await asyncio.Event().wait()
+        self._clock.advance(self._step)
+        return self._chunks.pop(0)
+
+
+class AsyncioProxy:
+    """Module proxy that overrides selected ``asyncio`` attributes.
+
+    Patched over ``proxy.proxy_remote.asyncio`` to simulate a starved event
+    loop without mutating the real ``asyncio`` module.
+    """
+
+    def __init__(self, real_module, **overrides):
+        self._real = real_module
+        self._overrides = overrides
+
+    def __getattr__(self, name):
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._real, name)
+
+
+class WaitForStarvedOnce:
+    """``asyncio.wait_for`` stand-in whose timeout handler wins a ready read.
+
+    Simulates the load-sensitive interleaving behind LP-0MVX0NEM7003HRW3: the
+    awaited upstream chunk was already available but a starved loop ran the
+    timer callback before the read task's step, so ``wait_for`` raises
+    ``TimeoutError`` with no upstream idleness at all. The first call raises;
+    later calls delegate to the real ``wait_for``.
+    """
+
+    def __init__(self, real_wait_for):
+        self._real = real_wait_for
+        self.calls = 0
+
+    async def __call__(self, awaitable, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            # Cancellation is what the real wait_for does to a timed-out read.
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise TimeoutError
+        return await self._real(awaitable, timeout=timeout)
+
+
+def _activity_terminations() -> float:
+    """Current count of ``stream_activity_timeout`` watchdog terminations."""
+    return metrics.llama_remote_stream_terminated_total.labels(
+        reason="stream_activity_timeout"
+    )._value.get()
 
 
 # ===================================================================
@@ -140,10 +255,15 @@ def mock_request():
     return req
 
 
-async def _call_streaming(mock_request, client, **kwargs):
+async def _call_streaming(mock_request, client, server_config=None, clock=None, **kwargs):
     """Run _handle_remote_streaming with standard patches; return result + chunks.
 
     Returns (result, chunks) — chunks already collected from the stream.
+
+    ``clock`` is forwarded as the watchdog's monotonic time source and
+    ``server_config`` overrides the ``server:`` config keys the handler reads
+    (e.g. the retry backoff) — both used by the deterministic tests added for
+    LP-0MVX0NEM7003HRW3.
     """
     defaults = dict(
         target_url="https://api.example.com/v1/chat/completions",
@@ -155,13 +275,15 @@ async def _call_streaming(mock_request, client, **kwargs):
         upstream_idle_timeout_seconds=0.5,
     )
     defaults.update(kwargs)
+    if clock is not None:
+        defaults["clock"] = clock
     with patch("proxy.proxy_remote.httpx.AsyncClient", return_value=client):
         with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
             with patch("proxy.proxy_remote.log_response_chunk"):
                 with patch("proxy.proxy_remote.log_response"):
                     with patch("proxy.proxy_remote.log_request"):
                         with patch("proxy.proxy_remote._srv") as mock_srv:
-                            mock_srv.return_value.config = {}
+                            mock_srv.return_value.config = dict(server_config or {})
                             mock_srv.return_value.logger = MagicMock()
                             result = await _handle_remote_streaming(
                                 request=mock_request, **defaults
@@ -263,25 +385,84 @@ class TestActivityTimeout:
     @pytest.mark.asyncio
     async def test_content_progress_resets_activity_timer(self, mock_request):
         """A stream that keeps producing content-bearing chunks is never
-        killed by the activity watchdog."""
+        killed by the activity watchdog.
+
+        Driven by an injected clock (LP-0MVX0NEM7003HRW3): the four chunks are
+        spaced 0.15s apart, so the stream spans 0.6s — three times the 0.2s
+        activity budget — while no single inter-chunk gap exceeds it. Only a
+        watchdog that resets its activity deadline on every content-bearing
+        chunk, using the injected clock rather than wall-clock elapsed time,
+        lets the stream finish — so this cannot flake on a loaded host.
+        """
+        clock = FakeClock(time.monotonic())
+        start = clock()
         content = [
             b'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n',
             b'data: {"choices":[{"delta":{"content":" world"},"index":0}]}\n\n',
             b'data: {"choices":[{"delta":{"content":"!"},"index":0}]}\n\n',
             b'data: [DONE]\n\n',
         ]
-        mock_resp = _make_mock_response(iterator=HangAfterChunksIterator(content))
+        iterator = ClockAdvancingContentIterator(content, clock, seconds_per_chunk=0.15)
+        mock_resp = _make_mock_response(iterator=iterator)
         client = _make_streaming_mock_client(mock_resp)
 
         _, chunks = await _call_streaming(
             mock_request,
             client,
+            clock=clock,
             upstream_max_stream_duration_seconds=9999,
             upstream_activity_timeout_seconds=0.2,
         )
 
+        # The stream spanned 3x the activity budget in watchdog time ...
+        assert clock() - start == pytest.approx(0.6)
+        # ... yet every inter-chunk gap stayed below it, so nothing fired.
         assert _synthetic_error_from(chunks) is None
         assert len(chunks) >= 4
+
+    @pytest.mark.asyncio
+    async def test_progress_in_same_tick_as_activity_check_is_not_a_timeout(
+        self, mock_request
+    ):
+        """Load-sensitive interleaving (LP-0MVX0NEM7003HRW3): the read timeout
+        fires in the same tick in which the upstream chunk became available, so
+        ``asyncio.wait_for`` raises ``TimeoutError`` although no activity
+        budget elapsed.
+
+        Classification must come from the injected clock, not wall-clock
+        elapsed time: zero progress budget was consumed, so the read is an
+        ordinary stall that may be retried — never a ``stream_activity_timeout``
+        watchdog termination.
+        """
+        clock = FakeClock(0.0)
+        content = [
+            b'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":" world"},"index":0}]}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+        mock_resp = _make_mock_response(iterator=HangAfterChunksIterator(content))
+        client = _make_streaming_mock_client(mock_resp)
+        before = _activity_terminations()
+
+        starved = WaitForStarvedOnce(asyncio.wait_for)
+        with patch("proxy.proxy_remote.asyncio", AsyncioProxy(asyncio, wait_for=starved)):
+            _, chunks = await _call_streaming(
+                mock_request,
+                client,
+                clock=clock,
+                server_config={"server": {"upstream_retry_base_delay_seconds": 0}},
+                upstream_max_stream_duration_seconds=9999,
+                upstream_activity_timeout_seconds=0.2,
+            )
+
+        # The starved read was retried, not turned into a watchdog kill.
+        assert starved.calls >= 2
+        assert client.stream.call_count == 2
+        assert _synthetic_error_from(chunks) is None
+        assert any(b"Hello" in c for c in chunks)
+        # No watchdog time elapsed and no activity termination was recorded.
+        assert clock() == pytest.approx(0.0)
+        assert _activity_terminations() == before
 
 
 # ===================================================================
