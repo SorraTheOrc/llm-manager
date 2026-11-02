@@ -786,6 +786,21 @@ async def _update_session_and_slot(
                                 prompt_tokens=_sidecar_tokens,
                                 messages=_sidecar_messages,
                             )
+                        else:
+                            # LP-0MVVX6RAR002QAUT AC2: a 0-token fallback
+                            # used to leave an unseedable snapshot with no log
+                            # evidence at all. Behaviour-neutral (the snapshot
+                            # is saved either way) — the pairing skip is now
+                            # attributable from logs instead of inferred from
+                            # later seed outcomes.
+                            srv.logger.info(
+                                "slot_sidecar_write_skipped "
+                                "reason=no_trustworthy_count source=router "
+                                "session=%s slot=%s model=%s",
+                                session_id[:8] if session_id else "unknown",
+                                slot_id,
+                                srv.current_model,
+                            )
                     except Exception:
                         srv.logger.debug(
                             "slot ratio sidecar write failed", exc_info=True

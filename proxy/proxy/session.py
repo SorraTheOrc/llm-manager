@@ -936,7 +936,7 @@ async def save_evicted_session_snapshot(
         except Exception:
             pass
         if saved:
-            _write_eviction_sidecar(session_id, model, filename)
+            _write_eviction_sidecar(session_id, model, filename, slot_id=slot_id)
     except Exception:
         report["reason"] = f"{reason}:snapshot_error"
     return report
@@ -966,6 +966,7 @@ def _write_eviction_sidecar(
     session_id: str | None,
     model: str | None,
     slot_filename: str | None,
+    slot_id: int | None = None,
 ) -> None:
     """Pair an eviction-saved snapshot with its routing-ratio sidecar.
 
@@ -978,8 +979,11 @@ def _write_eviction_sidecar(
     prefix (``provider.record_prompt_prefix`` → ``_last_prompt_prefix``) is the
     only trustworthy token count: it is a measurement of exactly the prompt the
     slot held. A session with no recorded prefix gets no sidecar rather than an
-    invented count. Never raises — pairing is best effort and must not fail a
-    save that already succeeded.
+    invented count. The skip itself is logged at INFO
+    (``slot_sidecar_write_skipped reason=no_trustworthy_count source=eviction
+    pairing=no_sidecar_source``, LP-0MVVX6RAR002QAUT AC4) so the unpaired save
+    stays attributable from logs. Never raises — pairing is best effort and
+    must not fail a save that already succeeded.
     """
     if not session_id or not model or not slot_filename:
         return
@@ -988,6 +992,14 @@ def _write_eviction_sidecar(
 
         recorded = _eviction_sidecar_source(session_id, model)
         if recorded is None:
+            logger.info(
+                "slot_sidecar_write_skipped reason=no_trustworthy_count "
+                "source=eviction pairing=no_sidecar_source session=%s "
+                "slot=%s model=%s",
+                session_id[:8],
+                slot_id,
+                model,
+            )
             return
         cached_tokens, fingerprints = recorded
         write_slot_ratio_sidecar(

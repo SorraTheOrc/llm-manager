@@ -2999,6 +2999,23 @@ root, sidecar in the subdirectory) made every seed report `missing_sidecar` and
 no restore ever run. Point every local llama-server's `--slot-save-path` at
 `session_slot_save_path`.
 
+**Sidecar-write observability (LP-0MVVX6RAR002QAUT).** Whenever a snapshot is
+saved but its `.ratio.json` sidecar cannot be written honestly, one INFO line
+makes the skip attributable instead of inferable only from later seed outcomes:
+
+```text
+slot_sidecar_write_skipped reason=no_trustworthy_count source=router session=… slot=… model=…
+slot_sidecar_write_skipped reason=no_trustworthy_count source=eviction pairing=no_sidecar_source session=… slot=… model=…
+```
+
+`reason=no_trustworthy_count` means there was no measured usage, recorded
+prefix or estimable message text to pair the snapshot with, so no sidecar is
+invented; `source` names the write path — `router` (a response save whose
+`sidecar_cached_tokens()` returned 0) or `eviction` (no request body, so only
+a recorded prefix could pair it; `pairing=no_sidecar_source` marks that case).
+The snapshot itself is still saved — only the pairing is skipped — and the
+session's next measured turn writes a paired snapshot that replaces it.
+
 Config keys:
 - `server.session_slot_save_path` — directory for slot snapshot files
 - `server.session_slot_pool_size` — number of slots; should match llama-server `--parallel`
