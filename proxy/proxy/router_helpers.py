@@ -7521,13 +7521,20 @@ _last_child_port_fallback_warn_ts = 0.0
 """Monotonic timestamp of the last child-port fallback warning (throttle)."""
 
 _router_model_ids_snapshot: dict[str, Any] = {}
-"""Cached router ``/models`` id snapshot (LP-0MVU7ZZIA0092AXW).
+"""Cached router ``/models`` snapshot (LP-0MVU7ZZIA0092AXW).
 
 Keys: ``ids`` (``list[str]``), ``solo`` (the sole non-embed id, or ``None``),
-``at`` (``time.monotonic()`` fetch time) and ``key`` (router port,
-llama-server pid, ``srv.current_model``). A changed key (restart or model
-switch) invalidates it; :func:`ensure_router_model_ids` refreshes it when the
-TTL (:func:`_child_port_cache_ttl`, mirroring the child-port cache) expires.
+``loaded`` (``list[str]`` of ids whose ``/models`` entry reports a loaded
+status, or ``None`` when the last probe was unparseable — see
+:func:`_loaded_models_snapshot`), ``at`` (``time.monotonic()`` fetch time) and
+``key`` (router port, llama-server pid, ``srv.current_model``). A changed key
+(restart or model switch) invalidates it; :func:`ensure_router_model_ids`
+refreshes it when the TTL (:func:`_child_port_cache_ttl`, mirroring the
+child-port cache) expires.
+
+LP-0MVWBX2YT001OEYE (slice 2 of LP-0MVVCY3HQ0009F0K) added ``loaded`` so the
+synchronous "is this model loaded?" guard reads this **same** cached
+``/models`` snapshot instead of opening a second ``/models`` cache (Q3 = B).
 """
 
 _child_model_signal_cache: dict[Any, tuple[str | None, float]] = {}
@@ -7834,6 +7841,111 @@ def _cached_router_model_ids(srv) -> list[str]:
     return ids
 
 
+def _extract_router_loaded_ids(payload) -> set[str] | None:
+    """Loaded-model ids from a router ``/models`` payload.
+
+    Returns ``None`` (indeterminate) when the payload is not a parseable
+    ``/models`` document — a non-dict, a non-list model array, or a payload the
+    lifecycle readiness rules cannot be imported for. That distinction is the
+    whole point: an unparseable/failed probe must never be mistaken for "no
+    models are loaded", which would turn a transient probe failure into a
+    false skip of a real availability gate (LP-0MVWBX2YT001OEYE AC2).
+
+    A parseable payload with an **empty** model array is a genuine "nothing is
+    loaded" answer and yields ``set()``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    models_payload = payload.get("data") or payload.get("models") or []
+    if not isinstance(models_payload, list):
+        return None
+    try:
+        from proxy.lifecycle import _model_entry_is_loaded
+    except Exception:
+        return None
+    loaded: set[str] = set()
+    for entry in models_payload:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not model_id:
+            continue
+        if _model_entry_is_loaded(entry):
+            loaded.add(str(model_id))
+    return loaded
+
+
+def _loaded_models_snapshot(srv) -> set[str] | None:
+    """Synchronously readable loaded-model id set from the cached snapshot.
+
+    Never performs an HTTP round trip: it reads
+    :data:`_router_model_ids_snapshot` (warmed by
+    :func:`ensure_router_model_ids` on the async dispatch path) so the hot
+    ``/slots`` resolution path adds **zero** ``/models`` requests once warm
+    (LP-0MVWBX2YT001OEYE AC1/AC3).
+
+    Returns the set of ids whose ``/models`` entry reports a loaded status, or
+    ``None`` (indeterminate) when the snapshot is absent, belongs to another
+    router/pid/model, has outlived its TTL, or was produced by an unparseable
+    probe. Callers must **fail open** on ``None`` — poll as today — and never
+    treat it as "nothing is loaded".
+    """
+    _ids, _solo = _router_models_snapshot_meta(srv)  # clears a stale key
+    snapshot = _router_model_ids_snapshot
+    if not snapshot:
+        return None
+    at = float(snapshot.get("at", 0.0) or 0.0)
+    if time.monotonic() - at >= _child_port_cache_ttl():
+        return None
+    loaded = snapshot.get("loaded")
+    if loaded is None:
+        return None
+    return {str(model_id) for model_id in loaded}
+
+
+def is_model_known_unloaded(srv, model_name: str | None) -> bool | None:
+    """Tri-state "is *model_name* definitively not loaded?" for the guard.
+
+    ``True`` — the cached ``/models`` snapshot is trustworthy and
+    *model_name* is **not** in the loaded set (skip the poll). ``False`` — the
+    model is loaded. ``None`` — indeterminate (no successful probe, stale
+    snapshot, or an unresolved/empty name); the caller must fail open and poll
+    as today.
+
+    Matching is case-insensitive membership against the router's own ids. The
+    caller is expected to pass an id resolved from ``/models``
+    (:func:`resolve_local_model_id` guarantees that), so an alias/preset
+    mismatch is not guessed here — guessing would risk a false skip.
+
+    Readiness uses the same rules as ``srv.router_is_model_loaded()``
+    (:func:`proxy.lifecycle._model_entry_is_loaded`), so the async and
+    synchronous "is it loaded" views cannot disagree
+    (LP-0MVWBX2YT001OEYE AC5).
+    """
+    name = str(model_name or "").strip()
+    if not name:
+        return None
+    loaded = _loaded_models_snapshot(srv)
+    if loaded is None:
+        return None
+    want = name.lower()
+    return not any(str(model_id).strip().lower() == want for model_id in loaded)
+
+
+async def ensure_loaded_models_snapshot(srv) -> set[str] | None:
+    """Refresh the shared ``/models`` snapshot and return the loaded-id set.
+
+    Async entry point for callers that already have a place to await (the
+    dispatch path calls :func:`ensure_router_model_ids` directly); it exists so
+    a caller can express "warm the loaded set now" without reaching into the
+    snapshot internals. It reuses :func:`ensure_router_model_ids`, so it never
+    adds a second ``/models`` cache or an extra request while warm
+    (LP-0MVWBX2YT001OEYE AC3/AC4).
+    """
+    await ensure_router_model_ids(srv)
+    return _loaded_models_snapshot(srv)
+
+
 async def ensure_router_model_ids(srv) -> list[str]:
     """Refresh the cached router ``/models`` id snapshot when it is stale.
 
@@ -7844,6 +7956,11 @@ async def ensure_router_model_ids(srv) -> list[str]:
     the child-port cache), and when *srv* exposes no lister (unit-test stubs),
     so the hot ``/slots`` path costs **zero** ``/models`` requests once warm
     (LP-0MVU7ZZIA0092AXW).
+
+    The same fetch also populates the snapshot's ``loaded`` key (via
+    :func:`_extract_router_loaded_ids`), so the synchronous
+    :func:`_loaded_models_snapshot` view is served from this one request rather
+    than a second ``/models`` cache (LP-0MVWBX2YT001OEYE AC3).
     """
     ids, _solo = _router_models_snapshot_meta(srv)
     if _router_model_ids_snapshot:
@@ -7863,6 +7980,10 @@ async def ensure_router_model_ids(srv) -> list[str]:
         fetched = _extract_router_model_ids(payload)
     except Exception:
         fetched = []
+    # The loaded set shares this snapshot (Q3 = B). ``None`` here means the
+    # probe was unparseable/failed, so the synchronous guard must fail open
+    # rather than conclude that nothing is loaded (LP-0MVWBX2YT001OEYE AC2).
+    loaded = _extract_router_loaded_ids(payload)
     non_embed = _non_embed_model_ids(fetched)
     solo = non_embed[0] if len(non_embed) == 1 else None
     _router_model_ids_snapshot.clear()
@@ -7870,6 +7991,7 @@ async def ensure_router_model_ids(srv) -> list[str]:
         {
             "ids": list(fetched),
             "solo": solo,
+            "loaded": sorted(loaded) if loaded is not None else None,
             "at": time.monotonic(),
             "key": _router_models_snapshot_key(srv),
         }

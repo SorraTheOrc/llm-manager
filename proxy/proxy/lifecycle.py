@@ -1030,6 +1030,48 @@ def _extract_router_model_ids(router_models: dict | None) -> list[str]:
 
 
 
+#: ``status.value`` strings a router/llama-server build uses for a model
+#: that is resident and ready to serve.
+_LOADED_STATUS_VALUES = {"loaded", "ready", "running", "active"}
+
+#: ``status.value`` strings that positively mean "not ready to serve".
+_UNLOADED_STATUS_VALUES = {"loading", "unloaded", "error", "failed"}
+
+
+def _model_entry_is_loaded(entry: dict) -> bool:
+    """Whether one ``/models`` entry describes a loaded, ready model.
+
+    The single source of truth for "is this model loaded" readiness, shared by
+    :func:`router_is_model_loaded` (async) and the synchronous loaded-set
+    snapshot in :mod:`proxy.router_helpers` (LP-0MVWBX2YT001OEYE), so the two
+    views cannot disagree.
+
+    Different llama-server/router builds expose readiness with varying
+    schemas. Model **presence with no explicit status** is treated as loaded to
+    avoid false negatives that can pin ``srv.background_loads`` and keep
+    returning ``scheduled=False`` + 503. An unrecognised status shape/value is
+    likewise treated as loaded (presence wins over an unknown vocabulary).
+    """
+    status = entry.get("status")
+    if status is None:
+        return True
+
+    if isinstance(status, dict):
+        value = str(status.get("value", "")).strip().lower()
+    elif isinstance(status, str):
+        value = status.strip().lower()
+    else:
+        # Presence with unrecognized status shape/value: consider loaded.
+        return True
+
+    if value in _LOADED_STATUS_VALUES:
+        return True
+    if value in _UNLOADED_STATUS_VALUES:
+        return False
+    # Unknown status value: fall back to presence as loaded.
+    return True
+
+
 async def router_is_model_loaded(model_name: str) -> bool:
     srv = _srv()
     router_models = await srv.router_list_models()
@@ -1043,32 +1085,7 @@ async def router_is_model_loaded(model_name: str) -> bool:
        if not (isinstance(m, dict) and m.get("id") == model_name):
            continue
 
-       # Different llama-server/router builds expose model readiness with
-       # varying schemas. Treat model presence as loaded when no explicit
-       # status is provided to avoid false negatives that can pin
-       # srv.background_loads and keep returning scheduled=False + 503.
-       status = m.get("status")
-       if status is None:
-           return True
-
-       if isinstance(status, dict):
-           value = str(status.get("value", "")).strip().lower()
-           if value in {"loaded", "ready", "running", "active"}:
-               return True
-           if value in {"loading", "unloaded", "error", "failed"}:
-               return False
-           # Unknown status value: fall back to presence as loaded.
-           return True
-
-       if isinstance(status, str):
-           value = status.strip().lower()
-           if value in {"loaded", "ready", "running", "active"}:
-               return True
-           if value in {"loading", "unloaded", "error", "failed"}:
-               return False
-
-       # Presence with unrecognized status shape/value: consider loaded.
-       return True
+       return _model_entry_is_loaded(m)
 
     return False
 
