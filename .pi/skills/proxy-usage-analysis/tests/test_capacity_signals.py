@@ -48,6 +48,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import types
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -259,6 +260,21 @@ class TestSingleDerivation:
         # The private copies are gone, so there is nothing to drift from.
         assert not hasattr(reference_tool, "_status_fields")
         assert not hasattr(reference_tool, "_STATUS_FIELD_RE")
+
+    def test_reference_tool_survives_a_poisoned_proxy_cache(self):
+        """A prior suite module can leave ``sys.modules["proxy"]`` as a broken
+        top-level namespace package (``<repo>/proxy`` has no ``__init__.py``);
+        the reference tool must still import ``proxy.measured_cache_abort``
+        (LP-0MVYNLWWL009R49W)."""
+        poisoned = types.ModuleType("proxy")
+        poisoned.__path__ = [str(REPO_ROOT / "proxy")]
+        sys.modules["proxy"] = poisoned
+        try:
+            tool = _load_reference_tool()
+            assert tool.is_status_poll.__module__ == "lib.capacity_signals"
+            assert tool.MEASURED_CACHE_DEFICIT_REASON
+        finally:
+            sys.modules.pop("proxy", None)
 
     def test_tally_excludes_polls_without_the_field(self):
         # AC1.1: a poll with no ``slots_stale`` field never counts as fresh.

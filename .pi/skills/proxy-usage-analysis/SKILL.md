@@ -284,6 +284,17 @@ hand and cross-checking two surfaces:
   disagree. Status polls are aggregated with the reference tool's half-open
   `[window_start, window_end)` window, so a poll exactly at the window end
   belongs to the next night.
+- **Same-process import safety.** The derivation tool imports the live
+  `MEASURED_CACHE_DEFICIT_REASON` constant from the proxy package
+  (`proxy.measured_cache_abort`) so its wording cannot drift from the proxy's
+  own reason string. The repo's `proxy/` directory is a PEP 420 namespace dir
+  without an `__init__.py`, so `aggregation.compaction_impact`'s best-effort
+  `from proxy.provider import ...` can leave a half-imported `proxy` entry in
+  `sys.modules` when it (expectedly) fails; a later same-process import of the
+  real package would then resolve against that stale cache. The aggregation
+  drops the broken entry on failure and the tool refreshes the cache before
+  importing, so the two never collide under the full test suite's single
+  process (LP-0MVYNLWWL009R49W).
 - **Standalone equivalent.** For an ad-hoc window — or to cross-check a night
   — run the same derivation without the rest of the report:
   `python3 scripts/capacity_signal_verification.py --since '<start>' --until
