@@ -2048,6 +2048,21 @@ server:
   # as a residual non-quarantine cause, so the trade (admitted-and-doomed risk)
   # is accepted for the re-measurement window; the trade and its result are
   # recorded on that item. Flip back to false to restore the queue-budget bound.
+  #
+  # KEEP ENABLED — POST-ENABLEMENT MEASUREMENT (LP-0MVZ5WV6W008UO5F, 2026-11-02):
+  # the operator decided to keep the rung on (the +132 % relative local-share
+  # gain from the LP-0MVXZWF7A002TUO1 re-measurement stands). Attribution of
+  # the 24 h window 2026-11-01 11:09 -> 2026-11-02 11:09 (`attribute_
+  # prefill_deadline.py`, SKILL.md triage rule) split its 126
+  # ``prefill_deadline`` evictions as: ``rung_accepted`` 26 (79,740 priced new
+  # tokens) — THE rung's own trade — plus 43 ``high_priority_inert`` (the guard
+  # never prices high priority, LP-0MVZF3JZ9009LTN2), 47 ``inert_unlogged``
+  # (inert admits log nothing, LP-0MVZF4SU10032OZH), 8
+  # ``priced_within_queue_budget`` (occupancy priced 0, LP-0MVZF50MJ00654O1)
+  # and 2 ``idle_override``. None of the 7 evictions with a stamped ETA above
+  # the 120 s deadline is an ETA-per-token under-prediction: each was priced
+  # over the deadline and admitted by a path that never enforced the bound.
+  # The rung's accepted rate is therefore 26 / 24 h, not 126 / 24 h.
   local_admission_guard_free_gate_deadline_budget: true
   #
   # The comparison is OCCUPANCY-AWARE (LP-0MVICD2YW004DJPV): the quantity

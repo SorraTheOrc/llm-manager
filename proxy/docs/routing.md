@@ -1336,11 +1336,53 @@ accepts the trade. **Status 2026-11-01:** enabled by operator decision
 (LP-0MVXZWF7A002TUO1 — the post-fix 13:17:50-15:34:42 UTC window measured
 1.56 % local share with free-gate refusals as a residual non-quarantine
 cause; the trade was accepted for a live re-measurement with the rung on,
-recorded in a comment on that item). Flip the config value back to `false` to
+recorded in a comment on that item). **Status 2026-11-02 (kept enabled, see
+"Measured attribution" below):** after the re-measurement the operator
+decided to keep the rung enabled; the measured attribution of its first 24 h
+window is LP-0MVZ5WV6W008UO5F.  Flip the config value back to `false` to
 restore the queue-bound behaviour. Contended admissions keep the queue bound in
 either case, and the deadline + safety bounds still refuse anything that could
 not finish. The log line carries `budget_s` (the resolved queue budget) and
 `bound_s` (the bound actually enforced), so the two can never be confused.
+
+### Measured attribution of the first rung-enabled 24 h window (LP-0MVZ5WV6W008UO5F)
+
+Window 2026-11-01 11:09:07 → 2026-11-02 11:09:07 (the rung was enabled at
+2026-11-01 21:27:04Z): **126** `local_eviction_after_acceptance
+reason=prefill_deadline` events, all inside the 25,000-token cold-prefill
+budget (max `new_tokens` 23,027), 796,993 priced new tokens discarded —
+matching the usage report's `wasted prefill tokens` figure exactly. Joining
+each eviction to its admission evidence at the measured dispatch start
+(`eviction_ts - elapsed_s`) splits them by admission path
+(`attribute_prefill_deadline.py`, see the proxy-usage-analysis
+[SKILL.md triage rule](../../.pi/skills/proxy-usage-analysis/SKILL.md)):
+
+| Admission path | Evictions | Priced new tokens discarded |
+|---|---|---|
+| `rung_accepted` — free-gate rung priced the wait inside the 114 s bound (43.0–112.9 s) but above the 30 s queue budget | 26 | 79,740 |
+| `high_priority_inert` — `priority=high` never queues, so the guard was inert (`no_budget`); **no** deadline/safety bound ran | 43 | 257,778 |
+| `inert_unlogged` — guard inert (uncalibrated bucket) and silent at the dispatch instant | 47 | 439,307 |
+| `priced_within_queue_budget` — admitted inside the 30 s queue budget (5.3–28.0 s) yet stalled the full deadline behind another session's prefill (occupancy priced 0) | 8 | 12,954 |
+| `idle_override` — admitted by the idle-capacity override, guard not consulted | 2 | 7,214 |
+
+**Conclusions.** (1) The rung's own accepted trade is **26 / 24 h** — not
+126 / 24 h: the other 100 events came from admission paths the rung does not
+govern and are tracked separately (LP-0MVZF3JZ9009LTN2 high priority,
+LP-0MVZF4SU10032OZH inert-unlogged, LP-0MVZF50MJ00654O1 occupancy-priced-0).
+(2) None of the 7 events with a stamped (admission-time) ETA above the 120 s
+deadline is an ETA-per-token **under-prediction** — AC1's hypothesis. In all 7
+the pricing, where it ran, already priced the prompt *over* the deadline (6
+high priority: 278.8–325.9 s; 1 inert medium priority: 170.3 s); each was
+admitted because the admission path never enforced the bound. (3) The
+attribution is reproducible with:
+
+```bash
+python3 .pi/skills/proxy-usage-analysis/scripts/attribute_prefill_deadline.py \
+  --start '2026-11-01 11:09:07' --until '2026-11-02 11:09:07'
+```
+
+A post-rung window returning toward ~26 `rung_accepted` / 24 h is the
+documented accepted behaviour.
 
 The occupancy term matters because prefills are serialised
 (`local_max_concurrent_prefills: 1`): the in-flight prefill holds the gate

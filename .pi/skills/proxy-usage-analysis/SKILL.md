@@ -180,7 +180,8 @@ budget, *any* such event is an alert — not a trend to watch. It means the
 budget/pricing model admitted a dispatch the GPU could not serve, which is
 exactly the failure the budget exists to prevent (baseline: 125 deadline
 cancellations and ~779k discarded prefill tokens in the 2026-10-24 18:38–23:47
-window).
+window). The rung trade-off that deliberately accepts some of these is
+quantified below — the threshold itself does not change.
 
 **Triage rule.** Any `local_eviction_after_acceptance` for a within-budget
 prompt is treated as a **defect** and filed as a **critical `test-failure`-class
@@ -198,6 +199,48 @@ is normal and is not reported (classification is by the dispatch record's
 `first_byte_seen` flag), so everything that does appear here is unserved work.
 If the events cluster in one prompt band, the band's calibrated rate is wrong —
 re-measure before changing the budget.
+
+**Attributing a `prefill_deadline` spike (LP-0MVZ5WV6W008UO5F).** The count
+alone cannot answer triage's question — *which admission path let this
+dispatch start?* — because the free-gate rung is only one of several answers.
+Run the attribution CLI over the alert window before filing, and record its
+class split on the work item:
+
+```bash
+python3 .pi/skills/proxy-usage-analysis/scripts/attribute_prefill_deadline.py \
+  --start '<window start YYYY-MM-DD HH:MM:SS>' \
+  --until '<window end YYYY-MM-DD HH:MM:SS>' [--json]
+```
+
+Each eviction is joined to its admission evidence at the measured dispatch
+start (`eviction_ts - elapsed_s`) and classified (`--json` carries the same
+summary plus per-event rows):
+
+| Class | Meaning | Action |
+|---|---|---|
+| `rung_accepted` | `local_admission_guard decision=admit` priced inside the deadline-relative bound but above the queue budget — the free-gate rung's documented admitted-and-doomed trade | compare the rate against the documented accepted level (26 / 24 h, ~80k priced tokens, measured 2026-11-01→02); no fix unless the rate grows |
+| `priced_within_queue_budget` | admitted inside the 30 s queue budget yet no first byte — the slot was held by another session's prefill (occupancy priced ~0) | occupancy-observability defect — file a `discovered-from` bug (measured 8 / 24 h) |
+| `high_priority_inert` | `priority=high` never queues, so the guard is inert (`no_budget`) and **no** bound ran — includes the evictions whose stamped ETA was already above the deadline | policy defect (guard never prices high priority) — file a `discovered-from` bug (measured 43 / 24 h) |
+| `inert_unlogged` | no guard line at the dispatch instant and no override — an inert decision that logged nothing (uncalibrated bucket or `no_budget`) | observability defect — file a `discovered-from` bug (measured 47 / 24 h) |
+| `idle_override` / `economic_override` / `capacity_override` | a routing override admitted the dispatch without the guard | assess the override's own trade |
+| `priced_above_bound` | admitted although the priced wait exceeded the bound it was compared against | impossible by construction — treat as a guard bug |
+
+**Measured accepted level (rung enabled).** For the window
+2026-11-01 11:09:07 → 2026-11-02 11:09:07 (the rung
+`local_admission_guard_free_gate_deadline_budget: true` was enabled at
+2026-11-01 21:27:04Z, LP-0MVXZWF7A002TUO1) the split of 126
+`prefill_deadline` evictions was: `rung_accepted` 26 (79,740 priced new
+tokens), `high_priority_inert` 43, `inert_unlogged` 47,
+`priced_within_queue_budget` 8, `idle_override` 2 — all inside the 25k
+cold-prefill budget, 796,993 priced new tokens discarded in total, 7 with a
+stamped ETA above the 120 s deadline (6 high priority + 1 inert; none is an
+ETA-per-token under-prediction — in each case the pricing, where it ran,
+already said "over the deadline"). **The rung's own trade is therefore 26 /
+24 h, not 126 / 24 h**: the other 100 belong to admission paths the rung does
+not govern, tracked in LP-0MVZF3JZ9009LTN2 (high priority),
+LP-0MVZF4SU10032OZH (inert unlogged) and LP-0MVZF50MJ00654O1 (occupancy
+priced at 0). A post-rung window returning toward ~26/24 h with the rung on
+is the documented accepted behaviour.
 
 **Reading the numbers.** `estimated_tokens` / `new_tokens` / `eta_prefill_s` are
 the **admission-time** values the routing decision priced and the dispatch
