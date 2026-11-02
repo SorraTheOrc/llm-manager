@@ -2657,22 +2657,27 @@ async def _query_prefill_progress(
             # LP-0MVP7525P008RXMF AC2: this probe runs *during* the prefill it
             # observes, so it must never traverse the router (the router
             # serializes /slots behind the busy child and 500s on cancel).
+            # LP-0MVWBXEAI008YZ7B: a definitively unloaded model has nothing
+            # to probe — the resolver's (None, None) skip sentinel means no
+            # /slots request and no router traversal; fall through to the
+            # /status aggregation below.
             _slots_endpoint, _slots_port = _resolve_local_slots_target(
                 srv, model=model_name, endpoint=endpoint, router_port=llama_port
             )
-            states = await asyncio.wait_for(
-                _query_slots_progress(
-                    _slots_port, timeout=timeout, model=model_name,
-                    endpoint=_slots_endpoint,
-                ),
-                timeout=timeout + 0.5,
-            )
-            state = states.get(slot_id)
-            if isinstance(state, dict):
-                alive = bool(state.get("processing", False))
-                value = state.get("progress")
-                if isinstance(value, (int, float)) and value >= 0:
-                    return int(value), alive
+            if _slots_port is not None:
+                states = await asyncio.wait_for(
+                    _query_slots_progress(
+                        _slots_port, timeout=timeout, model=model_name,
+                        endpoint=_slots_endpoint,
+                    ),
+                    timeout=timeout + 0.5,
+                )
+                state = states.get(slot_id)
+                if isinstance(state, dict):
+                    alive = bool(state.get("processing", False))
+                    value = state.get("progress")
+                    if isinstance(value, (int, float)) and value >= 0:
+                        return int(value), alive
         except Exception:
             pass
 
@@ -5870,9 +5875,14 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
         # LP-0MVP7525P008RXMF AC2: lease-liveness probes must not traverse the
         # router — resolve to the discovered child port (the pool of this probe
         # is exactly the giant prefill that makes the router 500).
+        # LP-0MVWBXEAI008YZ7B: a definitively unloaded model has no live slot
+        # to observe — the (None, None) skip sentinel yields no probe (same
+        # outcome as today's probe-failure path: not verified processing).
         _slots_endpoint, _slots_port = _resolve_local_slots_target(
             srv, model=model_name, endpoint=endpoint, router_port=llama_port
         )
+        if _slots_port is None:
+            return False
         states = await asyncio.wait_for(
             _query_slots_progress(
                 _slots_port, timeout=timeout, model=model_name,
@@ -7609,6 +7619,15 @@ _CHILD_PORT_FALLBACK_WARN_INTERVAL = 300.0
 _last_child_port_fallback_warn_ts = 0.0
 """Monotonic timestamp of the last child-port fallback warning (throttle)."""
 
+_last_child_port_skip_debug_ts = 0.0
+"""Monotonic timestamp of the last unloaded-model skip debug line (throttle).
+
+LP-0MVWBXEAI008YZ7B AC6: the skip signal is observable in two places — the
+``llama_slots_child_port_skipped_total`` counter (every skip) and a throttled
+debug log naming the skipped model (one line per
+:data:`_CHILD_PORT_FALLBACK_WARN_INTERVAL`, mirroring the fallback warning).
+"""
+
 _router_model_ids_snapshot: dict[str, Any] = {}
 """Cached router ``/models`` snapshot (LP-0MVU7ZZIA0092AXW).
 
@@ -8390,6 +8409,40 @@ def _warn_child_port_fallback(srv, model: str | None, router_port: int) -> None:
         pass
 
 
+def _record_slots_skip(srv, model: str, source: str) -> None:
+    """Throttled debug log + counter when a proxy ``/slots`` poll is skipped.
+
+    A poll for a model the router's cached ``/models`` snapshot definitively
+    reports as **not loaded** is skipped before any request
+    (LP-0MVWBXEAI008YZ7B AC1/AC6): the signal is the
+    ``llama_slots_child_port_skipped_total{reason="model_not_loaded"}`` counter
+    (every skip) plus a throttled debug line naming the skipped model — so a
+    skipped poll is distinguishable from a poll that was never attempted,
+    while the genuine loaded-model fallback signal
+    (``_warn_child_port_fallback``, ``no_child_port_router_mode``) stays
+    untouched.
+    """
+    global _last_child_port_skip_debug_ts
+    try:
+        from proxy.metrics import record_slots_child_port_skipped
+
+        record_slots_child_port_skipped("model_not_loaded")
+    except Exception:
+        pass
+    now = time.monotonic()
+    if now - _last_child_port_skip_debug_ts < _CHILD_PORT_FALLBACK_WARN_INTERVAL:
+        return
+    _last_child_port_skip_debug_ts = now
+    message = (
+        "slots_child_port_skipped: model not loaded — skipping /slots poll "
+        f"for model={model} (source={source}) (LP-0MVWBXEAI008YZ7B AC6)"
+    )
+    try:
+        srv.logger.debug(message)
+    except Exception:
+        pass
+
+
 def _resolve_local_slots_target(
     srv,
     model: str | None = None,
@@ -8408,6 +8461,16 @@ def _resolve_local_slots_target(
       (non-loopback host, or a loopback port that is not the configured router
       port — e.g. it is already a child port), the endpoint is returned
       untouched.
+    - When the router's cached ``/models`` snapshot **definitively** reports
+      the model as not loaded (:func:`is_model_known_unloaded`), the poll is
+      **skipped**: the ``(None, None)`` skip sentinel is returned, the
+      ``llama_slots_child_port_skipped_total{reason="model_not_loaded"}``
+      counter is incremented once and a throttled debug line names the model
+      (``_record_slots_skip``, LP-0MVWBXEAI008YZ7B AC1/AC6). Callers must
+      **not** issue the ``/slots`` request on the sentinel — the current
+      definitive-400 fall-through is behaviourally equivalent, so skipping
+      never refuses or blocks a request (AC7). An *indeterminate* loadedness
+      answer (``None``) fails open: discovery proceeds exactly as today.
     - When *endpoint* is the local router (loopback host on
       ``server.llama_server_port``) or omitted, the discovered child port is
       returned as ``(None, child_port)``; when discovery yields nothing, the
@@ -8416,7 +8479,10 @@ def _resolve_local_slots_target(
 
     Returns ``(endpoint_or_None, port)``: pass the tuple to
     ``_query_slots*`` so it builds the URL from the resolved port instead of
-    the router.
+    the router. The ``(None, None)`` tuple is the documented **skip
+    sentinel** — a port of ``None`` can never be a real llama-server port, so
+    a call site that ignores the sentinel fails loudly (it would build a
+    ``None``-port URL) instead of silently traversing the router.
     """
     cfg = getattr(srv, "config", None)
     server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}
@@ -8433,6 +8499,20 @@ def _resolve_local_slots_target(
             # A genuinely different instance — the router-proxied-500 problem
             # does not apply, never rewrite it.
             return endpoint, port
+    # LP-0MVWBXEAI008YZ7B: consult the synchronous loaded-set guard *before*
+    # discovery. ``resolve_local_model_id()`` may return a preset/alias
+    # spelling (explicit arg, ``srv.current_model``) while the router lists
+    # the actual id, so canonicalise against the router's own /models ids
+    # first — an alias must never be misread as an unloaded model (a false
+    # skip would swallow the loaded-model fallback signal,
+    # LP-0MVVCY3HQ0009F0K AC2). An indeterminate (``None``) answer fails
+    # open: poll as today.
+    resolved_model, model_source = resolve_local_model_id(srv, model)
+    _ids, _solo = _router_models_snapshot_meta(srv)
+    canonical = _match_model_preset(resolved_model, _ids) or resolved_model
+    if is_model_known_unloaded(srv, canonical) is True:
+        _record_slots_skip(srv, canonical, model_source)
+        return None, None
     child = _discover_local_child_port(srv, model=model)
     if child is not None:
         return None, child
@@ -8501,6 +8581,14 @@ async def _check_slot_availability(
         slots_endpoint, slots_port = _resolve_local_slots_target(
             srv, model=slot_model, endpoint=endpoint, router_port=llama_port
         )
+        if slots_port is None:
+            # LP-0MVWBXEAI008YZ7B AC7: the resolver's (None, None) skip
+            # sentinel — the model is definitively not loaded. Skipping the
+            # availability check returns the same admission result (``None``)
+            # as today's definitive-400 fall-through (a /slots 400 never
+            # produced a 503): the fix must never start refusing or blocking
+            # requests for an unloaded model.
+            return None
         if slots_endpoint:
             slots_url = f"{slots_endpoint.rstrip('/')}/slots?model={slot_model}"
         else:

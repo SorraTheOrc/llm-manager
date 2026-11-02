@@ -35,6 +35,7 @@ pins live next to the skip tests that must not regress them.
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import proxy.metrics as metrics
 import pytest
@@ -52,6 +53,16 @@ LOADED_PAYLOAD = {
     ],
 }
 
+#: Production-shaped /models payload: gpt120 is *definitively* unloaded — the
+#: router reports it, so every proxy /slots poll for it must be skipped
+#: (LP-0MVWBXEAI008YZ7B AC1).
+UNLOADED_PAYLOAD = {
+    "object": "list",
+    "data": [
+        {"id": "gpt120", "status": {"value": "unloaded"}},
+    ],
+}
+
 
 def _fallback_counter(reason: str) -> float:
     """Read the real Prometheus counter for one fallback reason label.
@@ -66,6 +77,21 @@ def _fallback_counter(reason: str) -> float:
     assert counter is not None, (
         "prometheus_client must be available for the child-port fallback "
         "counter (the test suite requires metrics._enabled)"
+    )
+    return float(counter.labels(reason=reason)._value.get())
+
+
+def _skip_counter(reason: str) -> float:
+    """Read the real Prometheus skip counter for one reason label.
+
+    Same reasoning as :func:`_fallback_counter`: reading the actual counter
+    makes the AC6 skip signal observable in ``/metrics`` exactly as operators
+    would, and a renamed/removed reason string fails loudly.
+    """
+    counter = metrics.llama_slots_child_port_skipped_total
+    assert counter is not None, (
+        "prometheus_client must be available for the slots skip counter "
+        "(the test suite requires metrics._enabled)"
     )
     return float(counter.labels(reason=reason)._value.get())
 
@@ -88,6 +114,7 @@ def _clear_signal_state():
     ):
         cache.clear()
     rh._last_child_port_fallback_warn_ts = 0.0
+    rh._last_child_port_skip_debug_ts = 0.0
     yield
     for cache in (
         rh._child_port_cache,
@@ -98,6 +125,7 @@ def _clear_signal_state():
     ):
         cache.clear()
     rh._last_child_port_fallback_warn_ts = 0.0
+    rh._last_child_port_skip_debug_ts = 0.0
 
 
 def _make_srv(
@@ -381,3 +409,211 @@ class TestFailOpenCharacterisation:
         # The model is resolved from current_model and named in the warning.
         assert "Qwen3-32B" in warns[0]
         assert "source=current_model" in warns[0]
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 (LP-0MVWBXEAI008YZ7B): AC1/AC6 — the unloaded-model skip itself
+# ---------------------------------------------------------------------------
+
+
+class TestUnloadedModelSkipSignal:
+    """AC1/AC6: a definitively unloaded model's poll is skipped, observably.
+
+    The router that unloads idle models reports them via ``/models``; a poll
+    for such a model must issue **no** ``/slots`` request and must not touch
+    the genuine loaded-model fallback signal
+    (``no_child_port_router_mode`` counter, ``slots_child_port_unavailable``
+    warning). The deliberate skip must itself be observable
+    (``llama_slots_child_port_skipped_total{reason="model_not_loaded"}`` plus
+    a throttled debug line naming the model) so AC1 is verifiable post-deploy.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unloaded_poll_issues_no_request_and_no_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """AC1: no router request, no fallback counter, no warning.
+
+        A ``/slots`` poll for ``gpt120`` (the router /models snapshot reports
+        it as unloaded) resolves to the ``(None, None)`` skip sentinel, so
+        ``poll_slots_for_model`` returns before building any request.
+        """
+        requests: list[str] = []
+        srv = _make_srv(tmp_path, payload=UNLOADED_PAYLOAD, requests=requests)
+        await rh.ensure_router_model_ids(srv)
+        assert rh.is_model_known_unloaded(srv, "gpt120") is True
+
+        before_fb = _fallback_counter("no_child_port_router_mode")
+        before_skip = _skip_counter("model_not_loaded")
+        await _run_poll(monkeypatch, srv, "gpt120")
+
+        # The genuine fallback signal is untouched (AC1).
+        assert _fallback_counter("no_child_port_router_mode") == before_fb
+        assert (
+            [m for m in srv.warn_msgs if "slots_child_port_unavailable" in m] == []
+        )
+        # The router is never contacted: no /slots request was issued.
+        assert requests == [], "an unloaded model's poll must issue no request"
+        # The skip itself is observable in /metrics (AC6).
+        assert _skip_counter("model_not_loaded") == before_skip + 1
+
+    @pytest.mark.asyncio
+    async def test_skip_debug_log_names_model_and_is_throttled(
+        self, tmp_path, monkeypatch
+    ):
+        """AC6: throttled debug line names the skipped model; counter is exact.
+
+        Two resolver calls for the same unloaded model increment the skip
+        counter twice (once per skip) but emit only one (throttled) debug
+        line inside the 300 s interval.
+        """
+        srv = _make_srv(tmp_path, payload=UNLOADED_PAYLOAD)
+        await rh.ensure_router_model_ids(srv)
+
+        before = _skip_counter("model_not_loaded")
+        rh._resolve_local_slots_target(srv, model="gpt120", router_port=ROUTER_PORT)
+        rh._resolve_local_slots_target(srv, model="gpt120", router_port=ROUTER_PORT)
+
+        assert _skip_counter("model_not_loaded") == before + 2
+        debugs = [m for m in srv.debug_msgs if "slots_child_port_skipped" in m]
+        assert len(debugs) == 1, "repetitive skips stay throttled"
+        assert "gpt120" in debugs[0]
+
+    @pytest.mark.asyncio
+    async def test_loaded_model_is_never_skipped(self, tmp_path, monkeypatch):
+        """AC2 guard: a loaded model keeps polling (no false skip).
+
+        Direct resolver check against the AC2 baseline fixture: the loaded
+        chat model resolves to a real target and fires the fallback (visible
+        in ``_run_poll``'s request), never ``(None, None)``.
+        """
+        srv = _make_srv(tmp_path, payload=LOADED_PAYLOAD)
+        await rh.ensure_router_model_ids(srv)
+        assert rh.is_model_known_unloaded(srv, "Qwen3-32B") is False
+
+        endpoint, port = rh._resolve_local_slots_target(
+            srv, model="Qwen3-32B", router_port=ROUTER_PORT
+        )
+        assert (endpoint, port) == (None, ROUTER_PORT), (
+            "a loaded model must never be skipped — it falls back to the "
+            "router port (kept observable via the AC2 fallback signal)"
+        )
+
+
+class TestAdmissionUnchanged:
+    """AC7: skipping the availability check never refuses or blocks."""
+
+    @pytest.mark.asyncio
+    async def test_availability_check_for_unloaded_model_returns_none(
+        self, tmp_path, monkeypatch
+    ):
+        """The skip yields the same admission result (None) as the current
+        definitive-400 fall-through: no 503, no /slots request at all."""
+        created: list[str] = []
+
+        class _SpyClient:
+            def __init__(self, *a, **k):
+                created.append("client")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, timeout=None):
+                created.append(url)
+                return None
+
+        srv = _make_srv(tmp_path, payload=UNLOADED_PAYLOAD)
+        await rh.ensure_router_model_ids(srv)
+        assert rh.is_model_known_unloaded(srv, "gpt120") is True
+        monkeypatch.setattr(
+            rh, "httpx",
+            SimpleNamespace(
+                AsyncClient=lambda timeout: _SpyClient(),
+                Timeout=lambda t: t,
+            ),
+        )
+
+        before = _skip_counter("model_not_loaded")
+        result = await rh._check_slot_availability(
+            srv,
+            {"llama_server_port": ROUTER_PORT,
+             "session_slot_availability_timeout_seconds": 1.0},
+            ROUTER_PORT,
+            "gpt120", "gpt120",
+            "v1/chat/completions",
+        )
+
+        assert result is None, "an unloaded model must never be refused (AC7)"
+        assert created == [], "no /slots request may be issued for the skip"
+        assert _skip_counter("model_not_loaded") == before + 1
+
+
+class TestStatusCapacityTruth:
+    """AC3: /status keeps reporting truthful capacity for an unloaded model."""
+
+    @pytest.mark.asyncio
+    async def test_status_fails_open_on_pool_without_querying(
+        self, tmp_path, monkeypatch
+    ):
+        """The skip preserves the definitive-absent behaviour: fail open on
+        the configured pool, no /slots counts/detail fetch, no fossils."""
+        import proxy.server as server
+        from proxy.handlers import get_llama_local_status
+
+        queries: list[tuple[str, int]] = []
+
+        async def fake_query_slots(
+            client, port, timeout=2.0, model=None, status_out=None,
+            provenance_out=None,
+        ):
+            queries.append(("counts", port))
+            return (0, 0)
+
+        async def fake_query_detail(
+            port, timeout=2.0, model=None, _client=None, provenance_out=None,
+        ):
+            queries.append(("detail", port))
+            return []
+
+        with monkeypatch.context() as m:
+            m.setattr(rh, "_discover_local_child_port", lambda *a, **k: None)
+            m.setattr(
+                server, "query_llama_status",
+                AsyncMock(return_value={"llama_server_running": True}),
+            )
+            server.current_model = "gpt120"
+            server.llama_process = MagicMock(poll=lambda: None)
+            server._http_client = None
+            server.config = {
+                "server": {
+                    "llama_server_port": ROUTER_PORT,
+                    "session_slot_pool_size": 3,
+                }
+            }
+
+            async def _list_models():
+                return UNLOADED_PAYLOAD
+
+            m.setattr(server, "router_list_models", _list_models)
+            await rh.ensure_router_model_ids(server)
+            assert rh.is_model_known_unloaded(server, "gpt120") is True, (
+                "fixture: gpt120 must be definitively unloaded for the /status skip"
+            )
+
+            m.setattr("proxy.observability._query_slots", fake_query_slots)
+            m.setattr("proxy.observability._query_slots_detail", fake_query_detail)
+
+            req = MagicMock()
+            req.headers = {}
+            req.client = MagicMock(host="127.0.0.1", port=54321)
+            j = await get_llama_local_status(req)
+
+        # Truthful capacity: fail open on the configured pool (AC3), same as
+        # today's definitive-400 path — never fossil counts.
+        assert j["total_slots"] == 3
+        assert j["available_slots"] == 3
+        # The skip means zero upstream /slots requests were issued.
+        assert queries == [], "an unloaded model's /status must skip /slots"

@@ -16,6 +16,14 @@ Extended by LP-0MVP7525P008RXMF (child-port discovery observability):
   be discovered (the previously silent regression that made the rank-1
   direct-polling fix inert).
 
+Extended by LP-0MVWBXEAI008YZ7B (unloaded-model /slots skip, slice 3 of
+LP-0MVVCY3HQ0009F0K):
+- llama_slots_child_port_skipped_total{reason="..."} (counter) — proxy-initiated
+  /slots polls that were deliberately **skipped** because the router
+  definitively reports the model as not loaded (a skipped poll is thereby
+  distinguishable in /metrics from a poll that was never attempted, so the
+  unloaded-model noise origin is verifiable post-deploy).
+
 Extended by LP-0MVT1O0VG00905EL (slot occupancy, parent LP-0MVNWUEY8008XM6W):
 - llama_slots_total (gauge) — slots reported by the last successful sample
 - llama_slots_busy (gauge) — slots with ``is_processing`` true
@@ -93,6 +101,13 @@ llama_slots_query_failures_total = None
 # hidden by `except Exception: pass` (weeks of silent router 500s) now surfaces
 # as an alert/trend instead.
 llama_slots_child_port_fallbacks_total = None
+# Unloaded-model skip (LP-0MVWBXEAI008YZ7B AC6): a proxy-initiated /slots poll
+# for a model the router's /models snapshot definitively reports as not loaded
+# is skipped before any request and signal. Counted by reason so "skipped" is
+# observable (llama_slots_child_port_skipped_total) without polluting the
+# genuine child-port-discovery regression signal
+# (llama_slots_child_port_fallbacks_total).
+llama_slots_child_port_skipped_total = None
 # Slot occupancy (LP-0MVT1O0VG00905EL). Power/VRAM/GTT already reach Prometheus
 # through node_exporter, but nothing published llama-server *workload*, so "the
 # GPU drew 115 W" could not be attributed to llama-server. These gauges carry
@@ -185,6 +200,12 @@ if _enabled:
             'llama_slots_child_port_fallbacks_total',
             'Proxy /slots queries falling back to the router port because no '
             'model child port could be discovered, by reason',
+            ['reason'],
+        )
+        llama_slots_child_port_skipped_total = Counter(
+            'llama_slots_child_port_skipped_total',
+            'Proxy /slots polls skipped without a request because the router '
+            'definitively reports the model as not loaded, by reason',
             ['reason'],
         )
         # Slot occupancy (LP-0MVT1O0VG00905EL). Deliberately no ``slot=`` label
@@ -430,6 +451,32 @@ def record_slots_child_port_fallback(reason: str):
         return
     try:
         llama_slots_child_port_fallbacks_total.labels(reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_slots_child_port_skipped(reason: str):
+    """Increment ``llama_slots_child_port_skipped_total`` for a skipped poll.
+
+    Args:
+        reason: Why the poll was skipped without issuing a ``/slots`` request
+            — ``model_not_loaded`` (the router's cached ``/models`` snapshot
+            definitively reports the model as not loaded, so the poll would
+            only reproduce the definitive-400 noise).
+
+    LP-0MVWBXEAI008YZ7B AC1/AC6: before this counter, a skipped unloaded-model
+    poll was indistinguishable from a poll that was never attempted, so the
+    unloaded-model fallback noise (parent AC1/AC2) could not be verified
+    post-deploy. This counter makes the deliberate skip observable in
+    ``/metrics`` without touching ``llama_slots_child_port_fallbacks_total``
+    (which stays reserved for the genuine loaded-model discovery regression).
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or llama_slots_child_port_skipped_total is None:
+        return
+    try:
+        llama_slots_child_port_skipped_total.labels(reason=reason).inc()
     except Exception:
         pass
 
