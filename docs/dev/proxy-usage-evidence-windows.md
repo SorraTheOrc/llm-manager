@@ -90,6 +90,10 @@ Two lessons worth carrying into the next investigation:
 
 ## Related
 
+- [`measurement-windows.md`](measurement-windows.md) — the shared restart-free 24 h
+  calendar: which windows are open, the current anchor, and the batching /
+  deploy-before-window convention. Archive the segments a window depends on
+  *before* they age out.
 - `.pi/skills/proxy-usage-analysis/SKILL.md` — the analysis CLI used unchanged
   for every window here.
 - `scripts/lib/proxy_logs.py` — shared rotation-aware discovery/coverage.

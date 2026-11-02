@@ -10,6 +10,13 @@ cancelled by the prefill deadline (or stalls with no observable progress), does
 the local gate recover in minutes and does local serving resume — instead of
 re-dispatching the same giant prompt for hours?
 
+> **Concurrent 24 h windows are coordinated in
+> [`measurement-windows.md`](measurement-windows.md).** That file is the shared
+> restart-free calendar: the open measurement items, the current proxy anchor,
+> the batching convention (deploy before a window opens, never inside one) and
+> the manual-restart investigation convention. Use it together with the
+> deployed-anchor rule below (*a pushed commit is not a deployed fix*).
+
 > **Later measurements live in their own sections.** The 2026-10-30
 > post-deadline **re-dispatch** fix (LP-0MVSAMN14001DMTY) is verified by
 > **LP-0MVSAMS5O006OAIS** — see

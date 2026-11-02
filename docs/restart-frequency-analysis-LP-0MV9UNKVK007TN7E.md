@@ -184,3 +184,12 @@ avoid this if the fast/cheap configs stopped differing in `session_slot_pool_siz
 5. **Blast radius** — 5 s restart latency, but warm-cache loss and a fallback spike;
    143 drains with 65 timeouts and 372 deferred requests, so some in-flight work is lost
    when a drain exceeds the 30 s window.
+
+## See also
+
+- [`docs/dev/measurement-windows.md`](dev/measurement-windows.md) — the shared
+  restart-free 24 h measurement calendar. It reuses this document's
+  restart-attribution method and records the later manual-restart
+  investigation (including the 2026-10-31T00:37:53Z restart #2, attributed to
+  the LP-0MVSD5RJW008F1IB deploy) plus the batching convention that keeps a
+  deploy from invalidating a concurrent verification window.
