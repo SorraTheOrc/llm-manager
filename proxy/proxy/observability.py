@@ -1528,18 +1528,31 @@ async def query_llama_status() -> dict:
     # allow updating/reading endpoint cache/failures
     srv = _srv()
 
+    server_config = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+    llama_port = server_config.get("llama_server_port", 8080)
+
+    running = srv.llama_process is not None and srv.llama_process.poll() is None
+    if not running and bool(server_config.get("llama_router_mode", False)):
+        # LP-0MVZT9L3N001XABB AC2/AC3: a reachable router-mode backend is
+        # running even when this proxy holds no process handle for it (an
+        # unadopted self-heal spawn, or a host-first server started outside
+        # the proxy). Without this, /health and /llama/local/status reported
+        # ``llama_server_running: false`` and ``total_slots: 0`` while the
+        # local route was fully functional.
+        try:
+            running = bool(await srv._probe_backend_reachable(llama_port))
+        except Exception:
+            running = False
+
     result = {
         "n_ctx": None,
         "kv_cache_tokens": None,
-        "llama_server_running": srv.llama_process is not None and srv.llama_process.poll() is None,
+        "llama_server_running": running,
         "router_mode": False
     }
 
-    if not result["llama_server_running"]:
+    if not running:
         return result
-
-    server_config = srv.config.get("server", {})
-    llama_port = server_config.get("llama_server_port", 8080)
 
     # One-time discovery: probe metadata endpoints once per llama-server process
     client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)

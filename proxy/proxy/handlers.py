@@ -1437,9 +1437,27 @@ async def health_check():
         router_models = await srv.router_list_models()
         loaded_models = srv._extract_router_model_ids(router_models)
 
-    llama_running = srv.llama_process is not None and srv.llama_process.poll() is None
     llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-    backend_reachable = bool(llama_running and await srv._probe_backend_reachable(llama_port))
+    llama_server_managed = (
+        srv.llama_process is not None and srv.llama_process.poll() is None
+    )
+    # LP-0MVZT9L3N001XABB AC2: in router mode a backend can serve the local
+    # route while this proxy holds no process handle for it (a self-heal spawn
+    # that outlived its readiness wait, or a host-first server started outside
+    # the proxy). Deriving liveness from the handle alone left /health
+    # reporting ``degraded`` / ``llama_server_running: false`` for ~20 minutes
+    # on 2026-11-02 while an orphan answered every request on :8080, so every
+    # health consumer (dashboards, slot_sweep_preflight.py, machine-hygiene)
+    # took the wrong action. Reachability is now the signal in router mode and
+    # ``llama_server_managed`` keeps an unmanaged backend distinguishable.
+    backend_reachable = False
+    if llama_server_managed or router_mode:
+        backend_reachable = bool(
+            await srv._probe_backend_reachable(llama_port)
+        )
+    llama_running = bool(
+        llama_server_managed or (router_mode and backend_reachable)
+    )
     self_healing = srv._is_self_healing_active()
     gpu_wedge_detected = bool(getattr(srv, "gpu_wedge_detected", False))
     gpu_wedge_detection_disabled = bool(
@@ -1475,6 +1493,10 @@ async def health_check():
         "loaded_models": loaded_models,
         "llama_server_running": llama_running,
         "backend_reachable": backend_reachable,
+        # LP-0MVZT9L3N001XABB AC2 (additive): True when the running backend is
+        # owned by this proxy (live process handle), False when it is reachable
+        # but unmanaged. ``llama_server_running`` is True in both cases.
+        "llama_server_managed": bool(llama_server_managed),
         "self_healing_in_progress": self_healing,
         "gpu_wedge_detected": gpu_wedge_detected,
         "gpu_wedge_detection_disabled": gpu_wedge_detection_disabled,

@@ -374,8 +374,17 @@ async def test_router_self_heal_uses_exponential_backoff_and_attempt_cap(monkeyp
     async def fake_sleep(delay):
         sleep_calls.append(delay)
 
+    async def fake_probe_unreachable(_port):
+        return False
+
     monkeypatch.setattr(server, "start_llama_server", fake_start)
     monkeypatch.setattr(server, "wait_for_llama_server", fake_wait)
+    # LP-0MVZT9L3N001XABB: a failed readiness wait now probes the port and
+    # adopts a reachable spawn instead of counting the attempt as failed. The
+    # probe must be stubbed here — otherwise the test depends on whether a real
+    # backend happens to be listening on 8080 and the attempt-cap path is
+    # never exercised.
+    monkeypatch.setattr(server, "_probe_backend_reachable", fake_probe_unreachable)
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(server, "config", {"server": {
         "llama_self_heal_max_attempts": 3,

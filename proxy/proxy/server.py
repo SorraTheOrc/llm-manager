@@ -1732,6 +1732,7 @@ from .lifecycle import (  # noqa: E402, F401
     _inc_model_switch_refcount,
     _is_retryable_backend_exception,
     _is_self_healing_active,
+    _kill_process_group,
     _model_loading_response,
     _probe_backend_reachable,
     _probe_model_instance,

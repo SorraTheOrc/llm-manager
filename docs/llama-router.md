@@ -62,6 +62,8 @@ The router exposes:
 - Router worker zombie/defunct states are treated as backend failures and trigger self-healing.
 - During active self-healing, requests return `503` with `Retry-After: 30` and a `backend_recovery_in_progress` error payload.
 - Backend crash-path signals are exposed via `/health` and `/admin/metrics` in `backend_signals`, and current recovery progress is reported in `backend_recovery`.
+- **Self-heal never orphans its own spawn** (LP-0MVZT9L3N001XABB). A host-first spawn whose readiness wait expires is *adopted* when the port answers — the live `Popen` when the handle survived, an adopted-port sentinel when only a descendant did — and *terminated* when it does not, so a failed attempt can never leave an unadopted `llama-server` holding `llama_server_port` and block the next attempt. The watchdog adopts a reachable backend it holds no handle for, and a bind conflict during startup logs the conflicting listener (`pid`, `comm`) resolved from the port, so an orphan is identifiable without `ss`.
+- **Liveness follows reachability in router mode** (LP-0MVZT9L3N001XABB). `llama_server_running` (and therefore `/llama/local/status` slot reporting) is derived from the backend actually answering, not only from the process handle, and `/health` adds `llama_server_managed` (`false` for a reachable backend this proxy does not own). A working local route therefore no longer reports `degraded` / `total_slots: 0` while an unmanaged backend serves it.
 - Repro fault injection script: `proxy/scripts/fault-injection-backend-crash.sh` captures health/metrics snapshots and log signatures during a forced backend crash.
 
 ## KV-cache quantization (LP-0MSDCLQ2W001LGWC)

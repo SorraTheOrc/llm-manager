@@ -1671,6 +1671,56 @@ def stop_llama_log_tailer() -> None:
             pass
 
 
+# Markers llama-server / llama.cpp emits when the listen socket is taken.
+_PORT_BIND_CONFLICT_MARKERS = (
+    "couldn't bind",
+    "could not bind",
+    "cannot bind",
+    "address already in use",
+    "eaddrinuse",
+    "bind http server socket",
+)
+
+
+def _is_port_bind_conflict(output: str | None) -> bool:
+    """True when spawn output reports a port-bind conflict.
+
+    LP-0MVZT9L3N001XABB AC4: only a bind conflict is worth paying for the
+    port-holder lookup, so the detection is a pure string match on the
+    documented llama.cpp / start-script diagnostics.
+    """
+    text = (output or "").lower()
+    return any(marker in text for marker in _PORT_BIND_CONFLICT_MARKERS)
+
+
+def _describe_port_holder(port: int) -> str:
+    """Name the process holding *port*, so an orphan is identifiable without ``ss``.
+
+    LP-0MVZT9L3N001XABB AC4: the 2026-11-02 restart burst logged
+    ``start: couldn't bind HTTP server socket ... port: 8080`` with no
+    indication of *who* held the port, so the orphan had to be found by hand
+    (``ss -ltnp``) before it could be killed.
+    """
+    try:
+        found = _find_pid_on_port(int(port))
+    except Exception:
+        found = None
+    if found is None:
+        return "not identifiable"
+    pids = found if isinstance(found, list) else [found]
+    described: list[str] = []
+    for pid in pids:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            continue
+        comm = ""
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+        except Exception:
+            comm = ""
+        described.append(f"pid={pid}" + (f" ({comm})" if comm else ""))
+    return ", ".join(described) or "not identifiable"
+
+
 def start_llama_server(model: str | None, display_name: str | None = None) -> subprocess.Popen | None:
     """Start the llama-server with the specified model.
 
@@ -1727,6 +1777,23 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
 
     mode_label = "router" if router_mode else f"model: {model}"
     srv.logger.info(f"Starting llama-server with {mode_label}")
+
+    def _log_bind_conflict(source: str, output: str | None) -> None:
+        """Name the conflicting listener when a spawn dies on the port (AC4)."""
+        if not _is_port_bind_conflict(output):
+            return
+        try:
+            holder = _describe_port_holder(int(llama_port))
+        except Exception:
+            holder = "not identifiable"
+        srv.logger.error(
+            "llama-server could not bind port %s (%s): conflicting listener %s — "
+            "an unadopted or orphaned backend is holding the port",
+            llama_port,
+            source,
+            holder,
+        )
+
     # LP-0MUCEFCL6001ZXYN: record what we started so a later proxy-only
     # restart can detect an unchanged local backend and preserve it.
     _write_llama_server_signature(model, slot_pool_size, router_mode)
@@ -1797,6 +1864,7 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
             f"Host-first startup failed (falling back to configured script "
             f"'{script_path}'): {host_out}"
         )
+        _log_bind_conflict("host-first startup", host_out)
 
     # Retry loop configuration
     retries = 4
@@ -1815,6 +1883,7 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
            start_llama_log_tailer(srv, model_name=_display)
            return proc
        srv.logger.warning(f"Attempt {attempt+1} failed quickly: {out}")
+       _log_bind_conflict(f"attempt {attempt + 1}/{retries}", out)
        time.sleep(backoff * (2 ** attempt))
 
     # All attempts failed — assemble diagnostic
