@@ -2232,3 +2232,323 @@ class TestLocalRouteAvailability:
         )
         assert embed["local_route_available"] is False
         assert embed["local_route_reason"] == "local_provider_cooldown"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# /slots read-path latency bound (LP-0MVVXGHHB0073W1B AC3 / F3 AC2)
+#
+# Pre-fix the status handler awaits ``query_llama_status()`` (1 s) then the
+# counts query (2 s) then the detail query (``STATUS_QUERY_TIMEOUT``, 1 s) in
+# series, so a /slots backend that never answers makes a poll last ~3 s — far
+# beyond the configured budget. The shared-snapshot read path must bound the
+# WHOLE handler by ``STATUS_QUERY_TIMEOUT`` + 250 ms (F3 AC2): at most one
+# bounded upstream fetch per poll, served from the shared snapshot afterwards.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _HangingSlotsBackend:
+    """Raw /slots fetch stub that records attempts and never answers within
+    the caller's own timeout (mirroring the real primitive's bounded fetch, so
+    the leader itself terminates at its budget instead of hanging the test).
+    """
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    async def __call__(self, url: str, timeout: float, client=None):
+        self.calls.append(url)
+        await asyncio.wait_for(
+            asyncio.sleep(3600.0), timeout=max(timeout or 0.01, 0.01)
+        )
+        return (200, [])
+
+
+class _FakeLock:
+    def locked(self):
+        return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+
+async def _status_poll_with_hanging_fetch(backend):
+    """GET /llama/local/status with the REAL slots query path (only the raw
+    upstream fetch is stubbed) and a controlled backend.
+
+    Returns ``(json, elapsed_seconds, backend_calls)``. The fallback caches are
+    pinned empty so a sibling test's leftover snapshot cannot mask the verdict.
+    """
+    import time as _time
+
+    from proxy.server import app
+
+    from proxy import observability as _obs
+    from proxy import server
+
+    async def fake_query():
+        return {"llama_server_running": True}
+
+    with patch.object(_obs, "_last_slot_details_cache", []):
+        with patch.object(_obs, "_last_slot_details_at", 0.0):
+            start = _time.monotonic()
+            transport = httpx.ASGITransport(app=app)
+            with patch("proxy.server.query_llama_status", side_effect=fake_query):
+                with patch.object(server, "active_queries", 0):
+                    with patch.object(server, "active_queries_lock", asyncio.Lock()):
+                        with patch.object(server, "local_active_queries", 0):
+                            with patch.object(
+                                server, "local_active_queries_lock", asyncio.Lock()
+                            ):
+                                with patch.object(server, "current_model", "test-model"):
+                                    with patch.object(server, "model_switch_refcount", 0):
+                                        with patch.object(
+                                            server, "model_switch_lock", _FakeLock()
+                                        ):
+                                            with patch.object(server, "background_loads", {}):
+                                                with patch.object(
+                                                    server, "local_dispatch_records", {}
+                                                ):
+                                                    with patch.object(
+                                                        server,
+                                                        "local_dispatch_records_lock",
+                                                        _FakeLock(),
+                                                    ):
+                                                        with patch.object(
+                                                            server,
+                                                            "config",
+                                                            {"server": {"llama_server_port": 8080}},
+                                                        ):
+                                                            with patch(
+                                                                "proxy.observability._do_slots_fetch",
+                                                                backend,
+                                                            ):
+                                                                async with httpx.AsyncClient(
+                                                                    transport=transport,
+                                                                    base_url="http://test",
+                                                                ) as ac:
+                                                                    resp = await ac.get(
+                                                                        "/llama/local/status"
+                                                                    )
+            elapsed = _time.monotonic() - start
+    assert resp.status_code == 200
+    return resp.json(), elapsed, backend.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LP-0MVVXGHHB0073W1B red-first (AC1): the pre-fix path serialises the "
+        "counts (2 s) + detail (1 s) awaits, so a hanging backend makes the "
+        "handler take ~3 s; the shared snapshot read path (LP-0MVVXGLTM008ROJ9) "
+        "must bound the handler by STATUS_QUERY_TIMEOUT + 250 ms — remove the "
+        "xfail when it lands."
+    ),
+)
+async def test_status_handler_within_budget_when_slots_never_answers():
+    """AC3: a never-answering /slots backend must not serialise the counts
+    (2 s) + detail (1 s) awaits; the handler returns within
+    ``STATUS_QUERY_TIMEOUT`` + 250 ms and the payload stays well-formed.
+    """
+    import os
+
+    with patch.dict(os.environ, {"STATUS_QUERY_TIMEOUT": "1.0"}):
+        backend = _HangingSlotsBackend()
+        j, elapsed, _calls = await _status_poll_with_hanging_fetch(backend)
+
+    budget = 1.0
+    assert elapsed < budget + 0.25, (
+        f"handler took {elapsed:.2f}s with a /slots backend that never answers; "
+        f"it must fit inside STATUS_QUERY_TIMEOUT ({budget}s) + 250 ms slack "
+        f"instead of serialising counts (2 s) + detail (1 s) awaits"
+    )
+    # Failure paths stay well-formed and the response is never a hang.
+    assert j["llama_server_running"] is True
+    assert j["available_slots"] == 0
+    assert j["total_slots"] == 0
+    assert j["slots"] == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# slots_stale from snapshot age (LP-0MVVXGHHB0073W1B AC4 / F4 AC1)
+#
+# Once the poll path serves a warm shared snapshot by design, "served from
+# cache" is true for almost every poll and ``slots_stale`` must stop meaning
+# that. The contract: ``slots_stale`` = served-snapshot-age >
+# ``SLOTS_SNAPSHOT_MAX_AGE_SECONDS`` (missing snapshot ⇒ stale), with the age
+# published on the payload. The pre-fix path derives the flag from cache use,
+# so the ``< budget`` / ``== budget`` / missing-snapshot rows are red against
+# dev. The shared-snapshot stamp (``observability._last_slot_details_at``, the
+# F4-reused stamp) is seeded and the clock frozen so the served age is exact;
+# the fresh /slots query is made to fail so the poll is served from the seeded
+# snapshot (F4's serve-on-refresh-failure path).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SNAPSHOT_AGE_BUDGET = 2.0
+_AGE_SNAPSHOT_SLOTS = [
+    {"slot_id": 0, "is_processing": True, "n_decoded": 7, "context_tokens": 4096}
+]
+
+
+@pytest.mark.parametrize(
+    "seeded_age,has_snapshot,expected_stale",
+    [
+        pytest.param(
+            1.0,
+            True,
+            False,
+            id="age_lt_budget",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "LP-0MVVXGHHB0073W1B red-first (AC1): pre-fix slots_stale is a "
+                    "cache-use flag (True whenever the detail cache is served), so an "
+                    "age-fresh snapshot still reports stale; F4 derives it from the "
+                    "snapshot age — remove the xfail when it lands."
+                ),
+            ),
+        ),
+        pytest.param(
+            2.0,
+            True,
+            False,
+            id="age_eq_budget",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "LP-0MVVXGHHB0073W1B red-first (AC1): see age_lt_budget; "
+                    "age == budget must not be stale (F4 AC1) — remove the xfail "
+                    "when it lands."
+                ),
+            ),
+        ),
+        pytest.param(3.0, True, True, id="age_gt_budget"),
+        pytest.param(
+            None,
+            False,
+            True,
+            id="missing_snapshot",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "LP-0MVVXGHHB0073W1B red-first (AC1): pre-fix an absent snapshot "
+                    "reports slots_stale=false (fail-open on the pool); F4 defines "
+                    "missing ⇒ stale — remove the xfail when it lands."
+                ),
+            ),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_slots_stale_follows_snapshot_age(
+    seeded_age, has_snapshot, expected_stale
+):
+    """AC4: the age-derivation table — a served snapshot older than the
+    freshness budget is stale, equal-or-fresher is not, and a missing snapshot
+    is stale (one assertion per case)."""
+    from proxy import observability as _obs
+
+    _frozen = 65536.0
+    stamp = _frozen - seeded_age if seeded_age is not None else 0.0
+    with patch("proxy.observability.time.monotonic", lambda: _frozen):
+        with patch("proxy.handlers.time.monotonic", lambda: _frozen):
+            with patch.object(_obs, "_last_slot_details_at", stamp):
+                j = await _CapacityStatusHarness().get(
+                    slots_detail=[],
+                    stale_cache=_AGE_SNAPSHOT_SLOTS if has_snapshot else None,
+                    counts=(0, 0),
+                    counts_outcome={"status": 500, "reason": "http_500"},
+                )
+
+    assert j["slots_stale"] is expected_stale, (
+        f"served snapshot age {seeded_age!r} vs freshness budget "
+        f"{_SNAPSHOT_AGE_BUDGET}s: slots_stale must be {expected_stale!r}, got "
+        f"{j['slots_stale']!r}"
+    )
+    # The published age (F4 AC1) must match the snapshot that was served.
+    published = j.get("slot_snapshot_age_seconds")
+    if published is not None and seeded_age is not None:
+        assert abs(published - seeded_age) <= 0.05, (
+            f"published slot_snapshot_age_seconds {published} must match the "
+            f"seeded snapshot age {seeded_age}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Additive schema (LP-0MVVXGHHB0073W1B matrix 4 / F4 AC2)
+#
+# The read-path change only EVER adds fields (the snapshot age, its source and
+# the bumped schema version): a consumer that ignores unknown fields must
+# observe unchanged ``available_slots`` / ``total_slots`` / ``slots`` semantics
+# and the payload must keep carrying the versioned schema field.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_status_payload_additive_schema_for_unknown_field_consumers():
+    """A consumer that ignores unknown fields sees unchanged base-field
+    semantics, and the payload carries the versioned schema field."""
+    fresh_slots = [
+        {"slot_id": 0, "is_processing": False, "n_decoded": None, "context_tokens": None},
+        {"slot_id": 1, "is_processing": True, "n_decoded": 9, "context_tokens": 512},
+    ]
+    j = await _CapacityStatusHarness().get(
+        slots_detail=fresh_slots,
+        counts=(1, 2),
+    )
+
+    assert isinstance(j["status_schema_version"], int)
+    assert j["status_schema_version"] >= 3
+    # The base fields are backend-derived and unchanged by any additive field.
+    assert j["available_slots"] == 1
+    assert j["total_slots"] == 2
+    base_slots = [
+        {k: s[k] for k in ("slot_id", "is_processing", "n_decoded")}
+        for s in j["slots"]
+    ]
+    assert base_slots == [
+        {"slot_id": 0, "is_processing": False, "n_decoded": None},
+        {"slot_id": 1, "is_processing": True, "n_decoded": 9},
+    ]
+    assert j["slots_stale"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stale reconciliation invariant (LP-0MVVXGHHB0073W1B AC5, F4 AC4 / F5 AC3)
+#
+# LP-0MVKSXR4P001V0CM AC3 must survive the snapshot read-path change: a
+# ``capacity_hint`` computed from a STALE snapshot must never claim
+# ``saturated`` while ``local_in_flight_requests == 0``. This parametrises the
+# invariant across every stale-snapshot fixture shape (all-decode fossil,
+# decode+prefill fossil, idle fossil, single decode fossil).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_STALE_FOSSIL_FIXTURES = [
+    ("all-decode fossil (would be saturated if fresh)", [_slot(0, is_processing=True, n_decoded=11), _slot(1, is_processing=True, n_decoded=22)]),
+    ("decode+prefill fossil", [_slot(0, is_processing=True, n_decoded=0), _slot(1, is_processing=True, n_decoded=7)]),
+    ("idle fossil", [_slot(0, is_processing=False), _slot(1, is_processing=False)]),
+    ("single decode fossil", [_slot(0, is_processing=True, n_decoded=3)]),
+]
+
+
+@pytest.mark.parametrize("fixture", _STALE_FOSSIL_FIXTURES, ids=lambda f: f[0])
+@pytest.mark.asyncio
+async def test_stale_snapshot_never_saturated_without_live_work(fixture):
+    """AC5: across every stale-snapshot fixture, ``capacity_hint`` is never
+    ``saturated`` while ``local_in_flight_requests == 0``."""
+    _, slots = fixture
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[],
+        stale_cache=slots,
+        dispatch_records={},
+    )
+    assert j["slots_detail_stale"] is True
+    assert j["local_in_flight_requests"] == 0
+    assert j["capacity_hint"] != "saturated", (
+        f"stale fixture {fixture[0]!r} reports capacity_hint="
+        f"{j['capacity_hint']!r} with no live local work (LP-0MVKSXR4P001V0CM "
+        f"AC3 must survive the snapshot read-path change)"
+    )

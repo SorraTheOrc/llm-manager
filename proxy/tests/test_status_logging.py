@@ -504,3 +504,92 @@ def test_key_value_formatter_handles_non_scalar_values():
     formatter = KeyValueFormatter("%(asctime)s - %(levelname)s - %(message)s")
     text = formatter.format(record)
     assert 'current_model={"name": "Qwen3", "tokens": 4096}' in text
+
+
+# ---------------------------------------------------------------------------
+# Log-compatibility for the per-phase timing surface (LP-0MVVXGHHB0073W1B)
+# ---------------------------------------------------------------------------
+
+
+def _load_capacity_signals():
+    """Load the shared status-poll parser (scripts/lib/capacity_signals.py)."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "lib"
+        / "capacity_signals.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "capacity_signals_lib", script
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _render_status_line(extra_fields: dict) -> str:
+    """Render a status_request log line from the standard extra payload plus
+    *extra_fields*, exactly as the KeyValueFormatter would."""
+    from proxy.utils import KeyValueFormatter
+
+    record = _make_status_record()
+    record.slots_stale = True
+    record.slots_detail_stale = True
+    record.slot_counts_stale = False
+    record.capacity_hint = "idle"
+    record.status_schema_version = 5
+    record.local_in_flight_requests = 0
+    record.slots = []
+    for key, value in extra_fields.items():
+        setattr(record, key, value)
+    formatter = KeyValueFormatter("%(asctime)s - %(levelname)s - %(message)s")
+    return formatter.format(record)
+
+
+def test_capacity_parser_keeps_parsing_unchanged_lines_with_additive_fields():
+    """Matrix 6: the per-phase timing surface is ADDITIVE — the shared
+    capacity parser (``scripts/capacity_signal_verification.py``'s field regex)
+    keeps parsing unchanged ``status_request`` lines and simply ignores the new
+    timing fields, so pre-change windows stay measurable (F1 AC4).
+    """
+    signals = _load_capacity_signals()
+
+    # The pre-change line, plus the additive per-phase timing surface the
+    # instrumenting child (LP-0MVVXGHT1001I5YX) adds: unknown-to-the-parser
+    # fields must not disturb the fields it extracts.
+    line = _render_status_line(
+        {
+            "status_query_ms": 3,
+            "slots_counts_ms": 4,
+            "slots_detail_ms": 5,
+            "slots_upstream_calls": 1,
+            "slots_snapshot_age_seconds": 0.42,
+            "slots_snapshot_source": "upstream",
+        }
+    )
+
+    assert signals.is_status_poll(line)
+    fields = signals.status_fields(line)
+    # The unchanged pre-change fields keep their names and values (the
+    # parser's fixed field set deliberately reads available_slots, not
+    # total_slots).
+    assert fields["slots_stale"] == "true"
+    assert fields["slots_detail_stale"] == "true"
+    assert fields["capacity_hint"] == "idle"
+    assert fields["available_slots"] == "3"
+    assert fields["status_schema_version"] == "5"
+    assert fields["latency_ms"] == "12"
+    assert signals.stale_flag(fields) is True
+    assert signals.parse_latency_ms(fields["latency_ms"]) == 12
+    # The additive timing fields render on the line but are unknown to the
+    # parser's fixed field set — they neither appear in the extraction nor
+    # break it.
+    assert "slots_upstream_calls=1" in line
+    assert "slots_snapshot_source" not in fields
+    assert "slots_upstream_calls" not in fields
