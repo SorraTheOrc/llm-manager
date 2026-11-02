@@ -89,6 +89,25 @@ def _guard(
     )
 
 
+def _inert_no_budget(ts: datetime, session: str, *, priority: str = "high") -> str:
+    """A logged inert ``no_budget`` decision (every time bound disabled).
+
+    Inert decisions log nothing by default, so this line is only produced when
+    an inert decision was explicitly logged; it is what separates a genuine
+    ``high_priority_inert`` from an unlogged eviction (LP-0MVZQUT3A0039MLY).
+    """
+    return (
+        f"{_ts(ts)} - INFO - local_admission_guard decision=admit "
+        f"reason=no_budget enforced=false eta_prefill_s=0.0 "
+        f"eta_occupancy_s=0.0 projected_wait_s=0.0 budget_s=0.0 bound_s=0.0 "
+        f"deadline_s=120.0 deadline_budget_s=114.0 new_tokens=12000 "
+        f"budget_tokens=25000 rate_bucket=solitary contended_samples=0 "
+        f"busy_slots=0 in_flight_prefills=0 gate_occupancy=0 free_slot=true "
+        f"priority={priority} policy=reject model=Qwen3 samples=5 "
+        f"provider=local-qwen3 session={session}"
+    )
+
+
 def _priority(ts: datetime, session: str, priority: str) -> str:
     return (
         f"{_ts(ts)} - INFO - priority_routing model=unknown priority={priority} "
@@ -155,10 +174,12 @@ def log_dir(tmp_path: Path) -> Path:
         _eviction(moment + timedelta(seconds=120), idle, new_tokens=14041),
     ]
 
-    # ``high`` priority: the guard is inert (no_budget) and logs nothing.
+    # ``high`` priority with a genuine inert ``no_budget`` decision: the only
+    # remaining shape that still attributes to ``high_priority_inert``.
     high = "sess-high"
     lines += [
         _priority(moment, high, "high"),
+        _inert_no_budget(moment, high),
         _eviction(moment + timedelta(seconds=121), high, new_tokens=20723,
                   eta_prefill_s="278.8", elapsed_s=121.0),
     ]
@@ -240,6 +261,7 @@ def test_gzipped_rotation_files_inside_the_window_are_scanned(tmp_path: Path) ->
         tmp_path, "proxy.log.2026-11-01_13.gz",
         [
             _priority(moment, session, "high"),
+            _inert_no_budget(moment, session),
             _eviction(moment + timedelta(seconds=120), session, new_tokens=23027),
         ],
         compress=True,
@@ -248,6 +270,52 @@ def test_gzipped_rotation_files_inside_the_window_are_scanned(tmp_path: Path) ->
     summary = _attribute(tmp_path)
     assert summary["by_admission"] == {attribution.HIGH_PRIORITY_INERT: 1}
     assert summary["max_new_tokens"] == 23027
+
+
+def test_unlogged_high_priority_eviction_is_inert_unlogged(tmp_path: Path) -> None:
+    """A high-priority eviction with no guard line is unlogged, not inert-high.
+
+    LP-0MVZQUT3A0039MLY AC3: after the guard fix ``high`` is bounded like every
+    other priority, so an eviction with no ``no_budget`` line is as
+    un-attributable as any other unlogged inert decision.
+    """
+    moment = datetime(2026, 11, 1, 22, 0, 0)
+    session = "sess-high-unlogged"
+    _write_log(
+        tmp_path, "proxy.log",
+        [
+            _priority(moment, session, "high"),
+            _eviction(moment + timedelta(seconds=121), session, new_tokens=20723,
+                      eta_prefill_s="278.8", elapsed_s=121.0),
+        ],
+    )
+
+    summary = _attribute(tmp_path)
+    assert summary["by_admission"] == {attribution.INERT_UNLOGGED: 1}
+    row = summary["rows"][0]
+    assert row["priority"] == "high"
+    assert row["admission"] == attribution.INERT_UNLOGGED
+
+
+def test_high_priority_with_no_budget_guard_is_high_priority_inert(
+    tmp_path: Path,
+) -> None:
+    """Only a logged inert ``no_budget`` line keeps ``high_priority_inert``."""
+    moment = datetime(2026, 11, 1, 22, 0, 0)
+    session = "sess-high-no-budget"
+    _write_log(
+        tmp_path, "proxy.log",
+        [
+            _priority(moment, session, "high"),
+            _inert_no_budget(moment, session),
+            _eviction(moment + timedelta(seconds=121), session, new_tokens=20723,
+                      eta_prefill_s="278.8", elapsed_s=121.0),
+        ],
+    )
+
+    summary = _attribute(tmp_path)
+    assert summary["by_admission"] == {attribution.HIGH_PRIORITY_INERT: 1}
+    assert summary["rows"][0]["admission"] == attribution.HIGH_PRIORITY_INERT
 
 
 def test_summary_reports_budget_and_over_deadline_evidence(log_dir: Path) -> None:

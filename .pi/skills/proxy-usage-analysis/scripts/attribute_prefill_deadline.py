@@ -32,14 +32,19 @@ evidence for the same session at the measured dispatch start
     A routing override admitted the dispatch without the guard adjudicating.
 
 ``high_priority_inert``
-    ``high`` priority never queues, so ``wait_budget_seconds`` is 0 and the
-    guard returns inert ``no_budget`` — nothing was priced and the deadline
-    and safety-budget bounds never ran.
+    ``high`` priority was *genuinely* inert: every time bound was disabled, so
+    the guard returned ``no_budget`` and nothing was priced. This class now
+    requires a logged inert ``no_budget`` decision; an **unlogged**
+    high-priority eviction is ``inert_unlogged`` like any other priority
+    (LP-0MVZQUT3A0039MLY). Before the guard fix ``high`` was inert by
+    construction (it never queues), so this class used to absorb every
+    unlogged high-priority eviction.
 
 ``inert_unlogged``
     No admission line at the dispatch instant and no override: the guard
     returned an inert decision, which by design logs nothing (an uncalibrated
-    bucket is the remaining explanation). Un-attributable from the log alone.
+    bucket, or ``high`` priority with no logged ``no_budget`` line, is the
+    remaining explanation). Un-attributable from the log alone.
 
 Usage::
 
@@ -82,7 +87,14 @@ GUARD_AFTER = timedelta(seconds=10)
 OVERRIDE_BEFORE = timedelta(seconds=45)
 OVERRIDE_AFTER = timedelta(seconds=10)
 
-#: Stable class vocabulary, in report order.
+#: The inert ``no_budget`` reason: returned when every time bound is disabled.
+#: Inert decisions log nothing by default, so a line carrying this reason only
+#: appears when an inert decision was explicitly logged (LP-0MVZQUT3A0039MLY).
+INERT_NO_BUDGET = "no_budget"
+
+#: Stable class vocabulary, in report order. ``high_priority_inert`` requires a
+#: logged inert ``no_budget`` decision; an unlogged ``high`` eviction is
+#: ``inert_unlogged`` like any other unlogged priority (LP-0MVZQUT3A0039MLY).
 ADMISSION_CLASSES = (
     "rung_accepted",
     "priced_within_queue_budget",
@@ -237,9 +249,27 @@ def classify(
     seen = [item for item in priorities.get(session, []) if item[0] <= eviction["ts"]]
     row["priority"] = max(seen, key=lambda item: item[0])[1] if seen else None
 
+    session_guards = guard_decisions.get(session, [])
+    # An inert ``no_budget`` decision admits nothing: exclude it from the
+    # pricing lookup and use it only to recognise the genuine inert-high case
+    # (LP-0MVZQUT3A0039MLY). Everything else — including the absence of a guard
+    # line, which is how an uncalibrated bucket and, by design, an inert
+    # decision present themselves — falls through to ``inert_unlogged``.
     guard = _nearest(
-        guard_decisions.get(session, []), dispatch_start,
-        GUARD_BEFORE, GUARD_AFTER, admits_only=True,
+        [
+            decision
+            for decision in session_guards
+            if str(decision.get("reason", "")) != INERT_NO_BUDGET
+        ],
+        dispatch_start, GUARD_BEFORE, GUARD_AFTER, admits_only=True,
+    )
+    inert_no_budget = _nearest(
+        [
+            decision
+            for decision in session_guards
+            if str(decision.get("reason", "")) == INERT_NO_BUDGET
+        ],
+        dispatch_start, GUARD_BEFORE, GUARD_AFTER,
     )
     override = _nearest(
         overrides.get(session, []), dispatch_start,
@@ -266,7 +296,7 @@ def classify(
     elif override is not None:
         row["admission"] = override["kind"]
         row["override_reason"] = override.get("reason")
-    elif row["priority"] == "high":
+    elif row["priority"] == "high" and inert_no_budget is not None:
         row["admission"] = HIGH_PRIORITY_INERT
     else:
         row["admission"] = INERT_UNLOGGED
