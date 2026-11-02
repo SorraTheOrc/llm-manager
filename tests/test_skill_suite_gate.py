@@ -156,8 +156,8 @@ def test_full_suite_command_set_targets_the_skill_test_dir() -> None:
         f"expected exactly one full-suite pytest command targeting "
         f"{SKILL_TEST_DIR!r}, found {len(targets)}: {commands!r}. "
         "The SA-0MVQJSGLY0098DVB rule (run_tests.py full_suite_commands) "
-        "emits it; without it the dev-push gate silently drops ~529 skill "
-        "tests (pytest's norecursedirs prunes .*/). Check for a "
+        "emits it; without it the dev-push gate silently drops the 790 "
+        "skill tests (pytest's norecursedirs prunes .*/). Check for a "
         "suiteCommands pin in .pi/test-config.json — see docs/dev/git-hooks.md."
     )
 
@@ -172,7 +172,7 @@ def test_canonical_repo_pytest_command_is_still_present() -> None:
 
     The gate's full-suite cache entry for the repo tests is keyed on exactly
     this command (docs/dev/git-hooks.md); replacing it would silently reblind
-    the repo's own 5 264-test suite, which is not what the upstream rule does.
+    the repo's own 7 599-test suite, which is not what the upstream rule does.
     """
     commands = _full_suite_commands(REPO_ROOT)
 
@@ -194,9 +194,13 @@ def test_no_suite_commands_pin_in_test_config() -> None:
     """A pinned ``suiteCommands`` would silently drop the skill tests.
 
     The pinned list wins by design: ``run_tests.py`` returns it verbatim and
-    skips convention detection, which would remove the skill-test command and
-    also disable changed-scope selection (the finish loop falls back to the
-    full suite). The repo deliberately keeps only ``timeoutPerCommand``.
+    skips convention detection, which would remove the skill-test command
+    from the full suite. (The plan expected a pin also to disable
+    changed-scope selection — full-suite fallback on every ``implement.py
+    finish`` — but SA-0MVL7YOMJ006UMDO removed that: a pinned list defines
+    the full suite only, so the lasting harm is the silent skill-test drop;
+    see docs/dev/git-hooks.md.) The repo deliberately keeps only
+    ``timeoutPerCommand``.
     """
     config_path = REPO_ROOT / ".pi/test-config.json"
     assert config_path.is_file(), (
@@ -208,10 +212,9 @@ def test_no_suite_commands_pin_in_test_config() -> None:
 
     assert "suiteCommands" not in config, (
         ".pi/test-config.json pins 'suiteCommands' — that pin silently drops "
-        "the .pi/skills/*/tests skill tests (the pinned list wins by design) "
-        "and also disables changed-scope selection (full-suite fallback on "
-        "every implement.py finish). Remove the key; see docs/dev/git-hooks.md "
-        "and SA-0MVQJSGLY0098DVB."
+        "the .pi/skills/*/tests skill tests (the pinned list wins by design, "
+        "so the skill-test command disappears from the full suite). Remove "
+        "the key; see docs/dev/git-hooks.md and SA-0MVQJSGLY0098DVB."
     )
 
 
