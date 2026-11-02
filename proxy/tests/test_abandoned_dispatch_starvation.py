@@ -10,11 +10,11 @@ retry must not be admitted into a slot that is still draining work the proxy
 itself abandoned, and the drain is bounded (p90 6.6 s = one ubatch at the
 measured rate), so the refusal carries the remaining drain as its retry-after.
 
-This module is red-first in the tree's usual shape: every assertion pins the
-**fixed** contract and is marked ``xfail(strict=True)`` until the sibling
-implementation item lands, which removes the markers. The one non-xfail test
-(pinning the fixture/state contract that must hold with today's code) guards
-the test harness itself.
+This module pins the **fixed** contract. It was red-first (every contract
+assertion carried ``xfail(strict=True)`` until the sibling implementation
+LP-0MVW8S8DH008E4W4 landed); the implementation item removed the markers so the
+assertions now run for real. Tests that must hold with or without the fix (the
+harness/state contract and the warm-path guard) are not and never were xfail.
 
 No live ``llama-server``, no network, no wall-clock sleeps longer than an
 injected fake second: the abandoned-slot registry runs under the injected
@@ -29,8 +29,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-#: The sibling implementation item that lands the fix and removes the
-#: ``xfail(strict=True)`` markers below.
+#: The implementation item that landed the fix and removed the
+#: ``xfail(strict=True)`` markers (kept for provenance: the markers were
+#: removed by LP-0MVW8S8DH008E4W4).
 IMPL_ITEM = "LP-0MVW8S8DH008E4W4"
 
 #: The gate reason string the fix publishes on the refusal (asserted by
@@ -187,9 +188,6 @@ def test_live_drain_entry_is_visible_to_the_published_annotation(clock):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=f"starvation fix not implemented ({IMPL_ITEM})", strict=True
-)
 def test_retry_is_not_admitted_into_own_draining_slot_deadline_variant(clock):
     """AC1/AC2a: session S pinned to slot 0 releases its dispatch at the
     prefill deadline; the drain entry is live; S's retry (same session, same
@@ -214,9 +212,6 @@ def test_retry_is_not_admitted_into_own_draining_slot_deadline_variant(clock):
     assert remaining > 0.0
 
 
-@pytest.mark.xfail(
-    reason=f"starvation fix not implemented ({IMPL_ITEM})", strict=True
-)
 def test_retry_is_not_admitted_into_own_draining_slot_measured_deficit_variant(
     clock,
 ):
@@ -232,9 +227,6 @@ def test_retry_is_not_admitted_into_own_draining_slot_measured_deficit_variant(
     assert remaining > 0.0
 
 
-@pytest.mark.xfail(
-    reason=f"starvation fix not implemented ({IMPL_ITEM})", strict=True
-)
 def test_drain_refusal_bounds_the_wait_to_the_drain_ttl(clock):
     """AC2b: the refusal is a bound, not a quarantine — once the drain ends
     (the recorded window expires) the same session is admitted again with the
@@ -272,9 +264,6 @@ def test_drain_refusal_bounds_the_wait_to_the_drain_ttl(clock):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=f"starvation fix not implemented ({IMPL_ITEM})", strict=True
-)
 def test_drain_refusal_emits_an_attributable_log_line(clock):
     """AC3: the refusal is observable in the log by field, not guessed —
     ``routing_skip_local … reason=abandoned_slot_drain … entry=…`` so the

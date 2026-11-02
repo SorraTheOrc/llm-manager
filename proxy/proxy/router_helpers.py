@@ -1782,6 +1782,79 @@ _LOCAL_DISPATCH_TERMINAL_ATTR = "_local_dispatch_post_deadline_ts"
 #: request instead of quarantining the whole ``local`` entry for every session.
 LOCAL_GATE_REASON_POST_DEADLINE_TERMINAL = "post_deadline_terminal"
 LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN = "prefill_thrash_cooldown"
+#: The session's own abandonment is still draining on its pinned slot
+#: (LP-0MVVEQW5Y00962T2 AC3, mechanism (c) from
+#: ``docs/dev/abandoned-prefill-release-cancel.md``): a retry must not be
+#: admitted into a slot that still runs work the proxy itself abandoned, or it
+#: would burn its lease with zero ``prefill_progress_measured``. The refusal
+#: carries the remaining recorded drain window as its retry-after so the wait
+#: is bounded by the observed drain, never a fixed sleep.
+LOCAL_GATE_REASON_ABANDONED_DRAIN = "abandoned_slot_drain"
+
+
+def _abandoned_drain_remaining_for_session(
+    session_key: str | None,
+) -> float:
+    """Seconds until the session's own abandoned drain window is expected to clear.
+
+    Consumes the published abandoned-slot registry (LP-0MVRMI5HK00558TB / the
+    identity annotation LP-0MVUVHAQP001IRKK): when *session_key* has a live
+    abandoned entry — recorded when the proxy gave up on a dispatch for this
+    session — the proxy itself abandoned work there, and this session's
+    immediate retry would land behind that drain. Returns 0 when no own
+    abandoned entry is live (warm path — the gate then behaves exactly as
+    before, LP-0MVD8S8DH008E4W4 AC4).
+
+    The returned value is the **remaining recorded drain window** (entry
+    ``abandoned_at + ttl - now``): a bounded wait (mechanism (c)), never a
+    fixed sleep. Expired entries are pruned lazily exactly as by every other
+    registry reader, so a drain that has already cleared (or a fresh
+    ``/slots`` poll that cleared it — observability clears with
+    :func:`_clear_abandoned_slot`) unblocks the next gate call. Read-only with
+    respect to capacity; never assigns a slot.
+    """
+    if not session_key:
+        return 0.0
+    now = time.monotonic()
+    _prune_abandoned_slots(now=now)
+    best = 0.0
+    own_slot = None
+    try:
+        from proxy.session import _assigned_slot_for_session
+
+        own_slot = _assigned_slot_for_session(session_key)
+    except Exception:
+        own_slot = None
+    for entry in _abandoned_slots.values():
+        # Only the session's own abandonment counts as its drain: another
+        # session's ghost on the same slot is that session's drain, not this
+        # retry's (capacity, not starvation — the AC1 record's H5 verdict).
+        if entry.get("session_id") != session_key:
+            continue
+        # Only a **real-slot** entry can defer: an endpoint-wide ghost (no
+        # resolvable slot identity) cannot name the slot this retry would land
+        # on, and refusing a dispatch on an unidentifiable ghost would be a
+        # worse over-refusal than the starvation it protects (LP-0MVW8S8DH008E4W4
+        # — the wedge/deadline paths legitimately record endpoint-wide entries
+        # for sessions whose identity was never pinned, and those sessions must
+        # stay admissible). The parent AC3's drain is a slot, not an endpoint.
+        if not _abandoned_slot_is_real_id(entry.get("slot_id")):
+            continue
+        # Prefer the entry on the session's own pinned slot when one exists.
+        entry_slot = entry.get("slot_id")
+        if own_slot is not None and entry_slot is not None and entry_slot != own_slot:
+            continue
+        try:
+            ttl = float(entry.get("ttl_seconds", 0.0))
+        except (TypeError, ValueError):
+            ttl = 0.0
+        try:
+            started = float(entry.get("abandoned_at", 0.0))
+        except (TypeError, ValueError):
+            started = 0.0
+        remainder = max(0.0, (started + ttl) - now)
+        best = max(best, remainder)
+    return best
 
 
 def _mark_local_dispatch_terminal(request, now=None) -> float | None:
@@ -1890,6 +1963,22 @@ def _local_dispatch_gate(
             entry,
         )
         return (True, LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN, remaining)
+    # Own-drain deferral (LP-0MVW8S8DH008E4W4 / parent AC3, mechanism (c) from
+    # the AC1 record): a retry must never be admitted into a slot that is still
+    # draining work the proxy abandoned for this session. The refusal is a
+    # bounded wait (cap = one batch tail, measured at p90 6.6 s) — it expends
+    # no lease and never expires a dispatch with zero measured progress. Warm
+    # path untouched: no own abandoned entry ⇒ 0 ⇒ admitted exactly as before.
+    drain_remaining = _abandoned_drain_remaining_for_session(session_key)
+    if drain_remaining > 0:
+        _log_local_dispatch_gate_skip(
+            srv,
+            session_key,
+            LOCAL_GATE_REASON_ABANDONED_DRAIN,
+            drain_remaining,
+            entry,
+        )
+        return (True, LOCAL_GATE_REASON_ABANDONED_DRAIN, drain_remaining)
     return (False, "", 0.0)
 
 
