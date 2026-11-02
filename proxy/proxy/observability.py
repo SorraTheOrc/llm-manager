@@ -222,6 +222,20 @@ def last_known_slot_counts() -> tuple[int, int] | None:
     return (available, total)
 
 
+def last_known_slot_counts_stamp() -> float | None:
+    """Monotonic stamp of the last successful counts fetch, or ``None``.
+
+    Published so the status handler can report the age of a graceful-
+    degradation snapshot exactly (LP-0MVVXGHT1001I5YX AC1 ``slots_"
+    "snapshot_age_seconds``) rather than guessing from the read time — the
+    age is the distance from when the data was fetched, not from when it was
+    served (LP-0MVECWYWK000U3E1 discipline).
+    """
+    if _last_slot_counts_cache is None:
+        return None
+    return _last_slot_counts_cache[2]
+
+
 # ===================================================================
 # /slots poll coalescing (LP-0MUCEFD5B003TURT)
 #
@@ -332,8 +346,14 @@ def reset_slots_poll_cache() -> None:
     _slots_poll_cache.clear()
 
 
-def _cached_slots_payload(url: str) -> tuple[int, object] | None:
-    """Return the cached (status, data) for *url* when still fresh."""
+def _cached_slots_payload_entry(url: str) -> tuple[float, int, object] | None:
+    """Return the cached ``(fetched_at, status, data)`` for *url* when fresh.
+
+    ``fetched_at`` is the ``time.monotonic()`` stamp of the upstream fetch that
+    produced the entry, so callers can publish the age of the snapshot they
+    were served (LP-0MVVXGHT1001I5YX). Never re-stamped on a cache read: a
+    cache hit must not make stale data look fresh (LP-0MVECWYWK000U3E1).
+    """
     cached = _slots_poll_cache.get(url)
     if cached is None:
         return None
@@ -342,8 +362,40 @@ def _cached_slots_payload(url: str) -> tuple[int, object] | None:
     if status != 200:
         ttl = max(ttl, _slots_poll_failure_backoff_seconds())
     if time.monotonic() - ts < ttl:
-        return status, data
+        return ts, status, data
     return None
+
+
+def _cached_slots_payload(url: str) -> tuple[int, object] | None:
+    """Return the cached (status, data) for *url* when still fresh."""
+    entry = _cached_slots_payload_entry(url)
+    if entry is None:
+        return None
+    return entry[1], entry[2]
+
+
+def _note_slots_provenance(
+    provenance_out: dict | None,
+    *,
+    source: str,
+    fetched_at: float | None,
+    upstream_calls: int,
+) -> None:
+    """Record how a ``/slots`` read was served (LP-0MVVXGHT1001I5YX).
+
+    Fills the caller's optional dict with the provenance of one read path so
+    the status handler can publish per-poll attribution (which phase asked
+    upstream, which was served from cache, and how old the served snapshot
+    is). Best-effort: a provenance failure must never break a status poll.
+    """
+    if provenance_out is None:
+        return
+    try:
+        provenance_out["source"] = source
+        provenance_out["fetched_at"] = fetched_at
+        provenance_out["upstream_calls"] = int(upstream_calls)
+    except Exception:
+        pass
 
 
 async def _do_slots_fetch(
@@ -438,16 +490,32 @@ async def _await_slots_inflight(fut: "asyncio.Future", wait_seconds: float) -> b
 
 
 async def _run_slots_fetch_as_leader(
-    url: str, timeout: float, client, fut: "asyncio.Future"
+    url: str,
+    timeout: float,
+    client,
+    fut: "asyncio.Future",
+    provenance_out: dict | None = None,
 ) -> tuple[int, object]:
     """Fetch /slots and settle the shared future for every follower."""
     try:
         status, data = await _do_slots_fetch(url, timeout, client)
-        _slots_poll_cache[url] = (time.monotonic(), status, data)
+        fetched_at = time.monotonic()
+        _slots_poll_cache[url] = (fetched_at, status, data)
+        _note_slots_provenance(
+            provenance_out,
+            source="upstream",
+            fetched_at=fetched_at,
+            upstream_calls=1,
+        )
         if not fut.done():
             fut.set_result((status, data))
         return status, data
     except BaseException as exc:
+        # The attempt still reached upstream: record the cost even when it
+        # failed, so an error poll is not mislabelled as a cache hit.
+        _note_slots_provenance(
+            provenance_out, source="upstream", fetched_at=None, upstream_calls=1
+        )
         # ``CancelledError`` derives from ``BaseException``, so a leader
         # cancelled by a client disconnect used to skip this path entirely and
         # leave the future pending with no owner (LP-0MVJML600003CQ6Y, AC1).
@@ -465,7 +533,7 @@ async def _run_slots_fetch_as_leader(
 
 
 async def _fetch_slots_payload(
-    url: str, timeout: float, client=None
+    url: str, timeout: float, client=None, provenance_out: dict | None = None
 ) -> tuple[int, object]:
     """Fetch /slots with TTL caching and single-flight coalescing.
 
@@ -475,20 +543,39 @@ async def _fetch_slots_payload(
     ``SLOTS_POLL_FAILURE_BACKOFF_SECONDS`` so a failing backend is not
     hammered. Returns ``(status_code, parsed_data)``.
 
+    ``provenance_out`` (optional, additive) is filled with how the read was
+    served — ``source`` (``upstream`` | ``ttl_cache`` | ``failure_backoff``),
+    the monotonic ``fetched_at`` of the served payload and the number of
+    upstream calls this read caused — so the status path can attribute a poll
+    to a phase and a cache path instead of inferring it from an aggregate
+    latency (LP-0MVVXGHT1001I5YX AC1/AC2).
+
     Cancellation safety (LP-0MVJML600003CQ6Y): the shared future is always
     settled by its owner, and a follower waits for it only for a bounded time
     before promoting itself to leader — see the invariant block above.
     """
-    cached = _cached_slots_payload(url)
-    if cached is not None:
-        return cached
+    entry = _cached_slots_payload_entry(url)
+    if entry is not None:
+        _note_slots_provenance(
+            provenance_out,
+            source="failure_backoff" if entry[1] != 200 else "ttl_cache",
+            fetched_at=entry[0],
+            upstream_calls=0,
+        )
+        return entry[1], entry[2]
 
     lock = _get_slots_poll_lock()
     leader = False
     async with lock:
-        cached = _cached_slots_payload(url)
-        if cached is not None:
-            return cached
+        entry = _cached_slots_payload_entry(url)
+        if entry is not None:
+            _note_slots_provenance(
+                provenance_out,
+                source="failure_backoff" if entry[1] != 200 else "ttl_cache",
+                fetched_at=entry[0],
+                upstream_calls=0,
+            )
+            return entry[1], entry[2]
         inflight = _slots_poll_inflight.get(url)
         if inflight is not None:
             fut = inflight
@@ -498,12 +585,18 @@ async def _fetch_slots_payload(
             leader = True
 
     if leader:
-        return await _run_slots_fetch_as_leader(url, timeout, client, fut)
+        return await _run_slots_fetch_as_leader(
+            url, timeout, client, fut, provenance_out=provenance_out
+        )
 
     # Follower: bounded wait, then take over leadership (AC1/AC2).
     wait_seconds = _slots_poll_follower_timeout_seconds(timeout)
     for attempt in range(_SLOTS_POLL_FOLLOWER_ATTEMPTS):
         if await _await_slots_inflight(fut, wait_seconds) and not fut.cancelled():
+            # Followed a leader this poll caused no upstream call of its own.
+            _note_slots_provenance(
+                provenance_out, source="upstream", fetched_at=None, upstream_calls=0
+            )
             # Re-raises the leader's exception, preserving the old shared-await
             # semantics for genuine upstream failures.
             return fut.result()
@@ -511,16 +604,24 @@ async def _fetch_slots_payload(
         # progress rather than waiting forever.
         fut, leader = await _promote_slots_follower(url, fut)
         if leader:
-            return await _run_slots_fetch_as_leader(url, timeout, client, fut)
+            return await _run_slots_fetch_as_leader(
+                url, timeout, client, fut, provenance_out=provenance_out
+            )
         if attempt + 1 >= _SLOTS_POLL_FOLLOWER_ATTEMPTS:
             break
 
     # Every shared future this caller followed was abandoned: degrade to a
     # still-fresh cached payload, else report the timeout to the caller (which
     # records a /slots failure and falls back to last-known counts).
-    cached = _cached_slots_payload(url)
-    if cached is not None:
-        return cached
+    entry = _cached_slots_payload_entry(url)
+    if entry is not None:
+        _note_slots_provenance(
+            provenance_out,
+            source="failure_backoff" if entry[1] != 200 else "ttl_cache",
+            fetched_at=entry[0],
+            upstream_calls=0,
+        )
+        return entry[1], entry[2]
     raise TimeoutError(
         f"/slots single-flight follower waited {_SLOTS_POLL_FOLLOWER_ATTEMPTS} "
         f"bounded attempts for {url} without a payload"
@@ -558,6 +659,7 @@ async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None,
     base_url: str | None = None,
     status_out: dict | None = None,
+    provenance_out: dict | None = None,
 ) -> tuple:
     """Query the llama-server ``/slots`` endpoint.
 
@@ -597,7 +699,9 @@ async def _query_slots(
         # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls behind a
         # short TTL so N status pollers produce a bounded number of upstream
         # requests (not N per interval).
-        status, slots_data = await _fetch_slots_payload(url, timeout, client)
+        status, slots_data = await _fetch_slots_payload(
+            url, timeout, client, provenance_out=provenance_out
+        )
         if status == 200:
             if isinstance(slots_data, list):
                 total_slots = len(slots_data)
@@ -698,6 +802,7 @@ async def _query_slots_detail(
     model: str | None = None,
     endpoint: str | None = None,
     _client: httpx.AsyncClient | None = None,
+    provenance_out: dict | None = None,
 ) -> list[dict]:
     """Query the llama-server ``/slots`` endpoint and return per-slot details.
 
@@ -734,6 +839,9 @@ async def _query_slots_detail(
         url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
         url = f"{url}?model={resolved_model}"
         if _client is not None:
+            _note_slots_provenance(
+                provenance_out, source="upstream", fetched_at=None, upstream_calls=1
+            )
             slots_resp = await _client.get(url)
             if slots_resp.status_code == 200:
                 slots_data = await _safe_parse_json_response(slots_resp)
@@ -741,7 +849,9 @@ async def _query_slots_detail(
                 slots_data = None
         else:
             # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls.
-            status, slots_data = await _fetch_slots_payload(url, timeout, None)
+            status, slots_data = await _fetch_slots_payload(
+                url, timeout, None, provenance_out=provenance_out
+            )
             if status != 200:
                 slots_data = None
         if isinstance(slots_data, list):

@@ -27,6 +27,33 @@ from proxy.provider import clear_usage_limit_quarantine, get_model_type
 logger = logging.getLogger("llama-proxy")
 
 
+def _snapshot_age_seconds(fetched_at: float | None) -> float | None:
+    """Age (seconds) of a snapshot stamped at monotonic *fetched_at*.
+
+    ``None`` in (never a fabricated 0): the snapshot has no known fetch
+    stamp, so its age cannot be reported truthfully. Never negative — a
+    clock that appears to move backwards yields ``0.0`` rather than a
+    negative age (LP-0MVVXGHT1001I5YX AC1).
+    """
+    if fetched_at is None:
+        return None
+    return max(0.0, time.monotonic() - fetched_at)
+
+
+def _provenance_fetched_at(*provenance: dict) -> float | None:
+    """First known fetch stamp across the given phase provenance dicts.
+
+    Used to age the snapshot a poll was served from: the counts phase and
+    the detail phase share the coalesced ``/slots`` payload, so either one's
+    fetch stamp is the snapshot's age (LP-0MVVXGHT1001I5YX AC2).
+    """
+    for prov in provenance:
+        fetched = prov.get("fetched_at")
+        if fetched is not None:
+            return fetched
+    return None
+
+
 def _resolve_client_ip(request: Request) -> tuple[str, str]:
     """Resolve the client IP from the request.
 
@@ -570,10 +597,12 @@ async def get_llama_local_status(request: Request):
     # -- query_llama_status with timeout (non-blocking guarantee) ---------
     srv = _srv()
     timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
+    _status_query_t0 = time.monotonic()
     try:
         status = await asyncio.wait_for(srv.query_llama_status(), timeout=timeout)
     except (TimeoutError, Exception):
         status = {"llama_server_running": False, "n_ctx": None, "kv_cache_tokens": None, "router_mode": False}
+    status_query_ms = int((time.monotonic() - _status_query_t0) * 1000)
 
     llama_running = bool(status.get("llama_server_running", False))
 
@@ -651,6 +680,19 @@ async def get_llama_local_status(request: Request):
     # must be reconciled with live proxy state (LP-0MVKSXR4P001V0CM AC3).
     counts_stale = False
     detail_stale = False
+    # Per-phase read-path instrumentation (LP-0MVVXGHT1001I5YX): each phase's
+    # elapsed time and provenance are published additively on the status_request
+    # line so a stale (> budget) poll can be attributed to a phase instead of
+    # inferred from an aggregate latency. ``None`` means the phase was never
+    # attempted (llama-server down / no model / exception before it started),
+    # 0 upstream calls means the poll was served from a cache.
+    slots_counts_ms: int | None = None
+    slots_detail_ms: int | None = None
+    slots_upstream_calls = 0
+    slots_snapshot_source = "none"
+    slots_snapshot_age_seconds: float | None = None
+    counts_provenance: dict = {}
+    detail_provenance: dict = {}
     if llama_running:
         try:
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
@@ -686,13 +728,17 @@ async def get_llama_local_status(request: Request):
                 # failure, so a fossil cache snapshot is never served as
                 # current capacity (LP-0MVKSXR4P001V0CM AC3).
                 counts_outcome: dict = {}
+                counts_provenance: dict = {}
+                _counts_t0 = time.monotonic()
                 available_slots, total_slots = await _query_slots(
                     client,
                     llama_port,
                     timeout=2.0,
                     model=cm,
                     status_out=counts_outcome,
+                    provenance_out=counts_provenance,
                 )
+                slots_counts_ms = int((time.monotonic() - _counts_t0) * 1000)
                 model_absent = slots_failure_is_definitive_model_absent(
                     counts_outcome
                 )
@@ -728,10 +774,16 @@ async def get_llama_local_status(request: Request):
                 # STATUS_QUERY_TIMEOUT window via the helper's own httpx
                 # timeout, so a slow /slots response cannot blow the
                 # endpoint's response budget (AC3).
+                detail_provenance: dict = {}
+                _detail_t0 = time.monotonic()
                 try:
-                    detail = await _query_slots_detail(llama_port, timeout=timeout, model=cm)
+                    detail = await _query_slots_detail(
+                        llama_port, timeout=timeout, model=cm,
+                        provenance_out=detail_provenance,
+                    )
                 except Exception:
                     detail = None
+                slots_detail_ms = int((time.monotonic() - _detail_t0) * 1000)
                 if isinstance(detail, list) and detail:
                     slots = detail
                 else:
@@ -761,6 +813,69 @@ async def get_llama_local_status(request: Request):
             except (TypeError, ValueError):
                 total_slots = 3
             available_slots = total_slots
+
+    # -- per-phase read-path attribution (LP-0MVVXGHT1001I5YX) ------------
+    # Aggregate the per-phase provenance into the three additive fields on
+    # the status_request line so a stale (> budget) poll can be attributed to
+    # a phase and a cache path (parent AC1). ``slots_upstream_calls`` counts
+    # every upstream ``/slots`` fetch this poll caused (0 or 1 today — the
+    # single-flight + TTL coalescing means the detail phase shares the counts
+    # phase's payload). ``slots_snapshot_source`` labels where the served
+    # snapshot came from and ``slots_snapshot_age_seconds`` its age.
+    slots_upstream_calls = int(
+        counts_provenance.get("upstream_calls", 0)
+        if isinstance(counts_provenance, dict)
+        else 0
+    ) + int(
+        detail_provenance.get("upstream_calls", 0)
+        if isinstance(detail_provenance, dict)
+        else 0
+    )
+    if detail_stale or counts_stale:
+        # Served the last-known snapshot (graceful degradation): label it a
+        # snapshot, not a cache hit, and age it from the snapshot's own fetch
+        # stamp (LP-0MVECWYWK000U3E1 — never re-stamped as fresh).
+        slots_snapshot_source = "snapshot"
+        if counts_stale:
+            from proxy.observability import last_known_slot_counts_stamp
+
+            slots_snapshot_age_seconds = _snapshot_age_seconds(
+                last_known_slot_counts_stamp()
+            )
+        else:
+            try:
+                from proxy.observability import _last_slot_details_at
+
+                slots_snapshot_age_seconds = _snapshot_age_seconds(
+                    _last_slot_details_at
+                )
+            except Exception:
+                slots_snapshot_age_seconds = None
+    elif slots_upstream_calls:
+        slots_snapshot_source = "upstream"
+        slots_snapshot_age_seconds = _snapshot_age_seconds(
+            _provenance_fetched_at(
+                counts_provenance
+                if isinstance(counts_provenance, dict)
+                else {},
+                detail_provenance
+                if isinstance(detail_provenance, dict)
+                else {},
+            )
+        )
+    else:
+        # No upstream fetch this poll: label the cache path that served it.
+        for _prov in (
+            counts_provenance if isinstance(counts_provenance, dict) else {},
+            detail_provenance if isinstance(detail_provenance, dict) else {},
+        ):
+            _src = _prov.get("source")
+            if _src in ("failure_backoff", "ttl_cache"):
+                slots_snapshot_source = _src
+                slots_snapshot_age_seconds = _snapshot_age_seconds(
+                    _prov.get("fetched_at")
+                )
+                break
 
     # -- per-slot capacity annotation (LP-0MVGDUVGE0024YAI) -----------------
     # Add owner_session_id / lease_state / phase / context_tokens /
@@ -976,6 +1091,17 @@ async def get_llama_local_status(request: Request):
         "available_slots": available_slots,
         "total_slots": total_slots,
         "slots_stale": slots_stale,
+        # Per-phase read-path timing + provenance (LP-0MVVXGHT1001I5YX
+        # AC1/AC2): additive fields that let a stale (> budget) poll be
+        # attributed to the status query, the counts query, the detail query
+        # or a cache path. ``null`` means the phase was never attempted
+        # (llama-server down / no model / exception before it started).
+        "status_query_ms": status_query_ms,
+        "slots_counts_ms": slots_counts_ms,
+        "slots_detail_ms": slots_detail_ms,
+        "slots_upstream_calls": slots_upstream_calls,
+        "slots_snapshot_age_seconds": slots_snapshot_age_seconds,
+        "slots_snapshot_source": slots_snapshot_source,
         "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
         "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
         # LP-0MVSD5RJW008F1IB AC6: the calibration context the metric needs is
