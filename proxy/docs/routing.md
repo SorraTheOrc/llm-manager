@@ -1302,11 +1302,13 @@ projected_wait = own_prefill_seconds + occupied_seconds
   busy_slots       = min(slot_pool, max(generating_concurrency, prefills_in_flight))
   gate_occupancy   = min(busy_slots, prefills_in_flight)   # in-flight PREFILLS only
 
-bound  = wait_budget
+bound  = wait_budget                                  # 0 when the caller never queues
        if free_gate_deadline_budget and gate_occupancy == 0 and safety_budget > 0:
            max(wait_budget, safety_budget)   # free gate ⇒ no queue, bound = deadline
-admit  if projected_wait <= bound
+within = True if wait_budget == 0 else projected_wait <= bound   # no queue ⇒ no queue comparison
+admit  if within
        and projected_wait <  local_prefill_deadline_seconds
+       and own_prefill   <= safety_budget            # both bound EVERY priority, `high` included
 else   refuse local admission immediately -> next provider in the chain
 ```
 
@@ -1360,7 +1362,7 @@ each eviction to its admission evidence at the measured dispatch start
 | Admission path | Evictions | Priced new tokens discarded |
 |---|---|---|
 | `rung_accepted` — free-gate rung priced the wait inside the 114 s bound (43.0–112.9 s) but above the 30 s queue budget | 26 | 79,740 |
-| `high_priority_inert` — `priority=high` never queues, so the guard was inert (`no_budget`); **no** deadline/safety bound ran | 43 | 257,778 |
+| `high_priority_inert` — `priority=high` never queues, so the guard was inert (`no_budget`); **no** deadline/safety bound ran (fixed by LP-0MVZF3JZ9009LTN2 — this class must now read 0) | 43 | 257,778 |
 | `inert_unlogged` — guard inert (uncalibrated bucket) and silent at the dispatch instant | 47 | 439,307 |
 | `priced_within_queue_budget` — admitted inside the 30 s queue budget (5.3–28.0 s) yet stalled the full deadline behind another session's prefill (occupancy priced 0) | 8 | 12,954 |
 | `idle_override` — admitted by the idle-capacity override, guard not consulted | 2 | 7,214 |
@@ -1480,9 +1482,17 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   ≈ 390 s and is refused. Behind an occupied gate the occupancy term applies
   to both, so a wait only stays admissible when the whole projected wait fits
   the budget. Locality is kept where it actually pays.
-- **Priority semantics are unchanged**: `high` never queues, so it has no
-  wait budget and the guard never applies to it; `low`/`medium` use
-  `contention_queue_max_wait_seconds`.
+- **Priority semantics**: `high` never queues, so it has no *queue-wait*
+  budget, and `low`/`medium` use `contention_queue_max_wait_seconds`. Every
+  priority — `high` included — is bounded by the prefill deadline and its
+  deadline-relative safety budget, because those are what actually cancel an
+  accepted dispatch; only the queue-wait comparison is skipped for `high`
+  (LP-0MVZF3JZ9009LTN2). Before that fix the guard returned inert
+  `no_budget` for `high` and never priced it at all, which is why 43 of the
+  126 `prefill_deadline` evictions in the 2026-11-01→02 window were
+  high-priority dispatches (6 of them already priced above the deadline when
+  they were admitted). A `high` prompt that fits both time bounds admits
+  exactly as before.
 - **Refusal is immediate and visible**: the request falls through to the next
   provider without waiting. If the whole chain is exhausted, the client
   receives a `429` with `X-Local-Admission: reject` /

@@ -1115,12 +1115,17 @@ class AdmissionDecision:
 
 
 def wait_budget_seconds(config: dict | None, priority: str | None = None) -> float:
-    """The caller's local wait budget (seconds).
+    """The caller's local queue-wait budget (seconds).
 
-    ``high`` priority never queues, so its budget is 0 (the guard is inert for
-    it — the pre-existing "never queue" behaviour is preserved). Otherwise the
-    budget is ``contention_queue_max_wait_seconds`` resolved through the
-    canonical queue config (so clamps and warnings match the queue).
+    ``high`` priority never queues, so its *queue* budget is 0 (the
+    pre-existing "never queue" behaviour). That does not make it unbounded:
+    ``evaluate_admission`` still applies the prefill deadline and its
+    deadline-relative safety budget to it, exactly as it does for every other
+    priority (LP-0MVZF3JZ9009LTN2) — those bounds are what actually cancel an
+    accepted dispatch, so refusing at admission is strictly cheaper than
+    accepting and detouring at the deadline. Otherwise the budget is
+    ``contention_queue_max_wait_seconds`` resolved through the canonical queue
+    config (so clamps and warnings match the queue).
     """
     try:
         from proxy.priority import PRIORITY_HIGH, parse_priority
@@ -1209,10 +1214,17 @@ def evaluate_admission(
     "the prefill gate is busy" is legible from the log.
 
     Fail-open by construction: the guard is inert (``admit=True``) when the
-    policy is ``off``, the priority never queues, the bucket is not yet
-    calibrated, or no budget can be resolved. Only a calibrated projected
-    wait that exceeds a bound refuses admission, and only when the policy is
-    ``reject`` (``observe`` logs the same verdict without refusing).
+    policy is ``off``, the bucket is not yet calibrated, or **no bound can be
+    resolved at all** (no queue-wait budget *and* neither the deadline nor the
+    deadline-relative safety budget enabled). Only a calibrated projected
+    wait, or a calibrated ETA, that exceeds a bound refuses admission, and only
+    when the policy is ``reject`` (``observe`` logs the same verdict without
+    refusing).
+
+    ``high`` priority is bounded exactly like every other priority
+    (LP-0MVZF3JZ9009LTN2): it never queues, so only the queue-wait comparison
+    is inapplicable — the prefill deadline and the safety budget still apply,
+    because those are what actually cancel an accepted dispatch.
     """
     guard_cfg = resolve_config(config)
 
@@ -1305,8 +1317,15 @@ def evaluate_admission(
             deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
         )
     budget = wait_budget_seconds(config, priority)
-    if budget <= 0:
-        return _inert("no_budget")
+    # No queue-wait budget means the caller never queues (``high`` priority, or
+    # an unresolvable queue config): there is no queue wait to compare against,
+    # so that one comparator is skipped. The prefill deadline and its
+    # deadline-relative safety budget are a different question — they bound
+    # every accepted dispatch, because they are what cancels it — so they are
+    # still evaluated below (LP-0MVZF3JZ9009LTN2). Measured evidence: 43 of 126
+    # ``prefill_deadline`` evictions in 24 h were ``priority=high`` with no bound
+    # enforced at all (LP-0MVZ5WV6W008UO5F AC1).
+    has_queue_budget = budget > 0.0
     # Co-residency selector (LP-0MVS9Y76R004B5M8): a contended admission
     # (occupied gate ahead) must be priced from the contended calibration
     # window when calibrated; an explicit override wins over the derivation.
@@ -1353,7 +1372,20 @@ def evaluate_admission(
         and deadline_budget > 0.0
     ):
         bound = max(bound, deadline_budget)
-    within = projected.projected_seconds <= bound
+    if has_queue_budget:
+        within = projected.projected_seconds <= bound
+    else:
+        # Nothing queues, so the queue-wait comparison is inapplicable; the
+        # time bounds below are the governing comparators. With every bound
+        # disabled (no queue budget, no deadline, no safety budget) nothing can
+        # refuse the dispatch and the guard stays inert — the documented
+        # rollback path keeps its exact pre-change meaning.
+        if deadline <= 0 and deadline_budget <= 0.0:
+            return _inert("no_budget")
+        within = True
+        # Report the bound actually enforced: the tighter time bound, since
+        # ``budget_seconds`` stays 0 by definition for a never-queue dispatch.
+        bound = deadline_budget if deadline_budget > 0.0 else deadline
     reason = "within_budget" if within else "eta_exceeds_budget"
     admit = within or guard_cfg.policy == POLICY_OBSERVE
     # Second independent bound: deadline check (LP-0MVKUKEU80022C3U).

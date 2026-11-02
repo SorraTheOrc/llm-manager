@@ -220,7 +220,7 @@ summary plus per-event rows):
 |---|---|---|
 | `rung_accepted` | `local_admission_guard decision=admit` priced inside the deadline-relative bound but above the queue budget — the free-gate rung's documented admitted-and-doomed trade | compare the rate against the documented accepted level (26 / 24 h, ~80k priced tokens, measured 2026-11-01→02); no fix unless the rate grows |
 | `priced_within_queue_budget` | admitted inside the 30 s queue budget yet no first byte — the slot was held by another session's prefill (occupancy priced ~0) | occupancy-observability defect — file a `discovered-from` bug (measured 8 / 24 h) |
-| `high_priority_inert` | `priority=high` never queues, so the guard is inert (`no_budget`) and **no** bound ran — includes the evictions whose stamped ETA was already above the deadline | policy defect (guard never prices high priority) — file a `discovered-from` bug (measured 43 / 24 h) |
+| `high_priority_inert` | `priority=high` never queues, so the guard was inert (`no_budget`) and **no** bound ran — includes the evictions whose stamped ETA was already above the deadline | **fixed** (LP-0MVZF3JZ9009LTN2): `high` is now bounded by the deadline and safety budget like every other priority — this class must read 0; a non-zero count means a regression |
 | `inert_unlogged` | no guard line at the dispatch instant and no override — an inert decision that logged nothing (uncalibrated bucket or `no_budget`) | observability defect — file a `discovered-from` bug (measured 47 / 24 h) |
 | `idle_override` / `economic_override` / `capacity_override` | a routing override admitted the dispatch without the guard | assess the override's own trade |
 | `priced_above_bound` | admitted although the priced wait exceeded the bound it was compared against | impossible by construction — treat as a guard bug |
@@ -241,6 +241,13 @@ not govern, tracked in LP-0MVZF3JZ9009LTN2 (high priority),
 LP-0MVZF4SU10032OZH (inert unlogged) and LP-0MVZF50MJ00654O1 (occupancy
 priced at 0). A post-rung window returning toward ~26/24 h with the rung on
 is the documented accepted behaviour.
+
+**Fix status of those classes.** LP-0MVZF3JZ9009LTN2 landed first (producer
+decision: "high-priority are bound in the same way as anything else"), so a
+window measured after it should show `high_priority_inert` at **0** — a
+non-zero count is a regression, not an expected class. LP-0MVZF4SU10032OZH
+(inert unlogged) and LP-0MVZF50MJ00654O1 (occupancy priced at 0) remain open:
+those classes still appear until they land.
 
 **Reading the numbers.** `estimated_tokens` / `new_tokens` / `eta_prefill_s` are
 the **admission-time** values the routing decision priced and the dispatch

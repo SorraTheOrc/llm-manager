@@ -1996,8 +1996,15 @@ server:
   # Before dispatching a local request the proxy costs the projected local
   # prefill from OBSERVED dispatches (dispatch_first_byte_ms, per model and
   # context bucket, rolling window) and compares it with the caller's wait
-  # budget (``contention_queue_max_wait_seconds`` above; ``high`` priority
-  # never queues, so it has no budget). When the prefill cannot finish inside
+  # budget (``contention_queue_max_wait_seconds`` above). ``high`` priority
+  # never queues, so it has no *queue-wait* budget — but it is bounded in the
+  # same way as every other priority by the prefill deadline
+  # (``local_prefill_deadline_seconds``) and its deadline-relative safety
+  # budget (``local_admission_guard_budget_safety_fraction``), which are what
+  # actually cancel an accepted dispatch; refusing at admission is strictly
+  # cheaper than accepting and detouring at the deadline
+  # (LP-0MVZF3JZ9009LTN2, measured: 43 of 126 ``prefill_deadline`` evictions
+  # in 24 h were high-priority dispatches the inert guard never priced). When the prefill cannot finish inside
   # the budget the wait is a guaranteed loss — the request would park for up
   # to the full budget and then fall back remote anyway (measured 2026-10-19
   # → 10-20: 4,947 of 5,805 queued waits = 85 % abandoned) — so local

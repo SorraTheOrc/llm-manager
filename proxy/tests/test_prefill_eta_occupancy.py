@@ -298,13 +298,27 @@ def test_uncalibrated_bucket_still_admits_under_occupancy():
     assert decision.reason == "insufficient_samples"
 
 
-def test_high_priority_admits_and_never_queues():
+def test_high_priority_admits_when_the_deadline_fits_and_never_queues():
+    """``high`` never queues, but it is still bounded by the time bounds.
+
+    This fixture pins the deadline at 300 s and configures no safety budget, so
+    the ~224.8 s projected wait (own ETA behind three occupancy slots) fits: the
+    dispatch admits and the verdict is now *active* (logged) rather than the
+    inert ``no_budget`` it used to be, and it is refused by the queue bound for
+    no reason — there is no queue (LP-0MVZF3JZ9009LTN2). The refusal side is
+    pinned in ``tests/test_prefill_eta_deadline.py``.
+    """
     _seed_calibration()
     decision = prefill_eta.evaluate_admission(
         _cfg(), "Qwen3", _TOKENS, 0.0, "high", busy_slots=3
     )
     assert decision.admit is True
-    assert decision.reason == "no_budget"
+    assert decision.active is True
+    assert decision.reason == "within_budget"
+    assert decision.budget_seconds == 0.0, "never queues ⇒ no queue-wait budget"
+    assert decision.bound_seconds == pytest.approx(300.0), (
+        "the enforced comparator is the deadline, not a queue budget"
+    )
 
 
 def test_observe_policy_logs_refusal_but_admits_under_occupancy():
