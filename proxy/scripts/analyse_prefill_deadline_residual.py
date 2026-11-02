@@ -32,12 +32,17 @@ the window is a **recorded re-base event**, not a reason to discard the window:
 no in-process counter is consumed. (The same reasoning the 2026-10-25
 post-deploy measurement recorded for its certified window.)
 
-``llama-server.log`` is deliberately **not** used for per-event attribution: its
-lines carry no wall-clock timestamp, so a per-event join is impossible. It is
-used only for the optional window-level accounting cross-check in
-:func:`backend_prefill_accounting`, which compares the number of completed
-prefills in ``llama-server`` with the number of local streams the proxy actually
-consumed — the quantitative signature of prefills abandoned in the backend.
+``llama-server.log`` is used for two optional surfaces, both valid only when the
+file covers exactly the analysed window (its lines carry no wall-clock
+timestamp): the release→backend-cancel joiner
+(:func:`release_cancel_accounting`), which attributes every proxy release of an
+accepted local dispatch to a backend task lifecycle segment, and the window
+accounting cross-check in :func:`backend_prefill_accounting`, which compares the
+number of completed prefills in ``llama-server`` with the number of local
+streams the proxy actually consumed. When a llama-server log is supplied the
+abandoned-prefill windows are bounded by the **observed** backend stop
+(:func:`abandoned_prefill_windows`); without one they degrade to the legacy
+token/rate estimate, and the report says so (`measured_available=False`).
 
 Event grammar consumed (all from ``admission_events`` / ``measured_prefill`` /
 the dispatch monitor; see ``proxy/proxy/admission_events.py``)::
@@ -58,10 +63,12 @@ Usage::
     python3 proxy/scripts/analyse_prefill_deadline_residual.py \\
         --start "2026-10-29 14:08:10" --end "2026-10-30 14:08:10" --json
 
-    # optional backend accounting cross-check for a llama-server log that
-    # covers exactly the same window
+    # release→cancel accounting + corrected window model: point at the
+    # llama-server log(s) covering exactly the same window (comma-separated
+    # paths/globs); every release is then joined to a backend task lifecycle
     python3 proxy/scripts/analyse_prefill_deadline_residual.py \\
-        --start ... --end ... --llama-log /var/log/llama-proxy/llama-server.log-2026-10-30
+        --start ... --end ... \\
+        --llama-log /var/log/llama-proxy/llama-server.log-2026-10-30
 
 The JSON payload is the recorded dataset; the prose report is written from it
 (``docs/dev/prefill-deadline-residual.md``) so the ACs stay reproducible after
@@ -74,6 +81,7 @@ alter an admission decision or a deadline.
 from __future__ import annotations
 
 import argparse
+import glob
 import gzip
 import json
 import re
@@ -127,6 +135,36 @@ CLUSTER_HORIZON_SECONDS = 900.0
 LINE_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3})")
 FIELD = re.compile(r"([A-Za-z_]+)=(\S+)")
 
+#: ``llama-server.log`` task-lifecycle grammar (the log carries no wall-clock
+#: timestamp; only the order of these lines is available).
+LLAMA_LAUNCH = re.compile(r"launch_slot_: id\s+(\d+)\s*\|\s*task\s+(-?\d+)\s*\|")
+LLAMA_PROGRESS = re.compile(
+    r"update_slots: id\s+(\d+)\s*\|\s*task\s+(-?\d+)\s*\|\s*"
+    r"prompt processing progress, n_tokens = (\d+)"
+)
+LLAMA_TASK_CANCEL = re.compile(r"stop: cancel task, id_task = (-?\d+)")
+LLAMA_STOP = re.compile(
+    r"release: id\s+(\d+)\s*\|\s*task\s+(-?\d+)\s*\|\s*"
+    r"stop processing: n_tokens = (\d+)"
+)
+LLAMA_OPERATOR_CANCEL = re.compile(
+    r"operator\(\): http client error: Connection handling canceled"
+)
+LLAMA_EVAL_TIME = re.compile(r"prompt eval time =.*?([\d.]+)\s*tokens per second")
+
+#: Machine-readable ``unjoined_reason`` vocabulary for the release→cancel joiner.
+UNJOINED_NO_LLAMA_LOG = "no_llama_log"
+UNJOINED_NO_BACKEND_SEGMENT = "no_backend_segment"
+UNJOINED_CANCEL_WITHOUT_TASK_ID = "cancel_without_task_id"
+
+#: Coverage caveat for every llama-server-derived surface (the log has no clock).
+LLAMA_COVERAGE_NOTE = (
+    "Valid only when the llama-server log covers exactly the analysed window; "
+    "llama-server lines carry no wall-clock timestamp, so releases are joined "
+    "to backend task segments in log order (a proxy line's explicit "
+    "llama_task_id/slot_id takes precedence when present)."
+)
+
 ATTRIBUTION_OCCUPANCY = "occupancy"
 ATTRIBUTION_CAPACITY = "capacity"
 ATTRIBUTION_PREDICTED_WARMTH = "predicted-warmth"
@@ -169,6 +207,8 @@ class EvictionEvent:
     eta_prefill_s: float | None
     elapsed_s: float
     endpoint: str
+    llama_task_id: int | None = None
+    slot_id: int | None = None
 
     @property
     def dispatch_start(self) -> datetime:
@@ -222,6 +262,83 @@ class StatusPoll:
 
 
 @dataclass
+class LlamaTaskLifecycle:
+    """One backend task segment parsed from ``llama-server.log`` (log order).
+
+    A segment begins at its ``launch_slot_: … processing task`` line and
+    accumulates the ``prompt processing progress`` batches, any
+    ``stop: cancel task`` line, the ``prompt eval time`` line and the terminal
+    ``release: … stop processing`` line. Bare ``operator(): … Connection
+    handling canceled`` lines are *not* segments (they carry no task id); they
+    are tracked separately on :class:`LlamaLifecycle` so a release paired with
+    one is reported as an unjoined-with-cancel, never as a joined task.
+    """
+
+    task_id: int | None = None
+    slot_id: int | None = None
+    launch_index: int = -1
+    line_index: int = -1
+    progress: list[int] = field(default_factory=list)
+    cancel_seen: bool = False
+    cancel_after_n_tokens: int = 0
+    stop_seen: bool = False
+    stop_n_tokens: int | None = None
+    eval_time_seen: bool = False
+    eval_time_after_cancel: bool = False
+
+    @property
+    def progress_after_cancel(self) -> list[int]:
+        """Progress lines recorded after the task's cancel line."""
+        if not self.cancel_seen:
+            return []
+        return [n for n in self.progress if n > self.cancel_after_n_tokens]
+
+    @property
+    def tokens_after_cancel(self) -> int:
+        """Tokens evaluated after the cancel, from the progress lines only."""
+        if not self.cancel_seen or not self.progress:
+            return 0
+        return max(0, self.progress[-1] - self.cancel_after_n_tokens)
+
+
+@dataclass
+class LlamaLifecycle:
+    """Parsed ``llama-server.log``: ordered task segments and the observed rate.
+
+    ``observed_rate_tok_s`` is the median ``… tokens per second`` value from the
+    file's ``prompt eval time`` lines — the only seconds basis the joiner and
+    the measured window model may use (never :data:`ABANDONED_PREFILL_RATE_TOK_S`).
+    ``operator_cancels`` holds the line indices of bare ``operator(): …
+    Connection handling canceled`` lines — today's cancel shape, which carries no
+    task id — so they can be paired (as unjoined-with-cancel) with the releases
+    that triggered them.
+    """
+
+    segments: list[LlamaTaskLifecycle] = field(default_factory=list)
+    operator_cancels: list[int] = field(default_factory=list)
+    observed_rate_tok_s: float | None = None
+    source: str | None = None
+    lines: int = 0
+
+
+@dataclass
+class ReleaseJoin:
+    """The outcome of joining one proxy release to the backend log.
+
+    ``segment`` is the :class:`LlamaTaskLifecycle` the release maps to, or
+    ``None`` when the release is unjoined (including a release paired with a
+    bare ``operator()`` cancel, which has no task lifecycle).
+    ``operator_cancel`` records that the release was paired with such a cancel
+    line (``cancel_observed=True`` with ``task_id=None``). ``join_basis``
+    states how the join was made (AC1: record how each join was made).
+    """
+
+    segment: LlamaTaskLifecycle | None = None
+    operator_cancel: bool = False
+    join_basis: str = "unjoined"
+
+
+@dataclass
 class WindowLog:
     """Everything parsed from one window, indexed for attribution."""
 
@@ -262,6 +379,16 @@ def _int(value: str | None) -> int:
         return max(0, int(str(value)))
     except (TypeError, ValueError):
         return 0
+
+
+def _maybe_int(value: str | None) -> int | None:
+    """``int`` or ``None`` — ``unknown``/absent ids must not become ``0``."""
+    if value is None or value == "unknown":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _float(value: str | None) -> float | None:
@@ -333,6 +460,8 @@ def _parse_line(log: WindowLog, ts: datetime, line: str) -> None:
                 eta_prefill_s=_float(fields.get("eta_prefill_s")),
                 elapsed_s=_float(fields.get("elapsed_s")) or 0.0,
                 endpoint=fields.get("endpoint") or "unknown",
+                llama_task_id=_maybe_int(fields.get("llama_task_id")),
+                slot_id=_maybe_int(fields.get("slot_id")),
             )
         )
         return
@@ -475,40 +604,548 @@ def _group_by(items, key) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Release→cancel accounting (backend task lifecycles from llama-server.log)
+# ---------------------------------------------------------------------------
+
+
+def parse_llama_lifecycle(lines: list[str], source: str | None = None) -> LlamaLifecycle:
+    """Parse ``llama-server.log`` *lines* into ordered task segments.
+
+    ``launch_slot_: … processing task`` lines start a new segment (the
+    ``task -1`` sampler-chain launches are slot setup and are skipped); a bare
+    ``operator(): … Connection handling canceled`` line records an
+    operator-cancel event; ``prompt processing progress`` / ``stop: cancel
+    task`` / ``release: … stop processing`` / ``prompt eval time`` lines attach
+    to the current segment. ``observed_rate_tok_s`` is the median ``… tokens
+    per second`` value of the eval lines — the only seconds basis the joiner
+    and the measured window model may use.
+    """
+    lifecycle = LlamaLifecycle(source=source, lines=len(lines))
+    current: LlamaTaskLifecycle | None = None
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            continue
+        launch = LLAMA_LAUNCH.search(line)
+        if launch and int(launch.group(2)) != -1:
+            current = LlamaTaskLifecycle(
+                task_id=int(launch.group(2)),
+                slot_id=int(launch.group(1)),
+                launch_index=index,
+                line_index=index,
+            )
+            lifecycle.segments.append(current)
+            continue
+        if LLAMA_OPERATOR_CANCEL.search(line):
+            lifecycle.operator_cancels.append(index)
+            continue
+        if current is None:
+            continue
+        progress = LLAMA_PROGRESS.search(line)
+        if progress:
+            current.progress.append(int(progress.group(3)))
+            continue
+        cancel = LLAMA_TASK_CANCEL.search(line)
+        if cancel:
+            current.cancel_seen = True
+            # The tokens already evaluated at the cancel position: the last
+            # progress line before the cancel (the tokens-after-cancel count is
+            # ``final n_tokens − this``).
+            current.cancel_after_n_tokens = current.progress[-1] if current.progress else 0
+            continue
+        stop = LLAMA_STOP.search(line)
+        if stop:
+            current.stop_seen = True
+            current.stop_n_tokens = int(stop.group(3))
+            continue
+        eval_line = LLAMA_EVAL_TIME.search(line)
+        if eval_line:
+            current.eval_time_seen = True
+            if current.cancel_seen:
+                current.eval_time_after_cancel = True
+            continue
+    data_lines = [line for line in lines if not line.lstrip().startswith("#")]
+    rates = [
+        float(value)
+        for value in LLAMA_EVAL_TIME.findall("\n".join(data_lines))
+        if _lazy_is_finite(float(value))
+    ]
+    if rates:
+        rates.sort()
+        lifecycle.observed_rate_tok_s = _percentile(rates, 50.0)
+    return lifecycle
+
+
+def _lazy_is_finite(value: float) -> bool:
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
+def _llama_segment_timeline(llama: LlamaLifecycle) -> list[LlamaTaskLifecycle | None]:
+    """One entry per backend lifecycle event in log order; ``None`` = operator cancel.
+
+    Task segments and bare operator-cancel lines are merged by line index so the
+    joiner can walk both in the order the backend logged them. ``None`` entries
+    keep their own logical position (a release paired with one is
+    unjoined-with-cancel).
+    """
+    entries: list[tuple[int, LlamaTaskLifecycle | None]] = [
+        (segment.line_index, segment) for segment in llama.segments
+    ]
+    entries.extend((index, None) for index in llama.operator_cancels)
+    entries.sort(key=lambda item: item[0])
+    return [entry for _, entry in entries]
+
+
+def _pair_releases(
+    order: list[EvictionEvent], llama: LlamaLifecycle | None
+) -> list[ReleaseJoin]:
+    """Join each release to a backend lifecycle entry (AC: nothing is dropped).
+
+    Priority (work item step 2): the release's explicit ``llama_task_id``;
+    else its explicit ``slot_id`` matched against unused segments; else the next
+    unused lifecycle entry in log order. ``join_basis`` records which rule won;
+    a release with no remaining entry stays unjoined
+    (:data:`UNJOINED_NO_BACKEND_SEGMENT`), or is paired with the next bare
+    ``operator()`` cancel (:data:`UNJOINED_CANCEL_WITHOUT_TASK_ID`).
+    """
+    joins: list[ReleaseJoin] = [ReleaseJoin() for _ in order]
+    if llama is None:
+        return joins
+    timeline = _llama_segment_timeline(llama)
+    used: set[int] = set()
+
+    def _explicit(event: EvictionEvent) -> int | None:
+        if event.llama_task_id is not None:
+            for index, entry in enumerate(timeline):
+                if index not in used and entry is not None and entry.task_id == event.llama_task_id:
+                    return index
+        if event.slot_id is not None:
+            for index, entry in enumerate(timeline):
+                if index not in used and entry is not None and entry.slot_id == event.slot_id:
+                    return index
+        return None
+
+    for i, event in enumerate(order):
+        index = _explicit(event)
+        if index is None:
+            continue
+        entry = timeline[index]
+        used.add(index)
+        basis = "llama_task_id" if event.llama_task_id is not None else "slot_id"
+        joins[i] = ReleaseJoin(segment=entry, join_basis=basis)  # type: ignore[arg-type]
+
+    cursor = 0
+    for i, event in enumerate(order):
+        if joins[i].segment is not None or joins[i].operator_cancel:
+            continue
+        index = None
+        if event.slot_id is not None:
+            for candidate in range(cursor, len(timeline)):
+                entry = timeline[candidate]
+                if candidate in used or entry is None or entry.slot_id != event.slot_id:
+                    continue
+                index = candidate
+                break
+        if index is None:
+            for candidate in range(cursor, len(timeline)):
+                if candidate in used:
+                    continue
+                index = candidate
+                break
+        if index is None:
+            continue
+        entry = timeline[index]
+        used.add(index)
+        cursor = index + 1
+        if entry is None:
+            joins[i] = ReleaseJoin(operator_cancel=True, join_basis="log_order")
+        else:
+            joins[i] = ReleaseJoin(
+                segment=entry,
+                join_basis="slot_id" if event.slot_id is not None else "log_order",
+            )
+    return joins
+
+
+def release_cancel_accounting(
+    log: WindowLog,
+    llama: LlamaLifecycle | None = None,
+) -> dict:
+    """Attribute every proxy release of an accepted dispatch to a backend task.
+
+    Given a window's evictions and the (optional) parsed ``llama-server.log``
+    covering exactly that window, emit one row per release — joined,
+    unjoined-with-reason, or explained-by-another-mechanism — plus the window
+    aggregates AC1 requires. Log-only: no in-process counter is consumed.
+    """
+    order = sorted(log.evictions, key=lambda event: (event.ts, event.session))
+    joins = _pair_releases(order, llama)
+    rows: list[dict] = []
+    cancel_to_stop: list[float] = []
+    tokens_total = 0
+    observed_cancel = 0
+    unjoined_count = 0
+    unjoined_reasons: Counter[str] = Counter()
+    for event, join in zip(order, joins):
+        segment = join.segment
+        unjoined = segment is None
+        if llama is None:
+            unjoined_reason = UNJOINED_NO_LLAMA_LOG
+        elif segment is None and join.operator_cancel:
+            unjoined_reason = UNJOINED_CANCEL_WITHOUT_TASK_ID
+        elif segment is None:
+            unjoined_reason = UNJOINED_NO_BACKEND_SEGMENT
+        else:
+            unjoined_reason = None
+        if unjoined:
+            unjoined_count += 1
+            if unjoined_reason is not None:
+                unjoined_reasons[unjoined_reason] += 1
+        cancel_observed = bool(
+            (segment is not None and segment.cancel_seen) or join.operator_cancel
+        )
+        if cancel_observed:
+            observed_cancel += 1
+        tokens_after = segment.tokens_after_cancel if segment is not None else 0
+        tokens_total += tokens_after
+        if cancel_observed and segment is not None and segment.stop_seen:
+            if tokens_after > 0 and llama is not None and llama.observed_rate_tok_s:
+                cancel_to_stop_s = round(tokens_after / llama.observed_rate_tok_s, 3)
+            else:
+                cancel_to_stop_s = 0.0
+        else:
+            cancel_to_stop_s = None
+        if cancel_to_stop_s is not None:
+            cancel_to_stop.append(cancel_to_stop_s)
+        rows.append(
+            {
+                "session": event.session,
+                "reason": event.reason,
+                "released_at": event.ts.isoformat(sep=" ", timespec="seconds"),
+                "task_id": segment.task_id if segment is not None else None,
+                "slot_id": segment.slot_id if segment is not None else None,
+                "join": join.join_basis,
+                "unjoined": unjoined,
+                "unjoined_reason": unjoined_reason,
+                "cancel_observed": cancel_observed,
+                "progress_lines_after_cancel": (
+                    len(segment.progress_after_cancel) if segment is not None else 0
+                ),
+                "tokens_evaluated_after_cancel": tokens_after,
+                "cancel_to_stop_s": cancel_to_stop_s,
+                "prompt_eval_time_emitted": bool(
+                    segment is not None and segment.eval_time_seen
+                ),
+            }
+        )
+    total = len(order)
+    explained = sum(
+        1 for join in joins if join.segment is not None and join.segment.stop_seen
+    )
+    return {
+        "releases_total": total,
+        "releases_with_observed_cancel": observed_cancel,
+        "releases_without_explained_backend_stop": {
+            "count": total - explained,
+            "share": round((total - explained) / total, 3) if total else 0.0,
+        },
+        "releases_unjoined": {
+            "count": unjoined_count,
+            "reasons": dict(unjoined_reasons),
+        },
+        "cancel_to_stop_seconds": _percentiles(cancel_to_stop),
+        "tokens_evaluated_after_cancel": {
+            "total": tokens_total,
+            "per_release": {
+                row["session"]: row["tokens_evaluated_after_cancel"] for row in rows
+            },
+        },
+        "measured_available": any(
+            join.segment is not None and join.segment.stop_seen for join in joins
+        ),
+        "seconds_basis_tok_s": (
+            llama.observed_rate_tok_s if llama is not None else None
+        ),
+        "note": LLAMA_COVERAGE_NOTE,
+        "releases": rows,
+    }
+
+
+def _llama_log_paths(value: str | None) -> list[Path]:
+    """Expand the ``--llama-log`` value: comma-separated paths and/or globs."""
+    if not value:
+        return []
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        expanded = str(Path(part).expanduser())
+        matches = sorted(glob.glob(expanded))
+        for match in (matches or [expanded]):
+            if match in seen:
+                continue
+            seen.add(match)
+            paths.append(Path(match))
+    return paths
+
+
+def _load_llama_lifecycle(value: str | None) -> tuple[LlamaLifecycle | None, str | None]:
+    """Read and parse the llama-server log(s) behind ``--llama-log``.
+
+    Returns ``(lifecycle, llama_spec)`` — ``lifecycle`` is ``None`` when no
+    file resolved or every file was unreadable; ``llama_spec`` is the original
+    CLI value, kept so the report can say which log(s) it was asked to use.
+    """
+    if not value:
+        return None, None
+    paths = _llama_log_paths(value)
+    if not paths:
+        return None, value
+    failures: list[str] = []
+    lines = read_log_lines(paths, failures)
+    if not lines:
+        return None, value
+    source = ",".join(str(path) for path in paths)
+    return parse_llama_lifecycle(lines, source=source), value
+
+
+def _llama_coverage(
+    llama_spec: str | None, llama: LlamaLifecycle | None, log: WindowLog
+) -> dict:
+    """How well the backend log can cover this window (AC2 coverage caveat)."""
+    if llama_spec is None:
+        return {
+            "available": False,
+            "reason": "no_llama_log",
+            "note": LLAMA_COVERAGE_NOTE,
+        }
+    if llama is None:
+        return {
+            "available": False,
+            "reason": "unreadable_or_no_matching_files",
+            "llama_log": llama_spec,
+            "note": LLAMA_COVERAGE_NOTE,
+        }
+    entries = len(_llama_segment_timeline(llama))
+    releases = len(log.evictions)
+    return {
+        "available": True,
+        "llama_log": llama_spec,
+        "entries": entries,
+        "releases": releases,
+        "verdict": "exact" if entries == releases else "mismatch",
+        "note": LLAMA_COVERAGE_NOTE,
+    }
+
+
+def _coverage_window(
+    windows, event: EvictionEvent
+) -> dict:
+    """Whether *event*'s dispatch start falls inside any *windows* (tuple rows)."""
+    start = event.dispatch_start
+    covering = [
+        (end, reason, tokens, session)
+        for begin, end, reason, tokens, session in windows
+        if begin <= _seconds_after(start, BACKLOG_START_SLACK_SECONDS) and end >= start
+    ]
+    if not covering:
+        return {"overlap": False, "remaining_s": None}
+    end, reason, tokens, _session = max(covering, key=lambda item: item[0])
+    return {
+        "overlap": True,
+        "remaining_s": round((end - start).total_seconds(), 1),
+        "reason": reason,
+        "tokens": tokens,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-event attribution (AC4)
 # ---------------------------------------------------------------------------
 
 
-def abandoned_prefill_windows(log: WindowLog) -> list[tuple[datetime, datetime, str, int, str]]:
-    """Estimate how long each released dispatch kept the backend busy.
+def _legacy_priced_tokens(log: WindowLog, event: EvictionEvent) -> int:
+    """Tokens the legacy estimator prices into *event*'s abandoned window.
 
-    A released dispatch is **not** cancelled at ``llama-server``: the proxy drops
-    its lease and detours, but the prompt continues to be evaluated (measured on
-    2026-10-29: 1 092 completed prefills at the backend versus 807 local streams
-    the proxy consumed + 232 early releases). Each release therefore occupies the
-    shared GPU for ``new tokens / rate`` after the release. The duration is an
-    estimate — priced from the *measured* deficit when the release logged one
-    (``measured_cache_deficit``), otherwise from the admission-priced
-    ``new_tokens`` — and is reported as such.
-
-    Returns ``(start, end, reason, tokens, session)`` tuples.
+    The measured deficit logged beside a ``measured_cache_deficit`` release is
+    preferred (it is the tokens the retry actually had to recompute); otherwise
+    the admission-priced ``new_tokens`` is used. Unchanged provenance from the
+    pre-correction model, kept so the legacy basis stays comparable.
     """
-    windows = []
-    for event in log.evictions:
-        tokens = 0
-        if event.reason == REASON_MEASURED_CACHE_DEFICIT:
-            candidates = log.measurements_for(
-                event.session, _seconds_before(event.ts, 5.0), _seconds_after(event.ts, 5.0)
-            )
-            if candidates:
-                tokens = candidates[0].measured_new_tokens
-        if tokens <= 0:
-            tokens = event.new_tokens
+    tokens = 0
+    if event.reason == REASON_MEASURED_CACHE_DEFICIT:
+        candidates = log.measurements_for(
+            event.session, _seconds_before(event.ts, 5.0), _seconds_after(event.ts, 5.0)
+        )
+        if candidates:
+            tokens = candidates[0].measured_new_tokens
+    if tokens <= 0:
+        tokens = event.new_tokens
+    return tokens
+
+
+def abandoned_prefill_windows(
+    log: WindowLog,
+    paired: list[LlamaTaskLifecycle | None] | None = None,
+    llama: LlamaLifecycle | None = None,
+) -> list[dict]:
+    """One window row per released dispatch, bounded by what was **observed**.
+
+    What is measured (``basis="measured_stop"``, ``bounded=True``): when the
+    release is joined to a backend task that logged both a
+    ``stop: cancel task, id_task = N`` line and the terminal
+    ``slot release: … stop processing`` line, the window ends at the observed
+    stop. Its length is the tokens evaluated **after** the cancel (last
+    ``n_tokens`` minus the ``n_tokens`` at the cancel position, from the
+    ``prompt processing progress`` lines, never from a token-rate constant)
+    divided by the **observed** prompt-eval rate of the same log — the median
+    ``… tokens per second`` value of its ``prompt eval time`` lines. No wall
+    clock exists in ``llama-server.log``, so the stop is positioned at
+    ``release + measured stop latency``; the window is therefore valid only for
+    a log that covers exactly the analysed window (same caveat as
+    :func:`backend_prefill_accounting`).
+
+    What is estimated (``basis="legacy_rate_estimate"``, ``bounded=False``):
+    the released dispatch's priced tokens divided by
+    :data:`ABANDONED_PREFILL_RATE_TOK_S` (43.1 tok/s — F5's replay rate,
+    LP-0MVR7IXAI002QXXD: the baseline window's prompt-eval p10, the same value
+    LP-0MVS03KCV005BTGE used to price early-abort waste). That constant prices a
+    *whole* remaining prompt and is known to overstate a stopped prefill
+    several-fold (measured prompt-eval p50 on the 2026-10-29 log is 158 tok/s),
+    so a legacy row is labelled ``estimated=True`` and never mixed silently with
+    a measured one. ``legacy_duration_s`` is always exported for comparison.
+
+    Rows are keyed by ``start`` (the proxy release timestamp) and carry
+    ``end``/``duration_s``/``bounded``/``basis``/``estimated``/``tokens``/
+    ``measured_stop_s``/``legacy_duration_s`` plus the release's
+    ``reason``/``session`` for the overlap accounting.
+    """
+    order = sorted(log.evictions, key=lambda e: (e.ts, e.session))
+    paired = paired if paired is not None else [None] * len(order)
+    rows = []
+    for event, seg in zip(order, paired):
+        tokens = _legacy_priced_tokens(log, event)
         if tokens <= 0:
             continue
-        duration = tokens / ABANDONED_PREFILL_RATE_TOK_S
-        windows.append((event.ts, _seconds_after(event.ts, duration), event.reason, tokens, event.session))
-    return windows
+        legacy_duration = tokens / ABANDONED_PREFILL_RATE_TOK_S
+        measured_stop_s: float | None = None
+        bounded = False
+        basis = "legacy_rate_estimate"
+        window_tokens = tokens
+        if (
+            seg is not None
+            and seg.cancel_seen
+            and seg.stop_seen
+            and llama is not None
+            and llama.observed_rate_tok_s
+        ):
+            held = seg.tokens_after_cancel
+            if held > 0:
+                measured_stop_s = held / llama.observed_rate_tok_s
+                bounded = True
+                basis = "measured_stop"
+                window_tokens = held
+        duration = measured_stop_s if bounded else legacy_duration
+        assert duration is not None
+        rows.append(
+            {
+                "start": event.ts.isoformat(sep=" ", timespec="seconds"),
+                "end": _seconds_after(event.ts, duration).isoformat(
+                    sep=" ", timespec="seconds"
+                ),
+                "duration_s": round(duration, 3),
+                "bounded": bounded,
+                "basis": basis,
+                "estimated": not bounded,
+                "tokens": window_tokens,
+                "measured_stop_s": (
+                    round(measured_stop_s, 3) if measured_stop_s is not None else None
+                ),
+                "legacy_duration_s": round(legacy_duration, 3),
+                "reason": event.reason,
+                "session": event.session,
+            }
+        )
+    return rows
+
+
+def _parse_window_row_start(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+
+def _basis_rows(window_rows, basis: str) -> list[tuple[datetime, datetime, str, int, str]]:
+    """Covering tuples ``(begin, end, reason, tokens, session)`` for one basis."""
+    out: list[tuple[datetime, datetime, str, int, str]] = []
+    for row in window_rows:
+        start = _parse_window_row_start(row["start"])
+        if basis == "measured_stop":
+            if not row["bounded"] or row["measured_stop_s"] is None:
+                continue
+            end = _seconds_after(start, row["measured_stop_s"])
+        else:
+            end = _seconds_after(start, row["legacy_duration_s"])
+        out.append((start, end, row["reason"], row["tokens"], row["session"]))
+    return out
+
+
+def _windows_covering(windows, event: EvictionEvent) -> list[tuple[datetime, str, int, str]]:
+    """Windows whose span contains *event*'s dispatch start (same slack rule)."""
+    start = event.dispatch_start
+    return [
+        (end, reason, tokens, session)
+        for begin, end, reason, tokens, session in windows
+        if begin <= _seconds_after(start, BACKLOG_START_SLACK_SECONDS) and end >= start
+    ]
+
+
+def _dual_basis_overlap(window_rows, deadline_events, measured_available: bool) -> dict:
+    """The 58/60-style overlap on both bases, stating the verdict basis."""
+    legacy_rows = _basis_rows(window_rows, "legacy_rate_estimate")
+    measured_rows = _basis_rows(window_rows, "measured_stop")
+    total = len(deadline_events)
+    legacy_events = sum(1 for e in deadline_events if _windows_covering(legacy_rows, e))
+    if measured_available:
+        measured_events: int | None = sum(
+            1 for e in deadline_events if _windows_covering(measured_rows, e)
+        )
+        verdict_basis = "measured_stop"
+        verdict_events = measured_events
+    else:
+        measured_events = None
+        verdict_basis = "legacy_rate_estimate"
+        verdict_events = legacy_events
+    return {
+        "events": verdict_events,
+        "total": total,
+        "basis": verdict_basis,
+        "measured": {
+            "events": measured_events,
+            "total": total,
+            "basis": "measured_stop",
+            "available": measured_available,
+        },
+        "legacy": {
+            "events": legacy_events,
+            "total": total,
+            "basis": "legacy_rate_estimate",
+            "available": True,
+        },
+    }
+
+
+def _zero_progress_while_draining(log: WindowLog, window_rows, verdict_basis: str) -> dict:
+    """Accepted dispatches that expired their lease with no measured progress
+    while their dispatch started inside an abandoned window (parent AC3 second
+    half), reported separately from the overlap share."""
+    windows = _basis_rows(window_rows, verdict_basis)
+    count = 0
+    for event in log.evictions:
+        if log.measurements_for(event.session, event.dispatch_start, event.ts):
+            continue
+        if _windows_covering(windows, event):
+            count += 1
+    return {"count": count, "total": len(log.evictions), "basis": verdict_basis}
 
 
 def _seconds_before(ts: datetime, seconds: float) -> datetime:
@@ -621,31 +1258,70 @@ def classify_event(log: WindowLog, event: EvictionEvent, occupancy: dict) -> tup
 
 
 def backlog_evidence(orphan_windows, event: EvictionEvent) -> dict:
-    """Whether the dispatch started inside an abandoned-prefill backlog window."""
-    start = event.dispatch_start
-    covering = [
-        (end, reason, tokens, session)
-        for begin, end, reason, tokens, session in orphan_windows
-        if begin <= _seconds_after(start, BACKLOG_START_SLACK_SECONDS) and end >= start
-    ]
-    if not covering:
+    """Whether the dispatch started inside an abandoned-prefill backlog window.
+
+    *orphan_windows* is the covering-tuple list ``(begin, end, reason, tokens,
+    session)`` of one basis (see :func:`_basis_rows`). Kept for callers that
+    want a single-basis answer; :func:`attribute_events` uses
+    :func:`_coverage_window` on both bases instead.
+    """
+    result = _coverage_window(orphan_windows, event)
+    if not result["overlap"]:
         return {"abandoned_prefill_overlap": False, "abandoned_prefill_remaining_s": None}
-    end, reason, tokens, _session = max(covering, key=lambda item: item[0])
     return {
         "abandoned_prefill_overlap": True,
-        "abandoned_prefill_remaining_s": round((end - start).total_seconds(), 1),
-        "abandoned_prefill_reason": reason,
-        "abandoned_prefill_tokens": tokens,
+        "abandoned_prefill_remaining_s": result["remaining_s"],
+        "abandoned_prefill_reason": result["reason"],
+        "abandoned_prefill_tokens": result["tokens"],
     }
 
 
-def attribute_events(log: WindowLog) -> list[dict]:
-    """One row per ``prefill_deadline`` event with its evidence and verdict."""
-    orphans = abandoned_prefill_windows(log)
+def attribute_events(
+    log: WindowLog,
+    *,
+    window_rows: list[dict] | None = None,
+    measured_available: bool = False,
+) -> list[dict]:
+    """One row per ``prefill_deadline`` event with its evidence and verdict.
+
+    The abandoned-prefill overlap is reported on the *verdict* basis (measured
+    when the backend log supplied cancel→stop evidence, otherwise the legacy
+    estimate) with both basis counts alongside (AC3/AC4 of the window-model
+    contract) plus the reason/tokens of the covering window on the verdict
+    basis (backwards-compatible with the pre-correction evidence columns).
+    """
+    if window_rows is None:
+        window_rows = abandoned_prefill_windows(log)
+    verdict_basis = (
+        "measured_stop" if measured_available else "legacy_rate_estimate"
+    )
+    legacy_windows = _basis_rows(window_rows, "legacy_rate_estimate")
+    measured_windows = (
+        _basis_rows(window_rows, "measured_stop") if measured_available else None
+    )
     rows = []
     for event in [e for e in log.evictions if e.reason == REASON_PREFILL_DEADLINE]:
         occupancy = occupancy_evidence(log, event)
         verdict, evidence = classify_event(log, event, occupancy)
+        measured = (
+            _coverage_window(measured_windows, event) if measured_windows is not None else None
+        )
+        legacy = _coverage_window(legacy_windows, event)
+        used = measured if measured is not None else legacy
+        overlap_fields: dict = {
+            "abandoned_prefill_overlap": bool(used and used["overlap"]),
+            "abandoned_prefill_basis": verdict_basis,
+            "abandoned_prefill_overlap_measured": bool(
+                measured is not None and measured["overlap"]
+            ),
+            "abandoned_prefill_overlap_legacy": legacy["overlap"],
+        }
+        if used and used["overlap"]:
+            overlap_fields["abandoned_prefill_remaining_s"] = used["remaining_s"]
+            overlap_fields["abandoned_prefill_reason"] = used["reason"]
+            overlap_fields["abandoned_prefill_tokens"] = used["tokens"]
+        else:
+            overlap_fields["abandoned_prefill_remaining_s"] = None
         rows.append(
             {
                 "ts": event.ts.isoformat(sep=" ", timespec="seconds"),
@@ -673,19 +1349,30 @@ def attribute_events(log: WindowLog) -> list[dict]:
                             "own_prefill_wait_threshold_events"
                         ],
                     },
-                    **backlog_evidence(orphans, event),
+                    **overlap_fields,
                 },
             }
         )
     return rows
 
 
-def attribution_summary(rows, capture_available: bool = True) -> dict:
+def attribution_summary(
+    rows,
+    capture_available: bool = True,
+    *,
+    abandoned_prefill_overlap: dict | None = None,
+    zero_progress_while_draining: dict | None = None,
+) -> dict:
     counts = Counter(row["attribution"] for row in rows)
     by_class: dict[str, dict[str, int]] = {}
     for row in rows:
         by_class.setdefault(row["session_class"], Counter())[row["attribution"]] += 1
-    return {
+    if abandoned_prefill_overlap is None:
+        abandoned_prefill_overlap = {
+            "events": sum(1 for row in rows if row["evidence"]["abandoned_prefill_overlap"]),
+            "total": len(rows),
+        }
+    summary = {
         "totals": {name: counts.get(name, 0) for name in RULES},
         "by_session_class": {name: dict(counter) for name, counter in by_class.items()},
         "rules": RULES,
@@ -701,11 +1388,11 @@ def attribution_summary(rows, capture_available: bool = True) -> dict:
                 "deficit column as unmeasured."
             )
         ),
-        "abandoned_prefill_overlap": {
-            "events": sum(1 for row in rows if row["evidence"]["abandoned_prefill_overlap"]),
-            "total": len(rows),
-        },
+        "abandoned_prefill_overlap": abandoned_prefill_overlap,
     }
+    if zero_progress_while_draining is not None:
+        summary["zero_progress_while_draining"] = zero_progress_while_draining
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -713,23 +1400,28 @@ def attribution_summary(rows, capture_available: bool = True) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def backend_prefill_accounting(log: WindowLog, llama_log_path: str) -> dict:
+def backend_prefill_accounting(log: WindowLog, llama_log: str) -> dict:
     """Compare backend-completed prefills with proxy-consumed local streams.
 
     ``llama-server.log`` has no wall-clock timestamps, so this is valid only
     when the file covers exactly the analysed window (the day file of a
     logrotate-daily setup does). ``abandoned_prefills`` is then the number of
     prefills the GPU finished that no proxy stream consumed — the quantitative
-    signature of an abandoned-prefill backlog.
+    signature of an abandoned-prefill backlog.  *llama_log* may be a
+    comma-separated list of paths/globs, like ``--llama-log``.
     """
-    path = Path(llama_log_path)
-    if not path.exists():
-        return {"llama_log": str(path), "error": "not found"}
-    completed = sum(1 for line in read_log_lines([path]) if "prompt eval time" in line)
+    paths = _llama_log_paths(llama_log)
+    if not paths:
+        return {"llama_log": llama_log, "error": "not found"}
+    completed = sum(
+        1
+        for line in read_log_lines(paths)
+        if "prompt eval time" in line
+    )
     consumed = len(log.local_completions)
     released = len(log.evictions)
     return {
-        "llama_log": str(path),
+        "llama_log": ",".join(str(path) for path in paths),
         "backend_completed_prefills": completed,
         "proxy_consumed_local_streams": consumed,
         "proxy_released_dispatches": released,
@@ -755,7 +1447,21 @@ def build_report(
     llama_log: str | None = None,
 ) -> dict:
     hours = max((end - start).total_seconds() / 3600.0, 0.0)
-    rows = attribute_events(log)
+    llama, llama_spec = _load_llama_lifecycle(llama_log)
+    order = sorted(log.evictions, key=lambda event: (event.ts, event.session))
+    joins = _pair_releases(order, llama)
+    paired = [join.segment for join in joins]
+    window_rows = abandoned_prefill_windows(log, paired=paired, llama=llama)
+    measured_available = any(
+        join.segment is not None and join.segment.stop_seen
+        for join in joins
+    )
+    verdict_basis = (
+        "measured_stop" if measured_available else "legacy_rate_estimate"
+    )
+    rows = attribute_events(
+        log, window_rows=window_rows, measured_available=measured_available
+    )
     by_reason = count_evictions_by_reason(log.evictions)
     deadline_events = [e for e in log.evictions if e.reason == REASON_PREFILL_DEADLINE]
     report = {
@@ -780,10 +1486,28 @@ def build_report(
         "distributions": {
             "prefill_deadline": distributions(deadline_events),
         },
-        "attribution": attribution_summary(rows, capture_available=bool(log.measurements)),
+        "abandoned_prefill_windows": {
+            "legacy_rate_tok_s": ABANDONED_PREFILL_RATE_TOK_S,
+            "basis": verdict_basis,
+            "measured_available": measured_available,
+            "coverage": _llama_coverage(llama_spec, llama, log),
+            "note": LLAMA_COVERAGE_NOTE,
+            "rows": window_rows,
+        },
+        "attribution": attribution_summary(
+            rows,
+            capture_available=bool(log.measurements),
+            abandoned_prefill_overlap=_dual_basis_overlap(
+                window_rows, deadline_events, measured_available
+            ),
+            zero_progress_while_draining=_zero_progress_while_draining(
+                log, window_rows, verdict_basis
+            ),
+        ),
         "events": rows,
     }
     if llama_log:
+        report["release_cancel_accounting"] = release_cancel_accounting(log, llama=llama)
         report["backend_prefill_accounting"] = backend_prefill_accounting(log, llama_log)
     return report
 
@@ -828,7 +1552,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-glob", default=DEFAULT_LOG_GLOB, help=f"file glob inside --log-dir (default {DEFAULT_LOG_GLOB})")
     parser.add_argument("--start", required=True, help="window start, 'YYYY-MM-DD HH:MM:SS' (UTC)")
     parser.add_argument("--end", required=True, help="window end, 'YYYY-MM-DD HH:MM:SS' (UTC, exclusive)")
-    parser.add_argument("--llama-log", help="llama-server log covering exactly the window (optional cross-check)")
+    parser.add_argument(
+        "--llama-log",
+        help=(
+            "llama-server log/path-glob(s) covering exactly the window "
+            "(comma-separated; enables release→cancel accounting and bounds "
+            "the abandoned-prefill windows by observed backend stops)"
+        ),
+    )
     parser.add_argument("--output", help="write the JSON report here instead of stdout")
     parser.add_argument("--json", action="store_true", help="emit the JSON dataset (default: a short text summary)")
     return parser.parse_args(argv)
@@ -880,12 +1611,49 @@ def _text_summary(report: dict) -> str:
             f"(user {split['user']} / audit {split['audit']}) — "
             f"user {split['user_per_hour']}/h, audit {split['audit_per_hour']}/h"
         )
+    windows = report.get("abandoned_prefill_windows")
+    if windows:
+        bounded = sum(1 for row in windows["rows"] if row["bounded"])
+        lines.append(
+            f"Abandoned-prefill windows: {len(windows['rows'])} releases, "
+            f"{bounded} bounded by an observed backend stop "
+            f"(basis={windows['basis']}, measured_available={windows['measured_available']})"
+        )
+    accounting = report.get("release_cancel_accounting")
+    if accounting:
+        unexplained = accounting["releases_without_explained_backend_stop"]
+        unjoined = accounting["releases_unjoined"]
+        stop = accounting["cancel_to_stop_seconds"]
+        tokens = accounting["tokens_evaluated_after_cancel"]
+        lines.append(
+            f"Release→cancel: {accounting['releases_total']} releases, "
+            f"{accounting['releases_with_observed_cancel']} with an observed "
+            f"backend cancel, {unexplained['count']} without an explained stop "
+            f"({unexplained['share']:.2%}), {unjoined['count']} unjoined"
+        )
+        lines.append(
+            f"  cancel→stop latency s: p10={stop['p10']} p50={stop['p50']} "
+            f"p90={stop['p90']} (n={stop['count']}); "
+            f"tokens evaluated after cancel: {tokens['total']}"
+        )
     attribution = report["attribution"]["totals"]
     lines.append(
         "Attribution: " + ", ".join(f"{name}={count}" for name, count in sorted(attribution.items()))
     )
+    overlap = report["attribution"].get("abandoned_prefill_overlap")
+    if overlap and "total" in overlap:
+        lines.append(
+            f"prefill_deadline overlap: {overlap['events']}/{overlap['total']} "
+            f"(basis={overlap.get('basis', 'legacy_rate_estimate')})"
+        )
     if not report["attribution"]["capture_available"]:
         lines.append("(no measured-prefill capture in this window: attributions rest on price alone)")
+    resting = report.get("attribution", {}).get("zero_progress_while_draining")
+    if resting:
+        lines.append(
+            f"Zero-progress lease expiries inside an abandoned window: "
+            f"{resting['count']}/{resting['total']} (basis={resting['basis']})"
+        )
     restarts = report["source"].get("restarts_in_window") or []
     if restarts:
         lines.append(f"Re-base events (restarts) in window: {len(restarts)}")

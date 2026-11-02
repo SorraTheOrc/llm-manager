@@ -24,9 +24,9 @@
 #       inside W4/W3's expensive LEGACY windows): task 54 still processing,
 #       unbounded. Measured overlap FALSE; legacy overlap TRUE.
 #
-# There are no prefill_progress_measured lines at all in this fixture, so every
-# release is a zero-progress lease expiry. Only W4 (dispatch start inside W1's
-# MEASURED window) counts in zero_progress_while_draining.
+# There are no measured-prefill capture lines at all in this fixture, so
+# every release is a zero-progress lease expiry. Only W4 (dispatch start
+# inside W1's MEASURED window) counts in zero_progress_while_draining.
 2026-02-01 00:00:00,000 - ERROR - local_eviction_after_acceptance session=user-one reason=prefill_deadline estimated_tokens=56000 new_tokens=5120 eta_prefill_s=13.8 elapsed_s=120.1 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
 2026-02-01 00:02:05,000 - ERROR - local_eviction_after_acceptance session=user-one reason=prefill_deadline estimated_tokens=30000 new_tokens=30000 eta_prefill_s=24.2 elapsed_s=120.0 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
 2026-02-01 00:02:30,000 - ERROR - local_eviction_after_acceptance session=user-one reason=prefill_deadline estimated_tokens=30000 new_tokens=30000 eta_prefill_s=24.2 elapsed_s=120.0 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080

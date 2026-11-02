@@ -9,14 +9,12 @@ the matching ``llama-server.log`` slice covering the same fake window), so
 measured, per-dispatch fact instead of the subtraction of two unrelated
 counters.
 
-Red-first encoding: every joiner assertion is pinned with
-``pytest.mark.xfail(strict=True)`` — the joiner does not exist yet, so each
-test fails today (the contract is deliberately unpinned). The implementation
-item turns each assertion green and **removes the marker**; ``strict`` means an
-unexpectedly passing test fails the suite, so a marker cannot be forgotten.
-(The same pattern was used for the prefill-thrash and slots-coalescing
-contracts.) One test — ``test_fixture_pair_is_hermetic_and_covers_all_shapes``
-— is not xfail: it verifies the fixture pair itself (AC1) and already passes.
+The joiner is implemented by the sibling implementation item
+LP-0MVW8S7FN001B2Y1 ("Release→cancel accounting in the residual analyser");
+the assertions below were pinned as ``xfail(strict=True)`` until it landed and
+the markers have been removed — the tests now assert the contract directly.
+One test — ``test_fixture_pair_is_hermetic_and_covers_all_shapes`` — verifies
+the fixture pair itself (AC1) rather than the joiner.
 
 Joiner contract pinned here
 ---------------------------
@@ -99,8 +97,8 @@ LLAMA_FIXTURE = (
 WINDOW_START = datetime(2026, 1, 1, 0, 0, 0)
 WINDOW_END = datetime(2026, 1, 1, 0, 4, 0)
 
-#: The sibling implementation item that lands the joiner and removes the
-#: ``xfail`` markers below. See docs on the parent LP-0MVVEQW5Y00962T2 AC2.
+#: The sibling implementation item that delivered the joiner (formerly pinned
+#: here with ``xfail`` markers). See docs on the parent LP-0MVVEQW5Y00962T2 AC2.
 IMPL_ITEM = "LP-0MVW8S7FN001B2Y1"
 
 
@@ -150,9 +148,9 @@ def test_fixture_pair_is_hermetic_and_covers_all_shapes(script):
     """AC1: the committed fixture pair contains all four shapes and is parseable.
 
     This test verifies the *fixture artifacts* — it is deliberately not
-    xfail-marked: the fixtures exist the moment this item lands. The four
-    shapes are exercised behaviourally (not textually) by the xfail joiner
-    tests below once the implementation item arrives.
+    xfail-marked: the fixtures exist the moment their item lands. The four
+    shapes are exercised behaviourally (not textually) by the joiner tests
+    below.
     """
     proxy_lines = script.read_log_lines([PROXY_FIXTURE])
     llama_text = LLAMA_FIXTURE.read_text()
@@ -189,11 +187,10 @@ def test_fixture_pair_is_hermetic_and_covers_all_shapes(script):
 
 
 # ---------------------------------------------------------------------------
-# AC2 — per-release columns (xfail until the implementation item lands)
+# AC2 — per-release columns
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"release→cancel joiner not implemented ({IMPL_ITEM})", strict=True)
 def test_every_release_reports_the_required_columns(report):
     """AC2: per-release columns — reason, timestamp, task, cancel, latency."""
     expected = {
@@ -252,7 +249,6 @@ def test_every_release_reports_the_required_columns(report):
             )
 
 
-@pytest.mark.xfail(reason=f"release→cancel joiner not implemented ({IMPL_ITEM})", strict=True)
 def test_cancel_to_stop_latency_is_in_seconds_per_release(report):
     """AC2: the cancel→stop latency column — 0.0 for an immediate stop, no
     fabricated latency when no cancel was observed."""
@@ -267,11 +263,10 @@ def test_cancel_to_stop_latency_is_in_seconds_per_release(report):
 
 
 # ---------------------------------------------------------------------------
-# AC3 — nothing is dropped (xfail until the implementation item lands)
+# AC3 — nothing is dropped
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"release→cancel joiner not implemented ({IMPL_ITEM})", strict=True)
 def test_every_release_appears_exactly_once_unjoined_is_counted(report):
     """AC3: joined + unjoined sums to the release count; unjoined carries a
     machine-readable reason and is never dropped."""
@@ -292,11 +287,10 @@ def test_every_release_appears_exactly_once_unjoined_is_counted(report):
 
 
 # ---------------------------------------------------------------------------
-# AC4 — no fabricated cancels (xfail until the implementation item lands)
+# AC4 — no fabricated cancels
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"release→cancel joiner not implemented ({IMPL_ITEM})", strict=True)
 def test_release_without_backend_cancel_is_not_fabricated(report):
     """AC4: shape (b) reports no cancel. A naive time-window join that marks
     everything cancelled because a cancel line exists elsewhere in the window
@@ -311,11 +305,10 @@ def test_release_without_backend_cancel_is_not_fabricated(report):
 
 
 # ---------------------------------------------------------------------------
-# AC5 — distributions, not point estimates (xfail until impl lands)
+# AC5 — distributions, not point estimates
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"release→cancel joiner not implemented ({IMPL_ITEM})", strict=True)
 def test_cancel_to_stop_latency_is_reported_as_a_distribution(report):
     """AC5: the cancel→stop latency is p10/p50/p90 over the per-release values
     (here exactly two: 0.0 for the immediate stop and the joined (a) value)."""
@@ -331,7 +324,6 @@ def test_cancel_to_stop_latency_is_reported_as_a_distribution(report):
     assert dist["p90"] <= dist["max"]
 
 
-@pytest.mark.xfail(reason=f"release→cancel joiner not implemented ({IMPL_ITEM})", strict=True)
 def test_tokens_after_cancel_are_counted_from_progress_lines(report):
     """AC5: tokens evaluated after the cancel come from the fixture's progress
     lines — 10000 for shape (a) (50000 − 40000) — not from the
@@ -352,12 +344,11 @@ def test_tokens_after_cancel_are_counted_from_progress_lines(report):
 
 
 # ---------------------------------------------------------------------------
-# Window aggregates (impl AC1) at the fixture ground truth (xfail) — pinned so
+# Window aggregates (impl AC1) at the fixture ground truth — pinned so
 # the sibling implementation cannot report a different fixture than this one
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"release→cancel joiner not implemented ({IMPL_ITEM})", strict=True)
 def test_window_aggregates_match_the_fixture_ground_truth(report):
     accounting = report["release_cancel_accounting"]
     assert accounting["releases_total"] == 4

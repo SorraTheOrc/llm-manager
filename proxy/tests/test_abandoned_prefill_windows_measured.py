@@ -16,16 +16,14 @@ covering the same fake window). Every assertion is on the *report surface*
 the implementation item is free to refactor ``abandoned_prefill_windows()`` /
 ``backlog_evidence()`` internals as long as the documented columns below hold.
 
-Red-first encoding: every contract assertion is pinned with
-``pytest.mark.xfail(strict=True)`` — the measured basis does not exist yet, so
-each test fails today (the contract is deliberately unpinned). The
-implementation item turns each assertion green and removes the marker;
-``strict`` means an unexpectedly passing test fails the suite, so a marker
-cannot be forgotten. (The same pattern was used for the release→cancel joiner
-contract, LP-0MVW8S6SR003MBP5.) Two tests are not xfail: the fixture-integrity
-test (AC6) verifies the fixture artifacts and already passes, and the
-legacy-compat test pins the pre-existing ``events``/``total`` overlap keys that
-must survive the dual-basis change (AC6).
+The corrected window model is implemented by the sibling implementation item
+LP-0MVW8S7FN001B2Y1; the assertions below were pinned as
+``xfail(strict=True)`` until it landed and the markers have been removed — the
+tests now assert the contract directly. (The same red-first pattern was used
+for the release→cancel joiner contract, LP-0MVW8S6SR003MBP5.) Two tests are
+not xfail: the fixture-integrity test (AC6) verifies the fixture artifacts and
+the legacy-compat test pins the pre-existing ``events``/``total`` overlap keys
+that must survive the dual-basis change (AC6).
 
 Window-model contract pinned here
 ---------------------------------
@@ -129,8 +127,8 @@ LLAMA_FIXTURE = (
 WINDOW_START = datetime(2026, 2, 1, 0, 0, 0)
 WINDOW_END = datetime(2026, 2, 1, 0, 10, 0)
 
-#: The sibling implementation item that lands the measured window basis and
-#: removes the ``xfail`` markers below. See docs on the parent
+#: The sibling implementation item that delivered the measured window basis
+#: (formerly pinned here with ``xfail`` markers). See docs on the parent
 #: LP-0MVVEQW5Y00962T2 AC2/AC3 (measurement half).
 IMPL_ITEM = "LP-0MVW8S7FN001B2Y1"
 
@@ -210,10 +208,9 @@ def test_fixture_pair_is_hermetic_and_covers_all_shapes(script):
     """AC6: the committed fixture pair parses and contains all four shapes.
 
     This test verifies the *fixture artifacts* — it is deliberately not
-    xfail-marked: the fixtures exist the moment this item lands. The window
+    xfail-marked: the fixtures exist the moment their item lands. The window
     model shapes (measured stop, unbounded, retry before stop, retry after
-    stop) are exercised behaviourally by the xfail tests below once the
-    implementation item arrives.
+    stop) are exercised behaviourally by the contract tests below.
     """
     proxy_lines = script.read_log_lines([PROXY_FIXTURE])
     llama_text = LLAMA_FIXTURE.read_text()
@@ -248,11 +245,10 @@ def test_fixture_pair_is_hermetic_and_covers_all_shapes(script):
 
 
 # ---------------------------------------------------------------------------
-# AC1 — window end comes from the observed stop (xfail until impl lands)
+# AC1 — window end comes from the observed stop
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"measured window basis not implemented ({IMPL_ITEM})", strict=True)
 def test_bounded_window_end_is_the_observed_stop(report):
     """AC1: W1's window ends at the observed stop, not the token/rate estimate.
 
@@ -273,11 +269,10 @@ def test_bounded_window_end_is_the_observed_stop(report):
 
 
 # ---------------------------------------------------------------------------
-# AC2 — unbounded windows are labelled, not invented (xfail until impl lands)
+# AC2 — unbounded windows are labelled, not invented
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"measured window basis not implemented ({IMPL_ITEM})", strict=True)
 def test_unbounded_window_is_explicitly_legacy_estimate(report):
     """AC2: no stop observed => bounded=false and the legacy token/rate
     estimate carries an explicit estimate label; the two bases are never mixed
@@ -299,7 +294,6 @@ def test_unbounded_window_is_explicitly_legacy_estimate(report):
         assert retry["duration_s"] == pytest.approx(RETRY_LEGACY_DURATION_S, abs=1.0)
 
 
-@pytest.mark.xfail(reason=f"measured window basis not implemented ({IMPL_ITEM})", strict=True)
 def test_no_backend_log_degrades_to_legacy_basis_without_inventing(report_without_llama):
     """AC2/AC3: without a llama-server log every window is an unbounded legacy
     estimate and the report says the measured basis is unavailable — it never
@@ -319,11 +313,10 @@ def test_no_backend_log_degrades_to_legacy_basis_without_inventing(report_withou
 
 
 # ---------------------------------------------------------------------------
-# AC3 — dual-basis reporting (xfail until impl lands)
+# AC3 — dual-basis reporting
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"measured window basis not implemented ({IMPL_ITEM})", strict=True)
 def test_both_overlap_bases_are_reported_and_the_verdict_basis_stated(report, script):
     """AC3: the 58/60-style overlap is reported on the measured AND the legacy
     basis, and the report states which one the verdict uses (here measured,
@@ -359,7 +352,6 @@ def test_both_overlap_bases_are_reported_and_the_verdict_basis_stated(report, sc
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"measured window basis not implemented ({IMPL_ITEM})", strict=True)
 def test_retry_before_the_observed_stop_is_inside_the_measured_window(report):
     """AC4: the retry dispatched at 00:00:05 starts before W1's observed stop
     (00:00:16), so it IS inside the measured abandoned window."""
@@ -369,7 +361,6 @@ def test_retry_before_the_observed_stop_is_inside_the_measured_window(report):
     assert evidence["abandoned_prefill_overlap"] is True  # verdict = measured
 
 
-@pytest.mark.xfail(reason=f"measured window basis not implemented ({IMPL_ITEM})", strict=True)
 def test_retry_after_the_observed_stop_is_not_counted_as_starved(report):
     """AC4: the retry dispatched at 00:00:30 starts after W1's observed stop
     (00:00:16). It must NOT be counted as starved on the measured basis — even
@@ -386,7 +377,6 @@ def test_retry_after_the_observed_stop_is_not_counted_as_starved(report):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=f"measured window basis not implemented ({IMPL_ITEM})", strict=True)
 def test_zero_progress_lease_inside_a_window_is_counted(report):
     """AC5: of the four zero-progress lease expiries, exactly one (W4, whose
     dispatch starts inside W1's measured window) is a starvation; the count is
