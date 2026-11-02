@@ -403,7 +403,23 @@ class TestModeRemoval:
         # router, so no client can trigger a routing-policy restart.
         from proxy.server import app
 
-        paths = {r.path for r in app.routes}
+        # Flatten included routers: FastAPI >= 0.136 exposes them as
+        # ``_IncludedRouter`` entries in ``app.routes`` (no ``.path`` attribute).
+        def _paths(routes):
+            for route in routes:
+                path = getattr(route, "path", None)
+                if path:
+                    yield path
+                source = getattr(route, "original_router", None)
+                nested = (
+                    source.routes
+                    if source is not None and hasattr(source, "routes")
+                    else getattr(route, "routes", None)
+                )
+                if nested:
+                    yield from _paths(nested)
+
+        paths = set(_paths(app.routes))
         assert "/admin/set-mode" not in paths
         assert "/admin/mode" not in paths
         assert "/admin/mode-switch-lock" not in paths
