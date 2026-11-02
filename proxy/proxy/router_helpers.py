@@ -8029,6 +8029,14 @@ def is_model_known_unloaded(srv, model_name: str | None) -> bool | None:
     (:func:`proxy.lifecycle._model_entry_is_loaded`), so the async and
     synchronous "is it loaded" views cannot disagree
     (LP-0MVWBX2YT001OEYE AC5).
+
+    ``True`` additionally requires the model to be **listed** in the router's
+    ``/models`` ids: a model the router does not list at all is *indeterminate*
+    (``None``), never a skip. The loaded-subset alone cannot distinguish "the
+    router reports this model with an unloaded/error status" from "the model
+    is absent from ``/models`` entirely", and a false skip on the latter
+    would remove a real availability gate (LP-0MVVCY3HQ0009F0K Risks: treat
+    "unknown/not present" as *not* evidence of unloaded and poll as today).
     """
     name = str(model_name or "").strip()
     if not name:
@@ -8037,6 +8045,10 @@ def is_model_known_unloaded(srv, model_name: str | None) -> bool | None:
     if loaded is None:
         return None
     want = name.lower()
+    ids, _solo = _router_models_snapshot_meta(srv)
+    if not any(str(model_id).strip().lower() == want for model_id in ids):
+        # Not present in the router's /models at all: cannot prove absence.
+        return None
     return not any(str(model_id).strip().lower() == want for model_id in loaded)
 
 

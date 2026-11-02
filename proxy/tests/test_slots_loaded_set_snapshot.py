@@ -192,11 +192,25 @@ class TestIndeterminateStates:
 
     @pytest.mark.asyncio
     async def test_known_empty_payload_is_a_known_empty_set(self, tmp_path):
-        """A 200 with an empty data list positively reports nothing loaded."""
+        """A 200 with an empty data list positively reports nothing loaded.
+
+        ``_loaded_models_snapshot`` must return ``set()`` (a truthful "nothing
+        loaded" answer), never ``None`` — slice 2 pins that distinction. The
+        *guard verdict* for a model absent from that empty list is
+        **indeterminate** (``None``), not "definitively unloaded": the parent
+        (LP-0MVVCY3HQ0009F0K) fail-open rule says absence from ``/models`` is
+        *not* evidence of unloaded and the poll must proceed as today — a
+        false skip would remove a real availability gate. The skip fires only
+        when ``/models`` **lists** the model with an explicit non-loaded
+        status (AC1's ``gpt120`` in ``UNLOADED_PAYLOAD``).
+        """
         srv = _srv(tmp_path, payload={"object": "list", "data": []})
         loaded = await rh.ensure_loaded_models_snapshot(srv)
         assert loaded == set()
-        assert rh.is_model_known_unloaded(srv, "gpt120") is True
+        assert rh.is_model_known_unloaded(srv, "gpt120") is None, (
+            "absent from /models is indeterminate -> fail open, poll as today "
+            "(LP-0MVVCY3HQ0009F0K fail-open rule)"
+        )
 
 
 # ---------------------------------------------------------------------------
