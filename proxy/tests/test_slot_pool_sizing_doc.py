@@ -202,8 +202,8 @@ class TestCitationsStillResolve:
     #: (relative path, 1-based line, needle that must be present on that line)
     CITATIONS: tuple[tuple[str, int, str], ...] = (
         # 1 — pool size exported as --parallel
-        ("proxy/config.yaml", 1753, "session_slot_pool_size: 2"),
-        ("proxy/proxy/lifecycle.py", 1672, "LLAMA_PARALLEL"),
+        ("proxy/config.yaml", 1781, "session_slot_pool_size: 2"),
+        ("proxy/proxy/lifecycle.py", 1710, "LLAMA_PARALLEL"),
         ("start-llama.sh", 239, "LLAMA_PARALLEL:=1"),
         ("start-llama.sh", 252, "--parallel"),
         ("start-llama.sh", 501, "LLAMA_PARALLEL:=1"),
@@ -231,8 +231,8 @@ class TestCitationsStillResolve:
         ("proxy/proxy/session.py", 848, "def plan_eviction_snapshot"),
         # 8 — tenancy default
         ("proxy/proxy/router_helpers.py", 3655, "def _default_tenants"),
-        ("proxy/config.yaml", 1373, "session_slot_pool_size"),
-        ("proxy/config.yaml", 1381, "local_session_tenants: 2"),
+        ("proxy/config.yaml", 1441, "session_slot_pool_size"),
+        ("proxy/config.yaml", 1447, "local_session_tenants: 2"),
         # 9 — capacity admission + status fail-open
         ("proxy/proxy/capacity_admission.py", 124, "def _slots"),
         ("proxy/proxy/handlers.py", 469, "session_slot_pool_size"),
