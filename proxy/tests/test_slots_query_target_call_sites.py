@@ -251,13 +251,18 @@ class TestStatusHandlerCallSite:
             }
             seen = {}
 
-            async def fake_query_slots(client, port, timeout=2.0, model=None, status_out=None):
+            async def fake_query_slots(
+                client, port, timeout=2.0, model=None, status_out=None,
+                provenance_out=None,
+            ):
                 seen["counts_port"] = port
                 if isinstance(status_out, dict):
                     status_out.update({"status": 200, "reason": None})
                 return (1, 3)
 
-            async def fake_query_detail(port, timeout=2.0, model=None, _client=None):
+            async def fake_query_detail(
+                port, timeout=2.0, model=None, _client=None, provenance_out=None,
+            ):
                 seen["detail_port"] = port
                 return [{"slot_id": 0, "is_processing": False, "n_decoded": 10}]
 
