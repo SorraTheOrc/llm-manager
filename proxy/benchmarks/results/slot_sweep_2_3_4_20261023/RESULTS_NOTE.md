@@ -195,6 +195,16 @@ locally (see the reopen conditions in LP-0MVK09622002CRMR).
   reopen-condition #1 of the verdict doc for the exact command and audit keys
   (`contention.local_stream_share > 0`, `contention.max_concurrent_local_streams >= 2`,
   per-request `resolved_model`, `warm_start.completed_locally`).
+- **Re-run status 2026-11-02 (LP-0MVLHNEDO008FTBH):** the harness change is merged on `dev`,
+  but no valid re-run has been captured yet. Two scheduling attempts were blocked. First the
+  local `llama-server` was down from ~16:15Z (backend self-heal exhausted after a port-bind
+  conflict) until it was restored at 20:37Z with `proxy/scripts/start-proxy.sh --restart`
+  (LP-0MVZOUEMS000AEQM). Second, the host never went quiet afterwards: an audit plus several
+  `implement`/`ship` sessions held local slots continuously, so
+  `scripts/slot_sweep_preflight.py` never observed its 120 s idle window. With the producer's
+  agreement the re-run is therefore **an operator-gated follow-up**: run the command above in a
+  quiet window and file the artefacts in a new `results/` directory. A contaminated run is worse
+  than no run — the 2026-10-20 attempt was aborted under exactly this contention.
 - A harness that can exercise *session* concurrency locally is required to test the
   projection: e.g. warm the backend before the measured set (`--warm-start`, now
   available), stagger arrivals (`--stagger-seconds`), or single-turn production-sized

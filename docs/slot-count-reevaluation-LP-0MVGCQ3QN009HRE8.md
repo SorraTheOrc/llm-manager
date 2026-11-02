@@ -309,6 +309,13 @@ admission cap**: each slot-count restart reloads the model, re-arming
    `python -m proxy.benchmarks.slot_benchmark --sweep --resume 2 --concurrency 3
    --prompt-tokens 2000 --warm-start --stagger-seconds 0` (after
    `scripts/slot_sweep_preflight.py`).
+   **Status 2026-11-02:** the harness change is merged on `dev`, but the re-run remains an
+   operator-gated follow-up (producer agreement 2026-11-02): it needs
+   `scripts/slot_sweep_preflight.py` green — 120 s of local idle with every slot free. That
+   window could not be obtained on 2026-11-02: `llama-server` was down from ~16:15Z until
+   20:37Z (LP-0MVZOUEMS000AEQM), and afterwards an audit plus several agent sessions kept the
+   local slots occupied. Run the command above in a quiet window and file the artefacts under
+   `proxy/benchmarks/results/`; a contended run is not evidence.
 2. **A warmed N=2-vs-N=3 comparison whose decode-throughput gain exceeds the warm-cache loss**
    from the 83,285 clamp (79,121 warm threshold vs 120,627 at N=2). Any move must re-decide the
    warm-threshold target in the same pass.
