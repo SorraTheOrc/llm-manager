@@ -320,6 +320,10 @@ from lib.capacity_signals import (  # noqa: E402
     latency_band,
     parse_int,
     parse_latency_ms,
+    parse_phase_ms,
+    parse_upstream_calls,
+    per_phase_distribution,
+    per_phase_fields,
     share,
     stale_flag,
     stale_rate,
@@ -542,6 +546,19 @@ def analyse_status_stream(
     stale_flags: list[bool | None] = []
     stale_by_source = {"detail_cache": 0, "counts_cache": 0, "unknown": 0}
     stale_by_latency_band: dict[str, int] = {band: 0 for band in LATENCY_BANDS}
+    # Per-phase /slots read-path attribution (LP-0MVVXGHT1001I5YX, parent AC1
+    # of LP-0MVVCO1N7004TNGY): crosstab stale-vs-fresh against the per-phase
+    # timing fields, the upstream fan-out and the snapshot source. Strictly
+    # additive — a pre-F1 window (no field present on any line) reports
+    # ``instrumented: false`` rather than fabricated numbers.
+    per_phase_timings: dict[str, dict[str, list[int | None]]] = {
+        "status_query_ms": {"stale": [], "fresh": []},
+        "slots_counts_ms": {"stale": [], "fresh": []},
+        "slots_detail_ms": {"stale": [], "fresh": []},
+    }
+    per_phase_fanout: dict[str, dict[str, int]] = {"stale": {}, "fresh": {}}
+    per_phase_source: dict[str, dict[str, int]] = {"stale": {}, "fresh": {}}
+    per_phase_instrumented = 0
     # One ``(capacity_hint, has_live_local_work)`` sample per poll. The
     # histogram, the shares and the saturated-without-live-work tallies are
     # derived from these by the shared implementation (LP-0MVU8O9OC005YQU1
@@ -578,6 +595,36 @@ def analyse_status_stream(
                     hint_samples.append((hint, live_work))
                     stale = stale_flag(fields)
                     stale_flags.append(stale)
+                    # Per-phase read-path attribution (additive, F2 of
+                    # LP-0MVVCO1N7004TNGY): only polls that carry the
+                    # instrumentation enter the per-phase crosstab. A poll
+                    # classified stale/fresh by its ``slots_stale`` flag feeds
+                    # its per-phase timing, fan-out and snapshot source into
+                    # the matching bucket; polls with no ``slots_stale`` field
+                    # (schema 1) are excluded from the crosstab exactly as they
+                    # are excluded from the rate denominator.
+                    per_phase = per_phase_fields(line)
+                    if per_phase:
+                        per_phase_instrumented += 1
+                        bucket = "stale" if stale is True else (
+                            "fresh" if stale is False else None
+                        )
+                        for phase, value in per_phase.items():
+                            if phase in per_phase_timings:
+                                parsed = parse_phase_ms(value)
+                                if bucket is not None:
+                                    per_phase_timings[phase][bucket].append(parsed)
+                            elif phase == "slots_upstream_calls":
+                                calls = parse_upstream_calls(value) or 0
+                                if bucket is not None:
+                                    per_phase_fanout[bucket][str(calls)] = (
+                                        per_phase_fanout[bucket].get(str(calls), 0) + 1
+                                    )
+                            elif phase == "slots_snapshot_source":
+                                if bucket is not None:
+                                    per_phase_source[bucket][value] = (
+                                        per_phase_source[bucket].get(value, 0) + 1
+                                    )
                     if stale:
                         # Attribute the poll to the cache that served it
                         # (counts vs per-slot detail) and to the response
@@ -657,6 +704,41 @@ def analyse_status_stream(
             "by_source": dict(stale_by_source),
             "by_latency_band": dict(stale_by_latency_band),
             "unattributed": stale_by_source["unknown"],
+        },
+        "per_phase_read_path": {
+            "instrumented": per_phase_instrumented > 0,
+            "polls_with_fields": per_phase_instrumented,
+            "phases": {
+                phase: {
+                    "stale": per_phase_distribution(timings["stale"]),
+                    "fresh": per_phase_distribution(timings["fresh"]),
+                }
+                for phase, timings in per_phase_timings.items()
+            },
+            "upstream_calls": {
+                "stale": dict(sorted(per_phase_fanout["stale"].items())),
+                "fresh": dict(sorted(per_phase_fanout["fresh"].items())),
+            },
+            "snapshot_source": {
+                "stale": dict(sorted(per_phase_source["stale"].items())),
+                "fresh": dict(sorted(per_phase_source["fresh"].items())),
+            },
+            # An honest absence is a result, not a gap: every recorded window
+            # predates the instrumentation (F1 landed 2026-11-02), so the block
+            # reports that a window carries no per-phase surface instead of
+            # fabricating a distribution.
+            **(
+                {
+                    "note": (
+                        "no poll in this window carries the per-phase fields "
+                        "(window predates the LP-0MVVXGHT1001I5YX "
+                        "instrumentation); per-phase latency distributions "
+                        "are unavailable for this window"
+                    )
+                }
+                if per_phase_instrumented == 0
+                else {}
+            ),
         },
         "capacity_hint": {
             "histogram": dict(hint_summary.counts),
@@ -1622,6 +1704,38 @@ def render(report: dict) -> str:
             "  stale by poll latency         : "
             + ", ".join(f"{key}={value}" for key, value in bands.items())
         )
+    per_phase = metrics.get("per_phase_read_path") or {}
+    if per_phase:
+        if per_phase.get("instrumented"):
+            out.append(
+                "per-phase read path (inst.)    : "
+                f"{per_phase['polls_with_fields']} polls carry the fields"
+            )
+            for phase, dist in per_phase["phases"].items():
+                stale = dist["stale"]
+                fresh = dist["fresh"]
+                out.append(
+                    f"  {phase:22s} : stale p50/p90/p99="
+                    f"{stale['p50']}/{stale['p90']}/{stale['p99']}"
+                    f" (n={stale['count']}, not_attempted={stale['not_attempted']})"
+                    f" · fresh p50/p90/p99={fresh['p50']}/{fresh['p90']}/"
+                    f"{fresh['p99']} (n={fresh['count']})"
+                )
+            fanout = per_phase["upstream_calls"]
+            out.append(
+                "  per-poll upstream fan-out    : "
+                f"stale={fanout['stale']} fresh={fanout['fresh']}"
+            )
+            source = per_phase["snapshot_source"]
+            out.append(
+                "  snapshot source              : "
+                f"stale={source['stale']} fresh={source['fresh']}"
+            )
+        else:
+            out.append(
+                "per-phase read path           : NOT INSTRUMENTED in this "
+                "window (" + (per_phase.get("note") or "fields absent") + ")"
+            )
     attribution = report.get("attribution")
     if attribution is not None and violations["count"]:
         by_cause = ", ".join(
