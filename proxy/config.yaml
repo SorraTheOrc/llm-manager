@@ -564,9 +564,8 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
-      # after the opencode-go chain. It declares no available_times window,
-      # so it is eligible around the clock. The API key is resolved from
-      # ~/.pi/agent/auth.json (key ``munitoai``).
+      # after the opencode-go chain. Restricted to 10:00-23:00 UTC so
+      # paid dispatches fall within business hours.
       - name: munitoai
         priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
@@ -589,6 +588,7 @@ models:
         # x-ratelimit-limit-input-tokens=400000 per rolling 60s
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
+        available_times: ["10:00-23:00"]
       - name: deepseek-flash
         priorities: [low, medium, high]
         type: remote
@@ -726,9 +726,8 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
-      # after the opencode-go chain. It declares no available_times window,
-      # so it is eligible around the clock. The API key is resolved from
-      # ~/.pi/agent/auth.json (key ``munitoai``).
+      # after the opencode-go chain. Restricted to 10:00-23:00 UTC so
+      # paid dispatches fall within business hours.
       - name: munitoai
         priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
@@ -751,6 +750,7 @@ models:
         # x-ratelimit-limit-input-tokens=400000 per rolling 60s
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
+        available_times: ["10:00-23:00"]
       - name: deepseek-flash
         priorities: [low, medium, high]
         type: remote
@@ -895,9 +895,8 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
-      # after the opencode-go chain. It declares no available_times window,
-      # so it is eligible around the clock. The API key is resolved from
-      # ~/.pi/agent/auth.json (key ``munitoai``).
+      # after the opencode-go chain. Restricted to 10:00-23:00 UTC so
+      # paid dispatches fall within business hours.
       - name: munitoai
         priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
@@ -920,6 +919,7 @@ models:
         # x-ratelimit-limit-input-tokens=400000 per rolling 60s
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
+        available_times: ["10:00-23:00"]
       - name: deepseek-flash
         priorities: [low, medium, high]
         type: remote

@@ -313,17 +313,21 @@ def priority_routing_profile(
     spending at all. Once the free tier is exhausted the chain continues into
     the ``opencode-go`` entries, which are only eligible inside their own
     off-peak ``available_times`` (UTC) windows, and then into the
-    around-the-clock paid tail ``munitoai`` → ``deepseek-flash`` (reachable at
-    ``low`` since LP-0MVY8REC80097HI0, so low-priority requests keep a paid
-    fallback when the free tier is quarantined and the opencode accounts are
-    quota-exhausted). The cheap priority window is
-    local ``Europe/Dublin`` 01:00-10:00 (= UTC 00:00-09:00) while the opencode
-    windows are UTC 00:00-01:00, 04:00-06:00 and 10:00-00:00, so the opencode
-    exception adds capacity in ~3 of the 9 cheap hours; outside those windows
-    the paid tail absorbs overflow. Within the UTC 01:00-04:00 and
-    06:00-10:00 gaps the opencode entries are skipped (the windows are never
-    widened to close them) but the paid tier remains eligible as the final
-    fallback.
+    business-hours paid tail ``munitoai`` (UTC 10:00-23:00) →
+    ``deepseek-flash`` (reachable at ``low`` since LP-0MVY8REC80097HI0, so
+    low-priority requests keep a paid fallback when the free tier is
+    quarantined and the opencode accounts are quota-exhausted). The cheap
+    priority window is local ``Europe/Dublin`` 01:00-10:00 (= UTC
+    00:00-09:00) while the opencode windows are UTC 00:00-01:00, 04:00-06:00
+    and 10:00-00:00, so the opencode exception adds capacity in ~3 of the 9
+    cheap hours; outside those windows the paid tail absorbs overflow. Within
+    the UTC 01:00-04:00 and 06:00-10:00 gaps the opencode entries are
+    skipped (the windows are never widened to close them) but the paid tiers
+    remain eligible as the final fallback; ``munitoai``'s own window
+    (10:00-23:00 UTC, paid spend confined to business hours) leaves the
+    UTC 01:00-04:00 and 06:00-10:00 gaps to ``deepseek-flash``'s windows, so
+    neither paid tier is reachable at those times, and overflow is deferred
+    (chain-hold) or refused by the queue budget.
 
     ``low`` failover capacity vs resiliency:
 

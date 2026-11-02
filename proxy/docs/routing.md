@@ -326,8 +326,10 @@ Capacity vs resilience — the three entries are **not** interchangeable:
 | 5xx / stall / terminal error | `_failure_domain_key` = `endpoint:model` | Shared domain: one failure skips all three for the rest of the request → **no** 3× outage resilience (LP-0MSG45I8Q0020N1F). |
 
 The fully paid `munitoai` and `deepseek-flash` entries declare exactly
-`priorities: [medium, high]`, so they never join a `low` chain: they carry no
-window discipline that would confine spend to off-peak hours.
+`priorities: [medium, high]`, so they never join a `low` chain. `munitoai`
+carries a 10:00-23:00 UTC `available_times` window (paid dispatches confined
+to business hours); `deepseek-flash` keeps its off-peak windows and carries
+no spend discipline of its own.
 
 ### Priority-chain membership (`priorities`, LP-0MVGPZWY0001JD1D)
 
