@@ -52,6 +52,7 @@ REQUIRED_RULE_FILES = {
     "prometheus.yml": [
         "gpu_compute_rules.yaml",
         "gpu_memory_alerts.yaml",
+        "host_memory_alerts.yaml",
         "llama_memory_alerts.yaml",
         "proxy_5xx_alerts.yaml",
         "slots_query_alerts.yaml",
@@ -1059,6 +1060,88 @@ class TestGpuMemoryAlerts:
         assert warn < crit, (
             f"Warning threshold {warn} must be below critical threshold {crit}"
         )
+
+
+class TestHostMemoryAlerts:
+    """Pre-OOM alerts: MemAvailable and GTT-vs-RAM, not GTT-vs-pool.
+
+    LP-0MVZ810NG008A3EW AC3. At the 2026-11-02T12:03:08Z global OOM, GTT was
+    53 % of its 128 GiB pool — below `gpu_memory_alerts.yaml`'s 75 % warning —
+    while only 0.2 % of the host's 124 GiB of RAM was available and the kernel
+    killed the proxy. These rules must therefore key off `MemAvailable` and off
+    GTT relative to *physical RAM*; anything pool-relative cannot fire in time.
+    """
+
+    def _rules(self) -> list[dict]:
+        data = assert_valid_yaml(MONITORING_DIR / "host_memory_alerts.yaml")
+        return [r for g in data["groups"] for r in g.get("rules", [])]
+
+    def test_rule_file_is_loaded_by_prometheus(self):
+        loaded = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")["rule_files"]
+        assert "host_memory_alerts.yaml" in loaded
+
+    def test_available_memory_rules_use_memavailable_over_memtotal(self):
+        exprs = [r["expr"] for r in self._rules() if "node_memory_MemAvailable_bytes" in r["expr"]]
+        assert len(exprs) == 2, f"expected a warning+critical pair, got {exprs}"
+        for expr in exprs:
+            assert "node_memory_MemTotal_bytes" in expr, (
+                "a MemAvailable rule must be a fraction of MemTotal, not an "
+                f"absolute byte count that depends on the host: {expr}"
+            )
+
+    def test_gtt_rules_compare_against_physical_ram(self):
+        gtt_rules = [r for r in self._rules() if "gpu_gtt_used_bytes" in r["expr"]]
+        assert len(gtt_rules) == 2, f"expected a warning+critical pair, got {gtt_rules}"
+        for rule in gtt_rules:
+            assert "node_memory_MemTotal_bytes" in rule["expr"], (
+                "GTT must be compared with physical RAM: the GTT pool (128 GiB) "
+                "is larger than RAM (124 GiB) on this host, so a pool-relative "
+                f"threshold cannot fire before the kernel watermark: {rule['expr']}"
+            )
+
+    @staticmethod
+    def _comparison_value(expr: str) -> float | None:
+        """The threshold literal a ratio rule compares against (< 0.12, > 0.50)."""
+        match = re.search(r"[<>]=?\s*(\d+(?:\.\d+)?)\s*$", expr.strip())
+        return float(match.group(1)) if match else None
+
+    def test_warning_fires_before_critical_for_each_pair(self):
+        for series, fragment, usage_rule in (
+            ("MemAvailable", "node_memory_MemAvailable_bytes", False),
+            ("GPU GTT", "gpu_gtt_used_bytes", True),
+        ):
+            by_sev = {
+                r["labels"]["severity"]: r["expr"]
+                for r in self._rules()
+                if fragment in r["expr"]
+            }
+            assert set(by_sev) == {"warning", "critical"}, (series, by_sev)
+            warn = self._comparison_value(by_sev["warning"])
+            crit = self._comparison_value(by_sev["critical"])
+            assert warn is not None and crit is not None, by_sev
+            if usage_rule:
+                assert warn < crit, (
+                    f"{series}: the warning must fire at a LOWER usage fraction "
+                    f"than the critical (warn={warn}, crit={crit})"
+                )
+            else:
+                assert warn > crit, (
+                    f"{series}: the warning must fire at a HIGHER available "
+                    f"fraction than the critical (warn={warn}, crit={crit})"
+                )
+
+    def test_incident_value_trips_the_warning_thresholds(self):
+        """The measured 2026-11-02 ratios must have been alarming."""
+        snapshot = {
+            "available_fraction": 245_576 / 130_494_996,
+            "gtt_of_ram": (68_482 * 1024 * 1024) / (130_494_996 * 1024),
+        }
+        by_series = {
+            "node_memory_MemAvailable_bytes": 0.12,
+            "gpu_gtt_used_bytes": 0.50,
+        }
+        assert snapshot["available_fraction"] < by_series["node_memory_MemAvailable_bytes"]
+        assert snapshot["gtt_of_ram"] > by_series["gpu_gtt_used_bytes"]
 
 
 class TestPrometheusRuleValidation:

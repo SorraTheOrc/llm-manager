@@ -990,6 +990,20 @@ server:
   # podman-backed container via the host start script wrapper.
   llama_allow_host_fallback: true
   llama_embed_load_timeout: 30
+  # --- OOM protection + pre-OOM host pressure (LP-0MVZ810NG008A3EW) ---
+  # 2026-11-02T12:03:08Z: a global OOM killed the proxy and its llama-server
+  # backend in one event (both at oom_score_adj 0) after GPU-backed memory
+  # (amdgpu GTT) reached ~96.7 GiB on this 124 GiB host.
+  #
+  # oom_score_adj applied to the proxy process. Negative values require
+  # CAP_SYS_RESOURCE: the systemd unit sets OOMScoreAdjust=-900 for privileged
+  # deployments; when the write is refused the current score is kept and a
+  # WARNING explains the remedy at startup.
+  oom_score_adj: -900
+  # oom_score_adj applied to the llama-server backend after it is spawned (and
+  # to an adopted backend). Raising a child's score is always permitted, so the
+  # kernel prefers the model backend over the proxy in every deployment mode.
+  llama_server_oom_score_adj: 800
   # Router model-health monitoring cadence (seconds).
   # Preferred key (used by backend health loop):
   llama_model_health_interval_seconds: 10

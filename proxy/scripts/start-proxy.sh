@@ -13,7 +13,13 @@ set -euo pipefail
 #               down (LP-0MVGT0E6W000Q8CY). Unattended callers may instead set
 #               START_PROXY_FOREGROUND=1.
 #   --log-file <path>
-#               Detached server's stdout/stderr (default /tmp/proxy-startup.log).
+#               Detached server's stdout/stderr. DEFAULT (no flag): a
+#               per-invocation file in `$LLAMA_PROXY_STARTUP_LOG_DIR` (default
+#               /tmp) named `proxy-startup-<UTC>-<pid>.log`, with
+#               `proxy-startup.log` kept as a symlink to the newest one, so a
+#               later run (or a test suite) can never overwrite the startup log
+#               of an earlier incident (LP-0MVZ810NG008A3EW D3). An explicit
+#               `--log-file` is used verbatim.
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
 #   --reason    Restart reason echoed into the new process's startup log
 #               (LP-0MVAPNC2900145RH; flag > LLAMA_PROXY_RESTART_REASON >
@@ -115,7 +121,14 @@ FOREGROUND=0
 if [ "${START_PROXY_FOREGROUND:-}" = "1" ]; then
   FOREGROUND=1
 fi
-DETACH_LOG_FILE="/tmp/proxy-startup.log"
+# Directory holding the default per-invocation startup log (D3). Tests and
+# operators can point it elsewhere without passing --log-file.
+DETACH_LOG_DIR_DEFAULT="${LLAMA_PROXY_STARTUP_LOG_DIR:-/tmp}"
+DETACH_LOG_FILE="$DETACH_LOG_DIR_DEFAULT/proxy-startup.log"
+# LP-0MVZ810NG008A3EW D3: an explicit --log-file is written verbatim; the
+# DEFAULT path is per-invocation (see the detach block) so one run can never
+# clobber another run's startup log.
+DETACH_LOG_FILE_EXPLICIT=0
 UVICORN_ARGS=()
 prev=""
 for arg in "$@"; do
@@ -126,6 +139,7 @@ for arg in "$@"; do
   elif [ "$prev" = "--log-file" ]; then
     # --log-file <path>: consumed here, never forwarded to uvicorn
     DETACH_LOG_FILE="$arg"
+    DETACH_LOG_FILE_EXPLICIT=1
     prev=""
   elif [ "$prev" = "--port" ] || [ "$prev" = "-p" ]; then
     PORT="$arg"
@@ -162,6 +176,7 @@ for arg in "$@"; do
         ;;
       --log-file=*)
         DETACH_LOG_FILE="${arg#*=}"
+        DETACH_LOG_FILE_EXPLICIT=1
         ;;
       --keep-llama-server)
         # LP-0MUCEFCL6001ZXYN: proxy-only restart — preserve the co-located
@@ -242,6 +257,59 @@ _wait_for_port_release() {
   done
 }
 
+# _kill_matching <signal> <extended-regexp>
+#
+# Signal every process whose full command line matches <extended-regexp>,
+# EXCEPT this launcher, its parent and any other copy of this script.
+#
+# LP-0MVZ810NG008A3EW D2: `pkill -f '<pattern>'` matches the CALLER's argv too,
+# so a restart invoked with `--reason "... forced llama-server restart"`
+# SIGTERMed the launcher itself (exit 143, before the start phase) and left the
+# proxy down. Filtering by pid as well as by command line keeps the fix
+# independent of what an operator happens to put in --reason. `pgrep` never
+# matches itself, so only the ancestors and script copies need excluding.
+_kill_matching() {
+  local signal="$1" pattern="$2" pid cmdline
+  local -a matches=() targets=()
+
+  if ! command -v pgrep >/dev/null 2>&1; then
+    echo "Warning: pgrep not available; cannot stop processes matching '$pattern'." >&2
+    return 0
+  fi
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    matches+=("$pid")
+  done < <(pgrep -f -- "$pattern" 2>/dev/null || true)
+
+  for pid in ${matches[@]+"${matches[@]}"}; do
+    # Never signal ourselves or our parent (a wrapper shell may carry the
+    # pattern in its own argv as well).
+    [ "$pid" = "$$" ] && continue
+    [ "$pid" = "$PPID" ] && continue
+    cmdline=""
+    if [ -r "/proc/$pid/cmdline" ]; then
+      cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    fi
+    case "$cmdline" in
+      *start-proxy.sh*) continue ;;
+    esac
+    targets+=("$pid")
+  done
+
+  [ "${#targets[@]}" -eq 0 ] && return 0
+
+  if command -v xargs >/dev/null 2>&1; then
+    # `xargs kill` runs the external kill(1), not the shell builtin, so a test
+    # harness can intercept it through PATH and no signal escapes the match set.
+    printf '%s\n' "${targets[@]}" | xargs -r kill -s "$signal" 2>/dev/null || true
+  else
+    for pid in "${targets[@]}"; do
+      kill -s "$signal" "$pid" 2>/dev/null || true
+    done
+  fi
+}
+
 # --restart: kill all running proxy-related processes before starting
 if [ "$RESTART" -eq 1 ]; then
   # LP-0MVAPNC2900145RH: resolve the restart reason (--reason flag beats
@@ -289,23 +357,31 @@ print(merged_config_sha256('$REPO_ROOT/config.yaml', '$_restart_cfg'))
     echo "Preserving running llama-server (unchanged local backend config)."
   fi
 
-  # Phase 1: graceful SIGTERM
-  pkill -f 'uvicorn proxy\.server' 2>/dev/null || true
+  # Phase 1: graceful SIGTERM.
+  #
+  # LP-0MVZ810NG008A3EW D2: never use a bare `pkill -f '<pattern>'` here. The
+  # launcher's own argv can contain the pattern — a `--reason` text such as
+  # "... forced llama-server restart" made the launcher SIGTERM itself (exit
+  # 143, mid phase 1), leaving the proxy stopped and the backend dying. The
+  # helper above filters this process, its parent and any copy of this script
+  # out of the match set before signalling (same failure family as
+  # LP-0MS9LJIAE008Q3AK's os.killpg broadcast).
+  _kill_matching TERM 'uvicorn proxy\.server'
   if [ "$KEEP_LLAMA" -eq 0 ]; then
-    pkill -f 'llama-server' 2>/dev/null || true
+    _kill_matching TERM 'llama-server'
   fi
-  pkill -f 'qwentts' 2>/dev/null || true
-  pkill -f 'tts-server' 2>/dev/null || true
+  _kill_matching TERM 'qwentts'
+  _kill_matching TERM 'tts-server'
   sleep 3
 
   # Phase 2: force-kill any survivors (graceful shutdown may hang — e.g.,
   # asyncio tasks that don't cancel cleanly leaving a zombie process).
-  pkill -9 -f 'uvicorn proxy\.server' 2>/dev/null || true
+  _kill_matching KILL 'uvicorn proxy\.server'
   if [ "$KEEP_LLAMA" -eq 0 ]; then
-    pkill -9 -f 'llama-server' 2>/dev/null || true
+    _kill_matching KILL 'llama-server'
   fi
-  pkill -9 -f 'qwentts' 2>/dev/null || true
-  pkill -9 -f 'tts-server' 2>/dev/null || true
+  _kill_matching KILL 'qwentts'
+  _kill_matching KILL 'tts-server'
   sleep 2
 
   # Phase 3: fuser fallback — kill any leftover processes holding our ports
@@ -604,23 +680,42 @@ if [ ! -d "$DETACH_LOG_DIR" ] && ! mkdir -p "$DETACH_LOG_DIR" 2>/dev/null; then
   echo "       Pass --log-file <path> pointing at a writable location." >&2
   exit 1
 fi
-if ! : > "$DETACH_LOG_FILE" 2>/dev/null; then
-  echo "Error: cannot write the detached-startup log file $DETACH_LOG_FILE." >&2
+
+# LP-0MVZ810NG008A3EW D3: the DEFAULT log path is per-invocation. A fixed
+# `/tmp/proxy-startup.log` shared by the launcher and the test suite meant a
+# pytest run at 12:03 on 2026-11-02 overwrote the real startup log of the OOM
+# incident with `FAKE_UVICORN` output, destroying the forensic record. Each run
+# now writes its own file and `proxy-startup.log` remains as a symlink to the
+# newest, so `tail -f /tmp/proxy-startup.log` keeps working while older logs
+# survive. An explicit `--log-file` is honoured verbatim (tests pass one).
+if [ "$DETACH_LOG_FILE_EXPLICIT" -eq 0 ]; then
+  _log_stem="$(basename "$DETACH_LOG_FILE" .log)"
+  DETACH_RUN_LOG="$DETACH_LOG_DIR/${_log_stem}-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+else
+  DETACH_RUN_LOG="$DETACH_LOG_FILE"
+fi
+
+if ! : > "$DETACH_RUN_LOG" 2>/dev/null; then
+  echo "Error: cannot write the detached-startup log file $DETACH_RUN_LOG." >&2
   echo "       Pass --log-file <path> pointing at a writable location." >&2
   exit 1
+fi
+
+if [ "$DETACH_LOG_FILE_EXPLICIT" -eq 0 ]; then
+  ln -sfn "$(basename "$DETACH_RUN_LOG")" "$DETACH_LOG_FILE" 2>/dev/null || true
 fi
 
 if command -v setsid >/dev/null 2>&1; then
   # setsid puts the child in its own session/process group, so a SIGKILL of the
   # launcher's group no longer reaches the server.
-  setsid bash "$SELF" "${CHILD_ARGS[@]}" >"$DETACH_LOG_FILE" 2>&1 &
+  setsid bash "$SELF" "${CHILD_ARGS[@]}" >"$DETACH_RUN_LOG" 2>&1 &
   CHILD_PID=$!
 else
   # Fallback for hosts without setsid (coreutils only): detach from the shell's
   # job table with nohup + disown. Weaker than setsid (the child stays in the
   # launcher's process group), but still immune to SIGHUP and to the launcher's
   # exit.
-  nohup bash "$SELF" "${CHILD_ARGS[@]}" >"$DETACH_LOG_FILE" 2>&1 &
+  nohup bash "$SELF" "${CHILD_ARGS[@]}" >"$DETACH_RUN_LOG" 2>&1 &
   CHILD_PID=$!
 fi
 disown "$CHILD_PID" 2>/dev/null || true
@@ -628,5 +723,5 @@ disown "$CHILD_PID" 2>/dev/null || true
 # Exactly ONE handoff line: the child PID, the log path (where any post-handoff
 # startup failure appears) and the health check callers must use instead of an
 # exit code, since uvicorn now outlives this process.
-echo "Proxy launched detached: child pid $CHILD_PID, output in $DETACH_LOG_FILE | health check: curl -sf http://127.0.0.1:$PORT/health"
+echo "Proxy launched detached: child pid $CHILD_PID, output in $DETACH_RUN_LOG | health check: curl -sf http://127.0.0.1:$PORT/health"
 exit 0

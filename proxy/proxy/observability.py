@@ -1098,6 +1098,19 @@ async def _slot_metrics_loop(
             record_slot_occupancy(snapshot)
         except Exception:
             pass
+        # LP-0MVZ810NG008A3EW AC3: the same cadence refreshes the host-memory
+        # pressure gauges. Cheap (one /proc read and two sysfs reads) and
+        # independent of the /slots result — pressure is what warns before the
+        # kernel watermark, so it must not stop when a slot query fails.
+        try:
+            from proxy import host_pressure as _host_pressure
+            from proxy.metrics import record_host_pressure
+
+            record_host_pressure(
+                _host_pressure.read_memory_snapshot(), time.time()
+            )
+        except Exception:
+            pass
         await asyncio.sleep(interval_seconds)
 
 

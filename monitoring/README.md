@@ -238,6 +238,7 @@ So in `monitoring/prometheus.yml` they must be **bare file names**:
 rule_files:
   - "gpu_compute_rules.yaml"
   - "gpu_memory_alerts.yaml"
+  - "host_memory_alerts.yaml"
   - "llama_memory_alerts.yaml"
 ```
 
@@ -847,6 +848,10 @@ would:
 | `GpuComputingSustained` | warning | `gpu:computing:bool == 1` (GPU at/above 90 W continuously) | 15m | [gpu_compute_rules.yaml](gpu_compute_rules.yaml) |
 | `GpuGttHighWarning` | warning | `gpu_gtt_used_bytes > 0.75 * 128 GiB` | 2m | [gpu_memory_alerts.yaml](gpu_memory_alerts.yaml) |
 | `GpuGttHighCritical` | critical | `gpu_gtt_used_bytes > 0.90 * 128 GiB` | 1m | [gpu_memory_alerts.yaml](gpu_memory_alerts.yaml) |
+| `HostMemoryAvailableLowWarning` | warning | `MemAvailable / MemTotal < 0.12` | 5m | [host_memory_alerts.yaml](host_memory_alerts.yaml) |
+| `HostMemoryAvailableLowCritical` | critical | `MemAvailable / MemTotal < 0.06` | 2m | [host_memory_alerts.yaml](host_memory_alerts.yaml) |
+| `GpuGttVsHostRamHighWarning` | warning | `sum(gpu_gtt_used_bytes) / sum(MemTotal) > 0.50` | 5m | [host_memory_alerts.yaml](host_memory_alerts.yaml) |
+| `GpuGttVsHostRamHighCritical` | critical | `sum(gpu_gtt_used_bytes) / sum(MemTotal) > 0.65` | 2m | [host_memory_alerts.yaml](host_memory_alerts.yaml) |
 | `ProxyHttpErrorsHigh` | critical | `rate(proxy_http_errors_total{endpoint="/v1/chat/completions",status="5xx"}[5m]) > 5` | 5m | [proxy_5xx_alerts.yaml](proxy_5xx_alerts.yaml) |
 | `LlamaSlotsQueryFailuresHigh` | warning | `rate(llama_slots_query_failures_total[5m]) > 1` | 5m | [slots_query_alerts.yaml](slots_query_alerts.yaml) |
 | `LlamaSlotsQueryFailuresCritical` | critical | `rate(llama_slots_query_failures_total[5m]) > 10` | 10m | [slots_query_alerts.yaml](slots_query_alerts.yaml) |
@@ -856,6 +861,16 @@ There are also four **recording** rules in `gpu_compute_rules.yaml`:
 `gpu:power_watts:amdgpu`, `gpu:computing:bool`, `gpu:computing_workload:bool`
 (power ≥ 90 W **and** ≥ 1 busy llama slot — the shared definition of our local
 model's work) and `gpu:power_watts:avg5m`.
+
+The `host_memory_alerts.yaml` pair is the **pre-OOM** layer
+(LP-0MVZ810NG008A3EW, [runbook](../docs/dev/oom-recovery-runbook.md)). It
+thresholds `MemAvailable` against `MemTotal`, and GTT against **physical RAM**
+rather than the GTT pool. That distinction matters: the pool is 128 GiB while the
+host has 124 GiB of RAM, so the pool-relative `GpuGttHigh*` thresholds can never
+fire early enough — at the 2026-11-02T12:03:08Z global OOM, GTT was 53.7 % of physical
+RAM — and 53 % of the pool, under the 75 % warning while only 0.2 % of RAM was available and the
+kernel killed the proxy. The kernel's own watermark is ~0.2 % of RAM, so these
+thresholds leave real headroom to unload a model.
 
 Alerts are visible in the UI (`/alerts`) and API (`/api/v1/rules`). Notification
 routing (email, webhook) needs Alertmanager, which is **not deployed** — alerts

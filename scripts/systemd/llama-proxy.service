@@ -20,9 +20,22 @@ Environment=LLAMA_PROXY_CONFIG=/home/rgardler/projects/llm/proxy/config.yaml
 Environment=LLAMA_START_SCRIPT=/home/rgardler/projects/llm/scripts/podman_start_llama.sh
 Environment=PYTHONPATH=/home/rgardler/projects/llm/proxy
 
-# Restart policy
-Restart=on-failure
-RestartSec=5
+# Restart policy (LP-0MVZ810NG008A3EW AC2). `always`, not `on-failure`: an
+# involuntary SIGKILL/OOM must be recovered even if the exit status somehow
+# looks clean, and RestartSec=2 (not 5) shortens the measured outage window.
+# StartLimitIntervalSec/Burst bound a crash loop without letting one OOM
+# permanently stop the front door.
+Restart=always
+RestartSec=2
+
+# OOM protection (LP-0MVZ810NG008A3EW AC1). This is the *user* template: the
+# user manager cannot lower a score below 0 without CAP_SYS_RESOURCE, so the
+# proxy keeps 0 here and the proxy sets it at startup (best-effort, logged).
+# The model backend is raised instead (see llama-podman-wrapper.service), which
+# is what makes the kernel pick the backend over the front door. For a truly
+# negative proxy score use the system service in docs/systemd/llama-proxy.service
+# (OOMScoreAdjust=-900, applied as root).
+OOMScoreAdjust=0
 
 
 # Logging

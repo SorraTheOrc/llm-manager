@@ -1,0 +1,82 @@
+# Pre-OOM host memory alerts: warn BEFORE the kernel watermark is breached
+#
+# LP-0MVZ810NG008A3EW (AC3). On 2026-11-02T12:03:08Z the kernel hit a *global*
+# OOM on this host and SIGKILLed the LLM proxy (pid 3698721) together with its
+# llama-server backend (pid 3702214) and 11 session helpers. Nothing warned
+# beforehand: the only record of the pressure was the kernel log line, and the
+# proxy was down for ~10.5 minutes until an operator restarted it.
+#
+# WHY THIS FILE EXISTS NEXT TO gpu_memory_alerts.yaml
+# --------------------------------------------------
+# `gpu_memory_alerts.yaml` thresholds GTT as a fraction of the **GTT pool**
+# (128 GiB). On this APU the pool is *larger than physical RAM* (124 GiB), which
+# is exactly what makes the pool-relative rule structurally unable to warn in
+# time: at OOM time `mem_info_gtt_used` was 68,482 MiB (53 % of the pool, below
+# that file's 75 % warning; 53.7 % of physical RAM) while the host had only 245,576 kB of 130,494,996 kB
+# MemAvailable left (0.2 %, `all_unreclaimable? yes`). The rules here therefore
+# compare
+#
+#   * `MemAvailable` against `MemTotal` (node_exporter's own collectors), and
+#   * GTT in use against **physical RAM**, not against the GTT pool,
+#
+# with thresholds that trip while the host still has room to shed a model.
+#
+# `gpu_active` (the kernel's `show_mem()` GPU-backed counter, 101,385,112 kB at
+# OOM time) has no procfs/sysfs interface and cannot be scraped. The driver's
+# own `mem_info_gtt_used` accounting of the same pool is the observable proxy
+# and is what these rules use; see docs/dev/oom-recovery-runbook.md.
+#
+# THRESHOLDS
+# ----------
+#   MemAvailable < 12 % of RAM : warning   (>= ~15 GiB of headroom lost)
+#   MemAvailable <  6 % of RAM : critical  (a model load can tip the host over)
+#   GTT/RAM       > 50 %       : warning   (2026-11-02 sat at 52 %)
+#   GTT/RAM       > 65 %       : critical
+# The kernel's own watermark on this host is ~0.2 % of RAM (min_free_kbytes), so
+# every threshold here fires well before it.
+#
+# Evaluation interval is the Prometheus default (15 s); the sampler feeding
+# `gpu_gtt_used_bytes` refreshes every 10 s, hence the `for:` durations.
+
+groups:
+  - name: host-memory-pressure.rules
+    rules:
+      - alert: HostMemoryAvailableLowWarning
+        expr: |
+          (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.12
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host MemAvailable below 12% of RAM ({{ $value | humanizePercentage }})"
+          description: "Only {{ $value | humanizePercentage }} of RAM is available on {{ $labels.instance }}. GPU-backed (GTT) memory and anonymous memory are competing for the same pool; unload an idle model before the next load pushes the host toward the kernel watermark."
+
+      - alert: HostMemoryAvailableLowCritical
+        expr: |
+          (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.06
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Host MemAvailable below 6% of RAM ({{ $value | humanizePercentage }}) — global OOM risk"
+          description: "MemAvailable on {{ $labels.instance }} is {{ $value | humanizePercentage }} of RAM. A model (re)load or a large-context session is likely to trigger a global OOM kill, which takes down the proxy as well as the model backend. Unload an idle model immediately (see docs/dev/oom-recovery-runbook.md)."
+
+      - alert: GpuGttVsHostRamHighWarning
+        expr: |
+          (sum(gpu_gtt_used_bytes) / sum(node_memory_MemTotal_bytes)) > 0.50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU GTT above 50% of physical RAM ({{ $value | humanizePercentage }})"
+          description: "GPU-backed memory (GTT) is {{ $value | humanizePercentage }} of the host's physical RAM on {{ $labels.instance }}. GTT is invisible to process RSS accounting, so this is the leading indicator that the next model load may exhaust the host. The 2026-11-02 global OOM sat at 53.7%."
+
+      - alert: GpuGttVsHostRamHighCritical
+        expr: |
+          (sum(gpu_gtt_used_bytes) / sum(node_memory_MemTotal_bytes)) > 0.65
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU GTT above 65% of physical RAM ({{ $value | humanizePercentage }}) — global OOM risk"
+          description: "GPU-backed memory (GTT) on {{ $labels.instance }} has reached {{ $value | humanizePercentage }} of physical RAM. Combined with anonymous memory this leaves little reclaimable headroom; the kernel prefers to kill a large process (llama-server) and may take the proxy too. Unload an idle model now."

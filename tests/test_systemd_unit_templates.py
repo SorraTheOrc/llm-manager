@@ -154,3 +154,84 @@ def test_readme_warns_against_user_group_in_user_units() -> None:
     assert "216/group" in lowered, "README should name the 216/GROUP failure mode"
     # The old, ambiguous instruction that let the bug through.
     assert "adjust user/group and paths in the unit files if your setup differs" not in lowered
+
+
+# ---------------------------------------------------------------------------
+# OOM survival: restart policy and OOM ranking (LP-0MVZ810NG008A3EW AC1, AC2)
+# ---------------------------------------------------------------------------
+
+PROXY_UNIT = "llama-proxy.service"
+BACKEND_UNIT = "llama-podman-wrapper.service"
+
+
+def _service_value(path: Path, key: str) -> str | None:
+    for name, value in service_directives(path)["Service"]:
+        if name == key:
+            return value
+    return None
+
+
+@pytest.mark.parametrize("unit_name", [PROXY_UNIT, BACKEND_UNIT])
+def test_restart_policy_recovers_an_involuntary_kill(unit_name: str) -> None:
+    """AC2: SIGKILL/OOM is a restart, not a dead unit, and it comes back fast.
+
+    The 2026-11-02 global OOM killed the proxy and its backend in one event and
+    nothing restarted either for ~10.5 minutes. `Restart=always` covers a kill
+    that systemd cannot classify as a clean failure, and a short `RestartSec`
+    bounds the outage window.
+    """
+    path = REPO_ROOT / USER_UNITS / unit_name
+    assert _service_value(path, "Restart") == "always", (
+        f"{unit_name} must use Restart=always so an involuntary SIGKILL/OOM is "
+        "recovered automatically"
+    )
+    restart_sec = _service_value(path, "RestartSec")
+    assert restart_sec is not None, f"{unit_name} declares no RestartSec"
+    assert int(restart_sec.rstrip("s")) <= 5, (
+        f"{unit_name} RestartSec={restart_sec} leaves a needlessly long outage; "
+        "the 2026-11-02 event lost ~10.5 minutes with no supervision at all"
+    )
+
+
+def test_backend_outranks_the_proxy_for_the_oom_killer() -> None:
+    """AC1: the kernel must prefer the model backend over the front door.
+
+    Ranking is `oom_score_adj`: higher dies first. The backend may always be
+    *raised*; the proxy can only be *lowered* with CAP_SYS_RESOURCE, which is why
+    the user unit keeps 0 and the system variant pins -900.
+    """
+    backend_adj = _service_value(REPO_ROOT / USER_UNITS / BACKEND_UNIT, "OOMScoreAdjust")
+    proxy_adj = _service_value(REPO_ROOT / USER_UNITS / PROXY_UNIT, "OOMScoreAdjust")
+    assert backend_adj is not None, f"{BACKEND_UNIT} declares no OOMScoreAdjust"
+    assert proxy_adj is not None, f"{PROXY_UNIT} declares no OOMScoreAdjust"
+    assert int(backend_adj) > int(proxy_adj), (
+        "the model backend must score higher than the proxy so a global OOM "
+        f"sacrifices the backend first (backend={backend_adj}, proxy={proxy_adj})"
+    )
+
+
+def test_system_service_variant_lowers_the_proxy_score() -> None:
+    """The system (root) variant is where a negative proxy score is possible."""
+    text = (REPO_ROOT / DOCS_UNIT).read_text(encoding="utf-8")
+    # The system-service block is the one that declares User=/Group=.
+    system_blocks = [
+        block
+        for block in re.split(r"```ini\n|\n```", text)
+        if "User=" in block and "ExecStart=" in block
+    ]
+    assert system_blocks, "docs/systemd/llama-proxy.service lost its system-service block"
+    system_block = system_blocks[0]
+    assert "OOMScoreAdjust=-900" in system_block, (
+        "the system-service variant must pin the proxy's oom_score_adj below 0: "
+        "as root, CAP_SYS_RESOURCE is available and the front door is then last "
+        "in the OOM kill order"
+    )
+
+
+def test_docs_units_also_flag_the_backend_above_the_proxy() -> None:
+    """The documented llama-server unit must raise the backend like the proxy does."""
+    text = (REPO_ROOT / "docs/systemd/llama-server.service").read_text(encoding="utf-8")
+    assert "OOMScoreAdjust=800" in text, (
+        "docs/systemd/llama-server.service must raise the backend's OOM score so "
+        "a global OOM kills a model rather than the proxy"
+    )

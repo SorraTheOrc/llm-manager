@@ -225,9 +225,47 @@ async def _try_adopt_running_llama_server(
             _verify_adopted_log_relay(srv)
         except Exception:
             pass
+        # LP-0MVZ810NG008A3EW AC1: an adopted backend may predate this proxy and
+        # keep score 0, so re-apply the OOM ranking to the running llama-server
+        # (the sentinel handle has pid 0; the real pid is discovered from the
+        # backend port). Best-effort — discovery may legitimately find nothing.
+        try:
+            from types import SimpleNamespace
+
+            from proxy.backend_rss import discover_llama_pids
+
+            for _backend_pid in discover_llama_pids(llama_port):
+                _apply_backend_oom_protection(SimpleNamespace(pid=_backend_pid))
+        except Exception:
+            pass
         return True
     except Exception:
         return False
+
+
+def _apply_backend_oom_protection(proc) -> None:
+    """Rank a llama-server backend above the proxy for the OOM killer (AC1).
+
+    LP-0MVZ810NG008A3EW: on 2026-11-02 both the proxy and its backend had
+    ``oom_score_adj`` 0, so a global OOM killed both (30 kill lines, one
+    timestamp). Raising the backend's score is always permitted (only lowering
+    below 0 needs privileges), so this half of the protection works in an
+    unprivileged deployment. The score is inherited by the backend's children
+    and, best-effort, never blocks a model load.
+    """
+    if proc is None:
+        return
+    try:
+        srv = _srv()
+        from proxy.host_pressure import protect_backend_process
+
+        protect_backend_process(
+            proc,
+            getattr(srv, "config", None),
+            getattr(srv, "logger", None),
+        )
+    except Exception:
+        pass
 
 
 def _resolve_llama_log_path(srv) -> Path:
@@ -1748,6 +1786,8 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
 
         if host_proc is not None:
             srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
+            # LP-0MVZ810NG008A3EW AC1: make the backend the OOM killer's first choice.
+            _apply_backend_oom_protection(host_proc)
             # LP-0MVECX47Z004LJAQ: recover prefill progress lines by tailing the
             # log the backend now writes to directly.
             start_llama_log_tailer(srv, model_name=_display)
@@ -1768,6 +1808,8 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
+           # LP-0MVZ810NG008A3EW AC1: rank the backend above the proxy for the OOM killer.
+           _apply_backend_oom_protection(proc)
            # LP-0MVECX47Z004LJAQ: recover prefill progress lines by tailing the
            # log the backend now writes to directly.
            start_llama_log_tailer(srv, model_name=_display)

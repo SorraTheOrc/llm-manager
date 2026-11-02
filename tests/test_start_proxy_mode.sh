@@ -200,9 +200,13 @@ chmod +x "$FAKE_PY"
 # The --restart tests must never touch live processes or ports. These fakes
 # are found first on PATH (the sandbox dir also holds the fake python shim)
 # and merely log their invocation; no live pkill/fuser ever runs.
+#
+# LP-0MVZ810NG008A3EW D2: start-proxy.sh selects kill targets with `pgrep -f`
+# and signals them with `kill`, so BOTH must be faked — an unfaked
+# `pgrep -f 'uvicorn proxy\.server'` would match the live proxy on this host.
 KILL_LOG="$SANDBOX/kill.log"
 
-for _fake in pkill fuser; do
+for _fake in pkill fuser kill; do
     cat > "$SANDBOX/$_fake" <<SH
 #!/usr/bin/env bash
 echo "$_fake \$*" >> "$KILL_LOG"
@@ -210,6 +214,14 @@ exit 0
 SH
     chmod +x "$SANDBOX/$_fake"
 done
+
+cat > "$SANDBOX/pgrep" <<SH
+#!/usr/bin/env bash
+echo "pgrep \$*" >> "$KILL_LOG"
+echo 424242
+exit 0
+SH
+chmod +x "$SANDBOX/pgrep"
 
 # Fake ss/netstat report no listeners so _wait_for_port_release() returns
 # immediately and never probes the live proxy ports (8080/8081).
@@ -476,9 +488,9 @@ test_restart_preserves_unchanged_merged_config() {
         fail "unchanged merged config: expected preserve, got: $out"
     fi
     if grep -q "llama-server" "$KILL_LOG"; then
-        fail "unchanged merged config: fake pkill saw a llama-server kill ($(cat "$KILL_LOG"))"
+        fail "unchanged merged config: fake kill selector saw a llama-server kill ($(cat "$KILL_LOG"))"
     else
-        pass "unchanged merged config: fake pkill never saw a llama-server kill"
+        pass "unchanged merged config: no llama-server kill was attempted"
     fi
 }
 
@@ -509,7 +521,7 @@ test_restart_on_base_only_change() {
         pass "base-only change: llama-server not preserved (KEEP_LLAMA=0)"
     fi
     if grep -q "llama-server" "$KILL_LOG"; then
-        pass "base-only change: fake pkill killed llama-server"
+        pass "base-only change: llama-server kill attempted"
     else
         fail "base-only change: llama-server kill not observed"
     fi
@@ -543,7 +555,7 @@ test_restart_on_overlay_only_change() {
         pass "overlay-only change: llama-server not preserved (KEEP_LLAMA=0)"
     fi
     if grep -q "llama-server" "$KILL_LOG"; then
-        pass "overlay-only change: fake pkill killed llama-server"
+        pass "overlay-only change: llama-server kill attempted"
     else
         fail "overlay-only change: llama-server kill not observed"
     fi

@@ -1948,8 +1948,15 @@ when `setsid` is unavailable) with its stdout/stderr redirected to a log file.
 It prints one handoff line and exits 0:
 
 ```
-Proxy launched detached: child pid 12345, output in /tmp/proxy-startup.log | health check: curl -sf http://127.0.0.1:8000/health
+Proxy launched detached: child pid 12345, output in /tmp/proxy-startup-20261102T121336Z-3865714.log | health check: curl -sf http://127.0.0.1:8000/health
 ```
+
+Each run writes its **own** startup log (LP-0MVZ810NG008A3EW D3); `/tmp/proxy-startup.log`
+stays as a symlink to the newest one, so `tail -30 /tmp/proxy-startup.log` keeps
+working while the log of an earlier incident survives. That matters: on
+2026-11-02 a pytest run overwrote the only startup log of the OOM incident with
+`FAKE_UVICORN` output and destroyed the forensic record. Point the directory
+elsewhere with `LLAMA_PROXY_STARTUP_LOG_DIR`, or a single file with `--log-file`.
 
 Because the server outlives the launcher, a failed startup after the handoff
 (bind error, model load failure, import error) can only be seen in the log —
@@ -1962,7 +1969,7 @@ curl -sf http://127.0.0.1:8000/health || tail -30 /tmp/proxy-startup.log
 | Flag | Effect |
 |------|--------|
 | `--foreground` | **Interactive debugging only** — blocking `exec` of uvicorn in the current process group. Unattended callers may set `START_PROXY_FOREGROUND=1` instead. |
-| `--log-file <path>` | Where the detached server's stdout/stderr go (default `/tmp/proxy-startup.log`). |
+| `--log-file <path>` | Where the detached server's stdout/stderr go. Default (no flag): a per-invocation file in `$LLAMA_PROXY_STARTUP_LOG_DIR` (default `/tmp`) plus a `proxy-startup.log` symlink to it. |
 | `--restart` | Kill any running proxy, llama-server and TTS processes first. |
 | `--keep-llama-server` | With `--restart`, preserve a warm llama-server (KV / prompt cache). |
 
@@ -2039,19 +2046,54 @@ Note on start-proxy.sh hardening
 
 The bundled `proxy/scripts/start-proxy.sh` script now prefers the virtualenv Python interpreter (`.venv/bin/python3`) when available, falls back to the system `python3`, and will set `PYTHONPATH` to the repository root if it is not already set to avoid import errors when running from the repository checkout.
 
-The script also **detaches the server by default** (LP-0MVGT0E6W000Q8CY): after the checks below it launches uvicorn in its own session with stdout/stderr redirected to `/tmp/proxy-startup.log` (override with `--log-file`), prints one handoff line and exits 0. Startup failures after the handoff are visible only in that log, so poll `/health`. Use `--foreground` (`START_PROXY_FOREGROUND=1` when flags cannot be passed) only for interactive debugging — never under an agent tool call, whose timeout would SIGKILL the server's process group.
+The script also **detaches the server by default** (LP-0MVGT0E6W000Q8CY): after the checks below it launches uvicorn in its own session with stdout/stderr redirected to a per-invocation log (`/tmp/proxy-startup-<UTC>-<pid>.log`, with `/tmp/proxy-startup.log` as a symlink to the newest — override with `--log-file`), prints one handoff line and exits 0. Startup failures after the handoff are visible only in that log, so poll `/health`. Use `--foreground` (`START_PROXY_FOREGROUND=1` when flags cannot be passed) only for interactive debugging — never under an agent tool call, whose timeout would SIGKILL the server's process group.
+
+### OOM protection and crash recovery (LP-0MVZ810NG008A3EW)
+
+On 2026-11-02T12:03:08Z a **global** OOM killed the proxy and its llama-server
+backend together (~96.7 GiB of GPU-backed amdgpu GTT memory on a 124 GiB host,
+`gpu_reclaim` 0, `vm.overcommit_memory` 0), and nothing restarted the proxy for
+~10.5 minutes. Three mechanisms now cover that:
+
+- **OOM ranking.** The proxy applies `server.oom_score_adj` (default `-900`) to
+  itself and `server.llama_server_oom_score_adj` (default `+800`) to the spawned
+  or adopted llama-server, so the kernel's `oom_badness` ranking sacrifices the
+  model backend before the front door. Raising a score is always permitted;
+  lowering one below 0 needs `CAP_SYS_RESOURCE` (the systemd **system** unit sets
+  `OOMScoreAdjust=-900`), and a refused lowering is logged with the remedy at
+  startup. Verify with
+  `cat /proc/$(pgrep -f 'uvicorn proxy\.server' | head -1)/oom_score_adj`.
+- **Supervision.** `scripts/systemd/llama-proxy.service` and
+  `scripts/systemd/llama-podman-wrapper.service` use `Restart=always` with
+  `RestartSec=2`. A hand-launched proxy is not supervised by design (the
+  launcher detaches and exits).
+- **Pre-OOM visibility.** Every startup logs the measured gap since the previous
+  process's last log write (`Recovery: previous proxy log write … Ns before this
+  start`), the current `MemAvailable`/GTT pressure verdict, and the applied
+  `oom_score_adj`; `/metrics` publishes `llama_host_mem_available_ratio`,
+  `llama_host_gtt_used_ratio_of_ram`, `llama_host_memory_sample_timestamp_seconds`
+  and `llama_oom_score_adj`. Alerts live in
+  [`monitoring/host_memory_alerts.yaml`](../monitoring/host_memory_alerts.yaml).
+
+Operator procedure: [docs/dev/oom-recovery-runbook.md](../docs/dev/oom-recovery-runbook.md).
 
 Before launching the server the script also checks whether the selected port (default `8000`, or overridden with `--port`) is already in use on the local host. If the port is occupied the script exits with a helpful message indicating the port and suggesting running with a different `--port` value.
 
 This makes manual invocations of the proxy more robust across developer environments and reduces confusing import or bind errors when starting the server directly.
 ```
 
-**Production:** Run the proxy under your platform's service manager or keep it as a manually started process:
+**Production:** Run the proxy under a service manager so an involuntary
+SIGKILL/OOM is recovered automatically. The shipped units use
+`Restart=always` + `RestartSec=2` (see
+[`scripts/systemd/README.md`](../scripts/systemd/README.md)):
 
 ```bash
-# Manual start (recommended for repo-managed installs)
-sudo systemctl start llama-proxy  # only if you created and installed a unit externally
+systemctl --user enable --now llama-podman-wrapper.service llama-proxy.service
+systemctl --user status llama-proxy.service
 ```
+
+A manually started process (`start-proxy.sh`) is **not** supervised: the
+launcher detaches and exits, so nothing restarts the proxy after a kill.
 
 ### Web UI
 
