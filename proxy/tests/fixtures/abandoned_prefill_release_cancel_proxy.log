@@ -1,0 +1,27 @@
+# Hermetic proxy-log slice for the release->backend-cancel joiner contract
+# (LP-0MVW8S6SR003MBP5). Covers the same fake window as
+# abandoned_prefill_release_cancel_llama.log (2026-01-01 00:00:00 -> 00:04:00).
+#
+# Real line shapes (field order) copied from /var/log/llama-proxy/proxy.log:
+#   lease_released session=... reason=... endpoint=...
+#   local_eviction_after_acceptance session=... reason=... estimated_tokens=N
+#       new_tokens=N eta_prefill_s=F elapsed_s=F slot_id=unknown llama_task_id=unknown endpoint=...
+#   abandoned_slot_recorded session=... endpoint=... slot=None slot_source=endpoint_wide reason=... ttl_s=900
+#
+# The four releases and the ground truth the llama fixture pairs them with:
+#   R_a user-alpha   00:00:00 prefill_deadline      -> task 41: cancel, 2 progress lines after, stop (+10000 tokens)
+#   R_b user-bravo   00:01:00 prefill_deadline      -> task 43: NO cancel, stop processing observed
+#   R_c user-charlie 00:02:00 measured_cache_deficit-> cancel exists but carries no joinable task id (unjoined)
+#   R_d user-delta   00:03:00 prefill_deadline      -> task 42: cancel, prompt eval time emitted before stop
+2026-01-01 00:00:00,000 - INFO - lease_released session=user-alpha reason=prefill_deadline endpoint=http://localhost:8080
+2026-01-01 00:00:00,000 - ERROR - local_eviction_after_acceptance session=user-alpha reason=prefill_deadline estimated_tokens=56000 new_tokens=5120 eta_prefill_s=13.8 elapsed_s=120.1 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
+2026-01-01 00:00:00,000 - INFO - abandoned_slot_recorded session=user-alpha endpoint=http://localhost:8080 slot=None slot_source=endpoint_wide reason=prefill_deadline ttl_s=900
+2026-01-01 00:01:00,000 - INFO - lease_released session=user-bravo reason=prefill_deadline endpoint=http://localhost:8080
+2026-01-01 00:01:00,000 - ERROR - local_eviction_after_acceptance session=user-bravo reason=prefill_deadline estimated_tokens=42000 new_tokens=5600 eta_prefill_s=11.3 elapsed_s=120.4 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
+2026-01-01 00:01:00,000 - INFO - abandoned_slot_recorded session=user-bravo endpoint=http://localhost:8080 slot=None slot_source=endpoint_wide reason=prefill_deadline ttl_s=900
+2026-01-01 00:02:00,000 - INFO - lease_released session=user-charlie reason=measured_cache_deficit endpoint=http://localhost:8080
+2026-01-01 00:02:00,000 - ERROR - local_eviction_after_acceptance session=user-charlie reason=measured_cache_deficit estimated_tokens=98000 new_tokens=97499 eta_prefill_s=112.6 elapsed_s=120.2 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
+2026-01-01 00:02:00,000 - INFO - abandoned_slot_recorded session=user-charlie endpoint=http://localhost:8080 slot=None slot_source=endpoint_wide reason=measured_cache_deficit ttl_s=900
+2026-01-01 00:03:00,000 - INFO - lease_released session=user-delta reason=prefill_deadline endpoint=http://localhost:8080
+2026-01-01 00:03:00,000 - ERROR - local_eviction_after_acceptance session=user-delta reason=prefill_deadline estimated_tokens=61000 new_tokens=9200 eta_prefill_s=14.2 elapsed_s=120.6 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
+2026-01-01 00:03:00,000 - INFO - abandoned_slot_recorded session=user-delta endpoint=http://localhost:8080 slot=None slot_source=endpoint_wide reason=prefill_deadline ttl_s=900
