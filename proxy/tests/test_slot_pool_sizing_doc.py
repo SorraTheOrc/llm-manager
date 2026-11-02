@@ -203,7 +203,7 @@ class TestCitationsStillResolve:
     CITATIONS: tuple[tuple[str, int, str], ...] = (
         # 1 — pool size exported as --parallel
         ("proxy/config.yaml", 1753, "session_slot_pool_size: 2"),
-        ("proxy/proxy/lifecycle.py", 1604, "LLAMA_PARALLEL"),
+        ("proxy/proxy/lifecycle.py", 1659, "LLAMA_PARALLEL"),
         ("start-llama.sh", 239, "LLAMA_PARALLEL:=1"),
         ("start-llama.sh", 252, "--parallel"),
         ("start-llama.sh", 501, "LLAMA_PARALLEL:=1"),
