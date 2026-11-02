@@ -397,6 +397,10 @@ async def status_events():
                 # previously built the URL from server.llama_server_port with
                 # no discovery at all, so page-loads during a giant prefill hit
                 # the router and its 500 echo.
+                # LP-0MVWBXEAI008YZ7B AC: the resolver's (None, None) skip
+                # sentinel — the model is definitively not loaded, so the
+                # initial payload issues **no** /slots request and the "slots"
+                # field degrades to the empty list.
                 try:
                     from proxy.router_helpers import _resolve_local_slots_target
 
@@ -407,9 +411,12 @@ async def status_events():
                     pass
                 # 5s timeout: llama-server may be slow to respond
                 # to /slots when busy generating tokens.
-                slot_details = await _query_slots_detail(
-                    llama_port, timeout=5.0, model=model_name,
-                )
+                if llama_port is None:
+                    slot_details = []
+                else:
+                    slot_details = await _query_slots_detail(
+                        llama_port, timeout=5.0, model=model_name,
+                    )
             except Exception:
                 pass
         # Preserve last known slot data when query fails or llama-server

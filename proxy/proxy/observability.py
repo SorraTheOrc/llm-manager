@@ -1013,6 +1013,13 @@ async def _sample_slot_occupancy(srv) -> dict | None:
         # fetch below report the outcome (a failure still publishes nothing).
         pass
 
+    if llama_port is None:
+        # LP-0MVWBXEAI008YZ7B AC6: the resolver's (None, None) skip sentinel —
+        # the model is definitively not loaded. The sampler publishes nothing
+        # (no gauges, no failure counter: the poll was deliberately skipped,
+        # not a failed sample) exactly like its failure path.
+        return None
+
     url = _build_llama_url(llama_port, "/slots")
     # Never model-less: the router answers a bare /slots with HTTP 400, so a
     # missing current_model is filled from the cached /models resolution
@@ -2815,14 +2822,21 @@ async def _periodic_broadcast_loop():
                             )
                         except Exception:
                             pass
-                        # 5s timeout: llama-server may be slow to respond
+                        # LP-0MVWBXEAI008YZ7B AC: the resolver's (None, None)
+                        # skip sentinel — the model is definitively not loaded,
+                        # so this broadcast issues **no** /slots request and
+                        # the payload degrades to the empty slot list. A 5s
+                        # timeout: llama-server may be slow to respond
                         # to /slots when busy generating tokens. The single-flight
                         # helper bounds a follower's wait too, so a cancelled leader
                         # can no longer stall this loop for every SSE client
                         # (LP-0MVJML600003CQ6Y, AC5).
-                        slot_details = await _query_slots_detail(
-                            llama_port, timeout=5.0, model=model_name,
-                        )
+                        if llama_port is None:
+                            slot_details = []
+                        else:
+                            slot_details = await _query_slots_detail(
+                                llama_port, timeout=5.0, model=model_name,
+                            )
                     except Exception:
                         pass
 

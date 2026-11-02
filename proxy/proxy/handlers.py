@@ -281,6 +281,14 @@ async def poll_slots_for_model(
             _ep, _port = _resolve_local_slots_target(
                 srv0, model=model, router_port=llama_port
             )
+            if _port is None:
+                # LP-0MVWBXEAI008YZ7B AC1: the resolver's (None, None) skip
+                # sentinel — the router definitively reports the model as not
+                # loaded, so a poll would only reproduce the definitive-400
+                # noise. Issue **no** /slots request (no router traversal, no
+                # fallback counter, no warning) and leave the polling state
+                # untouched.
+                return None
             if _port:
                 llama_port = _port
     except Exception:
@@ -709,39 +717,56 @@ async def get_llama_local_status(request: Request):
                 # into an HTTP 500). LP-0MTP1FQXH004JYEF: pass current_model so
                 # the lookup filters to the Qwen3 child, not the first spawn
                 # line (mxbai-embed).
+                # LP-0MVWBXEAI008YZ7B AC3: when the resolver reports a skip
+                # ((None, None)) the model is definitively not loaded — /slots
+                # would answer the same definitive 400 the ``model_absent``
+                # path below already handles (fail-open on the configured
+                # pool, no resurrected fossil counts), so the query is
+                # skipped entirely (no router request, no counts/detail
+                # fetch) and the response reports pool capacity truthfully.
                 from proxy.router_helpers import _resolve_local_slots_target
 
                 _, llama_port = _resolve_local_slots_target(
                     srv, model=cm, router_port=llama_port
                 )
-                client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-                from proxy.observability import (
-                    _last_slot_details_cache,
-                    _query_slots,
-                    _query_slots_detail,
-                    last_known_slot_counts,
-                    slots_failure_is_definitive_model_absent,
-                )
-                # The outcome of the fresh counts query (status + reason) lets
-                # the handler tell a definitive "this model is not loaded"
-                # (HTTP 400/404 from llama-server's router) from a transient
-                # failure, so a fossil cache snapshot is never served as
-                # current capacity (LP-0MVKSXR4P001V0CM AC3).
-                counts_outcome: dict = {}
-                counts_provenance: dict = {}
-                _counts_t0 = time.monotonic()
-                available_slots, total_slots = await _query_slots(
-                    client,
-                    llama_port,
-                    timeout=2.0,
-                    model=cm,
-                    status_out=counts_outcome,
-                    provenance_out=counts_provenance,
-                )
-                slots_counts_ms = int((time.monotonic() - _counts_t0) * 1000)
-                model_absent = slots_failure_is_definitive_model_absent(
-                    counts_outcome
-                )
+                if llama_port is None:
+                    total_slots = 0
+                    available_slots = 0
+                    model_absent = True
+                    detail = []
+                    slots_counts_ms = 0
+                    slots_detail_ms = 0
+                    counts_provenance = {}
+                    detail_provenance = {}
+                else:
+                    client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
+                    from proxy.observability import (
+                        _last_slot_details_cache,
+                        _query_slots,
+                        _query_slots_detail,
+                        last_known_slot_counts,
+                        slots_failure_is_definitive_model_absent,
+                    )
+                    # The outcome of the fresh counts query (status + reason) lets
+                    # the handler tell a definitive "this model is not loaded"
+                    # (HTTP 400/404 from llama-server's router) from a transient
+                    # failure, so a fossil cache snapshot is never served as
+                    # current capacity (LP-0MVKSXR4P001V0CM AC3).
+                    counts_outcome: dict = {}
+                    counts_provenance: dict = {}
+                    _counts_t0 = time.monotonic()
+                    available_slots, total_slots = await _query_slots(
+                        client,
+                        llama_port,
+                        timeout=2.0,
+                        model=cm,
+                        status_out=counts_outcome,
+                        provenance_out=counts_provenance,
+                    )
+                    slots_counts_ms = int((time.monotonic() - _counts_t0) * 1000)
+                    model_absent = slots_failure_is_definitive_model_absent(
+                        counts_outcome
+                    )
                 # Graceful degradation (LP-0MSVP7XJ6008QPKX): a /slots failure
                 # (e.g. HTTP 500 during a model reload after cheap-mode restart)
                 # previously surfaced as total_slots=0, fail-closing the herdr
