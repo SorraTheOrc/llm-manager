@@ -8286,6 +8286,18 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     :func:`_child_port_miss_ttl`, so a signal that appears later (e.g. the
     first proxied request after a restart) is picked up instead of being
     pinned for the life of the pid. A new pid (restart) re-parses.
+
+    The *loadedness* classification is **layered above** this function
+    (LP-0MVWBXEAI008YZ7B): a model the router's cached ``/models`` snapshot
+    definitively reports as not loaded is skipped by
+    :func:`_resolve_local_slots_target` **before** discovery runs. The
+    three-way outcome is therefore: **loaded** ⇒ poll (this function), i.e.
+    return the child port or ``None``; **definitively not loaded** ⇒ skip with
+    the ``llama_slots_child_port_skipped_total{reason="model_not_loaded"}``
+    signal and no request; **indeterminate** ⇒ fail open to polling. Semantics
+    here are unchanged — a missing child-port signal is still "no port"
+    (``None``), never "the model is unloaded", and a caller that is not the
+    shared resolver keeps falling back to the router port exactly as before.
     """
     try:
         proc = getattr(srv, "llama_process", None)
@@ -8482,7 +8494,11 @@ def _resolve_local_slots_target(
       **not** issue the ``/slots`` request on the sentinel — the current
       definitive-400 fall-through is behaviourally equivalent, so skipping
       never refuses or blocks a request (AC7). An *indeterminate* loadedness
-      answer (``None``) fails open: discovery proceeds exactly as today.
+      answer (``None``) fails open: discovery proceeds exactly as today. The
+      guard reads the shared TTL-cached ``/models`` snapshot
+      (:func:`_loaded_models_snapshot`) — there is no second cache and no new
+      hot-path round trip while it is warm — and compares against the router's
+      own ids so an alias/preset spelling can never be misread as unloaded.
     - When *endpoint* is the local router (loopback host on
       ``server.llama_server_port``) or omitted, the discovered child port is
       returned as ``(None, child_port)``; when discovery yields nothing, the
@@ -8495,6 +8511,18 @@ def _resolve_local_slots_target(
     sentinel** — a port of ``None`` can never be a real llama-server port, so
     a call site that ignores the sentinel fails loudly (it would build a
     ``None``-port URL) instead of silently traversing the router.
+
+    The three-way outcome (loaded ⇒ poll, definitively not loaded ⇒ skip with
+    signal, indeterminate ⇒ fail open) is pinned by
+    ``proxy/tests/test_slots_unloaded_model_skip.py``
+    (``TestUnloadedModelSkipSignal`` = AC1/AC6,
+    ``TestLoadedModelFallbackSignal`` = AC2, ``TestFailOpenCharacterisation``,
+    ``TestAdmissionUnchanged`` = AC7) and documented for operators in
+    ``docs/dev/slots-500-triage.md`` (*Observability signal* / *Target signal
+    going forward*) and ``proxy/README.md`` (*Child-port discovery* →
+    *Unloaded-model skip*). :func:`_discover_local_child_port` keeps its
+    unchanged semantics — a missing signal is still "no port"; the unloaded
+    classification is layered above it.
     """
     cfg = getattr(srv, "config", None)
     server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}

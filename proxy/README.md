@@ -2246,6 +2246,55 @@ stayed at 79.61 %, because that build predated the child-port resolver
 Figures, per-poll attribution and the re-derivation commands are in the
 [per-slot status contract](docs/per-slot-status-verification.md).
 
+#### Unloaded-model skip
+
+The fallback above is the **regression** signal: a *loaded* model whose child
+port cannot be discovered. A poll for a model that is **not loaded at all**
+carries no slot information and is not a discovery failure, so
+`_resolve_local_slots_target()` consults a synchronous loaded-set guard
+**before** discovery (LP-0MVWBXEAI008YZ7B, slice 3 of LP-0MVVCY3HQ0009F0K).
+The guard reads the same TTL-cached `/models` snapshot as the model-resolution
+rule below — no second cache and no extra `/models` request while it is warm.
+
+- **Loaded** → poll as documented above: discover the child port, and keep the
+  fallback counter + throttled warning for a loaded model with no child port.
+- **Definitively not loaded** → the resolver returns the documented
+  `(None, None)` **skip sentinel**. No `/slots` request is issued,
+  `llama_slots_child_port_fallbacks_total` is **not** incremented and no
+  `slots_child_port_unavailable` warning is emitted. The skip is recorded in
+  `llama_slots_child_port_skipped_total{reason="model_not_loaded"}` (every
+  skip) plus a throttled debug line (`slots_child_port_skipped: model not
+  loaded …`, one per 300 s). Every proxy-initiated call site honours the
+  sentinel, so no proxy surface can re-introduce the noise.
+- **Indeterminate** → **fail open**: a `/models` probe error, a stale or
+  unparseable snapshot, or a name the router does not list at all all resolve
+  to "unknown", and the poll proceeds exactly as today. The guard never skips
+  on `srv.current_model` disagreement alone.
+
+Skipping is admission-neutral: `_check_slot_availability()` already returned
+`None` for the router's definitive 400, so a skipped unloaded-model poll
+returns the same result and never starts refusing or blocking a request
+(AC7) — it only removes the request, the counter increment and the warning.
+
+Attribution is therefore unambiguous. A **skipped-counter delta with no
+corresponding router `/slots` request** is the expected unloaded-model
+outcome; a **fallback-counter delta** (with the `slots_child_port_unavailable`
+warning) is a genuine child-port discovery regression for a loaded model; a
+router-responder `/slots` 400/500 that neither counter accounts for is the
+residual class owned by LP-0MVP7HV7Q001AJF8. `_discover_local_child_port()`
+itself is unchanged — a missing signal still means "no port"; the loadedness
+classification is layered above it.
+
+The rule is verified by
+[`proxy/tests/test_slots_unloaded_model_skip.py`](tests/test_slots_unloaded_model_skip.py):
+`TestUnloadedModelSkipSignal` (AC1/AC6), `TestLoadedModelFallbackSignal`
+(AC2), `TestFailOpenCharacterisation` and `TestAdmissionUnchanged` (AC7). Run
+that module through the project test skill (or
+`pytest proxy/tests/test_slots_unloaded_model_skip.py`) to re-verify the rule.
+The operator-facing triage guidance is in
+[docs/dev/slots-500-triage.md](../docs/dev/slots-500-triage.md)
+(*Observability signal* / *Target signal going forward*).
+
 #### Model resolution rule
 
 Every proxy-initiated `/slots` query sends an explicit `?model=` — the query

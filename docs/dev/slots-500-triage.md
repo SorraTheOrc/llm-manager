@@ -156,6 +156,24 @@ discovery silently failed, plus two call sites never consulted it:
 - `proxy.log`: `slots_child_port_unavailable: no model child port
   discovered for model=<m>; falling back to router port 8080 — ...`
 - `/metrics`: `llama_slots_child_port_fallbacks_total` (by reason).
+- `/metrics`: `llama_slots_child_port_skipped_total{reason="model_not_loaded"}`
+  (LP-0MVWBXEAI008YZ7B, slice 3 of LP-0MVVCY3HQ0009F0K) — incremented once per
+  **deliberately skipped** poll, i.e. a `/slots` query for a model the router's
+  TTL-cached `/models` loaded set definitively reports as *not loaded*. Such a
+  poll issues **no** request and does **not** touch
+  `llama_slots_child_port_fallbacks_total`, so the two counters partition the
+  traffic: **fallback** = a *loaded* model whose child port could not be
+  discovered (the LP-0MVP7525P008RXMF AC3 regression signal), **skipped** = an
+  unloaded model (expected — there is no slot state to learn). `proxy.log`
+  carries the matching throttled debug line (one per 300 s):
+  `slots_child_port_skipped: model not loaded — skipping /slots poll for
+  model=<m> (source=<s>)`.
+- Loadedness is read from the **same** cached `/models` snapshot as the model
+  resolution rule (`is_model_known_unloaded()`, no second cache). Only a
+  model the router lists **and** reports as not loaded is skipped; an
+  errored/stale probe or a name the router does not list is *indeterminate*
+  and fails open to polling as before (the guard never skips on
+  `srv.current_model` disagreement alone).
 - `llama-server.log`: post-restart `/slots` polls should be answered by the
   model child (`[pid]`-prefixed lines) rather than the router; router :500
   counts toward 0. Router-responder `/slots` traffic is proxy-originated only
@@ -310,8 +328,31 @@ Consequences when reading these figures:
   500s are a genuine polling-path regression and
   `llama_slots_child_port_fallbacks_total` (plus the child-vs-router 200
   split) tells you which path regressed.
+- **Unloaded-model polls are no longer issued at all** (LP-0MVWBXEAI008YZ7B):
+  a `/slots` query for a model the router's cached `/models` snapshot reports
+  as not loaded is skipped before any request, so it contributes neither a
+  router request nor a router-responder 400/500. The skip is counted in
+  `llama_slots_child_port_skipped_total{reason="model_not_loaded"}`: a
+  non-zero value there is a *deliberate* poll suppression, not a missing
+  poll, and the unloaded-model class (`gpt120` in the 2026-10-28 window) no
+  longer reaches the router at all.
+- **Attribution rule when a router-responder `/slots` 400/500 does appear.**
+  Read the two counters, not the access line (the query string is absent): a
+  **skipped** delta means the proxy suppressed the poll, so a post-guard
+  unloaded-model event cannot be proxy-originated and an unexplained 400/500
+  is either the unknown/missing class (a proxy defect) or an external probe; a
+  **fallback** delta together with the `slots_child_port_unavailable` warning
+  means a *loaded* model's child port was not discoverable and the poll did
+  traverse the router — that is the genuine discovery regression to chase.
+- An **unloaded**-class 400 is expected truth and is not a regression: the
+  definitive model-absent answer keeps callers failing open
+  (`slots_failure_is_definitive_model_absent()`, see *The three router `/slots`
+  400 classes* below), and skipping the poll is admission-neutral.
 - The post-fix 24 h confirmation window is AC3 of LP-0MVVCXUDZ007XID0, using
-the recipe in this document.
+  the recipe in this document. The skip rule itself is verified by
+  `proxy/tests/test_slots_unloaded_model_skip.py`
+  (`TestUnloadedModelSkipSignal` = AC1/AC6, `TestLoadedModelFallbackSignal`
+  = AC2, `TestFailOpenCharacterisation`, `TestAdmissionUnchanged` = AC7).
 
 ## The three router `/slots` 400 classes
 
@@ -335,6 +376,15 @@ Reading a 400 in a triage window:
 a non-zero count is acceptable only when each event is explained by the
 unloaded-model class or by a call site removed in LP-0MVP7HV7Q001AJF8. An
 unexplained event reopens the item.
+- Attribute the **unloaded** class with the proxy counters, not the access
+  line: `llama_slots_child_port_skipped_total{reason="model_not_loaded"}`
+  counts polls the proxy deliberately suppressed (no request issued at all,
+  since LP-0MVWBXEAI008YZ7B), so a **skipped** delta cannot produce a 400;
+  `llama_slots_child_port_fallbacks_total{reason="no_child_port_router_mode"}`
+  plus the `slots_child_port_unavailable` warning counts polls that *did*
+  traverse the router because a loaded model's child port was not
+  discoverable (a regression, never the unloaded class). A 400 explained by
+  neither counter is the unknown/missing class and reopens the item.
 - The proxy-side metric `llama_slots_query_failures_total{reason="http_400"}`
 records the class for the status path (`_query_slots`); the detail and progress
 paths record no failure metric yet — that gap is LP-0MVTDMXXH005D5D5.
