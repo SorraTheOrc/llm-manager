@@ -1,0 +1,1494 @@
+{
+  "window": {
+    "start": "2026-10-29T12:58:32+00:00",
+    "end": "2026-10-31T04:09:00+00:00",
+    "hours": 39.17
+  },
+  "per_path": {
+    "router": {
+      "attempts": 47,
+      "ok": 46,
+      "failed": 1
+    },
+    "eviction": {
+      "attempts": 153,
+      "ok": 60,
+      "failed": 93
+    }
+  },
+  "failure_reasons": {
+    "ReadTimeout/ReadTimeout": 94
+  },
+  "failure_elapsed_seconds": {
+    "3.0": 80,
+    "3.1": 7,
+    "3.2": 2,
+    "3.4": 1,
+    "3.5": 1,
+    "3.8": 1,
+    "35.6": 1,
+    "9.3": 1
+  },
+  "timeout_used_seconds": {
+    "3.0": 93,
+    "35.6": 1
+  },
+  "busy_at_failure": {
+    "failures_with_zero_proxy_queries": 11,
+    "active_queries_distribution": {
+      "0": 11,
+      "1": 35,
+      "2": 16,
+      "3": 9,
+      "4": 7,
+      "5": 3,
+      "8": 7,
+      "11": 1,
+      "12": 1,
+      "14": 3,
+      "15": 1
+    },
+    "local_active_queries_distribution": {
+      "0": 14,
+      "1": 61,
+      "2": 19
+    }
+  },
+  "success_duration_logged": false,
+  "failures": [
+    {
+      "ts": "2026-10-29 13:01:57",
+      "path": "router",
+      "slot": 0,
+      "session": null,
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 35.6,
+      "timeout_s": 35.6,
+      "busy": {
+        "active_queries": 4,
+        "local_active_queries": 2,
+        "active_sessions": 2,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 13:56:54",
+      "path": "eviction",
+      "slot": 1,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:10:16",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.4,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:11:22",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:12:31",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 4,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:18:06",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 8,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:20:08",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 8,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:22:20",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.1,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 8,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:28:10",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.1,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 11,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:35:22",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.8,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 14,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:37:40",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.2,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 14,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:43:43",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 14,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:47:58",
+      "path": "eviction",
+      "slot": 1,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 15,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 14:50:28",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a187fc",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.1,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 15:21:21",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 15:22:20",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.1,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 18:38:18",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 4,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 18:40:17",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.5,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 5,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 18:40:36",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 4,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 18:51:29",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 18:52:02",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 18:52:55",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 4,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 21:44:46",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 21:45:26",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 21:45:42",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 22:03:51",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 22:04:45",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 22:54:25",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.1,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 8,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 22:54:32",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 8,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 22:58:43",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 22:59:14",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-29 23:00:05",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 4,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 01:23:39",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 01:24:01",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 01:25:16",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 01:36:30",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 01:37:02",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 03:01:33",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a18ac0",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 03:02:07",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a18ac0",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 03:02:22",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a18ac0",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 04:11:34",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 04:12:10",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 04:12:32",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 04:29:37",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 4,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 04:30:23",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-AH",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 5,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 04:58:23",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 5,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 06:06:18",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 06:06:23",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 06:11:58",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 06:13:08",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 06:13:38",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 06:28:22",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 06:28:46",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 06:29:22",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 3,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 08:48:51",
+      "path": "eviction",
+      "slot": 1,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 08:49:45",
+      "path": "eviction",
+      "slot": 1,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 09:50:38",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 09:51:06",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 09:51:37",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 10:42:25",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.1,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 10:50:28",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 8,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 10:54:24",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 10:58:00",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 10:59:03",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 11:00:24",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 13:49:43",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 13:51:37",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 14:08:31",
+      "path": "eviction",
+      "slot": 1,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 8,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 14:45:04",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 14:45:12",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 14:50:29",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-SA",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 9.3,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 15:10:05",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-RI",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 15:11:36",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-RI",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 15:11:52",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-RI",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 18:48:37",
+      "path": "eviction",
+      "slot": 1,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 18:48:53",
+      "path": "eviction",
+      "slot": 1,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 18:49:08",
+      "path": "eviction",
+      "slot": 1,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 19:02:14",
+      "path": "eviction",
+      "slot": 1,
+      "session": "01a18e2b",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 19:03:32",
+      "path": "eviction",
+      "slot": 1,
+      "session": "01a18e2b",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 19:03:48",
+      "path": "eviction",
+      "slot": 1,
+      "session": "01a18e2b",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.1,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 19:08:53",
+      "path": "eviction",
+      "slot": 1,
+      "session": "01a18e2b",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 19:10:44",
+      "path": "eviction",
+      "slot": 1,
+      "session": "01a18e2b",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 19:11:00",
+      "path": "eviction",
+      "slot": 1,
+      "session": "01a18e2b",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 19:16:27",
+      "path": "eviction",
+      "slot": 1,
+      "session": "01a18e2b",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 22:52:53",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-RI",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 22:53:55",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-RI",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 22:55:50",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-RI",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.2,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 2,
+        "local_active_queries": 2,
+        "active_sessions": 1,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 23:34:16",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a18f25",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 23:35:23",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a18f25",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-30 23:37:02",
+      "path": "eviction",
+      "slot": 0,
+      "session": "01a18f25",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-31 00:46:19",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-31 00:52:52",
+      "path": "eviction",
+      "slot": 0,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 12,
+        "local_active_queries": 1,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-31 01:13:52",
+      "path": "eviction",
+      "slot": 1,
+      "session": "audit-LP",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 1,
+        "local_active_queries": 1,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    },
+    {
+      "ts": "2026-10-31 04:01:32",
+      "path": "eviction",
+      "slot": 0,
+      "session": "herdr-17",
+      "error": "ReadTimeout/ReadTimeout",
+      "elapsed_s": 3.0,
+      "timeout_s": 3.0,
+      "busy": {
+        "active_queries": 0,
+        "local_active_queries": 0,
+        "active_sessions": 0,
+        "slot_busy": false
+      }
+    }
+  ],
+  "persistence_skips": {
+    "slot_busy": 375
+  },
+  "seed_outcomes": {
+    "missing_sidecar": 863,
+    "missing_snapshot": 32
+  },
+  "seeds_by_last_attempt": {
+    "missing_sidecar": {
+      "eviction": 263,
+      "eviction-failed": 316,
+      "no-save-in-window": 39,
+      "router": 245
+    },
+    "missing_snapshot": {
+      "eviction": 9,
+      "eviction-failed": 20,
+      "no-save-in-window": 3
+    }
+  },
+  "failed_save_attribution": {
+    "missing_sidecar": 316,
+    "missing_snapshot": 20
+  }
+}

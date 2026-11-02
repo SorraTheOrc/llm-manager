@@ -1124,7 +1124,9 @@ def test_eviction_saves_slot_snapshot(tmp_path, monkeypatch, caplog):
 
     calls = []
 
-    async def _fake_save(port, slot_id, filename, timeout, model=None, endpoint=None):
+    async def _fake_save(
+        port, slot_id, filename, timeout, model=None, endpoint=None, source=None
+    ):
         calls.append((port, slot_id, filename))
         return True
 

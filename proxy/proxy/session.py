@@ -700,6 +700,7 @@ async def _call_slot_endpoint(
     timeout: float,
     model: str | None = None,
     endpoint: str | None = None,
+    source: str = "unknown",
 ) -> bool:
     """Make a slot save/restore HTTP call to llama-server.
 
@@ -725,6 +726,13 @@ async def _call_slot_endpoint(
     Failures feed the circuit breaker (``_slot_failure_state``) so repeated
     timeouts disable persistence for the slot instead of piling doomed
     KV-cache copies onto the GPU (LP-0MS91DHPZ001VWQO).
+
+    *source* names the call path that issued the request (``router`` or
+    ``eviction``) and is appended to every log line. Both paths reach this
+    helper, so without it a ``slot_save failed`` line could not be attributed
+    to a path — the measurement error behind the 2026-10-29..31 "66 %
+    router-path failure" reading, which was mostly eviction saves
+    (LP-0MVVX6RM3001P4EY).
     """
     if not filename:
         return False
@@ -744,7 +752,7 @@ async def _call_slot_endpoint(
             body = getattr(response, "text", "")
             busy = _slot_busy_state_snapshot(slot_id)
             srv.logger.warning(
-                "slot_%s failed slot=%s status=%s body=%s elapsed=%.1fs timeout=%.1fs busy=%s",
+                "slot_%s failed slot=%s status=%s body=%s elapsed=%.1fs timeout=%.1fs busy=%s source=%s",
                 action,
                 slot_id,
                 response.status_code,
@@ -752,6 +760,7 @@ async def _call_slot_endpoint(
                 elapsed,
                 timeout,
                 json.dumps(busy),
+                source,
             )
             _record_slot_failure(slot_id)
             return False
@@ -760,11 +769,12 @@ async def _call_slot_endpoint(
         # save/restore latency vs the adaptive timeout (llama-server logs
         # lack timestamps; LP-0MSI1RWLM007N367 F1).
         srv.logger.debug(
-            "slot_%s ok slot=%s elapsed=%.1fs timeout=%.1fs",
+            "slot_%s ok slot=%s elapsed=%.1fs timeout=%.1fs source=%s",
             action,
             slot_id,
             elapsed,
             timeout,
+            source,
         )
         return True
     except Exception as exc:
@@ -775,7 +785,7 @@ async def _call_slot_endpoint(
         detail = str(exc) if str(exc) else exc_type
         busy = _slot_busy_state_snapshot(slot_id)
         srv.logger.warning(
-            "slot_%s failed slot=%s error=%s/%s elapsed=%.1fs timeout=%.1fs busy=%s",
+            "slot_%s failed slot=%s error=%s/%s elapsed=%.1fs timeout=%.1fs busy=%s source=%s",
             action,
             slot_id,
             exc_type,
@@ -783,6 +793,7 @@ async def _call_slot_endpoint(
             elapsed,
             timeout,
             json.dumps(busy),
+            source,
         )
         # Feed the circuit breaker so repeated timeouts disable persistence.
         _record_slot_failure(slot_id)
@@ -809,6 +820,7 @@ async def _restore_slot_snapshot(
     timeout: float,
     model: str | None = None,
     endpoint: str | None = None,
+    source: str = "unknown",
 ) -> bool:
     try:
         if not Path(filename).exists():
@@ -823,6 +835,7 @@ async def _restore_slot_snapshot(
         timeout,
         model=model,
         endpoint=endpoint,
+        source=source,
     )
 
 
@@ -833,6 +846,7 @@ async def _save_slot_snapshot(
     timeout: float,
     model: str | None = None,
     endpoint: str | None = None,
+    source: str = "unknown",
 ) -> bool:
     return await _call_slot_endpoint(
         llama_port,
@@ -842,7 +856,40 @@ async def _save_slot_snapshot(
         timeout,
         model=model,
         endpoint=endpoint,
+        source=source,
     )
+
+
+def _recorded_eviction_prompt_tokens(session_id: str | None) -> int:
+    """Recorded prompt tokens for an evicted session (``0`` when unknown).
+
+    The eviction save path has no request body, so ``_build_slot_context``
+    cannot estimate the slot's context size itself. Without an estimate the
+    adaptive timeout degrades to the static base
+    (``session_slot_timeout_seconds``, 3.0 s deployed) and every large
+    snapshot ReadTimeouts: 93 of 94 save failures in the 2026-10-29..31 window
+    were eviction saves logged at ``timeout=3.0s``, including 11 with zero
+    active queries (LP-0MVVX6RM3001P4EY). The session's recorded measured
+    prefix is the same trustworthy token count the sidecar writer uses, so
+    the eviction plan feeds it into the existing adaptive formula rather than
+    introducing a new tuning value. Returns ``0`` when nothing is recorded,
+    which keeps the base timeout for a genuinely unknown context.
+    """
+    if not session_id:
+        return 0
+    try:
+        from proxy.provider import get_recorded_prompt_prefix
+
+        model = getattr(_srv(), "current_model", None)
+        if not model:
+            return 0
+        recorded = get_recorded_prompt_prefix(model, session_id)
+        if not recorded:
+            return 0
+        tokens, _fingerprints = recorded
+        return int(tokens or 0)
+    except Exception:
+        return 0
 
 
 def plan_eviction_snapshot(
@@ -872,7 +919,11 @@ def plan_eviction_snapshot(
         if _assigned_slot_for_session(session_id, endpoint=endpoint) is None:
             return None
         slot_id, filename, timeout = _build_slot_context(
-            server_config, session_id, None, endpoint=endpoint
+            server_config,
+            session_id,
+            None,
+            endpoint=endpoint,
+            estimated_tokens=_recorded_eviction_prompt_tokens(session_id),
         )
     except Exception:
         return None
@@ -923,6 +974,7 @@ async def save_evicted_session_snapshot(
             timeout,
             model=model,
             endpoint=endpoint,
+            source="eviction",
         )
         report["saved"] = bool(saved)
         try:
@@ -1243,6 +1295,7 @@ def _build_slot_context(
     session_id: str | None,
     body_json: dict | None = None,
     endpoint: str | None = None,
+    estimated_tokens: int | None = None,
 ) -> tuple[int | None, str | None, float]:
     """Build the slot context for a request, applying persistence safeguards.
 
@@ -1268,6 +1321,13 @@ def _build_slot_context(
     When ``session_slot_timeout_per_token_seconds`` is configured, the
     returned timeout scales with the estimated context size, capped at
     ``session_slot_max_timeout_seconds``.
+
+    *estimated_tokens* supplies that estimate for a caller with no request
+    body of its own (the eviction save path, which holds a session prefix but
+    not the request that filled the slot). It feeds the SAME estimate and the
+    SAME adaptive formula as the body-derived path; ``0``/``None`` falls back
+    to the body estimate, and an unknown context keeps the static base timeout
+    (LP-0MVVX6RM3001P4EY).
     """
     slot_path = server_config.get("session_slot_save_path")
     slot_pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
@@ -1322,25 +1382,32 @@ def _build_slot_context(
         if _persist_threshold > max_prompt_tokens:
             max_prompt_tokens = _persist_threshold
     per_token = float(server_config.get("session_slot_timeout_per_token_seconds", 0.0) or 0.0)
-    need_estimate = max_prompt_tokens > 0 or per_token > 0
+    explicit_estimate = int(estimated_tokens or 0)
+    need_estimate = explicit_estimate > 0 or max_prompt_tokens > 0 or per_token > 0
     # Resolve the request's model config so the persistence estimate uses the
     # SAME tokenizer resolution chain as the routing clamp (AC3,
     # LP-0MSEQ71IF0003FRT). Falls back to None (server-level multiplier only)
     # when the model cannot be resolved (e.g. unit tests without a live
-    # server, or requests with no model field).
+    # server, or requests with no model field). Skipped when the caller
+    # already supplies the estimate.
     model_config = None
-    if isinstance(body_json, dict) and body_json.get("model"):
+    if (
+        explicit_estimate <= 0
+        and isinstance(body_json, dict)
+        and body_json.get("model")
+    ):
         try:
             from proxy.lifecycle import get_model_config
 
             model_config = get_model_config(body_json.get("model"))
         except Exception:
             model_config = None
-    estimated = (
-        _estimate_slot_prompt_tokens(body_json, server_config, model_config)
-        if need_estimate
-        else 0
-    )
+    if explicit_estimate > 0:
+        estimated = explicit_estimate
+    elif need_estimate:
+        estimated = _estimate_slot_prompt_tokens(body_json, server_config, model_config)
+    else:
+        estimated = 0
     if max_prompt_tokens > 0 and estimated > max_prompt_tokens:
         logger.info(
             "slot persistence skipped session=%s estimated_tokens=%d max_prompt_tokens=%d reason=context_too_large",

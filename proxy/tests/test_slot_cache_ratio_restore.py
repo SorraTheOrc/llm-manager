@@ -994,7 +994,9 @@ class TestEvictionSnapshotPairing:
 
         filename, server = self._slot_paths(tmp_path)
 
-        async def _fake_save(_port, _slot, target, _timeout, model=None, endpoint=None):
+        async def _fake_save(
+            _port, _slot, target, _timeout, model=None, endpoint=None, source=None
+        ):
             # llama-server contract: it accepts only a bare filename and writes
             # it under its own --slot-save-path (the cache root).
             on_disk = Path(server["session_slot_save_path"]) / Path(target).name
@@ -1328,7 +1330,7 @@ class TestSnapshotDirectoryAlignment:
         written: list[Path] = []
 
         async def _fake_save(
-            _port, _slot, target, _timeout, model=None, endpoint=None
+            _port, _slot, target, _timeout, model=None, endpoint=None, source=None
         ):
             on_disk = Path(config["session_slot_save_path"]) / Path(target).name
             on_disk.write_bytes(b"KV-SNAPSHOT")

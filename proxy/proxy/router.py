@@ -3571,6 +3571,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             slot_timeout,
                             model=slot_model_payload,
                             endpoint=endpoint,
+                            source="router",
                         )
 
                         if restored:
