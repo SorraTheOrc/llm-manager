@@ -349,6 +349,18 @@ PROXY_DIR = REPO_ROOT / "proxy"
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
+# A same-process import of the ``proxy`` package elsewhere (e.g. the
+# proxy-usage-analysis skill suite's ``aggregation.compaction_impact``
+# lazy-import) can leave a stale ``sys.modules["proxy"]`` entry (observed as
+# ``None`` under the full test suite, LP-0MVYMX0KF001FLY5) that makes this
+# import fail even though the path is correct. Refresh the cache so the
+# constant is read from the on-disk package the proxy ships (a re-typed
+# string is exactly the drift failure this module exists to prevent).
+if "proxy" in sys.modules and not hasattr(sys.modules["proxy"], "measured_cache_abort"):
+    del sys.modules["proxy"]
+    for name in [n for n in sys.modules if n.startswith("proxy.")]:
+        del sys.modules[name]
+
 from proxy.measured_cache_abort import (  # noqa: E402
     MEASURED_CACHE_DEFICIT_REASON,
 )
