@@ -132,6 +132,39 @@ runtime-cost rationale:
 The upstream acceptance record mirrors this decision — see
 [SA-0MVQJSGLY0098DVB](worklog).
 
+## One pytest configuration, at the repository root (LP-0MVZ43UR8004IL8Y)
+
+`pytest.ini` at the repository root is the **only** pytest configuration file
+in the tree; `proxy/pytest.ini` was folded into it (same marker registry, no
+new options, no `testpaths`). The move is a correctness fix, not a coverage
+change: the full suite still resolves exactly the same test set, and
+`.pi/test-config.json` still carries **no** `suiteCommands` pin (the no-pin
+rule above).
+
+**Why it is load-bearing.** pytest's rootdir algorithm looks upward from the
+initial paths' common ancestor for a configuration file and, failing that,
+adopts a configuration file found deeper in the tree. While `proxy/pytest.ini`
+was the only configuration file, any invocation that named a `proxy/` path
+resolved `rootdir` to `<repo>/proxy` — including
+`implement.py finish`'s changed-scope selection, which mixes
+`.pi/skills/proxy-usage-analysis/tests` with `proxy/tests` in one process.
+Test modules outside that rootdir then lost the file component of their node
+ids (`::Class::test`), so unrelated modules shared a node-id prefix and
+module-level autouse fixtures leaked across them: `_no_prometheus` from
+`test_capacity_signals.py` replaced `gpu_busy.compute_gpu_busy` inside
+`test_gpu_busy.py`, and three GPU-busy tests failed with `None` because their
+`patch("gpu_busy.query_prometheus")` had nothing left to intercept. The same
+tests passed in every other invocation (the skill suite alone, the
+pair-of-modules run, the full suite), which is what made the failure look
+like a flake.
+
+**The contract is pinned** by
+[`proxy/tests/test_pytest_rootdir_contract.py`](../proxy/tests/test_pytest_rootdir_contract.py):
+a mixed `.pi`/`proxy` collection must report the repository root as `rootdir`,
+keep file-qualified node ids, and execute the three previously-failing tests
+successfully in one process. Add new pytest markers to the root `pytest.ini`,
+never to a nested configuration file.
+
 ## Install (one-time, per clone)
 
 ```bash
