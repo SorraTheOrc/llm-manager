@@ -325,3 +325,68 @@ class TestIsModelKnownUnloaded:
         assert rh.is_model_known_unloaded(srv, "no-status-model") is False
         assert rh.is_model_known_unloaded(srv, "loading-model") is True
         assert rh.is_model_known_unloaded(srv, "error-model") is True
+
+
+# ---------------------------------------------------------------------------
+# The two "is it loaded" views cannot disagree (shared readiness rules)
+# ---------------------------------------------------------------------------
+
+
+#: Every readiness shape the router builds have been observed to emit.
+READINESS_SHAPES = {
+    "presence-no-status": {},
+    "loaded": {"status": {"value": "loaded"}},
+    "ready": {"status": {"value": "ready"}},
+    "running": {"status": {"value": "running"}},
+    "active": {"status": {"value": "active"}},
+    "loading": {"status": {"value": "loading"}},
+    "unloaded": {"status": {"value": "unloaded"}},
+    "error": {"status": {"value": "error"}},
+    "failed": {"status": {"value": "failed"}},
+    "status-string-loaded": {"status": "Loaded"},
+    "status-string-unloaded": {"status": "unloaded"},
+    "unknown-status-value": {"status": {"value": "mystery"}},
+    "unknown-status-shape": {"status": 7},
+}
+
+
+class TestViewsAgree:
+    @pytest.mark.asyncio
+    async def test_async_and_sync_views_agree_on_every_readiness_shape(
+        self, tmp_path, monkeypatch
+    ):
+        """AC5: the shared readiness rules keep both views in lockstep.
+
+        The async ``router_is_model_loaded()`` and the synchronous
+        ``is_model_known_unloaded()`` must never disagree for the same
+        ``/models`` payload — a disagreement would either skip a loaded model's
+        poll or poll an unloaded one.
+        """
+        from proxy import lifecycle
+
+        payload = {
+            "object": "list",
+            "data": [
+                {"id": name, **shape} for name, shape in READINESS_SHAPES.items()
+            ],
+        }
+        srv = _srv(tmp_path, payload=payload)
+        await rh.ensure_router_model_ids(srv)
+
+        async def _list_models():
+            return payload
+
+        monkeypatch.setattr(
+            lifecycle,
+            "_srv",
+            lambda: SimpleNamespace(router_list_models=_list_models),
+        )
+
+        for name in READINESS_SHAPES:
+            async_loaded = await lifecycle.router_is_model_loaded(name)
+            known_unloaded = rh.is_model_known_unloaded(srv, name)
+            assert known_unloaded is not None, name
+            assert known_unloaded is (not async_loaded), (
+                f"views disagree for {name}: async_loaded={async_loaded}, "
+                f"known_unloaded={known_unloaded}"
+            )
