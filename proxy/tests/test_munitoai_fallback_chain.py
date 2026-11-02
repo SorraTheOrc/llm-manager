@@ -178,7 +178,7 @@ def test_munitoai_paid_tier_is_restricted_to_business_hours(model):
 def _utc(hour: int, minute: int):
     import datetime as _dt
 
-    return _dt.datetime(2026, 10, 20, hour, minute, tzinfo=_dt.timezone.utc)
+    return _dt.datetime(2026, 10, 20, hour, minute, tzinfo=_dt.UTC)
 
 
 @pytest.mark.parametrize("model", CHAINS)
