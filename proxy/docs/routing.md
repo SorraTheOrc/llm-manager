@@ -2729,14 +2729,49 @@ deadline when the safety fraction is `0`) and waiting could not have succeeded.
 A deficit the gate declines continues the dispatch and abandons nothing (see
 [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135)).
 
-The cancel is real on this build, not decoration. llama-server aborts at its
-next write to the socket, and `return_progress` guarantees such writes
-throughout prefill. Evidence (2026-10-28 `llama-server.log`, 82
-`Connection handling canceled` events): **42** of them cancelled a task that
-never reached `prompt processing done`, i.e. mid-prefill cancellation is
-achievable and observable here. The sequence is always
+The cancel is real on **every** release path, not decoration. llama-server
+aborts at its next write to the socket, and `return_progress` guarantees such
+writes throughout prefill. The sequence is always
 `Connection handling canceled` → `stop: cancel task, id_task = N` →
 `slot release: … stop processing`.
+
+Per-path status — what each abandonment does to the backend:
+
+| Release path | Cancels the upstream stream? | Records slot identity? |
+|---|---|---|
+| `prefill_deadline` | **yes** — the handler passes `upstream_stream_cm=cm` and `abandoned_slot_id` | yes |
+| `session_evicted` | **yes** — the pinned `stream_cm` of each released record | yes |
+| `no_progress_watchdog` | **yes** — the record's `stream_cm` (`LP-0MVIQ0FJC000YLX0`) | yes |
+| `client_disconnect` | **yes** — the record's `stream_cm` (`LP-0MVLFVY6K003VYEL`) | yes |
+| `orphan_cleanup` | **yes** — same shared cancel/annotate core | yes |
+| `measured_cache_deficit` (Option D) | **yes since `LP-0MVUVHAQP001IRKK`** — the `MeasuredCacheAbortDetourError` arm in `proxy/proxy/router.py` now passes both `upstream_stream_cm=cm` and `abandoned_slot_id=slot_id`; before that change it closed `cm` itself and recorded no slot identity | yes |
+
+The per-path behaviour above is measured, not inferred. The evidence lives in
+[abandoned-prefill-release-cancel.md](../../docs/dev/abandoned-prefill-release-cancel.md)
+(child `LP-0MVW8S7QY002S7DV`, parent `LP-0MVVEQW5Y00962T2`) and is taken on
+the paths that actually produce the releases, not on the deadline path alone:
+
+- **Per-release cancel rate** (canonical 24 h window, 2026-10-29 14:08 →
+  2026-10-30 14:08 UTC): **300 of 375 post-acceptance releases (80.0 %)** had
+  an observed backend cancel. **66 % of that window's releases are Option D**
+  (`measured_cache_deficit`, 248 of 375), so the rate is dominated by the path
+  that produces most releases rather than by the deadline.
+- **H1 refuted — an abandoned prefill does not run to completion.** Over a
+  day-aligned 48 h window **748 of 2 581** backend launches stopped before
+  emitting `prompt eval time`, and post-cancel progress is at most 4 batches
+  and ≤ 1 746 tokens (one to two `ubatch`es).
+- **The stop is bounded.** `cancel → stop processing` p90 **6.585 s**, exactly
+  one `--ubatch-size 1024` at the window's measured **155.51 tok/s**. The
+  recorded bound is **6.6 s**.
+
+The 2026-10-28 sampler (**42 of 82** `Connection handling canceled` events,
+never reaching `prompt processing done`) is retained here as history: it was
+taken on the **deadline** path and must not be quoted as a generic
+per-release rate. What the logs cannot always supply is *attribution*, not
+cancellation: 227 of the 375 releases pair with a bare
+`operator(): http client error: Connection handling canceled` line that
+carries no task id (`unjoined_reason=cancel_without_task_id`), so the cancel is
+observed but the task cannot be named.
 
 Because the backend can lag the close, the abandonment is also **recorded**
 (`_record_abandoned_slot`, `proxy/proxy/router_helpers.py`) with a bounded TTL

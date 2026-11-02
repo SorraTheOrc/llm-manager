@@ -123,6 +123,18 @@ MEASURED_DEFICIT_RATIO_MIN = 4.0
 #: (tokens/s). This is F5's replay rate (LP-0MVR7IXAI002QXXD: the baseline
 #: window's prompt-eval p10) and the same value LP-0MVS03KCV005BTGE used to
 #: price early-abort waste, so the backlog figure is comparable with both.
+#:
+#: **Retained only as the legacy comparison basis** (LP-0MVW8S8ZK001ZZRV). It
+#: prices a whole remaining prompt, which the measurement refuted: a released
+#: prefill is cancelled at the backend's next socket write, so the backlog is
+#: the in-flight `ubatch` (p90 cancel→stop 6.6 s at the measured 155.51 tok/s
+#: on the 2026-10-29 window), not `tokens / 43.1` seconds — two to three orders
+#: of magnitude smaller. The model of record is ``basis="measured_stop"`` in
+#: :func:`abandoned_prefill_windows` (observed stop latency and tokens actually
+#: evaluated after the cancel); this constant still drives
+#: ``basis="legacy_rate_estimate"`` rows and ``legacy_duration_s`` so the
+#: published legacy figures stay reproducible and comparable.
+#: See ``docs/dev/abandoned-prefill-release-cancel.md``.
 ABANDONED_PREFILL_RATE_TOK_S = 43.1
 
 #: Slack allowed between an abort and a following dispatch that is treated as
