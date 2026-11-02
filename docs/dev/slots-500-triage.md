@@ -404,3 +404,71 @@ prefix defeats `_ACCESS_RE`, so they land in `unknown:?` rather than being
 attributed to their pid — the responder split therefore *under*-counts child
 503s while still reporting them. Tracked separately
 (`discovered-from:LP-0MVVWTWGY004BO5H`).
+## Post-fix 24 h window verification (LP-0MVVLKPBM007F6U6, 2026-11-01 → 2026-11-02) — RED
+
+**Work item:** LP-0MVVLKPBM007F6U6 (verifies the LP-0MVVCXUDZ007XID0 `/health` probe fix)
+**Window:** 2026-11-01T00:41:55Z → 2026-11-02T00:41:55Z (fix-era restart 2026-10-31T00:41:55Z + 24 h;
+measured 2026-11-02T08:00Z; raw evidence in
+[`router-slots-500-window-2026-11-01-to-02.json`](router-slots-500-window-2026-11-01-to-02.json))
+
+### TL;DR — verdict RED, the probe fix holds, a residual floor persists
+
+Router-responder `GET /slots ... 500` is **not zero** in the window:
+**≈ 385 in-window (superset 752 across three files)**, i.e. AC1 of the
+verification item is unmet. The `/health` probe **contributes 0** (verified
+live: 10 sequential `/health` curls produced 0 new `/slots` lines, and the
+deployed code probes `/models` + `/health` only). The known `gpt120`
+chat-fallback confound (LP-0MVVCY3HQ0009F0K) is **absent**. The residual is
+proxy-initiated Qwen3 (chat model) slot polling that still traverses the
+router port :8080 and 500s on busy-child moments at a persistent ~16/day
+floor (rate-matched to the parent window's non-probe share; the parent's
+full attribution of 1,171 to the probe overstates its share). Filed as
+**LP-0MVYZ8Z16004QIRG**.
+
+### Method and window file sets
+
+Access lines carry no timestamps; the window is scoped by file. Rotation
+boundaries: 11-01 00:00 copytruncate → `llama-server.log-2026-11-01.gz`;
+11-01 21:26:39 in-process restart rotation → `llama-server.1.log`;
+11-02 00:00 copytruncate → `llama-server.log-2026-11-02`; live
+`llama-server.log` continues to measurement time. Superset
+[11-01 00:00 → 11-02 07:57] ⊇ window.
+
+| File | Content range (UTC) | router 200 | router 400 | router 500 | child 200 | child 400/500 |
+|---|---|---|---|---|---|---|
+| `llama-server.1.log` | 11-01 00:00 → 21:26:39 | 401 | 1,864 | **331** | 60,301 | 0 |
+| `llama-server.log-2026-11-02` | 11-01 21:26:39 → 11-02 00:00 | 17 | 92 | **31** | 5,614 (+1×503) | 0 |
+| `llama-server.log` (live) | 11-02 00:00 → 07:57 | 396 | 1,941 | **390** | 19,412 | 0 |
+| **superset total** | | **814** | **3,897** | **752** | **85,328** | **0** |
+
+In-window estimate ≈ 385 (time-proportional; bounded 385 ≤ in-window ≤ 752).
+
+### Restart integrity (AC3)
+
+Three `Starting LLama Proxy Server` events inside the window (11-01
+13:12:53, 13:17:50, 21:26:41 UTC); current pid 1487007 (lstart
+11-01T21:26:39Z) replaced the fix-era pid 3944027 (lstart 10-31T00:41:55Z).
+At least one in-window pid change ⇒ **`llama_slots_child_port_fallbacks_total`
+delta unavailable**; per-file log counts only. The llama-server router was
+pid 32809 until 21:26:39, then 54819 (no router respawn at 13:12/13:17).
+
+### `slots_stale` share and fallback signals (AC2)
+
+- 20,926 `status_request` polls; **slots_stale=True 8,929 / 20,926 = 42.7 %**
+  (above the parent post-fix window's 31.4 %, below the pre-fix 64.4 %
+  baseline); active-prefill subset 14,482 / 20,926 = 69.2 %.
+- 3 throttled `slots_child_port_unavailable` WARNINGs (one per restart,
+  `source=log_signal`, model=Qwen3); current-process counter
+  `llama_slots_child_port_fallbacks_total{reason="no_child_port_router_mode"} 1`
+  and `llama_slots_query_failures_total{reason="timeout"} 9,001` (delta N/A).
+
+### Residual 500s: the probe is not the source
+
+The probe fix is effective on both axes: the live repro adds 0 `/slots`
+lines per `/health` call (pre-fix: one per call, 6×500 per 10 calls), and
+`proxy/proxy/lifecycle.py:751-754` probes `/models` + `/health` only in
+router mode. The residual router 500/400 lines are therefore a separate
+Qwen3 chat-model polling path that still hits the router port (live `ss`
+shows persistent proxy→:8080 connections), matching the same busy-child /
+unloaded-model mechanism documented above. Target signal remains
+`router:500 == 0`.

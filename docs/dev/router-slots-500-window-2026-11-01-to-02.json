@@ -1,0 +1,271 @@
+{
+  "work_item": "LP-0MVVLKPBM007F6U6",
+  "fix_under_test": "LP-0MVVCXUDZ007XID0",
+  "measurement_run_utc": "2026-11-02T08:00:00Z",
+  "window": {
+    "start_utc": "2026-11-01T00:41:55Z",
+    "end_utc": "2026-11-02T00:41:55Z",
+    "duration_hours": 24,
+    "anchored_to": "fix-era proxy restart 2026-10-31T00:41:55Z + 24 h (earliest-run rule)",
+    "verdict": "RED"
+  },
+  "restart_integrity_ac3": {
+    "window_start_proxy_pid": 3944027,
+    "window_start_proxy_lstart_utc": "2026-10-31T00:41:55Z",
+    "in_window_startup_lines": 3,
+    "in_window_startup_timestamps_utc": [
+      "2026-11-01T13:12:53.336Z",
+      "2026-11-01T13:17:50.026Z",
+      "2026-11-01T21:26:41.037Z"
+    ],
+    "current_proxy_pid": 1487007,
+    "current_proxy_lstart_utc": "2026-11-01T21:26:39Z",
+    "restart_inside_window": true,
+    "counter_delta_available": false,
+    "counter_delta_unavailable_reason": ">=1 proxy pid change inside the window (3944027 -> 1487007 at 11-01 21:26:39Z, plus 2 further 'Starting LLama Proxy Server' events at 13:12:53/13:17:50). Per method step 1 / AC3 the monotonic llama_slots_child_port_fallbacks_total cannot be read for the window; per-file log counts only.",
+    "window_router_pids": {
+      "part_a_until_2026_11_01T21_26_39Z": 32809,
+      "part_b_c_after_2026_11_01T21_26_39Z": 54819,
+      "note": "the 13:12/13:17 events did not respawn the router (single Server Environment per segment)"
+    }
+  },
+  "llama_server_file_set": [
+    {
+      "file": "llama-server.1.log",
+      "mtime_utc": "2026-11-01T21:26:00Z",
+      "content_range_utc": "2026-11-01T00:00:00Z..2026-11-01T21:26:39Z",
+      "intersects_window": true,
+      "in_window_coverage": "2026-11-01T00:41:55Z..2026-11-01T21:26:39Z (96.7% of file span; superset edge 00:00-00:41:55)",
+      "router": {
+        "200": 401,
+        "400": 1864,
+        "500": 331
+      },
+      "child": {
+        "200": 60301,
+        "400": 0,
+        "500": 0,
+        "other": 0
+      },
+      "slots_total": 62897,
+      "child_503": 0
+    },
+    {
+      "file": "llama-server.log-2026-11-02",
+      "mtime_utc": "2026-11-02T00:00:00Z",
+      "content_range_utc": "2026-11-01T21:26:39Z..2026-11-02T00:00:00Z",
+      "intersects_window": true,
+      "in_window_coverage": "whole file (inside the window)",
+      "router": {
+        "200": 17,
+        "400": 92,
+        "500": 31
+      },
+      "child": {
+        "200": 5614,
+        "400": 0,
+        "500": 0,
+        "other": 1
+      },
+      "slots_total": 5755,
+      "child_503": 1,
+      "slots_unparsed": 4
+    },
+    {
+      "file": "llama-server.log",
+      "mtime_utc": "2026-11-02T07:57:00Z",
+      "content_range_utc": "2026-11-02T00:00:00Z..2026-11-02T07:57:00Z (live, continuing)",
+      "intersects_window": true,
+      "in_window_coverage": "2026-11-02T00:00:00Z..2026-11-02T00:41:55Z (8.8% of file span; superset edge to measurement time)",
+      "router": {
+        "200": 396,
+        "400": 1941,
+        "500": 390
+      },
+      "child": {
+        "200": 19412,
+        "400": 0,
+        "500": 0,
+        "other": 0
+      },
+      "slots_total": 22139,
+      "child_503": 0
+    }
+  ],
+  "excluded_files": [
+    {
+      "file": "llama-server.log-2026-11-01.gz",
+      "mtime_utc": "2026-11-01T00:00:00Z",
+      "reason": "content 2026-10-31T00:41:55Z..2026-11-01T00:00:00Z (copytruncate at 11-01 00:00, rotation date = suffix), ends exactly at the window start"
+    },
+    {
+      "file": "llama-server.2.log",
+      "mtime_utc": "2026-10-31T23:10:00Z",
+      "reason": "older in-process rotation (pids 35173/40831), last write before the window"
+    },
+    {
+      "file": "llama-server.3.log",
+      "mtime_utc": "2026-10-31T14:22:00Z",
+      "reason": "older rotation (pids 35295/35443/47579/47675/47867), before the window"
+    },
+    {
+      "file": "llama-server.4.log .. llama-server.15.log",
+      "mtime_utc": "2026-10-18..2026-10-23",
+      "reason": "pre-window dated rotations"
+    }
+  ],
+  "superset": {
+    "content_range_utc": "2026-11-01T00:00:00Z..2026-11-02T07:57:00Z",
+    "router": {
+      "200": 814,
+      "400": 3897,
+      "500": 752
+    },
+    "child": {
+      "200": 85328,
+      "400": 0,
+      "500": 0,
+      "other": 1
+    },
+    "router_500_total": 752,
+    "router_400_total": 3897,
+    "router_200_total": 814,
+    "in_window_router_500_estimate": 385,
+    "in_window_router_500_bound": "385 <= in-window <= 752 (timestamp-free access lines; time-proportional estimate from superset edges)",
+    "child_503": 1,
+    "slots_unparsed": 4
+  },
+  "rate_comparison_with_parent_window": {
+    "parent_pre_fix_superset_two_days": 1171,
+    "parent_pre_fix_daily_rate": "~24.4/day (48 h superset incl. /health probe share)",
+    "this_window_superset_daily_rate": "~23.6/day (752 / 31.9 h superset)",
+    "this_window_in_window_daily_rate": "~16.0/day (385 est / 24 h)",
+    "reading": "the /health probe fix removed its own share but the non-probe residual floor (~16/day) persists; the parent's full attribution of the 1,171 to the probe overstates its share (the floor coexisted)."
+  },
+  "health_probe_verification": {
+    "method": "10 sequential `curl -s -o /dev/null localhost:8000/health` against the live proxy",
+    "result": "0 new `GET /slots` lines (before=after=22274 in the live llama-server.log), 10x HTTP 200",
+    "code_evidence": "proxy/proxy/lifecycle.py:751-754 — router-mode probe_paths are ['/models', '/health'] only (no /slots); commit ac8dc504 present on dev and main",
+    "conclusion": "/health probe contributes 0 to the window's router-500 count"
+  },
+  "model_attribution": {
+    "proxying_request_to_model_lines": {
+      "Qwen3": 4845,
+      "mxbai-embed": 1,
+      "gpt120": 0
+    },
+    "known_confound_absent": "LP-0MVVCY3HQ0009F0K (gpt120 chat-model fallback) had zero in-window traffic",
+    "residual_attribution": "proxy-initiated Qwen3 (chat model) slot polling still traverses the router port :8080 (live ss: persistent python3 pid 1487007 -> :8080 connections); router no-prefix 500/400 lines are the busy-child / unloaded-model answers"
+  },
+  "proxy_log_window": {
+    "window_files": [
+      "proxy.log.2026-10-31_23 (00:00:00..05:56:08)",
+      "proxy.log.2026-11-01_05 (05:56:09..11:56:08)",
+      "proxy.log.2026-11-01_131248 (11:56:09..13:12:48)",
+      "proxy.log.2026-11-01_131746 (13:12:52..13:17:46)",
+      "proxy.log.2026-11-01_13 (13:17:50..19:17:48)",
+      "proxy.log.2026-11-01_212637 (19:17:57..21:26:37)",
+      "proxy.log-2026-11-02_00 (21:26:40..00:00:00)",
+      "proxy.log.2026-11-01_21 (00:00:00..03:26:39, in-window slice 00:00:00..00:41:55)"
+    ],
+    "totals": {
+      "in_window_lines": 503925,
+      "status_request_polls": 20926,
+      "slots_stale_true": 8929,
+      "slots_stale_false": 11997,
+      "slots_stale_share_all_polls": 0.4267,
+      "active_prefill_polls": 14482,
+      "active_prefill_share_of_polls": 0.6920,
+      "starting_llama_proxy_server_markers": 3,
+      "health_watchdog_lines": 115
+    },
+    "parent_comparison": {
+      "parent_stale_share": 0.3137,
+      "pre_fix_10_26_baseline_share": 0.644,
+      "reading": "window slots_stale share 42.7% is above the parent post-fix window (31.4%) and below the pre-fix baseline (64.4%)"
+    },
+    "fallback_warnings": [
+      {
+        "ts_utc": "2026-11-01T13:12:54.949Z",
+        "model": "Qwen3",
+        "source": "log_signal"
+      },
+      {
+        "ts_utc": "2026-11-01T13:17:51.639Z",
+        "model": "Qwen3",
+        "source": "log_signal"
+      },
+      {
+        "ts_utc": "2026-11-01T21:26:42.654Z",
+        "model": "Qwen3",
+        "source": "log_signal"
+      }
+    ],
+    "fallback_warning_count": 3
+  },
+  "fallback_counter_ac2": {
+    "window_delta": null,
+    "in_window_warning_lines": 3,
+    "warn_throttle_seconds": 300,
+    "post_window_reading": {
+      "captured_utc": "2026-11-02T07:59:00Z",
+      "proxy_pid": 1487007,
+      "llama_slots_child_port_fallbacks_total_no_child_port_router_mode": 1.0,
+      "llama_slots_query_failures_total": {
+        "timeout": 9001,
+        "http_503": 6,
+        "unknown": 1
+      },
+      "note": "current-process values only (started 11-01 21:26:39Z); not usable as a window delta"
+    }
+  },
+  "linked_bugs": [
+    {
+      "id": "LP-0MVYZ8Z16004QIRG",
+      "priority": "medium",
+      "title": "Residual router /slots 500/400 floor persists after /health probe fix \u2014 Qwen3 slot polling still traverses the router (~16/day in-window)",
+      "attribution": "discovered-from:LP-0MVVLKPBM007F6U6 (plan open-question recommendation), references LP-0MVVCXUDZ007XID0"
+    },
+    {
+      "id": "LP-0MVVCXUDZ007XID0",
+      "priority": "high",
+      "title": "Proxy /health reachability probe polls router GET /slots?model= \u2014 residual router-responder /slots 500s under prefill (VERIFIED FIXED, probe contributes 0)"
+    },
+    {
+      "id": "LP-0MVP7HX2S008IU57",
+      "priority": "high",
+      "title": "Verify router:500 == 0 over 24 h after the child-port discovery fix (parent window; attribution cross-check note)"
+    },
+    {
+      "id": "LP-0MVTDMXXH005D5D5",
+      "priority": "medium",
+      "title": "Instrument /slots query call sites: caller tag + http_400 failure metric on detail/progress paths"
+    },
+    {
+      "id": "LP-0MVP7HV7Q001AJF8",
+      "priority": "medium",
+      "title": "Router /slots 400 sibling item (unloaded-model class)"
+    }
+  ],
+  "commands": [
+    "date -u",
+    "ps -o pid,lstart,etime -p \"$(pgrep -f 'uvicorn proxy.server:app' | head -1)\"",
+    "ls -l --time-style=long-iso /var/log/llama-proxy/llama-server*.log*",
+    "python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy --llama-file 'llama-server.1.log' --summary",
+    "python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy --llama-file 'llama-server.log-2026-11-02' --summary",
+    "python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy --llama-file 'llama-server.log' --summary",
+    "for i in $(seq 1 10); do curl -s -o /dev/null -w '%{http_code} ' localhost:8000/health; done",
+    "grep -c 'GET /slots' /var/log/llama-proxy/llama-server.log   # before vs after the health repro",
+    "curl -s localhost:8000/metrics | grep llama_slots_child_port_fallbacks_total",
+    "ss -tnp | grep ':8080'   # proxy -> router port connections (live sampling)",
+    "grep -h 'status_request' <window proxy.log files> | grep -o 'slots_stale=[a-z]*' | sort | uniq -c",
+    "grep -h 'Starting LLama Proxy Server' <window proxy.log files>"
+  ],
+  "limitations": [
+    "llama-server access lines carry no timestamps: the window file set is a superset (11-01 00:00:00Z..11-02 07:57:00Z vs the 24 h window); the in-window router-500 figure is an estimate (~385) bounded by the superset (752).",
+    "The proxy restarted inside the window (AC3), so the fallback counter delta is unavailable; per-file log counts only.",
+    "Fallback WARNING lines are throttled (one per 300 s) and current-process counter values post-date the window; they cannot bound the window's fallback count.",
+    "Router access lines omit the query string: per-model attribution uses the router's `proxying request to model <m> on port <p>` lines (no gpt120 in-window) plus the absence of /health-generated /slots (verified).",
+    "No in-window /health request count is directly available in proxy.log (health checks are not logged at INFO except watchdog resets); the 0-contribution proof is the live repro + code inspection."
+  ]
+}
