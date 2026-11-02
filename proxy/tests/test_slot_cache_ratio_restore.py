@@ -537,6 +537,65 @@ class TestSidecarWriterOnSave:
         response.headers = {}
         return response
 
+    def _no_usage_response(self):
+        """A success response with no extractable usage block."""
+        body = {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+        response = MagicMock()
+        response.content = json.dumps(body).encode("utf-8")
+        response.headers = {}
+        return response
+
+    def _real_logging_srv(self):
+        """The writer-save server with a real logger for INFO capture."""
+        import logging
+
+        srv = self._srv()
+        srv.logger = logging.getLogger("llama-proxy.sidecar-log-test")
+        return srv
+
+    def _run_router_save(
+        self, tmp_path, monkeypatch, srv, *, messages, response
+    ):
+        """Run one router-path slot save and return (filename, written)."""
+        import asyncio
+
+        import proxy.router as router
+
+        config = _write_snapshot(tmp_path, messages=messages, with_sidecar=False)
+        filename = _slot_filename_for_session(
+            SESSION, config["server"]["session_slot_save_path"]
+        )
+        written: list[Path] = []
+
+        async def _fake_save(*_args, **_kwargs):
+            written.append(Path(_args[2]))
+            return True
+
+        monkeypatch.setattr(router, "_save_slot_snapshot", _fake_save, raising=False)
+        monkeypatch.setattr(
+            router, "_detect_restore_signal_from_llama_log", lambda *a, **k: False
+        )
+
+        asyncio.run(
+            router._update_session_and_slot(
+                srv,
+                SESSION,
+                {"messages": messages},
+                False,
+                [],
+                len(messages),
+                response,
+                llama_port=8080,
+                slot_id=0,
+                slot_filename=filename,
+                slot_timeout=3.0,
+                slot_model_payload=MODEL,
+                slot_enabled=True,
+                upstream_status=200,
+            )
+        )
+        return filename, written
+
     def test_successful_save_writes_sidecar_with_prompt_tokens(
         self, tmp_path, monkeypatch
     ):
@@ -583,6 +642,73 @@ class TestSidecarWriterOnSave:
         # fraction llama-server reported as cached for that request.
         assert meta["cached_tokens"] == 90_000
         assert meta["messages"] == message_fingerprints(messages)
+
+    def test_no_trustworthy_count_logs_sidecar_write_skipped(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """AC2: a 0-count sidecar write on the router path is observable.
+
+        ``sidecar_cached_tokens()`` returns 0 when there is no trustworthy
+        count (no measured usage, no recorded prefix and no message text to
+        estimate). The snapshot is still saved, no sidecar is invented, and
+        exactly one INFO ``slot_sidecar_write_skipped`` line names the
+        session prefix, slot id and model — a writer-side regression must be
+        attributable from logs, not inferred from seed outcomes later.
+        """
+        import logging
+
+        caplog.set_level(logging.INFO, logger="llama-proxy.sidecar-log-test")
+        srv = self._real_logging_srv()
+        filename, written = self._run_router_save(
+            tmp_path,
+            monkeypatch,
+            srv,
+            messages=[],
+            response=self._no_usage_response(),
+        )
+
+        assert written == [Path(filename)]
+        assert read_slot_ratio_sidecar(filename) is None
+        skip_lines = [
+            m for m in caplog.messages if m.startswith("slot_sidecar_write_skipped ")
+        ]
+        assert len(skip_lines) == 1
+        assert "reason=no_trustworthy_count" in skip_lines[0]
+        assert "source=router" in skip_lines[0]
+        assert f"session={SESSION[:8]}" in skip_lines[0]
+        assert "slot=0" in skip_lines[0]
+        assert f"model={MODEL}" in skip_lines[0]
+
+    def test_trustworthy_count_writes_sidecar_and_no_skip_line(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """AC3: a measured count still pairs the sidecar, silently.
+
+        With ``sidecar_cached_tokens() > 0`` the sidecar is written beside the
+        snapshot and no ``slot_sidecar_write_skipped`` line is emitted — the
+        success path log stays untouched.
+        """
+        import logging
+
+        caplog.set_level(logging.INFO, logger="llama-proxy.sidecar-log-test")
+        srv = self._real_logging_srv()
+        messages = _messages()
+        filename, written = self._run_router_save(
+            tmp_path,
+            monkeypatch,
+            srv,
+            messages=messages,
+            response=self._response(prompt_tokens=90_000, cached_tokens=30_000),
+        )
+
+        assert written == [Path(filename)]
+        meta = read_slot_ratio_sidecar(filename)
+        assert meta is not None
+        assert meta["cached_tokens"] == 90_000
+        assert meta["messages"] == message_fingerprints(messages)
+        assert not [
+            m for m in caplog.messages if m.startswith("slot_sidecar_write_skipped ")
+        ]
 
     def test_failed_save_writes_no_sidecar(self, tmp_path, monkeypatch):
         import asyncio
@@ -951,6 +1077,36 @@ class TestEvictionSnapshotPairing:
         assert report["saved"] is True
         assert read_slot_ratio_sidecar(filename) is None
 
+    def test_no_recorded_prefix_logs_sidecar_write_skipped(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """AC4: the unpaired eviction save is observable at INFO.
+
+        The eviction path has no request body, so without a recorded prefix
+        there is no honest sidecar source. The snapshot is still saved (the KV
+        is worth retaining for a restore) but the skipped pairing logs one
+        INFO ``slot_sidecar_write_skipped … pairing=no_sidecar_source`` line —
+        behaviour-neutral (the landed LP-0MVVI8TEU006KTOZ decision) and
+        attributable from logs.
+        """
+        import logging
+
+        caplog.set_level(logging.INFO, logger="llama-proxy.session")
+        report, filename, _server = self._evict(monkeypatch, tmp_path)
+
+        assert report["saved"] is True
+        assert read_slot_ratio_sidecar(filename) is None
+        skip_lines = [
+            m for m in caplog.messages if m.startswith("slot_sidecar_write_skipped ")
+        ]
+        assert len(skip_lines) == 1
+        assert "reason=no_trustworthy_count" in skip_lines[0]
+        assert "source=eviction" in skip_lines[0]
+        assert "pairing=no_sidecar_source" in skip_lines[0]
+        assert f"session={SESSION[:8]}" in skip_lines[0]
+        assert "slot=0" in skip_lines[0]
+        assert f"model={MODEL}" in skip_lines[0]
+
     def test_failed_save_writes_no_sidecar(self, tmp_path, monkeypatch):
         messages = _messages()
         record_prompt_prefix(MODEL, SESSION, 90_000, messages)
@@ -1220,6 +1376,10 @@ class TestSnapshotDirectoryAlignment:
         )
 
         assert written == [Path(filename)]
+        # AC6 (LP-0MVVX6RAR002QAUT): the restore existence pre-check looks at
+        # exactly this path — it must find the snapshot after the save, so the
+        # round trip proves no ``missing_sidecar``/short-circuit either way.
+        assert Path(filename).exists()
         assert sidecar_path(filename).exists()
         assert sidecar_path(filename).parent == Path(filename).parent
         assert (
