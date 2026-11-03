@@ -1988,6 +1988,18 @@ def stop_llama_server():
     """
     srv = _srv()
 
+    # LP-0MVZVZLCS000LQNB AC3: a deliberate stop/restart abandons whatever
+    # prefills are in flight. Record them as ``backend_restart`` evictions so
+    # the churn is visible in the eviction accounting instead of looking like a
+    # capacity problem. Idempotent per dispatch record, so the self-heal path
+    # recording the same restart cannot double-count.
+    try:
+        from proxy.admission_events import record_backend_restart_evictions
+
+        record_backend_restart_evictions(srv, restart_reason="manual_restart")
+    except Exception:
+        pass
+
     if srv.llama_process is not None:
        pid = getattr(srv.llama_process, 'pid', 'N/A')
        srv.logger.info(f"Stopping llama-server wrapper (PID: {pid})")

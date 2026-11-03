@@ -359,6 +359,22 @@ async def _settle_unready_self_heal_spawn(srv, proc, llama_port: int) -> bool:
     return False
 
 
+async def _port_held_by_unmanaged_backend(srv, llama_port: int) -> bool:
+    """True when the port answers but this proxy owns no live process for it.
+
+    LP-0MVZVZLCS000LQNB AC4: the respawn guard. A backend that answers on the
+    configured port while ``llama_process`` is absent (or dead) is already
+    serving the local route — spawning a second one cannot bind and would
+    produce the restart cascade this item exists to stop.
+    """
+    if _proc_handle_alive(getattr(srv, "llama_process", None)):
+        return False
+    try:
+        return bool(await srv._probe_backend_reachable(llama_port))
+    except Exception:
+        return False
+
+
 async def _settle_leftover_spawn(srv, llama_port: int) -> bool:
     """Settle a spawn left alive by a failed self-heal attempt (AC1).
 
@@ -374,8 +390,15 @@ async def _settle_leftover_spawn(srv, llama_port: int) -> bool:
     return await _settle_unready_self_heal_spawn(srv, leftover, llama_port)
 
 
-async def _attempt_router_self_heal() -> bool:
-    """Attempt router-mode self-healing with capped exponential backoff."""
+async def _attempt_router_self_heal(reason: str = "unspecified") -> bool:
+    """Attempt router-mode self-healing with capped exponential backoff.
+
+    *reason* is the death/cause that triggered this restart attempt. It is
+    logged on every attempt line as ``restart_reason=<reason>`` and recorded in
+    ``backend_recovery_state["last_restart_reason"]`` so a restart is never
+    anonymous (LP-0MVZVZLCS000LQNB AC2), and it is attached to the
+    ``backend_restart`` evictions of the prefills the restart abandons (AC3).
+    """
     srv = _srv()
 
     server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
@@ -419,6 +442,7 @@ async def _attempt_router_self_heal() -> bool:
         return False
 
     srv.backend_recovery_state["in_progress"] = True
+    srv.backend_recovery_state["last_restart_reason"] = reason
     remaining = max_attempts - len(attempts)
 
     try:
@@ -429,13 +453,53 @@ async def _attempt_router_self_heal() -> bool:
             attempt_number = len(attempts)
 
             srv.logger.warning(
-                "self-heal attempt %s/%s started (window=%ss)",
+                "self-heal attempt %s/%s started (window=%ss, restart_reason=%s)",
                 attempt_number,
                 max_attempts,
                 window_seconds,
+                reason,
             )
 
             try:
+                # LP-0MVZVZLCS000LQNB AC4: never spawn over a backend that is
+                # already answering on the port. A crashed backend that a
+                # previous (or external) spawn has already replaced is adopted
+                # instead — spawning here is exactly the 21:40:16Z cascade
+                # where a second router died on
+                # "couldn't bind HTTP server socket ... port: 8080".
+                #
+                # Only retries are gated: the first attempt is the watchdog's
+                # deliberate recovery (it has already established that the
+                # backend is unreachable), so a router that answers /models
+                # while its child is dead still gets its restart.
+                if local_attempt > 0 and await _port_held_by_unmanaged_backend(
+                    srv, llama_port
+                ):
+                    adopted = _adopt_reachable_backend(srv, llama_port)
+                    srv.backend_ready = True
+                    srv.backend_recovery_state["last_failure"] = None
+                    srv.logger.warning(
+                        "self-heal: not respawning — port %s is already served by "
+                        "an unmanaged backend (restart_reason=%s, adopted=%s); no "
+                        "new process started",
+                        llama_port,
+                        "port_held_by_unmanaged_backend",
+                        adopted,
+                    )
+                    return True
+
+                # LP-0MVZVZLCS000LQNB AC3: a restart abandons the prefills in
+                # flight; record them so the churn is visible in the eviction
+                # accounting instead of looking like a capacity problem.
+                try:
+                    from .. import admission_events as _admission_events
+
+                    _admission_events.record_backend_restart_evictions(
+                        srv, restart_reason=reason
+                    )
+                except Exception:
+                    pass
+
                 restarted = srv.start_llama_server(None)
                 if restarted is None:
                     raise RuntimeError("start_llama_server returned None")
@@ -569,7 +633,9 @@ async def _backend_watchdog_loop() -> None:
                         "watchdog: llama_process is None and backend unreachable, "
                         "attempting restart"
                     )
-                    recovered = await srv._attempt_router_self_heal()
+                    recovered = await srv._attempt_router_self_heal(
+                        reason=f"backend_unreachable(port={llama_port})"
+                    )
                     srv.logger.info(
                         "watchdog restart-from-none recovered=%s", recovered
                     )
@@ -648,7 +714,13 @@ async def _backend_watchdog_loop() -> None:
             srv.current_model = None
 
             if router_mode:
-                recovered = await srv._attempt_router_self_heal()
+                recovered = await srv._attempt_router_self_heal(
+                    reason=(
+                        "worker_unhealthy"
+                        if code is None
+                        else f"llama_server_exit_code_{code}"
+                    )
+                )
                 srv.logger.info(
                     "watchdog router self-heal recovered=%s", recovered
                 )

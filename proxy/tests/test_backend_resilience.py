@@ -325,8 +325,11 @@ async def test_watchdog_detects_worker_failure_and_triggers_router_recovery(monk
 
     calls = {"recover": 0}
 
-    async def fake_recover():
+    async def fake_recover(reason=None):
+        # LP-0MVZVZLCS000LQNB: the watchdog now passes ``reason=`` naming the
+        # death that triggered the restart (recorded here for the assertion).
         calls["recover"] += 1
+        calls.setdefault("reasons", []).append(reason)
         return False
 
     sleep_calls = {"n": 0}
@@ -350,6 +353,10 @@ async def test_watchdog_detects_worker_failure_and_triggers_router_recovery(monk
     await server._backend_watchdog_loop()
 
     assert calls["recover"] == 1
+    assert calls["reasons"] == ["worker_unhealthy"], (
+        "the restart must carry the reason that triggered it "
+        "(LP-0MVZVZLCS000LQNB AC2)"
+    )
     assert server.backend_signal_counts["other_failures"] == 1
 
 
