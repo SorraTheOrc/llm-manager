@@ -1006,6 +1006,11 @@ def build_report(
     # separately so a stuck hold is not read as repeated client retries.
     _append_hold_cycle_section(ap, summary)
 
+    # Chain-end outcomes (LP-0MW0KZR7A003UFQK AC3): a hold and a fail-fast
+    # refusal are different events with different cost, so they are reported
+    # side by side and never folded together.
+    _append_chain_end_section(ap, summary)
+
     initial = Counter((s.initial_provider, s.initial_model) for s in sessions)
     ap("")
     ap("## Per-model breakdown (initial assignment)")
@@ -1910,6 +1915,76 @@ def _append_prefill_regression_section(ap, summary: AnalysisResult) -> None:
             ev.reason or UNKNOWN_LABEL for ev in evictions
         ).most_common():
             ap(f"| {reason} | {count} |")
+
+
+def _append_chain_end_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Chain-end outcomes`` section (LP-0MW0KZR7A003UFQK AC3).
+
+    A model whose whole fallback chain cannot serve ends one of two ways, and
+    the two are *not* interchangeable:
+
+    - ``Chain exhausted ... holding <N>s`` — the proxy waits the bounded hold
+      before retrying the chain. Real latency, counted here as a hold.
+    - ``chain_planned_unavailable ... hold=skipped
+      reason=deterministic_residual_chain`` — every remaining provider was
+      deterministically skipped or terminally refused, so no wait could change
+      the outcome and the error was returned immediately.
+
+    Before the fail-fast existed the second shape was invisible: it took the
+    full ``chain_hold_seconds x chain_hold_max_cycles`` budget and only the
+    hold line remained, so "a call that could never succeed burned 900 s" and
+    "a call was legitimately held" were indistinguishable in the report
+    (measured 2026-11-03 08:41: three holds on a chain where every provider
+    was skipped for a reason hours-to-days away). The table therefore reports
+    the fail-fast count separately and says explicitly that it is **not**
+    hold latency.
+
+    Omitted entirely when the window holds no chain-end event, like the
+    report's other conditional sections.
+    """
+    holds = list(getattr(summary, "chain_hold_events", []) or [])
+    fail_fast = list(getattr(summary, "chain_planned_unavailable_events", []) or [])
+    if not holds and not fail_fast:
+        return
+
+    hold_seconds = sum(float(getattr(ev, "hold_seconds", 0.0) or 0.0) for ev in holds)
+    ap("")
+    ap("## Chain-end outcomes")
+    ap("")
+    ap("`chain_hold` is the bounded wait before retrying a chain that may heal; "
+       "`chain_planned_unavailable` is the fail-fast refusal of a chain that "
+       "provably cannot serve. **A fail-fast refusal costs no hold latency and "
+       "is never counted as one.**")
+    ap("")
+    ap("| Outcome | Count | Meaning |")
+    ap("|---|---|---|")
+    ap(f"| `chain_hold` | {len(holds)} "
+       f"({hold_seconds:.0f} s planned) | "
+       "chain exhausted, holding before the next cycle (may still succeed) |")
+    ap(f"| `chain_planned_unavailable` | {len(fail_fast)} | "
+       "provably dead residual chain: error returned immediately, no hold |")
+    if fail_fast:
+        by_reason = Counter(
+            (getattr(ev, "reason", None) or UNKNOWN_LABEL) for ev in fail_fast
+        )
+        ap("")
+        ap("Fail-fast refusals by reason:")
+        ap("")
+        ap("| Reason | Count |")
+        ap("|---|---|")
+        for reason, count in by_reason.most_common():
+            ap(f"| `{reason}` | {count} |")
+        resets = sorted(
+            {
+                int(ev.retry_after)
+                for ev in fail_fast
+                if getattr(ev, "retry_after", None) is not None
+            }
+        )
+        if resets:
+            ap("")
+            ap("Advertised `Retry-After` on those refusals (earliest known "
+               "reset, seconds): " + ", ".join(str(r) for r in resets) + ".")
 
 
 def _append_admission_bucket_section(ap, summary: AnalysisResult) -> None:

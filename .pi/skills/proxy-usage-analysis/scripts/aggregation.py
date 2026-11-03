@@ -756,6 +756,15 @@ class AnalysisResult:
     #: Provider-chain exhaustion (``All providers exhausted``): the
     #: client-visible failure AC4 compares against the pre-change window.
     provider_exhausted_events: list[LogEvent] = field(default_factory=list)
+    #: Chain-end outcomes (LP-0MW0KZR7A003UFQK): the two mutually exclusive
+    #: shapes a fallback chain reports when it cannot serve. ``chain_hold`` is
+    #: ``Chain exhausted ... holding <N>s`` (real hold latency);
+    #: ``chain_planned_unavailable`` is the fail-fast refusal, which costs no
+    #: hold and must never be counted as one. Kept as separate lists so a
+    #: report can total both without inferring either from the other's
+    #: absence.
+    chain_hold_events: list[LogEvent] = field(default_factory=list)
+    chain_planned_unavailable_events: list[LogEvent] = field(default_factory=list)
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
@@ -2260,6 +2269,8 @@ def aggregate(
     eviction_after_acceptance_events: list[LogEvent] = []
     prefill_deadline_events: list[LogEvent] = []
     provider_exhausted_events: list[LogEvent] = []
+    chain_hold_events: list[LogEvent] = []
+    chain_planned_unavailable_events: list[LogEvent] = []
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
@@ -2463,6 +2474,12 @@ def aggregate(
         if ev.kind == "provider_exhausted":
             provider_exhausted_events.append(ev)
             continue
+        if ev.kind == "chain_hold":
+            chain_hold_events.append(ev)
+            continue
+        if ev.kind == "chain_planned_unavailable":
+            chain_planned_unavailable_events.append(ev)
+            continue
         if ev.kind == "local_eviction":
             eviction_events.append(ev)
             continue
@@ -2594,6 +2611,8 @@ def aggregate(
         eviction_after_acceptance_events=eviction_after_acceptance_events,
         prefill_deadline_events=prefill_deadline_events,
         provider_exhausted_events=provider_exhausted_events,
+        chain_hold_events=chain_hold_events,
+        chain_planned_unavailable_events=chain_planned_unavailable_events,
         compaction_events=compaction_events,
         busy=busy,
         hourly_activity=hourly_activity,

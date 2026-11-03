@@ -1261,6 +1261,22 @@ server:
   #   - Non-streaming requests are held silently (deferred response).
   #   - A client disconnect aborts the hold promptly.
   #   - 0 disables the wait (retries immediately).
+  #   - NO hold is taken when the residual chain is PROVABLY DEAD
+  #     (LP-0MW0KZR7A003UFQK): if every remaining provider is either
+  #     deterministically skipped (usage_limit_reset_pending /
+  #     quota_exhausted / quota_hard_stop / outside_available_window) or
+  #     terminally refused for this request (a non-retryable 4xx), no wait can
+  #     change the outcome, so the error is returned immediately with the
+  #     earliest known reset as its Retry-After and no chain_hold_cycle is
+  #     consumed. This is what stops an unattended caller burning its per-call
+  #     budget on 300 s x 3 holds for a call that can never succeed (measured
+  #     2026-11-03 08:41, every remote provider deterministically skipped).
+  #     Cooldowns, stall circuit breakers, budget-window rollovers, imminent
+  #     window edges and unknown reasons keep today's bounded hold — an
+  #     unknown skip reason is transient by contract. The fail-fast is logged
+  #     as ``chain_planned_unavailable ... hold=skipped
+  #     reason=deterministic_residual_chain``, beside which the hold's
+  #     ``Chain exhausted ... holding <N>s`` line remains distinguishable.
   chain_hold_seconds: 300
   # Maximum number of hold-retry cycles before returning the exhaustion error
   # response unchanged. 0 = infinite (keep holding/retrying until the client
@@ -1286,7 +1302,9 @@ server:
   # ``diagnostics``/``unavailable_providers`` and provider schedules,
   # cooldowns and quarantine durations are untouched. A missing, malformed or
   # non-positive value falls back to the default 3600 so the cap is never
-  # accidentally disabled.
+  # accidentally disabled. The cap also bounds the fail-fast Retry-After
+  # (LP-0MW0KZR7A003UFQK), which advertises the EARLIEST known reset of a
+  # provably dead chain rather than the slowest one.
   max_retry_after_seconds: 3600
   # Local slot-exhaustion grace retries before remote fallback.
   # Helps right-after-restart races where slot probes briefly report 0 available.

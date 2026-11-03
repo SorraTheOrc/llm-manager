@@ -1419,6 +1419,47 @@ either case, and the deadline + safety bounds still refuse anything that could
 not finish. The log line carries `budget_s` (the resolved queue budget) and
 `bound_s` (the bound actually enforced), so the two can never be confused.
 
+### The ETA refusal is only taken when a remote can serve (LP-0MW0KZR7A003UFQK)
+
+The guard's refusal is a **capacity** judgement about the local engine, so it
+only justifies moving the request remote when a remote provider can actually
+take it. On 2026-11-03 08:49:40 the guard refused a `remote-ok` request on an
+enforced ETA bound (`eta_prefill_s=45.2 enforced=true`) and routed it to a
+chain whose every entry was deterministically skipped; the request ended
+`outcome=exhausted`. At 08:50:41 the identical prompt with the identical ETA
+was admitted (`enforced=false`, `eta_occupancy_s=0.0`) and produced a first
+byte in 6 s.
+
+`_remote_chain_has_capacity` therefore gates the direct (free-slot) rejection
+with the resolution predicate's own vocabulary, read-only and in the same
+order: not deterministically skipped for this request, not in cooldown, no
+pending usage-limit reset, not quota-hard-stopped, inside its
+`available_times` window. When no remote can serve, the request is **admitted
+locally** and waits for its prefill — the same outcome the client got once the
+occupancy cleared — logged as:
+
+```
+local_admission_guard_local_wait provider=… model=… session=… preference=…
+  reason=eta_exceeds_budget_direct free_slot=true → remote chain has no
+  capacity; admitting locally and waiting for the prefill
+```
+
+and recorded as a `status=local_admission_override` attempt (so the
+diagnostics show why local was used despite the ETA bound). The
+`local_admission_guard_direct_fallback` line keeps its meaning — a real
+fall-through — and is never emitted on the admit-locally path.
+
+Deliberately narrow, because "admit locally" must not become a way to blow
+through the request's own bounds:
+
+| Case | Behaviour |
+|---|---|
+| `reason=eta_exceeds_budget_direct`, hybrid chain, no remote capacity | **admit locally** and wait for the prefill |
+| `reason=eta_exceeds_budget_direct`, hybrid chain, a remote has capacity | unchanged — refuse and route remote |
+| request-property reasons (`prefill_budget_exceeded`, `context_too_large`, deadline / safety budget) | unchanged refusal — the prompt cannot be served locally at all |
+| local-only chain (no remote provider) | unchanged refusal — there is nothing to bounce to, and the ETA bound is the honest answer to a caller whose budget cannot cover the prefill |
+| pin-local / `local-only` intent | unchanged (the pin branch runs first, including bounded deferral escalation) |
+
 ### Measured attribution of the first rung-enabled 24 h window (LP-0MVZ5WV6W008UO5F)
 
 Window 2026-11-01 11:09:07 → 2026-11-02 11:09:07 (the rung was enabled at

@@ -169,6 +169,20 @@ Outputs written to:
     breakdown; the event's admission-priced `new_tokens` stays readable on the
     event (and in the raw log line) for the wasted-token comparison, while
     `wasted_prefill_tokens` continues to mean deadline cancellations only.
+  - Chain-end outcomes (LP-0MW0KZR7A003UFQK): two **distinct** event kinds and
+    two report rows. `chain_hold` is `Chain exhausted for model=<p>; holding
+    <N>s before restarting cycle ...` (the bounded hold: real latency).
+    `chain_planned_unavailable` is `... reason=deterministic_residual_chain
+    hold=skipped retry_after=<s> ...` (the fail-fast refusal of a chain that
+    provably cannot serve: **no** hold latency). The parser keeps them apart
+    (`LogEvent.hold` is `taken` vs `skipped`), `aggregation` keeps two event
+    lists (`chain_hold_events`, `chain_planned_unavailable_events`) and the
+    report's **Chain-end outcomes** section states explicitly that a
+    fail-fast refusal is never counted as hold latency. Before this split the
+    fail-fast shape was invisible: it consumed the whole
+    `chain_hold_seconds x chain_hold_max_cycles` budget and only the hold line
+    remained (measured 2026-11-03 08:41 — three 300 s holds on a chain where
+    every provider was deterministically skipped hours-to-days away).
   - `provider_exhausted_errors` — `All providers exhausted` lines
     (client-visible chain failures); `upstream_status_503_errors` —
     `upstream_http_error` events with `status == 503` (provider-side 5xx).
