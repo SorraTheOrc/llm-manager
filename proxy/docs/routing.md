@@ -896,6 +896,40 @@ server:
   above are what make enabling it safe and effective once calibration
   supports it.
 
+## Routing occupancy counts other sessions, not your own lease (LP-0MW0VH2LB008JSKQ)
+
+Two gates decide local admission, and they must agree about the **requesting
+session's own** dispatch record:
+
+| Gate | Where | Own record |
+| --- | --- | --- |
+| routing concurrency (`cur_local >= max_local` → `local_concurrency_limit`) | `_proxy_with_fallback_cycle` → `_local_concurrency_info` | **idle lease excluded** |
+| dispatch lease (`_try_acquire_local_dispatch`) | lease choke point | same-session re-acquisition permitted (`own_has_lease`) |
+
+Before this, the routing gate counted *every* active-or-unexpired record —
+including the requester's own — so it fired first and the lease gate's
+own-lease exemption was unreachable. The 30 s no-preemption retention
+(`local_dispatch_lease_timeout_seconds`) exists so a returning session keeps its
+slot; the routing gate then denied it that slot, and because `remote-ok` (the
+default preference) never queues, the request stepped straight to a remote
+provider.
+
+Measured 2026-11-03 (14:25–15:10 UTC, `session_slot_pool_size: 2`): of 82
+`local_concurrency_limit` fall-throughs, **15 (18 %)** had the session's own
+local turn finish within the 30 s lease timeout — `cur_local = 2` with
+`generating = 0`, i.e. both "occupied" slots were finished turns inside their
+idle lease, one of them the returning session's own. Three sessions oscillated
+local→remote for no capacity reason, one of them pushed remote on four
+consecutive turns 4.5–26.2 s after its own local turn.
+
+**The rule.** `_get_local_concurrency_info(..., session_id=…)` excludes the
+requesting session's own record **only while it is an idle lease**
+(`active: false`). A record that is still `active` is genuine in-flight work, so
+a second concurrent request from the same session is gated exactly as before.
+`session_id=None` (anonymous callers, and the pool-description readers behind
+`/llama/local/status` and `/llama/local/reserve`) excludes nothing, so the
+engine-capacity view and the pure-legacy global-counter path are unchanged.
+
 ## Dispatch-lease occupancy and the denial line (LP-0MW0KZTWC004HXQ5)
 
 `_try_acquire_local_dispatch` (`proxy/router_helpers.py`) is the single

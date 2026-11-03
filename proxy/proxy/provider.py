@@ -6453,26 +6453,40 @@ def _get_proxy_to_local():
     raise ImportError('No proxy_to_local implementation available')
 
 
-def _local_concurrency_info(config: dict, endpoint: str | None = None) -> tuple:
+def _local_concurrency_info(
+    config: dict, endpoint: str | None = None, session_id: str | None = None
+) -> tuple:
     """Per-endpoint-aware wrapper around ``_get_local_concurrency_info``.
 
     Tests monkeypatch ``_get_local_concurrency_info`` with callables that only
     accept ``(config)``; passing the endpoint kwarg would break them. This
-    helper inspects the callable signature and only forwards the endpoint when
-    it is accepted (LP-0MRPILSMW004T4H8).
+    helper inspects the callable signature and only forwards the kwargs the
+    target accepts (LP-0MRPILSMW004T4H8).
+
+    *session_id* (LP-0MW0VH2LB008JSKQ) lets the routing gate exclude the
+    requesting session's own idle lease; it is forwarded only when the target
+    accepts it, so ``(config)``-only and ``(config, endpoint=…)`` stubs used by
+    existing tests keep working unchanged.
     """
     fn = _get_local_concurrency_info
     try:
         sig = inspect.signature(fn)
-        accepts_endpoint = (
-            "endpoint" in sig.parameters
-            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        params = sig.parameters
+        accepts_endpoint = "endpoint" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        accepts_session = "session_id" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
     except Exception:
         accepts_endpoint = False
+        accepts_session = False
+    kwargs: dict = {}
     if accepts_endpoint and endpoint is not None:
-        return fn(config, endpoint=endpoint)
-    return fn(config)
+        kwargs["endpoint"] = endpoint
+    if accepts_session and session_id is not None:
+        kwargs["session_id"] = session_id
+    return fn(config, **kwargs)
 
 
 def _dispatch_local(ptr_local, request, path, endpoint: str | None):
@@ -6494,7 +6508,35 @@ def _dispatch_local(ptr_local, request, path, endpoint: str | None):
     return ptr_local(request, path)
 
 
-def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tuple:
+def _is_own_idle_lease(
+    key, record: dict, session_id: str | None
+) -> bool:
+    """True when *key* is the requesting session's own **idle** lease.
+
+    LP-0MW0VH2LB008JSKQ: the routing concurrency gate and the dispatch-lease
+    gate must agree about the requesting session's own record. The lease gate
+    permits same-session re-acquisition (``own_has_lease`` in
+    ``_try_acquire_local_dispatch``), so the 30 s no-preemption retention keeps
+    a returning session's slot for it. Counting that same record as occupancy
+    at routing time defeated the retention: a session coming back inside its
+    own lease window was pushed remote while nothing was generating (measured
+    2026-11-03: 15 of 82 ``local_concurrency_limit`` fall-throughs).
+
+    Only an **inactive** record is excluded. A record that is still ``active``
+    is genuine in-flight work — a second concurrent request from the same
+    session must be gated exactly as before — so active records always count.
+    """
+    if not session_id or not isinstance(record, dict):
+        return False
+    if record.get("active"):
+        return False
+    key_session = key[1] if isinstance(key, tuple) and len(key) == 2 else key
+    return key_session == session_id
+
+
+def _get_local_concurrency_info(
+    config: dict, endpoint: str | None = None, session_id: str | None = None
+) -> tuple:
     """Lazily import and return (current_generating_active, max_local) from config.
 
     Generating-only pool (LP-0MTH7JX82000YS5N): occupancy is measured as the
@@ -6507,6 +6549,12 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
     independently (LP-0MRPILSMW004T4H8). When it is None (legacy
     single-server mode), the global ``local_generating_queries`` counter is
     used.
+
+    *session_id* is the requesting session. Its **own idle lease** is not
+    occupancy (see :func:`_is_own_idle_lease`), so a returning session keeps
+    the slot its lease reserved. ``None`` (anonymous/legacy callers, and the
+    pool-description readers used by the status surface) excludes nothing and
+    keeps today's count exactly (LP-0MW0VH2LB008JSKQ AC3).
 
     Returns the current generating-only count and the configured
     local concurrency limit.  Reads ``session_slot_pool_size`` (same value
@@ -6550,11 +6598,15 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
                     now = time.monotonic()
                     for key, record in records.items():
                         if isinstance(key, tuple) and len(key) == 2 and key[0] == endpoint:
+                            if _is_own_idle_lease(key, record, session_id):
+                                continue
                             if record.get("active") or record.get("expires_at", 0) > now:
                                 cur_active += 1
                         elif not isinstance(key, tuple) and endpoint == default_ep:
                             # Legacy plain-key record occupies the default
                             # server's pool alongside tuple-keyed records.
+                            if _is_own_idle_lease(key, record, session_id):
+                                continue
                             if record.get("active") or record.get("expires_at", 0) > now:
                                 cur_active += 1
             else:
@@ -13787,8 +13839,7 @@ async def _proxy_with_fallback_cycle(
                 # scoped per-endpoint so each llama-server's own slot pool is
                 # evaluated independently (LP-0MRPILSMW004T4H8).
                 cur_local, max_local = _local_concurrency_info(
-
-                    config, endpoint=local_endpoint
+                    config, endpoint=local_endpoint, session_id=_session_id
                 )
                 if cur_local >= max_local:
                     # Per-mode contention queue (LP-0MSORQVK50012Q4D): in cheap
@@ -15040,7 +15091,7 @@ async def _proxy_with_fallback_cycle(
                     # through to a remote chain that may be entirely out of
                     # window (LP-0MU5BOMJM008F17C).
                     _lease_cur, _lease_max = _local_concurrency_info(
-                        config, endpoint=local_endpoint
+                        config, endpoint=local_endpoint, session_id=_session_id
                     )
                     _lease_action, _lease_reason, _lease_elapsed = (
                         await _maybe_queue_for_local_slot(
