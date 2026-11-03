@@ -896,7 +896,79 @@ server:
   above are what make enabling it safe and effective once calibration
   supports it.
 
-## Prefill serialisation (LP-0MVGDUUV3001XFRJ)
+## Dispatch-lease occupancy and the denial line (LP-0MW0KZTWC004HXQ5)
+
+`_try_acquire_local_dispatch` (`proxy/router_helpers.py`) is the single
+admission choke point for local work. Its occupancy view and the capacity
+view published to clients are **different questions with different sources**,
+and conflating them is what made the 2026-11-03 incident undiagnosable.
+
+| Question | Source | Where |
+| --- | --- | --- |
+| May this session dispatch **now**? | in-process dispatch-lease records + the generating-only and prefill-in-flight counters | `_try_acquire_local_dispatch` |
+| Does the **engine** have a free slot? | llama-server's `/slots` (fresh, else the bounded last-known counts) | `_query_slots` → `/llama/local/status` |
+
+`available_slots` / `total_slots` are **never lease-derived**. They come from
+llama-server's `/slots`, with the documented fallbacks in
+`proxy/handlers.py` (last-known counts when the query fails, the configured
+`session_slot_pool_size` when the model is definitively unloaded) and the
+documented upward reconciliation with live in-flight work when the served
+*detail* is stale. A second derivation from lease records would let the two
+views drift apart silently again; there is exactly one.
+
+### Stale records never block (AC1)
+
+Before counting, the admission path runs `_prune_stale_dispatch_records`: a
+record is stale only when it is **inactive and past `expires_at`** (the request
+finished and its post-request cooldown elapsed). A record that is still
+`active` past its expiry is live work whose lease lapsed — the 180 s
+no-progress watchdog's concern, never the admission gate's — so it is left for
+the watchdog. Pruning also releases the freed session-slot assignment, so the
+slot registry cannot describe a slot the gate has already forgotten.
+
+### The denial line carries its evidence (AC2)
+
+Every `local_dispatch_denied` line is followed on the SAME line by an
+occupancy snapshot, so a refusal is diagnosable from the log alone:
+
+```
+local_dispatch_denied session=… owner=… active=… cold_start=… <turn>
+  records_total=… records_active=… records_unexpired=… records_stale=…
+  active_counter=… max_local=… generating=… prefill_in_flight=… prefill_cap=…
+  llama_available_slots=… llama_total_slots=…
+  records=<key>:<active|idle>:<expires_in=Ns|expired>,…
+```
+
+`records=` is `none` for an empty registry; the aggregate fields always appear
+(`None` when unavailable) so "no data" is never confused with "zero".
+`prefill_cap` is the *effective* cap (`local_max_concurrent_prefills`, clamped
+to the slot pool), which is what the prefill branch actually compares against.
+The field vocabulary is published as `OCCUPANCY_EVIDENCE_FIELDS` so the log
+contract cannot drift from the code.
+
+### Divergence is logged, not shipped silently (AC3)
+
+When a refusal contradicts the occupancy evidence, a
+`local_occupancy_divergence reason=… session=… owner=… <evidence>` warning is
+emitted beside the denial (reading the last known llama counts costs no extra
+poll). Two shapes are recognised:
+
+| `reason=` | Meaning |
+| --- | --- |
+| `llama_reports_free_slots` | llama-server's last known counts report a free slot while the lease gate refused — the 2026-11-03 08:49:31 shape (`available_slots=2` on a two-slot pool) |
+| `occupancy_unexplained` | the refusal cannot be reproduced from any gate input in the snapshot (generating, prefill and unexpired-record counts are all below their caps) |
+
+Nothing is inferred from missing data: an absent llama count is not a
+disagreement, and a genuinely full pool that llama agrees with logs no
+warning at all. The divergence is a *diagnostic*: it never changes the routing
+decision, so a divergence is observable without being a behaviour change.
+
+Log level follows blame: `occupancy_unexplained` (our numbers cannot reproduce
+the refusal) is a `WARNING`, while `llama_reports_free_slots` is an `INFO` line
+beside the denial — an idle-leased slot counts as free to llama while the
+prefill cap legitimately refuses, so treating it as a warning would flood the
+WARNING stream (2,633 denial lines were observed in one window).
+
 
 Prefill (dispatch → first byte) does not scale with concurrency on this
 backend. Measured 2026-10-19 → 10-20 over 460 paired local dispatches:

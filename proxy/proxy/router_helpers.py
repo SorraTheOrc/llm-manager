@@ -4127,14 +4127,10 @@ async def _try_acquire_local_dispatch(
                     backend if (isinstance(record_key, tuple) and backend and backend != "local")
                     else ""
                 )
-                for existing_key, record in list(srv.local_dispatch_records.items()):
-                    if not record.get("active") and record.get("expires_at", 0) <= now:
-                        del srv.local_dispatch_records[existing_key]
-                        try:
-                            from proxy.session import _free_slot_assignment
-                            _free_slot_assignment(_dispatch_key_session_id(existing_key))
-                        except Exception:
-                            pass
+                # AC1 (LP-0MW0KZTWC004HXQ5): clean expired/inactive records
+                # *before* counting, so a stale record can never block a live
+                # dispatch. Named so the invariant has a unit-test seam.
+                _prune_stale_dispatch_records(srv, now)
 
                 own_record = srv.local_dispatch_records.get(record_key)
                 own_has_lease = (
@@ -6663,6 +6659,249 @@ def _count_active_local_dispatch_records(srv) -> int | None:
         )
     except Exception:
         return None
+
+
+# ===================================================================
+# Local dispatch-lease occupancy: prune, evidence, divergence
+# (LP-0MW0KZTWC004HXQ5)
+#
+# On 2026-11-03 08:49:31 a dispatch was refused (``local_dispatch_denied
+# session=audit-... owner=herdr-... active=1``) while ``/llama/local/status``
+# reported ``available_slots=2`` on a 2-slot pool. The line named the owner and
+# a count, but not *which* of the lease gate's inputs refused, nor whether
+# llama-server agreed there was no capacity — so the refusal could not be
+# diagnosed without a repro. These three functions make the occupancy view
+# explicit: one prune of stale records (AC1), one shared evidence snapshot
+# (AC2) and one divergence verdict (AC3).
+# ===================================================================
+
+#: Divergence reasons published on the ``local_occupancy_divergence`` line.
+#: Each names a way the refusal contradicts the occupancy evidence at the
+#: moment it was taken, so a poll reader can tell a genuinely full pool from a
+#: bookkeeping disagreement (LP-0MW0KZTWC004HXQ5 AC3).
+LOCAL_OCCUPANCY_DIVERGENCE_LLAMA_FREE_SLOTS = "llama_reports_free_slots"
+LOCAL_OCCUPANCY_DIVERGENCE_UNEXPLAINED = "occupancy_unexplained"
+
+#: Aggregate fields :func:`_format_occupancy_evidence` always emits. Exposed
+#: so the denial-log contract test asserts the vocabulary rather than a
+#: rendered string, and so a future field cannot be added on one side only.
+OCCUPANCY_EVIDENCE_FIELDS: tuple[str, ...] = (
+    "records_total",
+    "records_active",
+    "records_unexpired",
+    "records_stale",
+    "active_counter",
+    "max_local",
+    "generating",
+    "prefill_in_flight",
+    "prefill_cap",
+    "llama_available_slots",
+    "llama_total_slots",
+)
+
+
+def _prune_stale_dispatch_records(srv, now: float) -> list:
+    """Delete dispatch records that are inactive *and* past their expiry.
+
+    AC1 (LP-0MW0KZTWC004HXQ5): the occupancy check runs this **before** it
+    counts, so a stale record can never block a live dispatch. A record is
+    stale only when it is both ``active=False`` (the request finished) and
+    past ``expires_at`` (its post-request cooldown elapsed); an ``active``
+    record past its expiry is live work whose lease lapsed — the no-progress
+    watchdog's concern, never the admission gate's — so it is left alone.
+
+    The freed session-slot assignment is released alongside the record so the
+    registry cannot describe a slot the gate has already forgotten.
+
+    Returns the keys removed (for diagnostics/tests).
+    """
+    removed: list = []
+    records = getattr(srv, "local_dispatch_records", None)
+    if not records:
+        return removed
+    for existing_key, record in list(records.items()):
+        if not isinstance(record, dict):
+            continue
+        if record.get("active"):
+            continue
+        try:
+            expires_at = float(record.get("expires_at", 0) or 0)
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        if expires_at > now:
+            continue
+        del records[existing_key]
+        removed.append(existing_key)
+        try:
+            from proxy.session import _free_slot_assignment
+
+            _free_slot_assignment(_dispatch_key_session_id(existing_key))
+        except Exception:
+            pass
+    return removed
+
+
+def _dispatch_key_label(key) -> str:
+    """Render a dispatch-lease key as ``<endpoint>|<session>`` (or session)."""
+    if isinstance(key, tuple) and len(key) == 2:
+        return f"{key[0]}|{key[1]}"
+    return str(key)
+
+
+async def _local_dispatch_occupancy_evidence(srv, max_local: int | None = None) -> dict:
+    """Snapshot every input the local dispatch-lease gate refuses on.
+
+    AC2 (LP-0MW0KZTWC004HXQ5): the ``local_dispatch_denied`` line carries this
+    snapshot, so a refusal is diagnosable from the log alone — record keys with
+    their ``active``/expiry state, the ``local_active_queries`` counter,
+    ``max_local``, the generating-only and prefill-in-flight counts with the
+    effective prefill cap, and llama-server's last known slot counts (which
+    makes an AC3 divergence visible on the same line).
+
+    Read-only: it takes ``local_dispatch_records_lock`` only to snapshot the
+    registry, never mutates it, and never prunes (AC1's prune belongs to the
+    admission path, not to diagnostics). Best-effort throughout — every field
+    degrades to ``None`` rather than raising on a legacy/partial server object.
+    """
+    evidence: dict = {field: None for field in OCCUPANCY_EVIDENCE_FIELDS}
+    evidence["records"] = []
+    evidence["max_local"] = max_local
+    now = time.monotonic()
+
+    snapshot: list = []
+    try:
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        records = getattr(srv, "local_dispatch_records", None) or {}
+        if lock is not None:
+            async with lock:
+                snapshot = list(records.items())
+        else:
+            snapshot = list(records.items())
+    except Exception:
+        snapshot = []
+
+    rendered: list[dict] = []
+    for key, record in snapshot:
+        if not isinstance(record, dict):
+            continue
+        active = bool(record.get("active"))
+        try:
+            expires_at = float(record.get("expires_at", 0) or 0)
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        try:
+            started_at = float(record.get("started_at", now) or now)
+        except (TypeError, ValueError):
+            started_at = now
+        rendered.append(
+            {
+                "key": _dispatch_key_label(key),
+                "session": _dispatch_key_session_id(key),
+                "endpoint": key[0] if isinstance(key, tuple) else "",
+                "active": active,
+                "expired": expires_at <= now,
+                "expires_in_s": round(max(0.0, expires_at - now), 1),
+                "age_s": round(max(0.0, now - started_at), 1),
+            }
+        )
+    evidence["records"] = rendered
+    evidence["records_total"] = len(rendered)
+    evidence["records_active"] = sum(1 for r in rendered if r["active"])
+    evidence["records_unexpired"] = sum(1 for r in rendered if not r["expired"])
+    evidence["records_stale"] = sum(
+        1 for r in rendered if not r["active"] and r["expired"]
+    )
+    try:
+        evidence["active_counter"] = int(getattr(srv, "local_active_queries", 0) or 0)
+    except (TypeError, ValueError):
+        evidence["active_counter"] = 0
+    evidence["generating"] = _get_generating_only_count(srv)
+    evidence["prefill_in_flight"] = _get_prefill_in_flight_count(srv)
+    try:
+        evidence["prefill_cap"] = _effective_prefill_cap(
+            _server_config_of(srv), max_local or 1
+        )
+    except Exception:
+        evidence["prefill_cap"] = None
+    try:
+        from proxy.observability import last_known_slot_counts
+
+        known = last_known_slot_counts()
+    except Exception:
+        known = None
+    if known is not None:
+        try:
+            evidence["llama_available_slots"], evidence["llama_total_slots"] = (
+                int(known[0]),
+                int(known[1]),
+            )
+        except (TypeError, ValueError, IndexError):
+            pass
+    return evidence
+
+
+def _format_occupancy_evidence(evidence: dict) -> str:
+    """Render occupancy evidence as a single ``key=value`` log-line suffix.
+
+    The aggregate fields always appear (``None`` when unavailable) so a reader
+    can tell "no data" from "zero", and the per-record detail follows as
+    ``records=<key>:<active|idle>:<expires_in=Ns|expired>,...`` (``records=none``
+    when the registry is empty).
+    """
+    parts = [f"{field}={evidence.get(field)}" for field in OCCUPANCY_EVIDENCE_FIELDS]
+    tokens: list[str] = []
+    for record in evidence.get("records") or []:
+        token = f"{record.get('key')}:{'active' if record.get('active') else 'idle'}"
+        if record.get("expired"):
+            token += ":expired"
+        else:
+            token += f":expires_in={record.get('expires_in_s')}"
+        tokens.append(token)
+    parts.append("records=" + (",".join(tokens) if tokens else "none"))
+    return " ".join(parts)
+
+
+def _occupancy_divergence_reason(evidence: dict) -> str | None:
+    """Name why a refusal contradicts the occupancy evidence, or ``None``.
+
+    AC3 (LP-0MW0KZTWC004HXQ5): a divergence is logged rather than left for a
+    poll reader to notice. Two shapes are recognised, in order:
+
+    - ``llama_reports_free_slots`` — llama-server's last known slot counts say
+      a slot is free while the lease gate refused. This is the 2026-11-03
+      08:49:31 shape (``available_slots=2``, two-slot pool, dispatch denied).
+    - ``occupancy_unexplained`` — the refusal cannot be reproduced from any
+      gate input in the snapshot (generating, prefill and unexpired-record
+      counts are all below their caps), so something outside the evidence
+      decided it.
+
+    ``None`` means the evidence explains the refusal truthfully, which is the
+    overwhelmingly common case (a genuinely full pool). Never infers a
+    divergence from missing data: an absent llama count is not a disagreement.
+    """
+    available = evidence.get("llama_available_slots")
+    if isinstance(available, int) and available > 0:
+        return LOCAL_OCCUPANCY_DIVERGENCE_LLAMA_FREE_SLOTS
+
+    def _int_or_zero(value) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    max_local = evidence.get("max_local")
+    if not isinstance(max_local, int) or max_local <= 0:
+        return None
+    prefill_cap = evidence.get("prefill_cap")
+    if not isinstance(prefill_cap, int) or prefill_cap <= 0:
+        return None
+    if (
+        _int_or_zero(evidence.get("generating")) < max_local
+        and _int_or_zero(evidence.get("prefill_in_flight")) < prefill_cap
+        and _int_or_zero(evidence.get("records_unexpired")) < max_local
+    ):
+        return LOCAL_OCCUPANCY_DIVERGENCE_UNEXPLAINED
+    return None
 
 
 async def _recover_stuck_global_active_queries(srv) -> None:
