@@ -246,3 +246,59 @@ class TestReadOnly:
             "subprocess",
         ):
             assert forbidden not in source, f"{forbidden!r} found in the verifier"
+
+
+class TestRouterModelProbe:
+    """The direct probe proves the model-parameter contract.
+
+    llama.cpp's request log omits the query string on this host, so the
+    model-bearing-200 evidence comes from probing the router rather than from
+    a log field that does not exist.
+    """
+
+    def test_probe_documents_its_contract(self):
+        """The probe's contract (400 without model, 200 with) is documented."""
+        documented = vs.probe_router_model_requirement.__doc__ or ""
+        assert "400" in documented
+        assert "200" in documented
+
+    def test_probe_reported_instead_of_the_log_check(self):
+        report = vs.verify(
+            HEALTHY_STATUS,
+            HEALTHY_HEALTH,
+            GOOD_LOG,
+            router_probe=(True, "model-less=400 model-bearing=200 model='Qwen3'"),
+        )
+        names = [c.name for c in report.checks]
+        assert "router requires ?model= and answers it" in names
+        assert "model-bearing /slots 200 in llama-server log" not in names
+        assert report.ok is True
+
+    def test_failing_probe_fails_the_verdict(self):
+        report = vs.verify(
+            HEALTHY_STATUS,
+            HEALTHY_HEALTH,
+            GOOD_LOG,
+            router_probe=(False, "model-less=400 model-bearing=400 model='Qwen3'"),
+        )
+        assert report.ok is False
+        failed = {c.name for c in report.checks if not c.ok}
+        assert "router requires ?model= and answers it" in failed
+
+    def test_successful_slots_read_in_log_is_always_checked(self):
+        report = vs.verify(
+            HEALTHY_STATUS,
+            HEALTHY_HEALTH,
+            "[1] srv  log_server_r: done request: GET /slots 127.0.0.1 200\n",
+            router_probe=(True, "model-less=400 model-bearing=200"),
+        )
+        names = [c.name for c in report.checks]
+        assert "/slots 200 in llama-server log" in names
+        assert report.ok is True
+
+    def test_missing_slots_200_in_log_fails(self):
+        report = vs.verify(
+            HEALTHY_STATUS, HEALTHY_HEALTH, "", router_probe=(True, "ok")
+        )
+        failed = {c.name for c in report.checks if not c.ok}
+        assert "/slots 200 in llama-server log" in failed

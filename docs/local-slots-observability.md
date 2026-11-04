@@ -100,3 +100,71 @@ stale ceiling. Follow `slots_stale_reason`:
 
 Every value is a member of `observability.SLOTS_STALE_REASONS`. Treat an
 unrecognised value as **stale** (fail closed), never as fresh.
+
+## Verification script
+
+`scripts/verify_slots_observability.py` produces the reproducible PASS/FAIL
+evidence block for this contract. It is read-only: plain HTTP GETs and log
+reads, no state mutation.
+
+```bash
+# against a running proxy (recommended: pass the router so the model-parameter
+# contract is probed directly)
+python3 scripts/verify_slots_observability.py --router-url http://localhost:8080
+
+# machine-readable
+python3 scripts/verify_slots_observability.py --router-url http://localhost:8080 --json
+```
+
+Exit `0` means every check passed; `1` means at least one failed and the failing
+checks are named.
+
+Checks performed:
+
+| Check | What it proves |
+|---|---|
+| `slots_stale=false` | the surface is not degraded (reason printed alongside) |
+| `snapshot age below ceiling` | a served snapshot is within `slots_max_snapshot_age_seconds`; "no snapshot served" passes, because a live read has nothing stale |
+| `health surface ok` | `slots_surface_status == "ok"` |
+| `health/status reason agreement` | `/health` and `/llama/local/status` report the same reason |
+| `router requires ?model= and answers it` | **a model-less `/slots` returns 400 and `/slots?model=<id>` returns 200** — the exact contract the 2026-11-04 freeze tripped over |
+| `/slots 200 in llama-server log` | the backend actually served a slot read after the restart |
+
+> **Why the model-parameter check is a probe, not a log grep.** llama.cpp's
+> `log_server_r` line does **not** include the query string on this build — it
+> logs `GET /slots 127.0.0.1 200` — so a `GET /slots?model=…` string cannot be
+> read out of the log. Probing the router directly is the same evidence and
+> strictly stronger: it proves the 400/200 asymmetry rather than inferring it.
+> When a build does log the query string, the script's log matcher accepts a
+> model-bearing `200` as well.
+
+### Recorded live verification (2026-11-04)
+
+After the proxy was restarted onto the fixed build
+(`bash scripts/start-proxy.sh --restart`, healthy immediately), the verifier
+reported, verbatim:
+
+```text
+available_slots: 2
+health_slots_stale_reason: None
+slots_detail_stale: False
+slots_max_snapshot_age_seconds: 300.0
+slots_snapshot_age_seconds: None
+slots_snapshot_source: None
+slots_stale: False
+slots_stale_reason: None
+slots_surface_status: ok
+total_slots: 2
+
+[PASS] slots_stale=false: slots_stale=False reason=None
+[PASS] snapshot age below ceiling: no snapshot served (live read, nothing stale)
+[PASS] health surface ok: slots_surface_status='ok'
+[PASS] health/status reason agreement: health=None status=None
+[PASS] router requires ?model= and answers it: model-less=400 model-bearing=200 model='Qwen3'
+[PASS] /slots 200 in llama-server log: found a successful /slots read after the restart
+
+RESULT: PASS
+```
+
+Recovery required **no llama-server restart** — the surface cleared as soon as
+`/slots` answered.

@@ -39,6 +39,7 @@ import json
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -152,10 +153,46 @@ def read_log_tail(path: Path, max_bytes: int = 4_000_000) -> str:
         return ""
 
 
+def probe_router_model_requirement(
+    router_url: str, model: str, timeout: float = 5.0
+) -> tuple[bool, str]:
+    """Prove the router requires ``?model=`` and answers when it is supplied.
+
+    llama.cpp's ``log_server_r`` line does **not** include the query string
+    (verified on this host: it logs ``GET /slots 127.0.0.1 200``), so a
+    model-bearing 200 can never be read straight out of the log on this build.
+    This probe supplies the same evidence directly:
+
+    * ``GET /slots`` **without** ``model`` must be rejected (400) — that is the
+      router contract the 2026-11-04 freeze tripped over;
+    * ``GET /slots?model=<model>`` must succeed (200 with a list body).
+
+    Returns ``(ok, detail)``.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _status(url: str) -> int:
+        try:
+            with opener.open(url, timeout=timeout) as response:
+                return int(getattr(response, "status", 0) or 0)
+        except urllib.error.HTTPError as exc:
+            return int(exc.code)
+        except Exception:
+            return 0
+
+    bare = _status(f"{router_url.rstrip('/')}/slots")
+    with_model = _status(
+        f"{router_url.rstrip('/')}/slots?model={urllib.parse.quote(model)}"
+    )
+    ok = bare == 400 and with_model == 200
+    return ok, f"model-less={bare} model-bearing={with_model} model={model!r}"
+
+
 def verify(
     status: dict | None,
     health: dict | None,
     log_text: str,
+    router_probe: tuple[bool, str] | None = None,
 ) -> Report:
     """Evaluate every parent acceptance check from already-fetched inputs.
 
@@ -262,12 +299,31 @@ def verify(
                 )
             )
 
-    found, line = find_model_bearing_slots_200(log_text)
+    if router_probe is not None:
+        probe_ok, probe_detail = router_probe
+        report.checks.append(
+            Check("router requires ?model= and answers it", probe_ok, probe_detail)
+        )
+    else:
+        found, line = find_model_bearing_slots_200(log_text)
+        report.checks.append(
+            Check(
+                "model-bearing /slots 200 in llama-server log",
+                found,
+                line or "no 'GET /slots?model=… … 200' line in the log tail",
+            )
+        )
+
+    # A successful /slots read is logged whether or not the build includes the
+    # query string, so this is always checkable and always meaningful.
+    ok_200 = bool(re.search(r"GET\s+/slots[^\s]*\s+\S+\s+200", log_text))
     report.checks.append(
         Check(
-            "model-bearing /slots 200 in llama-server log",
-            found,
-            line or "no 'GET /slots?model=… … 200' line in the log tail",
+            "/slots 200 in llama-server log",
+            ok_200,
+            "found a successful /slots read after the restart"
+            if ok_200
+            else "no 'GET /slots … 200' line in the log tail",
         )
     )
     return report
@@ -286,6 +342,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--llama-log",
         default=DEFAULT_LLAMA_LOG,
         help="llama-server log to scan for a model-bearing /slots 200",
+    )
+    parser.add_argument(
+        "--router-url",
+        default=None,
+        help=(
+            "llama-server router base URL (e.g. http://localhost:8080). When "
+            "given, the model-parameter contract is probed directly: a "
+            "model-less /slots must 400 and /slots?model=<id> must 200. "
+            "Preferred over the log check because llama.cpp's request log "
+            "omits the query string."
+        ),
     )
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--json", action="store_true", help="machine-readable")
@@ -306,7 +373,23 @@ def main(argv: list[str] | None = None) -> int:
         health = None
 
     log_text = read_log_tail(Path(args.llama_log))
-    report = verify(status, health, log_text)
+
+    router_probe = None
+    if args.router_url:
+        model = ""
+        if isinstance(status, dict):
+            model = str(status.get("current_model") or "")
+        if model:
+            router_probe = probe_router_model_requirement(
+                args.router_url, model, timeout=args.timeout
+            )
+        else:
+            router_probe = (
+                False,
+                "no current_model in the status payload to probe with",
+            )
+
+    report = verify(status, health, log_text, router_probe=router_probe)
 
     if args.json:
         print(json.dumps(report.to_json(), indent=2))
