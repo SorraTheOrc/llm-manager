@@ -979,6 +979,41 @@ async def get_llama_local_status(request: Request):
                 )
                 break
 
+    # -- snapshot age ceiling (LP-0MW1VVKPF001ZAV5) --------------------------
+    # The 2026-11-04 defect: ``slots_snapshot_age_seconds`` was published
+    # (29825.67) but never enforced, so an 8 h 17 m-old snapshot was served
+    # indefinitely *and* availability was claimed from it
+    # (``available_slots=2 capacity_hint=idle``). Past the configured ceiling a
+    # stale snapshot is no longer presented as a live slot list: the slots are
+    # withheld, availability is not claimed from the fossil, and the reason is
+    # the explicit ``snapshot_too_old``. Recovery is automatic — the next
+    # successful ``/slots?model=…`` poll restores a fresh surface, with no
+    # restart.
+    slots_max_snapshot_age_seconds = None
+    slots_snapshot_too_old = False
+    try:
+        from proxy.observability import (
+            local_slots_max_snapshot_age_seconds,
+            slots_snapshot_too_old as _snapshot_too_old,
+        )
+
+        slots_max_snapshot_age_seconds = local_slots_max_snapshot_age_seconds(
+            srv.config if isinstance(getattr(srv, "config", None), dict) else {}
+        )
+        if slots_snapshot_source == "snapshot":
+            slots_snapshot_too_old = _snapshot_too_old(
+                slots_snapshot_age_seconds, slots_max_snapshot_age_seconds
+            )
+    except Exception:
+        # Fail-open: a ceiling-resolution fault must not break the endpoint,
+        # and must not withhold a snapshot on a guess.
+        slots_snapshot_too_old = False
+    if slots_snapshot_too_old:
+        slots = []
+        detail_stale = True
+        available_slots = 0
+        total_slots = 0
+
     # -- per-slot capacity annotation (LP-0MVGDUVGE0024YAI) -----------------
     # Add owner_session_id / lease_state / phase / context_tokens /
     # prefill_eta_seconds to each slot so a dispatcher can distinguish a slot

@@ -358,6 +358,107 @@ def last_slots_stale_reason() -> str | None:
 def reset_slots_stale_reason() -> None:
     """Clear the recorded reason (test isolation, and a fresh healthy poll)."""
     record_slots_stale_reason(None)
+# Snapshot age ceiling (LP-0MW1VVKPF001ZAV5)
+#
+# The 2026-11-04 defect was not a missing *measurement* — the payload
+# published ``slots_snapshot_age_seconds=29825.67`` (8 h 17 m) — but a missing
+# *bound*: the per-slot detail cache was served, and availability claimed from
+# it, indefinitely. The counts cache was already bounded
+# (``SLOT_COUNTS_STALE_AFTER_SECONDS``, 1 h); the detail cache had no ceiling
+# at all.
+#
+# The bound is expressed as a small multiple of the status poll cadence
+# (``STATUS_POLL_CADENCE_SECONDS``) rather than an hour: the point is that a
+# consumer can never act on a snapshot older than roughly the next few polls.
+# ===================================================================
+
+STATUS_POLL_CADENCE_SECONDS: float = 30.0
+"""Assumed cadence (seconds) of the ``/llama/local/status`` consumers.
+
+A downtime dispatcher decides whether to schedule work on each poll; ~30 s is
+the observed decision cadence. Kept as a named constant so the default ceiling
+is *derived* from it in code (and asserted by a test) instead of hard-coding a
+magic number.
+"""
+
+_SLOTS_MAX_SNAPSHOT_AGE_FLOOR_SECONDS: float = 120.0
+"""Lower bound (seconds) for the derived ceiling.
+
+Even a fast poll cadence must not produce a ceiling so tight that ordinary
+jitter turns a healthy surface into ``snapshot_too_old``.
+"""
+
+_SLOTS_MAX_SNAPSHOT_AGE_CADENCE_MULTIPLE: float = 10.0
+"""How many poll intervals a snapshot may lag before it is too old to serve."""
+
+
+def _default_slots_max_snapshot_age_seconds() -> float:
+    """Cadence-derived default ceiling (seconds)."""
+    return max(
+        _SLOTS_MAX_SNAPSHOT_AGE_FLOOR_SECONDS,
+        _SLOTS_MAX_SNAPSHOT_AGE_CADENCE_MULTIPLE * STATUS_POLL_CADENCE_SECONDS,
+    )
+
+
+def _positive_float(value: object) -> float | None:
+    """Return *value* as a positive float, or ``None`` when unusable."""
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed <= 0.0:  # NaN or non-positive
+        return None
+    return parsed
+
+
+def local_slots_max_snapshot_age_seconds(config: dict | None = None) -> float:
+    """Resolve ``local_slots_max_snapshot_age_seconds`` (seconds).
+
+    Order: ``server.local_slots_max_snapshot_age_seconds`` in *config* → the
+    ``LOCAL_SLOTS_MAX_SNAPSHOT_AGE_SECONDS`` environment variable → the
+    cadence-derived default from
+    :func:`_default_slots_max_snapshot_age_seconds`.
+
+    An unparseable, non-positive or absent value falls through to the next
+    source, so a bad setting **never** disables the bound or raises inside the
+    status endpoint — the ceiling is a safety limit, not a preference.
+    """
+    server_cfg = {}
+    if isinstance(config, dict):
+        server_cfg = config.get("server") or {}
+        if not isinstance(server_cfg, dict):
+            server_cfg = {}
+    resolved = _positive_float(server_cfg.get("local_slots_max_snapshot_age_seconds"))
+    if resolved is not None:
+        return resolved
+    import os
+
+    resolved = _positive_float(os.environ.get("LOCAL_SLOTS_MAX_SNAPSHOT_AGE_SECONDS"))
+    if resolved is not None:
+        return resolved
+    return _default_slots_max_snapshot_age_seconds()
+
+
+def slots_snapshot_too_old(
+    age_seconds: float | None, ceiling_seconds: float
+) -> bool:
+    """True when a served snapshot is older than *ceiling_seconds*.
+
+    Total by construction: an unknown age (``None``, NaN) is **not** too old —
+    a missing measurement is not evidence of staleness, and the ceiling must
+    never turn a healthy poll into a degraded one. The ceiling itself is the
+    last acceptable age, so ``age == ceiling`` is still servable.
+    """
+    if age_seconds is None:
+        return False
+    try:
+        age = float(age_seconds)
+        ceiling = float(ceiling_seconds)
+    except (TypeError, ValueError):
+        return False
+    if age != age or ceiling != ceiling:  # NaN
+        return False
+    return age > ceiling
 
 
 def last_known_slot_counts_stamp() -> float | None:
