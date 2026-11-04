@@ -22,6 +22,10 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from proxy.observability import (
+    SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED,
+    SLOTS_STALE_REASON_ROUTER_MODEL_MISSING,
+)
 from proxy.provider import clear_usage_limit_quarantine, get_model_type
 
 logger = logging.getLogger("llama-proxy")
@@ -701,6 +705,12 @@ async def get_llama_local_status(request: Request):
     slots_snapshot_age_seconds: float | None = None
     counts_provenance: dict = {}
     detail_provenance: dict = {}
+    # Enumerated reason contributed by the shared /slots target resolver
+    # (LP-0MW1VVIPG008896N): ``child_port_undiscovered`` when router mode had
+    # to fall back to the router port, ``router_model_missing`` when model-id
+    # resolution fell through to its last resort. ``None`` when the resolver
+    # found a usable target.
+    slots_resolver_reason: str | None = None
     if llama_running:
         try:
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
@@ -726,9 +736,53 @@ async def get_llama_local_status(request: Request):
                 # fetch) and the response reports pool capacity truthfully.
                 from proxy.router_helpers import _resolve_local_slots_target
 
-                _, llama_port = _resolve_local_slots_target(
+                (
+                    _resolved_endpoint,
+                    llama_port,
+                ) = _resolve_local_slots_target(
                     srv, model=cm, router_port=llama_port
                 )
+                # The resolver's router-port fallback in router mode is its own
+                # diagnosable condition (the child port could not be
+                # discovered), so it is published as an enumerated reason rather
+                # than collapsing into a generic query error
+                # (LP-0MW1VVIPG008896N).
+                try:
+                    _router_mode = bool(
+                        (srv.config.get("server", {}) or {}).get(
+                            "llama_router_mode", False
+                        )
+                    )
+                except Exception:
+                    _router_mode = False
+                _configured_router_port = int(
+                    (srv.config.get("server", {}) or {}).get(
+                        "llama_server_port", 8080
+                    )
+                    or 8080
+                )
+                if (
+                    llama_port is not None
+                    and _router_mode
+                    and not _resolved_endpoint
+                    and llama_port == _configured_router_port
+                ):
+                    slots_resolver_reason = (
+                        SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED
+                    )
+                # A `last_resort` model id means the proxy could not determine
+                # which model to ask about at all — the 2026-11-04 failure
+                # mode. It cannot verify the slot surface from live evidence,
+                # so the surface is stale whatever the fetch returns
+                # (LP-0MW1VVIPG008896N).
+                try:
+                    from proxy.router_helpers import resolve_local_model_id
+
+                    _, _model_source = resolve_local_model_id(srv, model=cm)
+                except Exception:
+                    _model_source = None
+                if _model_source == "last_resort":
+                    slots_resolver_reason = SLOTS_STALE_REASON_ROUTER_MODEL_MISSING
                 if llama_port is None:
                     total_slots = 0
                     available_slots = 0
@@ -1102,6 +1156,39 @@ async def get_llama_local_status(request: Request):
     # alongside it so an operator can tell a count fallback from a capacity
     # view built on cached slot detail.
     slots_stale = counts_stale or detail_stale
+    if slots_resolver_reason == SLOTS_STALE_REASON_ROUTER_MODEL_MISSING:
+        # The proxy could not name the model it is observing, so it holds no
+        # live evidence about the slot surface at all (2026-11-04 shape).
+        slots_stale = True
+    # Enumerated staleness reason (LP-0MW1VVIPG008896N): a bare boolean forced
+    # an operator to decode /metrics counter labels to learn *why* the surface
+    # was stale during the 2026-11-04 freeze. ``slots_stale_reason`` carries
+    # the cause machine-readably; ``None`` when the surface is fresh.
+    # Precedence (``snapshot_too_old`` > detail phase > counts phase) lives in
+    # ``observability.select_slots_stale_reason``, not here. ``slots_resolver_reason``
+    # is the failure the shared /slots target resolver observed this poll
+    # (``child_port_undiscovered`` / ``router_model_missing``); the transport
+    # reasons arrive through the recorder inside the fetch helpers.
+    slots_stale_reason = None
+    try:
+        from proxy.observability import (
+            last_slots_stale_reason,
+            select_slots_stale_reason,
+        )
+
+        slots_stale_reason = select_slots_stale_reason(
+            detail_reason=last_slots_stale_reason(),
+            counts_reason=None,
+            snapshot_too_old=False,
+        )
+    except Exception:
+        # Fail-open: a recorder/evaluator fault publishes ``None`` rather than
+        # breaking the status endpoint.
+        slots_stale_reason = None
+    if slots_resolver_reason is not None:
+        # The resolver's own failure (child port undiscovered, model id
+        # unusable) is more specific than a generic transport error.
+        slots_stale_reason = slots_resolver_reason
     client_ip, client_ip_source = _resolve_client_ip(request)
     status_extra = {
         "client_ip": client_ip,
@@ -1116,6 +1203,7 @@ async def get_llama_local_status(request: Request):
         "available_slots": available_slots,
         "total_slots": total_slots,
         "slots_stale": slots_stale,
+        "slots_stale_reason": slots_stale_reason,
         # Per-phase read-path timing + provenance (LP-0MVVXGHT1001I5YX
         # AC1/AC2): additive fields that let a stale (> budget) poll be
         # attributed to the status query, the counts query, the detail query
@@ -1168,7 +1256,7 @@ async def get_llama_local_status(request: Request):
         "local_route_failure_count": local_route.get(
             "local_route_failure_count", 0
         ),
-        "status_schema_version": 5,
+        "status_schema_version": 6,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -1196,6 +1284,11 @@ async def get_llama_local_status(request: Request):
         # evidence) and ``slot_counts_stale`` only affects the counts.
         "slots_detail_stale": bool(detail_stale),
         "slot_counts_stale": bool(counts_stale),
+        # Enumerated, machine-readable cause of ``slots_stale``
+        # (LP-0MW1VVIPG008896N): one of ``SLOTS_STALE_REASONS``, or ``None``
+        # when the surface is fresh. Additive field; consumers that ignore it
+        # behave exactly as before. Treat an unrecognised value as stale.
+        "slots_stale_reason": slots_stale_reason,
         # Truthful in-flight local request count, derived from live dispatch
         # records (``None`` in legacy mode with no record registry).
         # ``local_active_query`` mirrors ``> 0``; ``Null`` is never emitted.
@@ -1262,7 +1355,12 @@ async def get_llama_local_status(request: Request):
         # v5 (LP-0MVWFKIKJ005XHAY): ``local_route_available`` /
         # ``local_route_reason`` / ``local_route_cooldown_remaining_s`` publish
         # the local entry's routing availability beside its capacity.
-        "status_schema_version": 5,
+        # v6 (LP-0MW1VVIPG008896N): additive enumerated
+        # ``slots_stale_reason`` states *why* the slot surface is degraded
+        # (``router_model_missing`` / ``child_port_undiscovered`` /
+        # ``query_timeout`` / ``query_error`` / ``snapshot_too_old``), so an
+        # operator no longer has to decode ``/metrics`` counter labels.
+        "status_schema_version": 6,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local

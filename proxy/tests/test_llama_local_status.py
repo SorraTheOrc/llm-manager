@@ -796,7 +796,7 @@ class TestPerSlotDetails:
                 slot["prefill_eta_seconds"], (int, float)
             )
         # v5 (LP-0MVWFKIKJ005XHAY): the three ``local_route_*`` fields.
-        assert j["status_schema_version"] == 5  # AC1: additive + versioned
+        assert j["status_schema_version"] == 6  # AC1: additive + versioned
 
 
 # ======================================================================
@@ -1172,7 +1172,8 @@ async def test_new_capacity_fields_are_additive_and_versioned():
     # ``abandoned_busy`` hint value and ``local_abandoned_slots``.
     # v5 (LP-0MVWFKIKJ005XHAY): ``local_route_available`` /
     # ``local_route_reason`` / ``local_route_cooldown_remaining_s``.
-    assert j["status_schema_version"] == 5
+    # v6 (LP-0MW1VVIPG008896N): additive ``slots_stale_reason``.
+    assert j["status_schema_version"] == 6
     assert j["capacity_hint"] in (
         "idle",
         "prefill_bound",
@@ -1762,7 +1763,7 @@ async def test_endpoint_wide_entry_annotates_the_draining_slot(
         slots_detail=[_slot(1, is_processing=True, n_decoded=7)],
     )
 
-    assert j["status_schema_version"] == 5
+    assert j["status_schema_version"] == 6
     assert j["capacity_hint"] == "abandoned_busy"
     assert j["capacity_hint"] != "saturated"
     assert j["capacity_hint"] != "idle"
@@ -1939,7 +1940,7 @@ class TestLocalRouteAvailability:
             config=_route_config(), current_model="Qwen3"
         )
 
-        assert j["status_schema_version"] == 5
+        assert j["status_schema_version"] == 6
         assert j["local_route_available"] is True
         assert j["local_route_reason"] is None
         # ``None`` — a fabricated ``0`` would read as "armed and expiring now".
@@ -2071,7 +2072,7 @@ class TestLocalRouteAvailability:
         """AC10b: a config with no resolvable local entry stays well-formed."""
         j = await _CapacityStatusHarness().get(config=_route_config(with_models=False))
 
-        assert j["status_schema_version"] == 5
+        assert j["status_schema_version"] == 6
         assert j["local_route_available"] is True
         assert j["local_route_reason"] is None
         assert j["local_route_cooldown_remaining_s"] is None

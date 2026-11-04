@@ -55,6 +55,7 @@ import asyncio
 import contextlib
 import json
 import re
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -220,6 +221,143 @@ def last_known_slot_counts() -> tuple[int, int] | None:
     if time.monotonic() - ts > _slots_counts_stale_after_seconds():
         return None
     return (available, total)
+
+
+# ===================================================================
+# Enumerated slot-staleness reason (LP-0MW1VVIPG008896N)
+#
+# ``slots_stale`` was a bare boolean, so the 2026-11-04 freeze (a per-slot
+# snapshot served unchanged for 8 h 17 m) could only be diagnosed by decoding
+# Prometheus counter labels. ``/llama/local/status`` now also publishes
+# ``slots_stale_reason`` from this single canonical vocabulary: one constant
+# so no call site spells a reason inline, and a test can assert every member
+# is produced by a covered path.
+#
+# Deliberately *additive*: the existing ``llama_slots_query_failures_total``
+# label vocabulary (``timeout``, ``http_<code>``, ``connection_error``,
+# ``invalid_payload``, ``unknown``) is unchanged, so
+# ``monitoring/slots_query_alerts.yaml`` keeps matching. The metric labels are
+# *mapped onto* this vocabulary rather than replaced by it.
+# ===================================================================
+
+SLOTS_STALE_REASON_ROUTER_MODEL_MISSING = "router_model_missing"
+"""No usable model id: resolution fell through to its last resort and the
+server rejected the query. Router mode requires ``?model=``."""
+
+SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED = "child_port_undiscovered"
+"""Router mode with no discoverable child port, so the poll went to the router
+port (``llama_slots_child_port_fallbacks_total{reason="no_child_port_router_mode"}``)."""
+
+SLOTS_STALE_REASON_QUERY_TIMEOUT = "query_timeout"
+"""The ``/slots`` fetch timed out."""
+
+SLOTS_STALE_REASON_QUERY_ERROR = "query_error"
+"""Any other ``/slots`` fetch failure: non-200 HTTP status, connection error or
+malformed payload."""
+
+SLOTS_STALE_REASON_SNAPSHOT_TOO_OLD = "snapshot_too_old"
+"""The served snapshot is older than the configured ceiling. Declared here so
+the vocabulary is complete; the ceiling that *produces* it end-to-end is
+supplied by LP-0MW1VVKPF001ZAV5."""
+
+SLOTS_STALE_REASONS: tuple[str, ...] = (
+    SLOTS_STALE_REASON_ROUTER_MODEL_MISSING,
+    SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED,
+    SLOTS_STALE_REASON_QUERY_TIMEOUT,
+    SLOTS_STALE_REASON_QUERY_ERROR,
+    SLOTS_STALE_REASON_SNAPSHOT_TOO_OLD,
+)
+"""The complete, ordered ``slots_stale_reason`` vocabulary.
+
+Precedence when several conditions hold at once (see
+:func:`select_slots_stale_reason`): ``snapshot_too_old`` dominates every
+transport reason, and the per-slot **detail** phase dominates the **counts**
+phase — a cached ``is_processing`` is a fossil of a past request, and detail is
+what ``capacity_hint`` consumes.
+
+Consumer rule: treat any unrecognised value as *stale* (fail closed); never as
+fresh. Additive values may appear in future schema versions.
+"""
+
+_STALE_REASON_LOCK = threading.Lock()
+_last_slots_stale_reason: str | None = None
+
+
+def classify_slots_failure_reason(label: str | None) -> str:
+    """Map a ``llama_slots_query_failures_total`` label onto the vocabulary.
+
+    ``timeout`` becomes ``query_timeout``; every other failure label (a
+    ``http_<code>`` status, ``connection_error``, ``invalid_payload``,
+    ``unknown``, or anything unrecognised) becomes ``query_error``. A reason is
+    never silently dropped: an unknown label still reports a failure.
+    """
+    if isinstance(label, str) and label.strip().lower() == "timeout":
+        return SLOTS_STALE_REASON_QUERY_TIMEOUT
+    return SLOTS_STALE_REASON_QUERY_ERROR
+
+
+def select_slots_stale_reason(
+    detail_reason: str | None,
+    counts_reason: str | None,
+    snapshot_too_old: bool = False,
+) -> str | None:
+    """Pick the single published reason under the documented precedence.
+
+    * ``snapshot_too_old`` wins over every transport reason — an over-age
+      snapshot is the condition a consumer must act on regardless of why the
+      last fetch failed.
+    * Otherwise the detail phase wins over the counts phase (detail is what
+      capacity consumes).
+    * A value outside the vocabulary is reported as ``query_error`` rather
+      than published verbatim, so the field can never carry an invented
+      spelling.
+    """
+    if snapshot_too_old:
+        return SLOTS_STALE_REASON_SNAPSHOT_TOO_OLD
+    for candidate in (detail_reason, counts_reason):
+        if candidate is None:
+            continue
+        if candidate in SLOTS_STALE_REASONS:
+            return candidate
+        return SLOTS_STALE_REASON_QUERY_ERROR
+    return None
+
+
+def record_slots_stale_reason(reason: str | None) -> None:
+    """Remember the staleness reason for the current poll (fail-open).
+
+    Best-effort by contract: a recorder fault must never break the status
+    endpoint, so any exception is swallowed. A value outside the vocabulary is
+    ignored (``None`` clears the record), keeping the published field free of
+    invented spellings.
+    """
+    global _last_slots_stale_reason
+    try:
+        with _STALE_REASON_LOCK:
+            if reason is None:
+                _last_slots_stale_reason = None
+            elif reason in SLOTS_STALE_REASONS:
+                _last_slots_stale_reason = reason
+    except Exception:
+        pass
+
+
+def last_slots_stale_reason() -> str | None:
+    """Current recorded reason, or ``None`` when the surface is fresh.
+
+    Fail-open: a recorder fault reports ``None`` ("no reason claimed") rather
+    than raising inside the status path.
+    """
+    try:
+        with _STALE_REASON_LOCK:
+            return _last_slots_stale_reason
+    except Exception:
+        return None
+
+
+def reset_slots_stale_reason() -> None:
+    """Clear the recorded reason (test isolation, and a fresh healthy poll)."""
+    record_slots_stale_reason(None)
 
 
 def last_known_slot_counts_stamp() -> float | None:
@@ -710,6 +848,11 @@ async def _query_slots(
                 )
                 if total_slots > 0:
                     _record_last_slot_counts(available_slots, total_slots)
+                    # A successful counts read is fresh evidence: clear any
+                    # recorded staleness reason so the published field never
+                    # lingers from an earlier failed poll
+                    # (LP-0MW1VVIPG008896N).
+                    reset_slots_stale_reason()
                 _set_slots_status_out(status_out, status=status)
                 return available_slots, total_slots
             _record_slots_query_failure("invalid_payload")
@@ -768,13 +911,21 @@ def _record_last_slot_counts(available_slots: int, total_slots: int) -> None:
 
 
 def _record_slots_query_failure(reason: str) -> None:
-    """Increment the /slots query failure metric (best-effort)."""
+    """Increment the /slots query failure metric and record the stale reason.
+
+    Best-effort on both counts (LP-0MW1VVIPG008896N): the metric increment is
+    wrapped exactly as before, and the reason is mapped onto the enumerated
+    ``slots_stale_reason`` vocabulary and recorded for the status payload. The
+    metric *label* is passed through unchanged, so
+    ``monitoring/slots_query_alerts.yaml`` keeps matching.
+    """
     try:
         from proxy.metrics import record_slots_query_failure
 
         record_slots_query_failure(reason)
     except Exception:
         pass
+    record_slots_stale_reason(classify_slots_failure_reason(reason))
 
 
 def _slot_context_tokens(slot: dict) -> int | None:
@@ -2648,6 +2799,10 @@ def _resolve_slot_details_for_enrichment(slot_details: list[dict] | None) -> lis
         global _last_slot_details_at
         _last_slot_details_cache[:] = [dict(s) for s in slot_details]
         _last_slot_details_at = time.monotonic()
+        # Fresh per-slot detail clears any previously recorded staleness
+        # reason (LP-0MW1VVIPG008896N): the surface is live again, so the
+        # published reason must not linger from an earlier failed poll.
+        reset_slots_stale_reason()
     return [dict(s) for s in _last_slot_details_cache]
 
 
