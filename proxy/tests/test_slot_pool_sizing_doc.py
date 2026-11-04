@@ -235,10 +235,12 @@ class TestCitationsStillResolve:
         ("proxy/config.yaml", 1447, "local_session_tenants: 2"),
         # 9 — capacity admission + status fail-open
         ("proxy/proxy/capacity_admission.py", 124, "def _slots"),
-        ("proxy/proxy/handlers.py", 481, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 839, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 891, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 1084, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 482, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 862, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 914, "session_slot_pool_size"),
+        # the fourth handlers.py occurrence (the stale-detail pool reconciliation)
+        # was removed by LP-0MW1VDZIX0011D8M — a stale list no longer fabricates
+        # a pool size beside available_slots=0.
         # geometry-independent retention + per-session snapshot filenames
         ("proxy/proxy/session.py", 1266, "def _slot_filename_for_session"),
         ("proxy/proxy/session.py", 1268, "slot_{safe_id}.bin"),

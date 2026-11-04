@@ -897,7 +897,11 @@ async def test_slots_snapshot_source_labels_a_last_known_snapshot():
     async with _status_poll(
         backend=backend, warm_counts=(2, 3, time.monotonic() - 4.0)
     ) as (payload, rec, _b):
-        assert payload["available_slots"] == 2
+        # Since LP-0MW1VDZIX0011D8M a stale snapshot asserts no availability:
+        # the summary publishes 0 + an explicit unknown flag rather than the
+        # cached ``2`` that contradicted the detail.
+        assert payload["available_slots"] == 0
+        assert payload["availability_unknown"] is True
         assert payload["total_slots"] == 3
         assert rec.slots_snapshot_source == "snapshot"
         assert rec.slots_snapshot_age_seconds == pytest.approx(4.0, abs=1.0)

@@ -366,7 +366,7 @@ class TestPayload:
         payload = await _get_status(_Ok())
         assert payload["slots_stale"] is False
         assert payload["slots_stale_reason"] is None
-        assert payload["status_schema_version"] == 6
+        assert payload["status_schema_version"] == 7
 
     @pytest.mark.asyncio
     async def test_query_error_is_published(self):

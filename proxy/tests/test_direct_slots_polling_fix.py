@@ -141,7 +141,11 @@ class TestLastKnownFallbackBehaviour:
 
     @pytest.mark.asyncio
     async def test_status_uses_last_known_when_direct_fails(self):
-        """get_llama_local_status serves the cached counts with slots_stale=true when direct _query_slots fails."""
+        """get_llama_local_status serves the cached total with
+        slots_stale=true when direct _query_slots fails. Since
+        LP-0MW1VDZIX0011D8M a stale list asserts no availability: the summary
+        publishes ``available_slots: 0`` with ``availability_unknown: true``
+        instead of the cached ``2`` (which over-dispatched behind a fossil)."""
         import proxy.observability as obs
         import proxy.server as server
         from proxy.handlers import get_llama_local_status
@@ -183,7 +187,8 @@ class TestLastKnownFallbackBehaviour:
                         req.client = MagicMock(host="127.0.0.1", port=54321)
                         j = await get_llama_local_status(req)
                         assert j["total_slots"] == 3
-                        assert j["available_slots"] == 2
+                        assert j["available_slots"] == 0
+                        assert j["availability_unknown"] is True
                         assert j["slots_stale"] is True
 
     @pytest.mark.asyncio

@@ -2138,6 +2138,20 @@ Consumer rule: any hint value a consumer does not recognise — including this
 one, and any future one — must be treated as **busy**, never as idle.
 """
 
+CAPACITY_UNKNOWN = "unknown"
+"""Capacity cannot be asserted from the served evidence (LP-0MW1VDZIX0011D8M).
+
+Published when the only evidence is a stale ``/slots`` snapshot and the proxy
+has no live in-flight local work of its own: the fossil cannot prove the pool
+is available, and it cannot prove it is busy either. Reporting ``idle`` there
+was the defect the item fixes — it asserted availability from a stale list
+(``available_slots: 2`` while ``slots[]`` showed both slots
+``is_processing: true``). ``unknown`` asserts neither direction; per the
+consumer rule above it is treated as **busy** by any consumer that does not
+recognise it, so the failure mode is fail-closed (a refused newcomer) rather
+than over-dispatch behind a ghost.
+"""
+
 STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS = 15.0
 """Maximum proxy-observed idle age that still counts as fresh decode evidence.
 
@@ -2262,6 +2276,25 @@ def compute_capacity_hint(slots: list[dict]) -> str:
     return CAPACITY_IDLE
 
 
+def count_available_slots(slots: list[dict]) -> int:
+    """Number of slots the served detail reports as *not* processing.
+
+    This is the single derivation behind ``available_slots``
+    (LP-0MW1VDZIX0011D8M AC1): the summary is computed from ``slots[]`` by
+    construction, never from a separate counter, so the two can never
+    contradict each other. A slot the proxy abandoned but llama-server still
+    reports processing counts as **not available** — abandonment reduces
+    availability rather than sitting beside it (AC4).
+    """
+    count = 0
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        if not bool(slot.get("is_processing", False)):
+            count += 1
+    return count
+
+
 def downgrade_stale_capacity_hint(
     hint: str,
     *,
@@ -2283,10 +2316,15 @@ def downgrade_stale_capacity_hint(
 
     1. Fresh detail → return ``hint`` unchanged (the decision table is
        authoritative).
-    2. Stale detail and **no** live in-flight local requests → ``idle``. The
-       cached occupancy is contradicted by the proxy's own dispatch state
+    2. Stale detail and **no** live in-flight local requests → ``unknown``.
+       The cached occupancy is contradicted by the proxy's own dispatch state
        (retained leases and a leaked ``local_active_queries`` counter are not
-       work, and an unloaded model reports no slots at all).
+       work), so neither availability nor saturation can be asserted from it
+       (LP-0MW1VDZIX0011D8M AC3). This was ``idle`` before that item: folding
+       a fossil into ``idle`` asserted availability from a stale list, which
+       is exactly the contradiction (``available_slots: 2`` beside two
+       ``is_processing: true`` slots) the item removes. ``unknown`` is
+       fail-closed for consumers that treat unrecognised hints as busy.
     3. Stale detail with live in-flight work and fresh decode evidence
        (``activity_source == "chunk"`` within
        ``STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS``) → ``saturated``.
@@ -2305,7 +2343,7 @@ def downgrade_stale_capacity_hint(
     if not stale:
         return hint
     if live_local_requests <= 0:
-        return CAPACITY_IDLE
+        return CAPACITY_UNKNOWN
     recent_decode = (
         activity_source == "chunk"
         and idle_seconds is not None

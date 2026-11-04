@@ -427,6 +427,7 @@ async def get_llama_local_status(request: Request):
          "current_model": str | None,
          "llama_server_running": bool,
          "available_slots": int,
+         "availability_unknown": bool,
          "total_slots": int,
          "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None,
                     "context_tokens": int | None, "owner_session_id": str | None,
@@ -481,6 +482,19 @@ async def get_llama_local_status(request: Request):
     ``session_slot_pool_size`` is reported instead (fail-open, so
     orchestrators see available capacity during idle windows —
     LP-0MSI06HPB0043MV1).
+
+    **``available_slots`` is derived from ``slots[]`` by construction**
+    (LP-0MW1VDZIX0011D8M, ``status_schema_version: 6``): whenever a per-slot
+    detail list is served it is ``count(slots[] where is_processing ==
+    false)`` — never a separately counted field — so the summary can never
+    contradict its own detail. An abandoned-but-processing slot therefore
+    counts as *not available* (AC4). When no detail list is served the
+    counts/pool fallback above applies (there is nothing to contradict).
+    When the served detail came from the last-known cache (a fossil),
+    ``available_slots`` is published as ``0`` and the additive
+    ``availability_unknown: true`` flag says why: availability is **not**
+    asserted from a stale list (AC3). ``total_slots`` is never smaller than
+    the served ``slots[]`` length, so ``0 <= available_slots <= total_slots``.
 
     When llama-server is running with a model loaded but the ``/slots``
     query fails (e.g. HTTP 500 while the model reloads after a cheap-mode
@@ -573,13 +587,22 @@ async def get_llama_local_status(request: Request):
     (AC7).
 
     When the served slot detail is stale, ``capacity_hint`` is reconciled
-    with live state (LP-0MVKSXR4P001V0CM AC1/AC3) so a fossil snapshot can
-    never starve a dispatcher: with no in-flight local request (counted from
-    active dispatch records in ``local_in_flight_requests``) every verdict
-    degrades to ``idle`` and ``available_slots`` is reconciled upward;
-    in-flight work with fresh chunk activity within
+    with live state (LP-0MVKSXR4P001V0CM AC1/AC3, revised by
+    LP-0MW1VDZIX0011D8M): with no in-flight local request (counted from
+    active dispatch records in ``local_in_flight_requests``) the verdict is
+    ``unknown`` — the fossil proves neither availability nor saturation, and
+    the earlier ``idle`` reconciliation is what let ``available_slots: 2``
+    sit beside two ``is_processing: true`` slots. ``available_slots`` is
+    published as ``0`` with ``availability_unknown: true`` in that case.
+    In-flight work with fresh chunk activity within
     ``STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS`` keeps ``saturated``; any other
     in-flight work is reported ``prefill_bound``, never ``saturated``.
+
+    ``local_idle_seconds`` is held at ``0`` while any slot reports
+    ``is_processing: true`` (LP-0MW1VDZIX0011D8M AC4): a processing slot
+    means the backend is demonstrably not idle, so the published idle age
+    must not climb beside it. The monotonic signal the routing override reads
+    is unchanged — this clamp is read-only observability.
 
     ``local_active_query`` reports whether local model work is genuinely in
     flight, derived from active dispatch records rather than the
@@ -979,6 +1002,42 @@ async def get_llama_local_status(request: Request):
         # Annotation is best-effort; the base slot fields remain valid.
         pass
 
+    # -- derive availability from the served detail (LP-0MW1VDZIX0011D8M) ---
+    # The summary must never contradict its own ``slots[]``. ``available_slots``
+    # was historically read from a separate counts counter (a different
+    # ``/slots`` read) and reconciled independently, which is how a payload
+    # could assert ``available_slots: 2`` while both listed slots were
+    # ``is_processing: true`` (2026-11-04 incident, 8 h frozen snapshot). From
+    # this change the value is derived from ``slots[]`` by construction:
+    # ``count(not is_processing)`` whenever a detail list is served (AC1), so
+    # abandoned-but-processing slots reduce availability instead of sitting
+    # beside it (AC4).
+    #
+    # A stale list cannot prove availability (AC3), so when ANY slot data
+    # (counts or detail) came from the last-known cache the value is published
+    # as ``0`` and the additive ``availability_unknown`` flag says why — never
+    # a fabricated "free" count read off a fossil. ``total_slots`` is raised to
+    # the served list length so ``0 <= available_slots <= total_slots`` holds.
+    availability_unknown = False
+    try:
+        if slots and total_slots < len(slots):
+            total_slots = len(slots)
+        if counts_stale or detail_stale:
+            # ``slots_stale`` (the union) is client-visible; whenever it is
+            # true no summary field may assert availability (AC3). This covers
+            # the counts-only fallback too: cached counts are a stale list of
+            # slot states with no per-slot detail, and serving them as
+            # availability is the same over-dispatch hazard.
+            available_slots = 0
+            availability_unknown = True
+        elif slots:
+            from proxy.observability import count_available_slots
+
+            available_slots = count_available_slots(slots)
+    except Exception:
+        # Derivation is best-effort; leave the counts-derived value.
+        availability_unknown = bool(counts_stale or detail_stale)
+
     # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
     # The owner id is normalised to its bare session-id string: per-endpoint
     # leases are keyed by ``(endpoint, session_id)`` tuples and the raw key
@@ -1048,6 +1107,22 @@ async def get_llama_local_status(request: Request):
     except Exception:
         _idle_snapshot = {}
 
+    # AC4 (LP-0MW1VDZIX0011D8M): a slot the detail reports as processing means
+    # the backend is demonstrably not idle — the published idle age must not
+    # keep climbing beside ``is_processing: true`` (the 2026-11-04 payload
+    # showed ``local_idle_seconds`` growing while two slots were generating).
+    # Clamp the *published* value to 0 while any slot reports work; the raw
+    # monotonic signal the routing override reads is untouched.
+    published_idle_seconds = _idle_snapshot.get("idle_seconds")
+    try:
+        if any(
+            isinstance(_slot, dict) and bool(_slot.get("is_processing", False))
+            for _slot in slots
+        ):
+            published_idle_seconds = 0.0
+    except Exception:
+        pass
+
     # AC4 (LP-0MVGDUVGE0024YAI): summarise whether the pool is genuinely
     # working — ``idle`` (a free slot, or only idle leases), ``prefill_bound``
     # (no free slot, at least one prefill) or ``saturated`` (no free slot, all
@@ -1063,8 +1138,10 @@ async def get_llama_local_status(request: Request):
         capacity_hint = _capacity_hint(slots)
         # LP-0MVKSXR4P001V0CM AC3: a hint derived from cached ``/slots``
         # detail must never claim the pool is saturated without fresh
-        # evidence. Reconcile it with the live dispatch/activity state so a
-        # fossil snapshot cannot starve a dispatcher through an idle window.
+        # evidence — and, since LP-0MW1VDZIX0011D8M, must never claim it is
+        # *available* either. Reconcile it with the live dispatch/activity
+        # state so a fossil snapshot is reported ``unknown`` (neither idle nor
+        # saturated) when the proxy has no live work of its own.
         capacity_hint = _downgrade_stale_hint(
             capacity_hint,
             stale=detail_stale,
@@ -1072,22 +1149,13 @@ async def get_llama_local_status(request: Request):
             activity_source=_idle_snapshot.get("last_activity_source"),
             idle_seconds=_idle_snapshot.get("idle_seconds"),
         )
-        if detail_stale and capacity_hint == "idle":
-            # The proxy sees no in-flight local work, so the cached counts
-            # must not report a full pool either: reconcile
-            # ``available_slots`` with the same view (fail-open, mirroring the
-            # no-model-loaded branch LP-0MSI06HPB0043MV1). A dispatcher polls
-            # this pair together and acts on both.
-            if total_slots <= 0:
-                try:
-                    total_slots = int(
-                        server_cfg.get("session_slot_pool_size", 3) or 3
-                    )
-                except (TypeError, ValueError):
-                    total_slots = 3
-            available_slots = max(
-                available_slots, total_slots - (live_local_requests or 0)
-            )
+        if availability_unknown and capacity_hint == "idle":
+            # The summary cannot assert availability from stale evidence, so a
+            # detail-derived ``idle`` becomes ``unknown`` (consumers treat
+            # unrecognised hints as busy — fail-closed, never over-dispatch).
+            from proxy.observability import CAPACITY_UNKNOWN
+
+            capacity_hint = CAPACITY_UNKNOWN
     except Exception:
         capacity_hint = "idle"
 
@@ -1201,6 +1269,7 @@ async def get_llama_local_status(request: Request):
         "model_switch_in_progress": switch_in_progress,
         "current_model": cm,
         "available_slots": available_slots,
+        "availability_unknown": bool(availability_unknown),
         "total_slots": total_slots,
         "slots_stale": slots_stale,
         "slots_stale_reason": slots_stale_reason,
@@ -1238,7 +1307,7 @@ async def get_llama_local_status(request: Request):
         ),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
-        "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
+        "local_idle_seconds": published_idle_seconds,
         "capacity_hint": capacity_hint,
         "local_in_flight_requests": live_local_requests,
         "local_abandoned_slots": abandoned_slots,
@@ -1256,7 +1325,7 @@ async def get_llama_local_status(request: Request):
         "local_route_failure_count": local_route.get(
             "local_route_failure_count", 0
         ),
-        "status_schema_version": 6,
+        "status_schema_version": 7,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -1272,6 +1341,7 @@ async def get_llama_local_status(request: Request):
         "current_model": cm,
         "llama_server_running": bool(llama_running),
         "available_slots": available_slots,
+        "availability_unknown": bool(availability_unknown),
         "total_slots": total_slots,
         # True when the served slot data (counts or per-slot detail) came from
         # the last-known cache because the fresh /slots query failed
@@ -1360,14 +1430,22 @@ async def get_llama_local_status(request: Request):
         # (``router_model_missing`` / ``child_port_undiscovered`` /
         # ``query_timeout`` / ``query_error`` / ``snapshot_too_old``), so an
         # operator no longer has to decode ``/metrics`` counter labels.
-        "status_schema_version": 6,
+        # v7 (LP-0MW1VDZIX0011D8M): ``available_slots`` is DERIVED from
+        # ``slots[]`` (``count(not is_processing)``) rather than a separate
+        # counts counter, so the summary can never contradict the detail; a
+        # stale detail list publishes ``available_slots: 0`` with the additive
+        # ``availability_unknown: true`` flag instead of asserting capacity,
+        # ``capacity_hint`` gains the additive ``unknown`` value in that case,
+        # and ``local_idle_seconds`` is held at ``0`` while any slot reports
+        # ``is_processing: true``.
+        "status_schema_version": 7,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local
         # backend has been idle (monotonic-derived) and when it last worked.
         # ``idle_seconds`` is the signal the routing override reads; the
         # timestamps are for operators.
-        "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
+        "local_idle_seconds": published_idle_seconds,
         "local_last_activity_at": _idle_snapshot.get("last_activity_at"),
         "local_last_activity_source": _idle_snapshot.get("last_activity_source"),
         # Prefill serialisation (LP-0MVGDUUV3001XFRJ AC4): in-flight prefills,
