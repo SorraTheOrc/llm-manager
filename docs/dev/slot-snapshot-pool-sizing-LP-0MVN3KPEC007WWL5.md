@@ -33,7 +33,7 @@ match llama-server's `--parallel` (`proxy/config.yaml:1754-1781`).
 | 6 | **Slot-ID space** — the numeric range a session may be assigned, and pool exhaustion | `_slot_id_for_session` returns the lowest free id in `[0, pool_size)`, `None` when the pool is full | `proxy/proxy/session.py:1062-1096` |
 | 7 | **Persistence on/off gate (global)** — pool size 0 disables all snapshotting | `_slot_persistence_enabled(slot_path, pool) = bool(slot_path and pool > 0)` | `proxy/proxy/session.py:488`, gate applied in `_build_slot_context` at `session.py:1264-1269` and in the eviction-save planner `session.py:848-871` |
 | 8 | **Tenancy default ("N tenants, N slots")** — the number of distinct sessions allowed to hold a large-prompt local reservation | `_default_tenants` uses the pool size when `local_session_tenants` is unset | `proxy/proxy/router_helpers.py:3655-3663`; config comment `proxy/config.yaml:1441` (live value `proxy/config.yaml:1447` = 2) |
-| 9 | **Capacity-admission slot count** and **status-endpoint fail-open total** | utilisation/admission accounting reads the pool; the `/status` handler reports the pool as `total_slots` when no model is loaded | `proxy/proxy/capacity_admission.py:124-129`; `proxy/proxy/handlers.py:442` (docstring), `:714`, `:760`, `:890` |
+| 9 | **Capacity-admission slot count** and **status-endpoint fail-open total** | utilisation/admission accounting reads the pool; the `/status` handler reports the pool as `total_slots` when no model is loaded | `proxy/proxy/capacity_admission.py:124-129`; `proxy/proxy/handlers.py:481` (docstring), `:839`, `:891`, `:1084` |
 
 Two further couplings that are *not* pool size but are commonly confused with it:
 
