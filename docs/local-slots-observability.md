@@ -53,6 +53,34 @@ the transport-level reason (`query_timeout` / `query_error`).
 An **unset** fetch stamp is treated as an unknown age, not an infinitely old
 one, so an un-initialised cache never trips the ceiling.
 
+## Visibility on `/health`
+
+A stale slot surface is a serving deficiency, so it is visible on `/health`
+without reading `/metrics`:
+
+| Field | Meaning |
+|---|---|
+| `slots_surface_status` | `ok` (fresh), `stale` (degraded — see the reason), `unknown` (backend unreachable, so nothing can be asserted) |
+| `slots_stale` | mirrors the status payload's flag |
+| `slots_stale_reason` | the same enumerated reason the status payload publishes |
+| `slots_snapshot_age_seconds` | age of the served snapshot, or `null` when unknown |
+| `slots_max_snapshot_age_seconds` | the applied ceiling |
+
+The values come from one shared evaluation (`observability.evaluate_slots_surface`),
+and `/health` mirrors the **last published** `/llama/local/status` reason — so a
+consumer that only polls `/health` still sees the cause.
+
+**`ready` and the top-level `status` are deliberately unaffected.** `ready`
+gates request admission; an unobservable slot *surface* does not stop the proxy
+serving a request, and flipping `ready` would fail-closed every consumer that
+reads it for liveness (the 2026-11-02 orphan-backend regression,
+LP-0MVZT9L3N001XABB AC2, is the cautionary precedent). Use
+`slots_surface_status != "ok"` as the non-OK signal.
+
+An ordinary idle window (llama-server down, or no model loaded yet) reports
+`slots_surface_status: "unknown"`, never `"stale"`, so a normal quiet period is
+not reported as a defect.
+
 ### Recovery
 
 No restart is required — and none should be performed to clear this condition.

@@ -1315,6 +1315,15 @@ async def get_llama_local_status(request: Request):
         # The resolver's own failure (child port undiscovered, model id
         # unusable) is more specific than a generic transport error.
         slots_stale_reason = slots_resolver_reason
+    # Publish the resolved reason into the shared recorder so ``/health``
+    # reports exactly what this endpoint reports (LP-0MW1VVMI1005XU0J AC3:
+    # one evaluation, one answer). A healthy poll clears it.
+    try:
+        from proxy.observability import record_slots_stale_reason
+
+        record_slots_stale_reason(slots_stale_reason)
+    except Exception:
+        pass
     client_ip, client_ip_source = _resolve_client_ip(request)
     status_extra = {
         "client_ip": client_ip,
@@ -1726,9 +1735,50 @@ async def health_check():
     if tts_enabled and tts_process_alive:
         tts_server_healthy = await _probe_tts_health(tts_host, tts_port, timeout=2.0)
 
+    # -- slot-surface staleness (LP-0MW1VVMI1005XU0J) ----------------------
+    # A stale slot surface was invisible to every health consumer during the
+    # 2026-11-04 freeze: /health reported healthy while
+    # /llama/local/status carried slots_stale=true and an 8 h 17 m-old
+    # snapshot, so dashboards, slot_sweep_preflight.py and machine-hygiene all
+    # saw a healthy proxy while the dispatcher was starved.
+    #
+    # ``ready`` and the top-level ``status`` are DELIBERATELY unchanged: ready
+    # gates request admission, and an unobservable slot surface does not make
+    # the proxy unable to serve a request. Flipping ready here would
+    # fail-closed every consumer that reads it for liveness — the 2026-11-02
+    # orphan-backend regression (LP-0MVZT9L3N001XABB AC2) is the cautionary
+    # precedent. The non-OK signal is ``slots_surface_status``.
+    try:
+        from proxy.observability import evaluate_slots_surface
+
+        slots_surface = evaluate_slots_surface(
+            srv.config if isinstance(srv.config, dict) else {},
+            backend_available=bool(llama_running and backend_reachable),
+        )
+    except Exception:
+        # Fail-open: never break /health over a slot-staleness evaluation.
+        slots_surface = {
+            "status": "unknown",
+            "slots_stale": False,
+            "slots_stale_reason": None,
+            "snapshot_age_seconds": None,
+            "max_snapshot_age_seconds": None,
+        }
+
     return {
         "status": "healthy" if ready else "degraded",
         "ready": ready,
+        # Slot-surface condition (additive). ``ok`` when the surface is fresh,
+        # ``stale`` when it is degraded (see ``slots_stale_reason`` for why),
+        # ``unknown`` when the backend is unreachable so nothing can be
+        # asserted. Consumers should treat any unrecognised value as non-ok.
+        "slots_surface_status": slots_surface["status"],
+        "slots_stale": bool(slots_surface["slots_stale"]),
+        "slots_stale_reason": slots_surface["slots_stale_reason"],
+        "slots_snapshot_age_seconds": slots_surface["snapshot_age_seconds"],
+        "slots_max_snapshot_age_seconds": slots_surface[
+            "max_snapshot_age_seconds"
+        ],
         "current_model": srv.current_model,
         "loaded_models": loaded_models,
         "llama_server_running": llama_running,

@@ -461,6 +461,109 @@ def slots_snapshot_too_old(
     return age > ceiling
 
 
+SLOTS_SURFACE_OK = "ok"
+SLOTS_SURFACE_STALE = "stale"
+SLOTS_SURFACE_UNKNOWN = "unknown"
+
+SLOTS_SURFACE_STATES: tuple[str, ...] = (
+    SLOTS_SURFACE_OK,
+    SLOTS_SURFACE_STALE,
+    SLOTS_SURFACE_UNKNOWN,
+)
+"""The ``slots_surface_status`` vocabulary published on ``/health``."""
+
+
+def _age_of_stamp(stamp: float | None) -> float | None:
+    """Age (seconds) of a monotonic *stamp*, or ``None`` when unset.
+
+    A non-positive or NaN stamp means "never fetched", which is an *unknown*
+    age — never "infinitely old" (the same discipline as the status handler's
+    ``_snapshot_age_seconds``, LP-0MW1VVKPF001ZAV5).
+    """
+    if stamp is None:
+        return None
+    try:
+        value = float(stamp)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value <= 0.0:
+        return None
+    return max(0.0, time.monotonic() - value)
+
+
+def evaluate_slots_surface(
+    config: dict | None = None,
+    backend_available: bool = True,
+    served_age_seconds: float | None = None,
+    served_from_snapshot: bool = False,
+) -> dict:
+    """Single source of truth for slot-surface freshness.
+
+    Both ``/llama/local/status`` and ``/health`` consume this, so the ceiling
+    arithmetic and the reason precedence exist once (LP-0MW1VVMI1005XU0J AC3).
+
+    Args:
+        config: server configuration (for the ceiling).
+        backend_available: whether the backend is reachable at all. When it is
+            not, the surface is simply unobservable — reported ``unknown``,
+            never ``stale``, so an ordinary idle window is not a defect.
+        served_age_seconds: the age of the snapshot this poll actually served,
+            when the caller knows it (the status handler does, from its
+            provenance). ``None`` falls back to the cache stamps.
+        served_from_snapshot: whether the served data came from a cache.
+
+    Returns a dict with ``status`` (one of :data:`SLOTS_SURFACE_STATES`),
+    ``slots_stale`` (bool), ``slots_stale_reason`` (vocabulary member or
+    ``None``), ``snapshot_age_seconds`` and ``max_snapshot_age_seconds``.
+
+    Never raises: a fault yields an ``unknown`` surface rather than breaking a
+    health or status poll.
+    """
+    try:
+        ceiling = local_slots_max_snapshot_age_seconds(config)
+    except Exception:  # pragma: no cover - defensive
+        ceiling = _default_slots_max_snapshot_age_seconds()
+
+    try:
+        if served_age_seconds is not None:
+            age = served_age_seconds
+        elif _last_slot_details_cache:
+            age = _age_of_stamp(_last_slot_details_at)
+        else:
+            age = _age_of_stamp(
+                _last_slot_counts_cache[2] if _last_slot_counts_cache else None
+            )
+    except Exception:  # pragma: no cover - defensive
+        age = None
+
+    try:
+        too_old = slots_snapshot_too_old(age, ceiling)
+        recorded = last_slots_stale_reason()
+    except Exception:  # pragma: no cover - defensive
+        too_old, recorded = False, None
+
+    reason = select_slots_stale_reason(
+        detail_reason=recorded, counts_reason=None, snapshot_too_old=too_old
+    )
+
+    if reason is not None:
+        status = SLOTS_SURFACE_STALE
+    elif not backend_available:
+        status = SLOTS_SURFACE_UNKNOWN
+    else:
+        status = SLOTS_SURFACE_OK
+
+    return {
+        "status": status,
+        "slots_stale": reason is not None or (
+            served_from_snapshot and bool(too_old)
+        ),
+        "slots_stale_reason": reason,
+        "snapshot_age_seconds": age,
+        "max_snapshot_age_seconds": ceiling,
+    }
+
+
 def last_known_slot_counts_stamp() -> float | None:
     """Monotonic stamp of the last successful counts fetch, or ``None``.
 
