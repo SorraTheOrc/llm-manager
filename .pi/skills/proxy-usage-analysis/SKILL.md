@@ -14,6 +14,13 @@ Markdown report with highlighted, data-backed recommendations — including an
 errors observed in the window, and a **provider context-skips** breakdown for
 the per-provider context-ceiling skips (`routing_skip_provider_context`).
 
+The report also opens with a **performance metrics scorecard**: the ten
+metrics the proxy is held to, each with its best recorded baseline, an
+evidence-based target, this window's actual value and a direction-aware
+result, followed by a per-metric detail block (importance, calculation,
+levers, trade-offs). See [Performance metrics
+scorecard](#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3).
+
 The pipeline is fully deterministic: every report section is produced by
 rule-based Python, not an LLM. The skill is a thin, CLI-focused wrapper
 around the pipeline. The daily report is produced unattended by the 05:00
@@ -53,8 +60,12 @@ Options:
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
 | `--stale-rate-target` | `0.05` | Target share of status polls allowed to report `slots_stale=true`; drives the **Local capacity signals** section's met/unmet outcome and `--json`'s `capacity_signals.slots_stale.passed`. Mirrors `scripts/capacity_signal_verification.py --stale-rate-target` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings) |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings — plus `performance_metrics` — the scorecard block keyed by metric id and its `performance_metrics_counts` totals) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
+| `--metrics-config` | `metrics/performance_metrics.yaml` | Path to the committed performance-metric defaults (metric detail copy and any seeded history); read-only at runtime, never written |
+| `--metrics-state` | `<output-dir>/performance_metrics_state.yaml` | Path to the live performance-metric history file this run records its window in |
+| `--no-metrics-update` | off | Render the performance metrics section but do not record this window (no state write) |
+| `--seed-metrics-history [DIR]` | `~/proxy-usage-reports` | One-off backfill: seed the best-3 history from archived `report.md` files and exit without analysing logs |
 
 ## Daily cadence (05:00 cron)
 
@@ -76,7 +87,8 @@ artifact and stays at the root, untouched by archival.
 
 Written to `--output-dir` (default `~/proxy-usage-reports`): `report.md`
 (primary deliverable), `fast_sessions.csv`, `cheap_sessions.csv`,
-`errors.csv`, and `errors.json`. On every non-`--quiet` run the CLI summary
+`errors.csv`, `errors.json`, and the live performance-metric history
+`performance_metrics_state.yaml`. On every non-`--quiet` run the CLI summary
 prints the complete absolute path to each artifact, starting with the
 report. `report.md` also carries the **Provider context skips** section
 (count, share of all skip events, standard/low split, provider breakdown and
@@ -86,6 +98,82 @@ figures as `provider_context_skips`.
 
 See [REFERENCE.md](REFERENCE.md#outputs) for the full schema of each
 artifact and the archival behaviour.
+
+## Performance metrics scorecard (LP-0MW0FU5Z6006A4P3)
+
+The report opens with `## Performance metrics summary`: the ten metrics the
+proxy is held to, one row each, with the columns **Metric | Baseline |
+Target | Actual | Result**. It is the report's first section after the header
+bullets — before `## Performance metric details`, `## Summary by hour` and
+every data section — so a stakeholder who reads only this table still learns
+whether the proxy improved in this window.
+
+| Column | Meaning |
+|---|---|
+| Metric | The registry label; row order is the registry order, which never changes between runs |
+| Baseline | The single best recorded value and the date it was measured |
+| Target | The mean of the three best recorded measurements (direction-aware) |
+| Actual | This window's measurement, `n/a` when it cannot be measured |
+| Result | `Met` / `Unmet` against the target, or `Insufficient history` below three measurements |
+
+The rules behind those numbers:
+
+- **Direction.** Each metric is registered as higher-is-better or
+  lower-is-better, and every comparison respects it — a decoding speed of
+  33.1 tok/s against a 32.4 tok/s target is `Met`, a 9.7 denials/h against
+  9.1 denials/h is `Unmet`.
+- **Retention.** The three best *windows* are retained behind each target,
+  one measurement per window, so a re-run of the same day replaces that day's
+  value instead of appending a duplicate.
+- **Target.** The mean of those three retained measurements; below three the
+  target is `n/a`.
+- **Verdict.** The actual is compared with the target (equality counts as
+  met). Fewer than three measurements reports **Insufficient history** —
+  never a false Met/Unmet — and a window with no measurable actual reports
+  `n/a` with `Insufficient history`, never `0`.
+- **Configuration era.** Every measurement records the slot geometry it was
+  taken under (`slots=<n>,ctx=<per-slot context>`). When a metric's retained
+  best three span more than one era the section prints a **cross-era note**
+  naming the metric and the eras, because such a target averages unlike
+  configurations.
+
+`## Performance metric details` follows the table immediately: one `###`
+subsection per metric, headed by the metric id and label (for example
+`### decode_speed — Decode speed`), stating why the metric matters, how it is
+calculated and from which data, the levers available to change it and the
+trade-offs of trying to improve it. The prose comes from the committed
+defaults file rather than the renderer, so a wording change is a defaults-file
+change; each subsection links to the data section reporting its figures
+instead of repeating those tables.
+
+Where the numbers live:
+
+- `.pi/skills/proxy-usage-analysis/metrics/performance_metrics.yaml` — the
+  **committed defaults**: empty history plus each metric's detail copy.
+  **Read-only at runtime**; no run ever writes it.
+- `<output-dir>/performance_metrics_state.yaml` — the **live state**: every
+  recorded measurement, written once per run while the report is built.
+
+Four flags relocate those files, suppress the write, or seed the history from
+the archive:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--metrics-config PATH` | `metrics/performance_metrics.yaml` | Committed defaults to read (detail copy and any seeded history); never written |
+| `--metrics-state PATH` | `<output-dir>/performance_metrics_state.yaml` | Live history file this run records its window in |
+| `--no-metrics-update` | off | Render the scorecard without recording this window (no state write) |
+| `--seed-metrics-history [DIR]` | `~/proxy-usage-reports` | One-off backfill: seed the best-3 history from the archived `report.md` files and exit without analysing logs |
+
+**The existing 05:00 cron invocation is unchanged.** No metrics flag is
+needed: a default run reads the committed defaults, writes
+`<output-dir>/performance_metrics_state.yaml` and renders the scorecard, so
+the cron line under [Daily cadence](#daily-cadence-0500-cron) stays exactly
+as it is. `--json` carries the same figures as a `performance_metrics` block
+keyed by metric id (plus `performance_metrics_counts`), so an audit reads
+`baseline` / `target` / `actual` / `verdict` without parsing Markdown.
+
+Metric definitions, the two file schemas and a worked backfill run:
+[REFERENCE.md § Performance metrics scorecard](REFERENCE.md#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3).
 
 ## GPU busy time from power (Prometheus)
 

@@ -2730,7 +2730,11 @@ def _hourly_session_classification(sessions: list[SessionStats]) -> dict[datetim
 
 
 def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
-    """Append the top-of-report ``## Summary by hour`` table.
+    """Append the ``## Summary by hour`` table (after the scorecard block).
+
+    The performance scorecard and its detail block are the report's first
+    sections (LP-0MW1BUA2M0005QRV, LP-0MW1BUAEG006FMHX); this table follows
+    them and still precedes the Session summary.
 
     One row per **absolute wall-clock hour** of the report window
     (window-bounded buckets, partial first/last hours truncated to the
@@ -2844,8 +2848,9 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     is never overstated). All figures — busy/idle, total compute
     (slot-seconds), concurrency, and the fast/cheap split — are computed on
     the new intervals. The section is omitted when the window has no local
-    traffic. (The former hourly busy profile moved to the top of the report
-    as the ``## Summary by hour`` table, LP-0MTFO210Q0044TTF.)
+    traffic. (The former hourly busy profile moved above the Session summary
+    as the ``## Summary by hour`` table, LP-0MTFO210Q0044TTF; the performance
+    scorecard, LP-0MW1BUA2M0005QRV, now precedes it.)
     """
     if summary.busy is None:
         return

@@ -52,7 +52,14 @@ Outputs written to:
   /home/user/proxy-usage-reports/errors.json
 ```
 
-- `report.md` — the aggregate report (primary deliverable, listed first).
+- `report.md` — the aggregate report (primary deliverable, listed first). It
+  opens with the **Performance metrics summary** scorecard and its
+  **Performance metric details** block (see [Performance metrics
+  scorecard](#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3)).
+- `performance_metrics_state.yaml` — the live performance-metric history: the
+  measurements behind each scorecard target, rewritten once per run (see
+  [Live state](#live-state-output-dirperformance_metrics_stateyaml)). It is
+  not one of the archived artifacts, so the archive step never moves it.
 - `standard_sessions.csv` — one row per **standard** session (sessions
   whose start fell outside the cheap priority window). One row per session,
   covering ALL sessions in the
@@ -343,8 +350,9 @@ Outputs written to:
   Events without markers fall back to `unknown` display values so historical
   logs degrade gracefully; source values render as the canonical
   `scheduler` / `worker` / `api` / `manual` labels (LP-0MVC144KS001PDR4).
-  **Summary by hour** (rendered at the top of the report, before the
-  Session summary and always — regardless of local traffic): one row per
+  **Summary by hour** (rendered after the scorecard and its detail block,
+  before the Session summary and always — regardless of local traffic): one
+  row per
   **absolute wall-clock hour** of the report window (partial first/last hours
   truncated to the window edges, idle hours included as `0s`) with busy time
   / busy-% columns — busy seconds ÷ window-bounded bucket duration,
@@ -526,6 +534,273 @@ overwritten. Only the skill's own artifacts are moved — anything else in the
 output dir (e.g. `cron.log`) stays put, and a pristine output dir is left
 touched-free (no empty archive dirs). The CLI prints the archive path on each
 run (`Previous outputs archived to …`).
+
+## Performance metrics scorecard (LP-0MW0FU5Z6006A4P3)
+
+Every report opens with the scorecard: the ten metrics the proxy is held to,
+one row each, with a best recorded baseline, an evidence-based target, this
+window's actual value and a direction-aware result. It is the report's
+**first** `##` section after the header bullets — `## Summary by hour` and
+every data section follow it — and it is rendered by
+`scripts/reporting.py` from the registry in `scripts/performance_metrics.py`,
+which is the single source of truth for metric identity, order, unit,
+direction and data source. No metric name, order or number is hard-coded in
+the renderer.
+
+```text
+## Performance metrics summary
+
+| Metric | Baseline | Target | Actual | Result |
+|---|---|---|---|---|
+| GPU busy / local utilisation | 18.4 % (2026-11-03) | n/a | 18.4 % | Insufficient history |
+| Fallback rate | 87.9 % of requests (2026-11-03) | n/a | 87.9 % of requests | Insufficient history |
+| Decode speed | 32.1 tok/s (2026-11-03) | n/a | 32.1 tok/s | Insufficient history |
+…one row per registered metric, in registry order…
+```
+
+(The excerpt above is a real run — 2026-11-03 11:10 → 2026-11-04 11:10, one
+recorded window — so `Target` reads `n/a` and every result is
+`Insufficient history`: three recorded windows are needed before a target
+exists.)
+
+### Reading the summary table
+
+- **Baseline** — the single best recorded value with the date it was measured
+  (best per the metric's direction). `n/a` when nothing is recorded yet.
+- **Target** — the mean of the **three best** recorded measurements. `n/a`
+  below three, because there is no evidence base to average.
+- **Actual** — this window's measurement. `n/a` (never `0`) when the window
+  cannot be measured: no GPU sample, no llama-server eval lines, no matched
+  ETA pairs, and so on. A genuine measured zero renders as `0.0 <unit>`.
+- **Result** — `Met` / `Unmet` / `Insufficient history`. The comparison is
+  direction-aware and *equality with the target counts as met*. Fewer than
+  three recorded measurements always reports `Insufficient history`, never a
+  false Met/Unmet; a metric with no measurable actual also reports
+  `Insufficient history` (its actual is `n/a`).
+- **Retention rules.** All measurements are stored (they are the evidence
+  behind the target); the best three are *derived* per direction, at most one
+  per window, so a re-run of the same window replaces that window's value
+  rather than appending a duplicate. Higher-is-better keeps the largest
+  values, lower-is-better the smallest.
+- **Configuration era.** Each measurement records the slot geometry it was
+  taken under, `slots=<slot count>,ctx=<per-slot context>` (the total
+  `server.local_model_ctx_size` split equally across
+  `server.session_slot_pool_size` slots). When a metric's retained best three
+  span more than one fingerprint the section prints a **cross-era note**
+  naming the metric and every era involved: such a target averages unlike
+  geometries and the comparison is indicative rather than like-for-like.
+  Measurements with an unknown era (backfilled from archived reports, which
+  do not record their configuration) carry an empty fingerprint and are
+  ignored by that check, so a missing era never manufactures a false warning.
+- **Ordering guarantee.** The table has exactly one row per registered metric
+  and the detail block exactly one subsection per metric, both in registry
+  order — the integration tests assert both, so a metric cannot be added to
+  one surface and forgotten in the other.
+
+### Metric definitions
+
+All ten metrics, in the order the report renders them. `id` is the registry
+key, the `--json` key and the detail-subsection prefix.
+
+| id | Label | Unit | Direction | Data source |
+|---|---|---|---|---|
+| `gpu_busy` | GPU busy / local utilisation | % | higher is better | GPU telemetry sampler power samples |
+| `fallback_rate` | Fallback rate | % of requests | lower is better | `Fallback triggered` log events |
+| `decode_speed` | Decode speed | tok/s | higher is better | `Stream finished` token counts |
+| `prompt_eval_speed` | Prompt eval speed | tok/s | higher is better | llama-server prompt eval timing |
+| `time_to_first_token` | Time to first token | ms | lower is better | `dispatch_first_byte_ms` and `ttft_seconds` log lines |
+| `stream_error_rate` | Stream error rate | % | lower is better | `Stream error` and `Stream finished reason=error` lines |
+| `context_pressure` | Context-size pressure | % | lower is better | `routing_skip_local estimated_tokens` lines |
+| `prompt_cache_hit_ratio` | Prompt cache hit ratio | ratio | higher is better | `cached_ratio` and `cache_state` log fields |
+| `contention_denials_per_hour` | Contention denials per hour | denials/h | lower is better | `local_dispatch_denied` log events |
+| `prefill_eta_accuracy` | Prefill ETA accuracy | % | higher is better | `local_admission_guard` prefill ETA and dispatch first-byte pairs |
+
+How each value is calculated (`aggregation.performance_metric_inputs` is the
+single roll-up that produces exactly these keys):
+
+- **`gpu_busy`** — power-based busy time from the GPU telemetry sampler
+  (`avg_over_time(gpu:computing:bool[Nh])` over the 15-second hwmon series),
+  corroborated by log-derived local busy time for the same window. This is the
+  **hardware** figure the **Local model utilization** section renders, **not**
+  a local-utilisation signal: decisions still use the log-derived
+  `local_busy` (see [Which busy figure is authoritative for
+decisions](#which-busy-figure-is-authoritative-for-decisions)). `n/a` when
+  Prometheus was unreachable.
+- **`fallback_rate`** — share of the window's requests that produced
+  `Fallback triggered` events, as a percentage; the dominant fallback reason
+  is rendered in the **Fallback reasons** section rather than in the table.
+- **`decode_speed`** — median decode throughput (tok/s) from `Stream finished`
+  token counts for local streams in the window (the same figure the **Decode
+  speed** section renders).
+- **`prompt_eval_speed`** — median prompt-evaluation throughput (tok/s) from
+  llama-server prompt eval timing for local requests (the **Prompt eval
+  speed** section).
+- **`time_to_first_token`** — **local** p90 of dispatch → first byte, in
+  milliseconds; remote `ttft_seconds` samples are excluded and events without
+  a first-byte field are skipped (the **Time to first token** section).
+- **`stream_error_rate`** — share of streams ending in error, from `Stream
+  error` and `Stream finished reason=error` lines divided by all streams (the
+  **Error analysis** section).
+- **`context_pressure`** — share of local requests whose estimated prompt size
+  is at or above the per-slot context threshold, from
+  `routing_skip_local estimated_tokens` lines against the configured slot
+  geometry (the **Context sizes approaching per-slot limits**
+  recommendation).
+- **`prompt_cache_hit_ratio`** — median `cached_ratio` across local dispatches
+  (a 0–1 ratio, rendered to three decimals); the warm/cold share comes from
+  the `cache_state` field. The underlying data section is **Time to first
+  token**, which carries the per-dispatch cache fields.
+- **`contention_denials_per_hour`** — `local_dispatch_denied` events divided
+  by the window length in hours (the **Local contention prediction vs
+  reality** section's denials-per-hour row). `n/a` for a zero-length window.
+- **`prefill_eta_accuracy`** — median **absolute relative error** between the
+  admission guard's priced ETA and the observed first byte over matched pairs
+  (`median(|predicted − observed| / observed × 100)`, the
+  **Local contention prediction vs reality** section's M2 figure), recorded as
+  an accuracy percentage: **`100 − error`**, clamped at 0 because an error
+  above 100 % is no accuracy at all. The registry direction is
+  higher-is-better, so recording the raw error would make the best-3
+  retention keep the *worst* windows. `n/a` when no dispatch pairs with a
+  guard record.
+
+### Committed defaults: `metrics/performance_metrics.yaml`
+
+Committed, **read-only at runtime**. It carries the per-metric detail copy
+(the prose of `## Performance metric details`, so a wording change is a
+defaults-file change) and an empty `measurements` list per metric that a
+future default history could seed:
+
+```yaml
+metrics:
+  decode_speed:
+    measurements: []          # optional seeded history, one entry per window
+    why: "…why the metric matters…"
+    calculation: "…how it is calculated and from which data…"
+    levers: "…what an operator can change…"
+    trade_offs: "…what improving it costs…"
+    data_section_anchor: "## Decode speed"   # link target for the data
+```
+
+Every field except `measurements` is optional: a field a custom defaults file
+omits is reported as `not documented in the committed metrics defaults.`
+rather than invented. `data_section_anchor` is the `##` heading of the data
+section reporting the metric's figures; the renderer links to it instead of
+restating its tables. Loading either file never writes it, and
+`config_loader`'s guarded-import YAML pattern keeps PyYAML optional — no new
+mandatory dependency.
+
+### Live state: `<output-dir>/performance_metrics_state.yaml`
+
+Written by every reporting run (once, while the report is built — a run that
+fails earlier cannot corrupt history mid-report). This is the only mutable
+file, and it never lives in the repository, so the nightly run cannot dirty
+the working tree:
+
+```yaml
+metrics:
+  contention_denials_per_hour:
+    measurements:
+    - date: '2026-11-03'          # measurement date
+      fingerprint: slots=2,ctx=131072   # configuration era ('' when unknown)
+      value: 9.12                 # measured value, in the registry unit
+      window: '2026-11-03'        # window id; one measurement per window
+  context_pressure:
+    measurements:
+    - date: '2026-11-03'
+      fingerprint: slots=2,ctx=131072
+      value: 0.0
+      window: '2026-11-03'
+```
+
+- Every registered metric appears, with its `measurements` list (empty until
+  it is measured).
+- The window id is the date the analysis window opens (`YYYY-MM-DD`), which is
+  also the archived-report directory naming the backfill seeds, so a re-run
+  updates that window instead of adding a second measurement for it.
+- Loading starts from the committed defaults and lets an existing state file
+  override it **per metric**, so the live file always wins where it has
+  something to say; a missing file simply leaves that metric empty.
+- A metric with no measurable actual is not recorded at all — never as `0`.
+
+### Backfilling the history (`--seed-metrics-history`)
+
+A one-off backfill seeds the best-3 history from the archived daily reports,
+so the scorecard is useful on its first post-ship run instead of reporting
+`Insufficient history` for the first three days:
+
+```bash
+python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+    --seed-metrics-history ~/proxy-usage-reports \
+    --output-dir ~/proxy-usage-reports
+```
+
+`DIR` (default `~/proxy-usage-reports`) holds one subdirectory per archived
+run, each with its `report.md`; every such file is parsed and the seed exits
+**without** analysing logs. Only the live state file is written — the
+committed defaults are read, never modified. Example run over the 258
+archived windows in this deployment:
+
+```text
+Seeded 333 measurement(s) from 258 archived report window(s); 643 measurement(s) were already present and left untouched.
+Metrics with no parseable value in the archive (history accrues from the next run):
+  stream_error_rate: not rendered in the archived report
+  context_pressure: not rendered in the archived report
+  prompt_cache_hit_ratio: not rendered in the archived report
+  prefill_eta_accuracy: not rendered in the archived report
+Live state file written: /tmp/metrics-seed-check/performance_metrics_state.yaml
+```
+
+The rules behind those numbers:
+
+- **Idempotent per window.** A metric already recorded for a window is left
+  untouched, so re-running the seed reports `Seeded 0 measurement(s)` and the
+  same `already present` count. Several archive directories routinely share
+  one window (`2026-08-07/` and `2026-08-07_2/`), which is why the
+  `already present` count exceeds the number of windows.
+- **Extraction is never guessed.** Only metrics whose figure is actually
+  rendered in the archived report are parsed (`fallback_rate`, `decode_speed`,
+  `prompt_eval_speed`, `time_to_first_token`, `gpu_busy`,
+  `contention_denials_per_hour`). A metric with no rendered figure — or whose
+  section did not exist in that report era — is reported as skipped and
+  accrues history from the first post-ship run.
+- **Unknown era.** A backfilled measurement carries an empty configuration
+  fingerprint, because an archived report does not record its slot geometry.
+  Cross-era flags therefore ignore backfilled entries.
+- **Units are taken as rendered.** A backfilled value keeps the scale the
+  archived report used. Where an older era rendered a figure in different
+  units from the current registry (the middle-era `## Time to first token`
+  table renders seconds, later tables milliseconds), the stored value keeps
+  the older scale; that extraction gap is tracked in LP-0MW20RKLE006TG4M, so
+  re-seed from a clean state after it lands rather than trusting a
+  seconds-era TTFT measurement.
+- The seed writes to `--metrics-state` when given, otherwise to
+  `<output-dir>/performance_metrics_state.yaml`; point `--output-dir` at the
+  report directory the daily cron writes to so the next run inherits the
+  history.
+
+### `--json` block
+
+The machine-readable summary carries the same figures, so an audit never
+parses Markdown:
+
+```json
+"performance_metrics": {
+  "decode_speed": {
+    "actual": 33.1,
+    "baseline": {"date": "2026-11-03", "value": 32.1},
+    "target": null,
+    "verdict": "Insufficient history"
+  }
+},
+"performance_metrics_counts": {"Met": 0, "Unmet": 0, "Insufficient history": 10}
+```
+
+The block is keyed by metric id (all ten, in registry order) and each entry
+carries `baseline` (`value` + `date`, `null` when nothing is recorded),
+`target` (`null` below three measurements), `actual` (`null`, never `0`, when
+unmeasurable) and `verdict`. It is produced by the same derivation as the
+rendered table, so the two views can never disagree, and it is **read-only**:
+the single state write happens while the report is built.
 
 ## Verifying the daily path is agent-free
 
@@ -714,9 +989,10 @@ entry is a local runtime edit, not a committed artifact.
    (LP-0MVJNW6SN008AKH3). Every pre-change key is retained unchanged, and the
    phase split stays at `local_busy.prefill_vs_decode`. Busy seconds are attributed to **absolute** hours and
    to fast/cheap periods (slot schedule) by splitting at hour and period
-   boundaries. The top-of-report **Summary by hour** table
-   (LP-0MTFO210Q0044TTF, reworked by LP-0MTYAZFGN003BYQS) then renders one
-   row per **absolute wall-clock hour** of the report window — the first/last
+   boundaries. The **Summary by hour** table (after the performance
+   scorecard; LP-0MTFO210Q0044TTF, reworked by LP-0MTYAZFGN003BYQS) then
+   renders one row per **absolute wall-clock hour** of the report window —
+   the first/last
    rows truncated to the window edges and every hour listed even when idle —
    with a busy-% column (busy seconds ÷ window-bounded bucket duration,
    clamped to 100%), a **State** column carrying the hour's local-availability
@@ -1178,7 +1454,8 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   warning recommendation. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
   fallback reasons), not that local is underprovisioned. The **Summary by
-  hour** table at the top of the report shows per-hour busy % and per-hour
+  hour** table (immediately after the performance scorecard) shows per-hour
+  busy % and per-hour
   activity across exactly the report window (idle hours included), so a
   glance at the hourly pattern correlates demand with provider usage and
   shows when local was saturated vs idle; the totals row gives the

@@ -15,6 +15,27 @@ Registry
 improvement points) and ``source`` (the log/telemetry input the metric is
 measured from). Registry order is the report's row and detail-section order.
 
+Retention, target and verdict rules
+-----------------------------------
+
+- **Direction** — ``Metric.direction`` decides which way improvement points:
+  ``higher`` keeps the largest values, ``lower`` the smallest. Every rule
+  below is direction-aware.
+- **Retention** — :func:`retained` returns the best ``RETENTION_LIMIT`` (3)
+  measurements, best first, at most one per window
+  (:func:`_dedupe_by_window` keeps that window's better value), so recording
+  the same window twice can never inflate a target.
+- **Baseline** — :func:`baseline_from` is the single best retained value plus
+  its measurement date. It is the report's context column, not the target.
+- **Target** — :func:`target_from` is the mean of the retained best three, or
+  ``None`` below three. With less evidence there is no target, and the report
+  says ``Insufficient history`` rather than inventing one.
+- **Verdict** — :func:`derive_verdict` compares this window's actual against
+  that target (equality counts as met) and returns ``Met``/``Unmet``; fewer
+  than three measurements always returns ``Insufficient history``, and an
+  unmeasurable actual (``None``) returns ``n/a`` and is never recorded as
+  ``0``.
+
 State schema
 ------------
 

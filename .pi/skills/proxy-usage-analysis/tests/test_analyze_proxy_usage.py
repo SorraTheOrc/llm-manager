@@ -3159,7 +3159,8 @@ class TestBusyStats:
     def test_report_summary_by_hour_table_window_bounded_with_pct_and_totals(self):
         # Regression (LP-0MSVMLM7G009N74N) extended by LP-0MTFO210Q0044TTF and
         # reworked by LP-0MTYAZFGN003BYQS: the hourly profile is the
-        # top-of-report ``## Summary by hour`` table — it spans exactly the
+        # ``## Summary by hour`` table (after the performance scorecard,
+        # LP-0MW1BUA2M0005QRV) — it spans exactly the
         # report window (partial first/last rows truncated to the window
         # edges), lists every hour including idle ones, carries a % column
         # (busy / window-bounded bucket duration, clamped to 100%), and its
@@ -3181,7 +3182,8 @@ class TestBusyStats:
         assert summary.busy is not None
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        # AC1: renamed, moved to the top of the report (before Session summary).
+        # AC1: renamed, moved above the Session summary; it now follows the
+        # performance scorecard (LP-0MW1BUA2M0005QRV).
         assert "Busy time by hour:" not in md
         assert md.index("## Summary by hour") < md.index("## Session summary")
         # AC2/AC1: window-bounded rows with a % column; idle middle hour
@@ -4294,8 +4296,9 @@ class TestPrefillVsDecodeSection:
 
 
 class TestSummaryByHourActivity:
-    """Per-hour activity columns in the top-of-report ``## Summary by hour``
-    table (LP-0MTYAZFGN003BYQS).
+    """Per-hour activity columns in the ``## Summary by hour``
+    table (LP-0MTYAZFGN003BYQS); the table follows the performance scorecard
+    (LP-0MW1BUA2M0005QRV) rather than opening the report.
 
     Activity is counted by each event's own timestamp inside its absolute-hour
     bucket: ``Requests started`` (all Stream started), ``Local attempts``
