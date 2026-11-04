@@ -3969,9 +3969,24 @@ class TestDispatchToFinishBusy:
         assert "Prefill vs decode" in section
         assert "Samples" in section
 
-    def test_report_note_is_deterministic_across_runs(self):
+    def test_report_note_is_deterministic_across_runs(self, monkeypatch):
         """AC3 (LP-0MVKN85WO007O00H): re-analysing the same logs renders a
-        byte-identical report, so the corrected note never drifts."""
+        byte-identical report, so the corrected note never drifts.
+
+        The clock is frozen for the comparison: the header records
+        ``Generated: <wall clock>``, so two builds that straddle a second
+        boundary differ by that line alone (observed as a full-suite flake once
+        the report body grew long enough for a second ``build_report`` call to
+        cross the boundary). Determinism is about the rendered content, not
+        about how long the build took.
+        """
+
+        class _FrozenClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 8, 2, 15, 0, 0)
+
+        monkeypatch.setattr(reporting, "datetime", _FrozenClock)
         lines = [
             "2026-08-02 10:00:00,000 - INFO - Stream started: provider=local "
             "model=Qwen3 session=old request=[]",
