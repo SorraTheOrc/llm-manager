@@ -32,6 +32,7 @@ import engine_cross_check
 import gpu_busy
 import llama_log_parser
 import log_parser
+import performance_metrics
 import recommendations
 from aggregation import AnalysisResult, SessionStats
 from llama_log_parser import CHEAP, FAST, TOTAL
@@ -830,6 +831,223 @@ def _ap_fallback_attribution(ap, summary: AnalysisResult) -> None:
     ap("- Session fallback attribution: " + " | ".join(parts))
 
 
+# ---------------------------------------------------------------------------
+# Performance metrics summary (LP-0MW1BUA2M0005QRV)
+# ---------------------------------------------------------------------------
+#
+# The scorecard is the report's first section so a stakeholder reads the held
+# metrics, their evidence-based target and this window's verdict without
+# reading anything else (parent LP-0MW0FU5Z6006A4P3 AC1/AC2/AC3). The table
+# itself hard-codes nothing: metric identity and order come from
+# ``performance_metrics.METRIC_REGISTRY``, the baseline/target/verdict maths
+# from that module, and this window's values from the aggregation helpers.
+
+#: Decimal places per registered unit. A 0-1 ratio is logged to two decimals
+#: and its median keeps three; a per-hour rate is already computed to two.
+_METRIC_UNIT_DECIMALS = {"ratio": 3, "denials/h": 2}
+
+
+def _fmt_metric_value(value: float | None, unit: str) -> str:
+    """Render one metric figure with its unit (``n/a`` when unmeasured).
+
+    An absent measurement never renders as ``0``: ``None`` is ``n/a``, while a
+    genuine measured zero (0.0) keeps its unit and renders as ``0.0 <unit>``,
+    because a measured zero and a missing measurement are different facts.
+    """
+    if value is None:
+        return performance_metrics.NOT_AVAILABLE
+    decimals = _METRIC_UNIT_DECIMALS.get(unit, 1)
+    return f"{float(value):.{decimals}f} {unit}".strip()
+
+
+def _fmt_metric_baseline(baseline: dict | None, unit: str) -> str:
+    """The baseline cell: best recorded value with its measurement date."""
+    if not baseline:
+        return performance_metrics.NOT_AVAILABLE
+    rendered = _fmt_metric_value(baseline.get("value"), unit)
+    date = baseline.get("date")
+    return f"{rendered} ({date})" if date else rendered
+
+
+def _metrics_window_id(summary: AnalysisResult) -> str:
+    """The window id a measurement is recorded under.
+
+    The daily run's window is identified by the date its window opens, which
+    matches the archived-report directory names the backfill seeds (one
+    measurement per window, replaced rather than appended on a re-run).
+    """
+    return summary.window_start.strftime("%Y-%m-%d")
+
+
+def _metrics_fingerprint(config: dict | None) -> str:
+    """Configuration fingerprint for this run's measurements.
+
+    ``slots=<slot count>,ctx=<per-slot context>``, derived from the analysed
+    configuration (``local_model_ctx_size`` is the total; each of the
+    ``session_slot_pool_size`` slots gets an equal share). Unknown geometry
+    yields the engine's unknown-era marker rather than a fabricated era, and
+    unknown eras are ignored by the cross-era check.
+    """
+    slots = (config or {}).get("session_slot_pool_size")
+    ctx = (config or {}).get("local_model_ctx_size")
+    try:
+        slot_count = int(slots)
+        total_ctx = int(ctx)
+    except (TypeError, ValueError):
+        return performance_metrics.UNKNOWN_FINGERPRINT
+    if slot_count <= 0 or total_ctx <= 0:
+        return performance_metrics.UNKNOWN_FINGERPRINT
+    return performance_metrics.configuration_fingerprint(
+        slot_count, total_ctx // slot_count
+    )
+
+
+def _performance_metric_actuals(
+    summary: AnalysisResult,
+    config: dict | None,
+    mode_map: bucketing.ModeScheduleMap | None,
+) -> dict[str, float | None]:
+    """This window's actual per registry metric (``None`` renders ``n/a``).
+
+    Thin wrapper over :func:`aggregation.performance_metric_inputs` that
+    converts the one metric whose aggregation input has the opposite sense to
+    its registry direction: ``prefill_eta_accuracy`` is registered as a
+    higher-is-better percentage, while the aggregation helper reports the
+    median absolute **relative error**. Recording the error would make the
+    direction-aware best-3 retention keep the worst windows, so the scorecard
+    records ``100 - error`` (clamped at 0: an error above 100 % is no accuracy
+    at all) — as the helper's docstring instructs.
+    """
+    actuals = aggregation.performance_metric_inputs(summary, config, mode_map)
+    error = actuals.get("prefill_eta_accuracy")
+    if error is not None:
+        actuals["prefill_eta_accuracy"] = round(max(0.0, 100.0 - float(error)), 1)
+    return actuals
+
+
+def _cross_era_fingerprints(measurements: list[dict], direction: str) -> list[str]:
+    """Configuration eras the retained best-3 span (empty when not cross-era)."""
+    best = performance_metrics.retained(measurements, direction)
+    if not performance_metrics.is_cross_era(best):
+        return []
+    return sorted(
+        {
+            str(measurement.get("fingerprint"))
+            for measurement in best
+            if measurement.get("fingerprint")
+        }
+    )
+
+
+def _append_cross_era_note(ap, state: dict) -> None:
+    """Flag targets whose best three measurements span configuration eras.
+
+    A target averaging across slot/context geometries compares unlike things,
+    so the section names the metric and every fingerprint involved instead of
+    silently presenting a mixed-era target as comparable.
+    """
+    lines: list[str] = []
+    for metric in performance_metrics.METRIC_REGISTRY:
+        measurements = state["metrics"][metric.id]["measurements"]
+        fingerprints = _cross_era_fingerprints(measurements, metric.direction)
+        if not fingerprints:
+            continue
+        named = ", ".join(f"`{fingerprint}`" for fingerprint in fingerprints)
+        lines.append(f"- {metric.label} (`{metric.id}`): {named}")
+    if not lines:
+        return
+    ap("")
+    ap(
+        "**Cross-era note:** the retained best three measurements behind these "
+        "targets span more than one configuration era (slot count / per-slot "
+        "context), so the target averages unlike geometries and the comparison "
+        "is indicative rather than like-for-like:"
+    )
+    ap("")
+    for line in lines:
+        ap(line)
+
+
+def _append_performance_metrics_section(
+    ap,
+    summary: AnalysisResult,
+    config: dict | None,
+    mode_map: bucketing.ModeScheduleMap | None,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+    update_metrics: bool = False,
+) -> None:
+    """Render the scorecard as the report's first section.
+
+    The window's measurement is recorded through the engine **before** the
+    rows are derived, so the rendered baseline and target reflect the history
+    this run just extended (parent AC2). Writing happens only when a mutable
+    state path is supplied *and* updates are enabled; the committed defaults
+    file is read-only and is never a write target. A metric whose actual is
+    ``None`` is not recorded at all — never as ``0``.
+    """
+    defaults_path = (
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
+    state = performance_metrics.load_state(metrics_state, defaults_path=defaults_path)
+    actuals = _performance_metric_actuals(summary, config, mode_map)
+
+    if update_metrics and metrics_state is not None:
+        window = _metrics_window_id(summary)
+        fingerprint = _metrics_fingerprint(config)
+        for metric in performance_metrics.METRIC_REGISTRY:
+            value = actuals.get(metric.id)
+            if value is None:
+                continue
+            performance_metrics.record_measurement(
+                state,
+                metric.id,
+                window=window,
+                value=value,
+                date=window,
+                fingerprint=fingerprint,
+            )
+        performance_metrics.save_state(state, metrics_state)
+
+    ap("")
+    ap("## Performance metrics summary")
+    ap("")
+    ap(
+        "**Baseline** is the best recorded value and the date it was measured; "
+        "**Target** is the mean of the three best measurements (direction-aware); "
+        "**Actual** is this window; **Result** compares the actual against the "
+        "target and reads `Met`, `Unmet` or `Insufficient history`."
+    )
+    ap("")
+    ap("| Metric | Baseline | Target | Actual | Result |")
+    ap("|---|---|---|---|---|")
+    for metric in performance_metrics.METRIC_REGISTRY:
+        measurements = state["metrics"][metric.id]["measurements"]
+        actual = actuals.get(metric.id)
+        baseline = performance_metrics.baseline_from(measurements, metric.direction)
+        target = performance_metrics.target_from(measurements, metric.direction)
+        # The Result column only ever reads Met / Unmet / Insufficient history:
+        # a window with no measurable actual has no verdict to give, and the
+        # engine's ``n/a`` (its "no actual" answer) would be a fourth label the
+        # scorecard contract does not allow. The Actual cell already shows
+        # ``n/a``, so the row still states exactly what evidence is missing.
+        verdict = (
+            performance_metrics.INSUFFICIENT
+            if actual is None
+            else performance_metrics.derive_verdict(
+                actual, measurements, metric.direction
+            )
+        )
+        ap(
+            f"| {metric.label} | {_fmt_metric_baseline(baseline, metric.unit)} | "
+            f"{_fmt_metric_value(target, metric.unit)} | "
+            f"{_fmt_metric_value(actual, metric.unit)} | {verdict} |"
+        )
+
+    _append_cross_era_note(ap, state)
+
+
 def build_report(
     summary: AnalysisResult,
     config: dict | None,
@@ -837,6 +1055,10 @@ def build_report(
     mode_map: bucketing.ModeScheduleMap | None = None,
     profiles: dict | None = None,
     stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+    update_metrics: bool = False,
 ) -> str:
     recs = recommendations.generate_recommendations(summary, config, mode_map)
     hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
@@ -886,6 +1108,19 @@ def build_report(
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
     _ap_fallback_attribution(ap, summary)
+
+    # The performance scorecard is the report's first section
+    # (LP-0MW1BUA2M0005QRV): a stakeholder reads baseline, target, actual and
+    # verdict for every metric before any of the detail sections.
+    _append_performance_metrics_section(
+        ap,
+        summary,
+        config,
+        mode_map,
+        metrics_config=metrics_config,
+        metrics_state=metrics_state,
+        update_metrics=update_metrics,
+    )
 
     _append_summary_by_hour(ap, summary)
 

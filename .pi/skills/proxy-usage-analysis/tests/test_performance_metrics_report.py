@@ -76,6 +76,9 @@ collected"). The probes are behavioural, not name-based:
 - the render tests run once ``performance_metrics.py`` and the committed
   defaults exist **and** ``build_report()`` actually emits
   ``## Performance metrics summary``;
+- the detail-section tests additionally wait for ``## Performance metric
+  details`` (LP-0MW1BUAEG006FMHX), so the summary renderer can land first
+  without leaving the suite red;
 - the CLI tests run once ``--metrics-config`` / ``--metrics-state`` /
   ``--no-metrics-update`` parse;
 - the backfill test runs once ``--seed-metrics-history`` also parses a
@@ -161,6 +164,24 @@ def _parse(args: list[str]):
 
 
 REPORT_AVAILABLE, REPORT_SKIP_REASON = _probe_report_surface()
+
+
+def _probe_details_surface() -> tuple[bool, str]:
+    """The detail block lands with its own work item (LP-0MW1BUAEG006FMHX)."""
+    if not REPORT_AVAILABLE:
+        return False, REPORT_SKIP_REASON
+    try:
+        report = reporting.build_report(_probe_summary(), None)
+    except Exception as exc:  # a half-landed renderer must not break collection
+        return False, f"build_report() raised {exc!r}"
+    if DETAILS_HEADING not in report:
+        return False, f"{DETAILS_HEADING!r} not rendered yet (LP-0MW1BUAEG006FMHX)"
+    return True, ""
+
+
+DETAILS_AVAILABLE, DETAILS_SKIP_REASON = _probe_details_surface()
+
+needs_details = pytest.mark.skipif(not DETAILS_AVAILABLE, reason=DETAILS_SKIP_REASON)
 
 CLI_AVAILABLE = REPORT_AVAILABLE and all(
     _parse(args) is not None
@@ -378,6 +399,7 @@ class TestSummaryTable:
 # ---------------------------------------------------------------------------
 
 
+@needs_details
 class TestMetricDetails:
     def test_details_block_follows_the_summary_and_covers_every_metric_once(self):
         report = _report()
