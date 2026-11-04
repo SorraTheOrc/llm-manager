@@ -30,14 +30,17 @@ aggregated. A session is included iff it has at least one in-window
 from __future__ import annotations
 
 import bisect
+import math
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import ClassVar
 
 import bucketing
 import capacity_signals
 from bucketing import ModeTransition
+from llama_log_parser import TOTAL as SPEED_TOTAL_BUCKET
 from log_parser import (
     BUSY_WINDOW_MARGIN,
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
@@ -823,6 +826,14 @@ class AnalysisResult:
     streams_finished: int = 0
     streams_without_usage: int = 0
     streams_without_usage_by_provider: Counter = field(default_factory=Counter)
+    #: Per-request local prompt sizes inside the window
+    #: (LP-0MW1BU9R5006C23N): ``(session_id, prompt_tokens)`` for every local
+    #: ``Stream finished`` line that carried counted ``tokens=``. Retained so
+    #: the context-size-pressure metric input can measure the share of local
+    #: requests at or above the effective per-slot context instead of only a
+    #: per-session maximum. Lines without usage (``tokens=missing``) carry no
+    #: prompt figure and are therefore absent — never recorded as ``0``.
+    local_prompt_samples: list[tuple[str | None, int]] = field(default_factory=list)
 
     @property
     def restart_events_sorted(self) -> list[LogEvent]:
@@ -978,6 +989,26 @@ class AnalysisResult:
         return dict(sorted(result.items(), key=lambda kv: kv[1][2], reverse=True))
 
 
+def _interpolated_percentile(sorted_values: list[float], p: float) -> float | None:
+    """Unrounded linear-interpolation percentile over sorted values.
+
+    ``None`` for an empty sample set. Callers round to the precision their
+    figure needs — percent figures round to one decimal (:func:`_percentile`),
+    while a 0–1 ratio rounds finer, since ``cached_ratio`` is logged to two
+    decimals and rounding it to one would discard real signal.
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return None
+    if n == 1:
+        return sorted_values[0]
+    pos = p / 100.0 * (n - 1)
+    lo = int(pos)
+    frac = pos - lo
+    hi = min(lo + 1, n - 1)
+    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
+
+
 def _percentile(sorted_values: list[float], p: float) -> float | None:
     """Linear-interpolation percentile (numpy default) over sorted values.
 
@@ -985,17 +1016,8 @@ def _percentile(sorted_values: list[float], p: float) -> float | None:
     (``reporting._percentile`` / ``llama_log_parser._percentile``); returns
     ``None`` for an empty sample set and rounds to one decimal place.
     """
-    n = len(sorted_values)
-    if n == 0:
-        return None
-    if n == 1:
-        return round(sorted_values[0], 1)
-    pos = p / 100.0 * (n - 1)
-    lo = int(pos)
-    frac = pos - lo
-    hi = min(lo + 1, n - 1)
-    value = sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
-    return round(value, 1)
+    value = _interpolated_percentile(sorted_values, p)
+    return round(value, 1) if value is not None else None
 
 
 @dataclass(frozen=True)
@@ -2290,6 +2312,10 @@ def aggregate(
     streams_finished = 0
     streams_without_usage = 0
     streams_without_usage_by_provider: Counter = Counter()
+    # Per-request local prompt sizes (LP-0MW1BU9R5006C23N): feeds the
+    # context-size-pressure metric input; kept with the session id so each
+    # sample is compared against its own profile's per-slot context.
+    local_prompt_samples: list[tuple[str | None, int]] = []
     # Local stream events across the (margin-widened) event stream for the
     # busy-time calculation; ``iter_events`` yields a margin beyond the window
     # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
@@ -2371,6 +2397,12 @@ def aggregate(
                 ] += 1
             else:
                 streams_finished += 1
+                if ev.provider == LOCAL_PROVIDER and ev.prompt is not None:
+                    # Per-request local prompt sizes, the context-size-pressure
+                    # metric input (LP-0MW1BU9R5006C23N): retained with the
+                    # session so each sample is measured against ITS profile's
+                    # per-slot context, which differs per operating mode.
+                    local_prompt_samples.append((ev.session, ev.prompt))
         elif ev.kind == "local_dispatch":
             # A ``[local] POST`` dispatch attempt (LP-0MVKUKG3F0035I85): counted
             # regardless of whether the attempt ever produced a first byte or a
@@ -2623,4 +2655,490 @@ def aggregate(
         streams_finished=streams_finished,
         streams_without_usage=streams_without_usage,
         streams_without_usage_by_provider=streams_without_usage_by_provider,
+        local_prompt_samples=local_prompt_samples,
     )
+
+
+# ---------------------------------------------------------------------------
+# Performance-metric inputs (LP-0MW1BU9R5006C23N)
+# ---------------------------------------------------------------------------
+#
+# One focused helper per scorecard metric input (parent LP-0MW0FU5Z6006A4P3,
+# registry in ``performance_metrics.METRIC_REGISTRY``). Every helper draws on
+# data the existing pipeline already produces — parsed proxy events
+# (``log_parser``), llama-server eval timings (``llama_log_parser``) and the
+# Prometheus GPU telemetry sampler (``gpu_busy``) — so no log field or parsing
+# change is needed. No helper renders anything: the report sections are a
+# separate work item, and this module's existing output is unchanged.
+#
+# **The never-mislead rule**: a helper returns ``None`` (rendered "n/a") when
+# the window holds no usable samples, never ``0``. A genuine zero is returned
+# as ``0.0`` (e.g. zero fallbacks in a window that served requests), because a
+# measured zero and an absent measurement are different facts.
+
+#: ``cache_state`` values the proxy emits on local dispatch lines
+#: (``proxy/docs/routing.md``). ``restored`` (the ratio was seeded from a
+#: persisted snapshot) counts in neither share, so ``warm + cold`` need not
+#: reach 100 %.
+CACHE_STATE_WARM = "warm"
+CACHE_STATE_COLD = "cold"
+
+#: Error kinds that mean a stream *ended* in error: the client-visible
+#: synthetic terminal (``Stream finished: reason=error``) and an aborted
+#: stream (``Stream error``). Non-terminal error kinds (``slot_save_error``,
+#: ``backend_retry``, ``upstream_http_error``) are excluded — they are retries
+#: or persistence failures, not a stream outcome.
+STREAM_ERROR_KINDS = ("stream_error", "stream_finish_error")
+
+#: Share of the effective per-slot context that counts as "pressure"
+#: (LP-0MW1BU9R5006C23N AC1): a request at or above the per-slot context
+#: cannot fit a slot at all.
+CONTEXT_PRESSURE_THRESHOLD_RATIO = 1.0
+
+PROMPT_CACHE_METRIC_ID = "prompt_cache_hit_ratio"
+CONTEXT_PRESSURE_METRIC_ID = "context_pressure"
+STREAM_ERROR_METRIC_ID = "stream_error_rate"
+FALLBACK_RATE_METRIC_ID = "fallback_rate"
+
+
+def _share_pct(part: int, whole: int) -> float | None:
+    """``part`` as a percentage of ``whole`` (one decimal), ``None`` if empty."""
+    if whole <= 0:
+        return None
+    return round(part / whole * 100.0, 1)
+
+
+def _float_or_none(value: object) -> float | None:
+    """Coerce *value* to a finite float (``None`` when it is not numeric)."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+@dataclass(frozen=True)
+class PromptCacheStats:
+    """Prompt-cache outcome of the window's local dispatches.
+
+    ``median_cached_ratio`` is the median of the already-parsed
+    ``cached_ratio=`` field; ``warm_share_pct`` / ``cold_share_pct`` are the
+    shares of the samples that carried a ``cache_state=`` token, so a
+    ``restored`` dispatch counts in neither. ``state_counts`` preserves every
+    observed state (including future ones) so a new token is visible rather
+    than silently folded into a known bucket.
+    """
+
+    metric_id: ClassVar[str] = PROMPT_CACHE_METRIC_ID
+
+    samples: int
+    median_cached_ratio: float | None
+    stated_samples: int
+    warm_share_pct: float | None
+    cold_share_pct: float | None
+    state_counts: tuple[tuple[str, int], ...] = ()
+
+
+def prompt_cache_stats(events: Iterable[LogEvent]) -> PromptCacheStats | None:
+    """Prompt-cache hit ratio over already-parsed local dispatch lines.
+
+    *events* are the in-window TTFT events (``AnalysisResult.ttft_events``): the
+    local ``dispatch_first_byte_ms=`` line is the only one that carries
+    ``cached_ratio=`` / ``cache_state=``, and remote ``ttft_seconds=`` lines
+    parse to ``None`` for both fields. Returns ``None`` when the window carries
+    neither a ratio nor a state — i.e. no cache evidence at all.
+    """
+    ratios: list[float] = []
+    states: Counter = Counter()
+    for event in events:
+        ratio = _float_or_none(getattr(event, "cached_ratio", None))
+        if ratio is not None:
+            ratios.append(ratio)
+        state = getattr(event, "cache_state", None)
+        if state:
+            states[str(state)] += 1
+    if not ratios and not states:
+        return None
+    stated = sum(states.values())
+    median_ratio = _interpolated_percentile(sorted(ratios), 50)
+    return PromptCacheStats(
+        samples=len(ratios),
+        # ``cached_ratio`` is logged to two decimals; three keeps the median
+        # faithful instead of collapsing it onto a tenth.
+        median_cached_ratio=(
+            round(median_ratio, 3) if median_ratio is not None else None
+        ),
+        stated_samples=stated,
+        warm_share_pct=_share_pct(states.get(CACHE_STATE_WARM, 0), stated),
+        cold_share_pct=_share_pct(states.get(CACHE_STATE_COLD, 0), stated),
+        state_counts=tuple(sorted(states.items())),
+    )
+
+
+def local_busy_pct(busy: BusyStats | None) -> float | None:
+    """Log-derived local busy percentage (``dispatch → finish`` union).
+
+    Returns ``None`` when the window has no local traffic (``busy`` is
+    ``None``) — never ``0``, which would read as a measured idle window.
+    """
+    if busy is None or busy.window_seconds <= 0:
+        return None
+    return round(busy.busy_pct, 1)
+
+
+def gpu_busy_pct(gpu: object | None) -> float | None:
+    """Power-based GPU busy percentage from the telemetry sampler.
+
+    Supplementary hardware telemetry (see :mod:`gpu_busy`), **not** a
+    local-utilisation signal. ``None`` when the Prometheus query failed or no
+    GPU result was collected.
+    """
+    value = _float_or_none(getattr(gpu, "busy_pct", None))
+    return round(value, 1) if value is not None else None
+
+
+def ttft_p90_ms(
+    events: Iterable[LogEvent], *, include_remote: bool = False
+) -> float | None:
+    """p90 time to first token in milliseconds.
+
+    The scorecard metric is the **local** p90 (dispatch → first byte), so
+    remote ``ttft_seconds=`` samples are excluded unless *include_remote* is
+    set. Events without a ``ttft_ms`` (pre-field rotated logs) are skipped;
+    ``None`` when no sample remains.
+    """
+    values = [
+        float(event.ttft_ms)
+        for event in events
+        if getattr(event, "ttft_ms", None) is not None
+        and (
+            include_remote
+            or getattr(event, "ttft_source", None) in (None, "local")
+        )
+    ]
+    if not values:
+        return None
+    return _percentile(sorted(values), 90)
+
+
+def _speed_median(speed: object | None, kind: str) -> float | None:
+    """Median tok/s of a llama-server speed statistic's all-buckets row."""
+    buckets = getattr(speed, kind, None)
+    if not isinstance(buckets, Mapping):
+        return None
+    bucket = buckets.get(SPEED_TOTAL_BUCKET)
+    return _float_or_none(getattr(bucket, "median", None))
+
+
+def decode_median_tok_s(speed: object | None) -> float | None:
+    """Median decode speed (tok/s) from the llama-server eval timings."""
+    return _speed_median(speed, "decode")
+
+
+def prompt_eval_median_tok_s(speed: object | None) -> float | None:
+    """Median prompt-eval (prefill) speed (tok/s) from the eval timings."""
+    return _speed_median(speed, "prompt_eval")
+
+
+@dataclass(frozen=True)
+class StreamErrorRate:
+    """Share of terminal stream events that ended in error."""
+
+    metric_id: ClassVar[str] = STREAM_ERROR_METRIC_ID
+
+    errored: int
+    completed: int
+    share_pct: float | None
+    by_kind: tuple[tuple[str, int], ...] = ()
+
+
+def stream_error_rate(summary: AnalysisResult) -> StreamErrorRate | None:
+    """Share of streams ending in error (percent).
+
+    Numerator: terminal error events (:data:`STREAM_ERROR_KINDS`); denominator:
+    those plus every completed ``Stream finished`` line in the window (with or
+    without measured usage). Both counts are per **terminal log line**, so a
+    stream that logged both an abort and a synthetic error terminal is counted
+    twice — the pairing of those two lines is not recoverable from the log.
+    Returns ``None`` when the window holds no stream outcome at all.
+    """
+    kinds: Counter = Counter(
+        event.kind
+        for event in summary.error_events
+        if event.kind in STREAM_ERROR_KINDS
+    )
+    errored = sum(kinds.values())
+    completed = summary.streams_finished + summary.streams_without_usage
+    total = errored + completed
+    if total <= 0:
+        return None
+    return StreamErrorRate(
+        errored=errored,
+        completed=completed,
+        share_pct=_share_pct(errored, total),
+        by_kind=tuple(sorted(kinds.items())),
+    )
+
+
+@dataclass(frozen=True)
+class FallbackRate:
+    """Fallback rate (percent of requests) and the dominant fallback reason."""
+
+    metric_id: ClassVar[str] = FALLBACK_RATE_METRIC_ID
+
+    fallbacks: int
+    requests: int
+    share_pct: float | None
+    dominant_reason: str | None
+    reason_counts: tuple[tuple[str, int], ...] = ()
+
+
+def fallback_rate(summary: AnalysisResult) -> FallbackRate | None:
+    """Fallback rate plus the dominant fallback reason.
+
+    Same numerator and denominator as the report header (fallback events over
+    total requests), so the scorecard and the header can never disagree. The
+    dominant reason is the most frequent ``reason=`` on in-window fallback
+    events; a tie is broken alphabetically for determinism. Returns ``None``
+    only when the window served no requests (no denominator); a window with
+    requests and no fallbacks is a measured ``0.0 %``.
+    """
+    requests = summary.total_requests
+    if requests <= 0:
+        return None
+    counts = summary.fallback_reason_counts
+    dominant = (
+        sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+        if counts
+        else None
+    )
+    fallbacks = len(summary.fallback_events)
+    return FallbackRate(
+        fallbacks=fallbacks,
+        requests=requests,
+        share_pct=_share_pct(fallbacks, requests),
+        dominant_reason=dominant,
+        reason_counts=tuple(sorted(counts.items())),
+    )
+
+
+def contention_denials_per_hour(summary: AnalysisResult) -> float | None:
+    """Slot-contention dispatch denials per hour over the analysis window.
+
+    ``local_dispatch_denied`` events normalised by the window length (exactly
+    the figure the contention section reports). Returns ``None`` when the
+    window has no positive length — there is no rate to compute, and ``0``
+    would claim a measured zero.
+    """
+    hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
+    if hours <= 0:
+        return None
+    return round(summary.dispatch_denied_count / hours, 2)
+
+
+def prefill_eta_pairs(
+    summary: AnalysisResult,
+) -> list[tuple[float, float]]:
+    """Matched ``(predicted_s, observed_s)`` prefill-ETA pairs.
+
+    Joins each local dispatch's first byte to the ETA the admission guard
+    priced for that same dispatch: predicted = the guard record's
+    ``eta_prefill_s`` (the own-prefill term, not ``projected_wait_s``), observed
+    = that dispatch's ``dispatch_to_first_byte_ms``, joined on the ``session=``
+    identifier both lines carry. The pairing rules mirror the report's matched
+    accuracy figure (``reporting._matched_prefill_eta``):
+
+    - a dispatch with no matching guard record is unmatched and never folded
+      in, and a later first byte in a session whose guard *enforced* a refusal
+      belongs to another request, so those guard records are not candidates;
+    - guard records whose priced ETA is ``0`` are not estimates and are
+      skipped;
+    - each dispatch takes the guard decision at or before its timestamp,
+      falling back to the earliest recorded decision for that session.
+    """
+    guards: dict[str, list[tuple[datetime, float]]] = {}
+    for event in getattr(summary, "local_admission_events", []) or []:
+        session = getattr(event, "session", None)
+        eta = _float_or_none(getattr(event, "eta_prefill_s", None))
+        if not session or eta is None or eta <= 0.0:
+            continue
+        if getattr(event, "enforced", None) == "true":
+            continue
+        guards.setdefault(session, []).append((event.ts, eta))
+    for entries in guards.values():
+        entries.sort(key=lambda item: item[0])
+
+    pairs: list[tuple[float, float]] = []
+    for event in getattr(summary, "ttft_events", []) or []:
+        if getattr(event, "ttft_source", None) not in (None, "local"):
+            continue
+        service_ms = _float_or_none(
+            getattr(event, "dispatch_to_first_byte_ms", None)
+        )
+        session = getattr(event, "session", None)
+        if service_ms is None or service_ms <= 0.0:
+            continue
+        candidates = guards.get(session) if session else None
+        if not candidates:
+            continue
+        chosen = candidates[0]
+        for candidate in candidates:
+            if candidate[0] <= event.ts:
+                chosen = candidate
+        pairs.append((chosen[1], service_ms / 1000.0))
+    return pairs
+
+
+def prefill_eta_accuracy(summary: AnalysisResult) -> float | None:
+    """Median **absolute relative error** of the prefill ETA, in percent.
+
+    ``median(|predicted − observed| / observed × 100)`` over the matched pairs
+    of :func:`prefill_eta_pairs`, using the module's shared percentile
+    convention. ``None`` when no dispatch pairs with a guard record (the guard
+    is inert for uncalibrated buckets and logs nothing in inactive observe
+    mode), never ``0``.
+
+    Note for the scorecard: this is an *error*, so **lower is better**, while
+    ``performance_metrics.METRIC_REGISTRY`` declares ``prefill_eta_accuracy``
+    as higher-is-better. A consumer recording this value as the metric actual
+    must invert it (e.g. ``100 − error``) or the direction-aware best-3
+    retention would keep the worst windows.
+    """
+    errors = [abs(predicted - observed) / observed * 100.0
+              for predicted, observed in prefill_eta_pairs(summary)
+              if observed > 0.0]
+    if not errors:
+        return None
+    return _percentile(sorted(errors), 50)
+
+
+def per_slot_context_limit(
+    session: SessionStats | None,
+    config: Mapping | None = None,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+) -> float | None:
+    """Effective per-slot context (tokens) for a session's requests.
+
+    The same clamp the context-size recommendation applies: the session's own
+    profile context (``SessionStats.ctx_size``, or the mode profile's
+    ``local_model_ctx_size`` when the schedule did not pin one, or the config's
+    ``local_model_ctx_size``) divided by the session's slot count. ``None``
+    when either half is unknown — an unclamped threshold would be a fabricated
+    limit.
+    """
+    if session is None or not session.slots or session.slots <= 0:
+        return None
+    ctx = _float_or_none(session.ctx_size)
+    if ctx is None and mode_map is not None and session.bucket:
+        ctx = _float_or_none(mode_map.ctx_for(session.bucket))
+    if ctx is None and config:
+        ctx = _float_or_none(config.get("local_model_ctx_size"))
+    if not ctx or ctx <= 0:
+        return None
+    return ctx / float(session.slots)
+
+
+@dataclass(frozen=True)
+class ContextPressureStats:
+    """Share of local requests at or above the effective per-slot context.
+
+    ``thresholds`` lists the distinct per-slot limits (rounded tokens) the
+    measured requests were compared against, so a mixed-mode window makes the
+    different eras visible. ``unknown_threshold_samples`` counts local requests
+    whose session (and therefore profile) could not be resolved: they are
+    excluded from the share rather than measured against a guessed limit.
+    """
+
+    metric_id: ClassVar[str] = CONTEXT_PRESSURE_METRIC_ID
+
+    samples: int
+    at_or_above: int
+    share_pct: float | None
+    thresholds: tuple[int, ...] = ()
+    unknown_threshold_samples: int = 0
+
+
+def context_pressure(
+    summary: AnalysisResult,
+    config: Mapping | None = None,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+    *,
+    threshold_ratio: float = CONTEXT_PRESSURE_THRESHOLD_RATIO,
+) -> ContextPressureStats | None:
+    """Share of local requests at or above the effective per-slot context.
+
+    Each per-request prompt size retained in
+    ``AnalysisResult.local_prompt_samples`` is compared with **its own
+    session's** :func:`per_slot_context_limit` (scaled by *threshold_ratio*),
+    because the fast and cheap profiles pin different slot geometries. Returns
+    ``None`` when the window has no local request with a resolvable limit.
+
+    Source note: ``performance_metrics.METRIC_REGISTRY`` describes this
+    metric's source as the ``routing_skip_local estimated_tokens=`` lines,
+    i.e. the routing decisions that were *skipped*. The measured input here is
+    the dispatched local requests' own prompt sizes, which is what "share of
+    local requests" means and is available for every serving window (a window
+    with no routing skips would otherwise report n/a). The skip-line evidence
+    remains the per-session ``context_at_fallback`` figure the report already
+    renders.
+    """
+    samples = getattr(summary, "local_prompt_samples", []) or []
+    at_or_above = 0
+    measured = 0
+    unknown = 0
+    thresholds: set[int] = set()
+    for session_id, tokens in samples:
+        session = summary.sessions.get(session_id) if session_id else None
+        limit = per_slot_context_limit(session, config, mode_map)
+        if limit is None:
+            unknown += 1
+            continue
+        measured += 1
+        thresholds.add(round(limit))
+        if tokens >= limit * threshold_ratio:
+            at_or_above += 1
+    if not measured:
+        return None
+    return ContextPressureStats(
+        samples=measured,
+        at_or_above=at_or_above,
+        share_pct=_share_pct(at_or_above, measured),
+        thresholds=tuple(sorted(thresholds)),
+        unknown_threshold_samples=unknown,
+    )
+
+
+def performance_metric_inputs(
+    summary: AnalysisResult,
+    config: Mapping | None = None,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+) -> dict[str, float | None]:
+    """One window actual per scorecard metric, keyed by registry metric id.
+
+    The dict has exactly the keys of
+    ``performance_metrics.METRIC_REGISTRY``; ``None`` means "n/a" for that
+    metric and must never be recorded as ``0``. The richer per-metric detail
+    (dominant fallback reason, cache shares, threshold mix) comes from the
+    individual helpers — this roll-up carries only the scalar the scorecard
+    compares against its target.
+    """
+    cache = prompt_cache_stats(summary.ttft_events)
+    pressure = context_pressure(summary, config, mode_map)
+    errors = stream_error_rate(summary)
+    fallbacks = fallback_rate(summary)
+    return {
+        "gpu_busy": gpu_busy_pct(summary.gpu_busy),
+        "fallback_rate": fallbacks.share_pct if fallbacks is not None else None,
+        "decode_speed": decode_median_tok_s(summary.speed),
+        "prompt_eval_speed": prompt_eval_median_tok_s(summary.speed),
+        "time_to_first_token": ttft_p90_ms(summary.ttft_events),
+        "stream_error_rate": errors.share_pct if errors is not None else None,
+        "context_pressure": pressure.share_pct if pressure is not None else None,
+        "prompt_cache_hit_ratio": (
+            cache.median_cached_ratio if cache is not None else None
+        ),
+        "contention_denials_per_hour": contention_denials_per_hour(summary),
+        "prefill_eta_accuracy": prefill_eta_accuracy(summary),
+    }
