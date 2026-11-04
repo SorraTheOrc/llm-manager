@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.1.28 (2026-11-04)
+### Features
+- Annotate the post-cancel release lag so a draining slot is never reported saturated (LP-0MVUTYHG7001S6BM)
+- Performance metrics in usage report (LP-0MW0FU5Z6006A4P3)
+- Local dispatch lease occupancy must match llama and be diagnosable on denial (LP-0MW0KZTWC004HXQ5)
+- Cross-check report slot-time against llama-server eval timings (LP-0MVNWULLI006ZYXX)
+- Chat-model child-port fallback fires for unloaded local models (gpt120) — polls the router and pollutes the fallback signal (LP-0MVVCY3HQ0009F0K)
+### Bug Fixes
+- In-request local re-dispatch after a prefill-deadline cancellation re-arms the lease and holds the gate ~6 min (3 wedge denials, 2026-10-26 10:41-10:47) (LP-0MVPUBQLQ008GJOV)
+- drive: finish-attempt bound exhausted by transient infrastructure refusals discards a committed child slice (LP-0MVVYQ1U3006GDWT)
+- Proxy killed by global OOM: GPU-backed (amdgpu GTT) RAM exhaustion takes down proxy and llama-server (LP-0MVZ810NG008A3EW)
+- [test-failure] local_eviction_after_acceptance:prefill_deadline — failing test (LP-0MVZ5WV6W008UO5F)
+- Routing concurrency gate counts the requesting session's own idle lease, pushing returning sessions remote (LP-0MW0VH2LB008JSKQ)
+- Backend self-heal orphans its own host-first llama-server: /health stuck degraded with an orphan serving :8080 (LP-0MVZT9L3N001XABB)
+- llama-server restart churn: 6 restart bursts in 2 h (self-heal/watchdog cycle) invalidates the >=24 h prefill-deadline window (LP-0MVZVZLCS000LQNB)
+- Router-mode /slots observability regression: per-slot state frozen 8h+, blocking dispatch (LP-0MW1VDWY0007EMH7)
+- Fail fast on a provably dead provider chain and never bounce to an empty remote (LP-0MW0KZR7A003UFQK)
+- available_slots contradicts its own slots[] in /llama/local/status (LP-0MW1VDZIX0011D8M)
+- Repo full-suite gate never runs .pi/skills/*/tests (529 unenforced tests) (LP-0MVOBJGB4001TQ8X)
+### Other
+- Coordinate restart-free 24 h measurement windows across concurrent verification items (deploys/restarts invalidate each other's windows) (LP-0MVWC0FAT0018PMW)
+- Slot-sweep harness cannot exercise local concurrency: add a warm-start / staggered-arrival mode (LP-0MVLHNEDO008FTBH)
+- Quality Improvement - Refactoring (LP-0MVTJXBKO00843I8)
+- Widen the local prefill deadline from 120 s to 180 s (LP-0MW1V0LPM000QLUC)
+- Make the dispatch-gate denial assertion independent of a live llama-server (LP-0MW0MI5RV001SLXX)
+- proxy-usage-analysis: remove ctx-size increase advice and deliver the report to Discord (LP-0MW2BD6G8001E960)
+
 ## v0.1.27 (2026-11-01)
 ### Features
 - Proxy /health reachability probe polls router GET /slots?model= — residual router-responder /slots 500s under prefill (LP-0MVVCXUDZ007XID0)
