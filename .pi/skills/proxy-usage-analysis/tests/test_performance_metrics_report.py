@@ -569,6 +569,131 @@ class TestDefaultRun:
 
 
 # ---------------------------------------------------------------------------
+# End-to-end verification (LP-0MW1BV81Q003KLLT)
+# ---------------------------------------------------------------------------
+#
+# The per-capability classes above each pin one surface. These two drive the
+# *unchanged cron invocation* end to end — the real CLI entry point, over a real
+# fixture log directory, twice over the same window — to prove the shipped
+# behaviour still holds when every capability runs together: history is
+# idempotent per window, the target is recomputed from the retained best three,
+# and a metric with no samples stays ``n/a`` rather than becoming a ``0`` or a
+# false Met/Unmet.
+
+
+def _seed_history(state_path: Path, values_by_metric: dict[str, list[float]]) -> None:
+    """Write a live state file holding prior-window measurements.
+
+    Each metric's values become one measurement per day, oldest first, dated
+    before the fixture window so the run under test adds its own window on top.
+    """
+    state = pm.new_state()
+    for metric_id, values in values_by_metric.items():
+        for index, value in enumerate(values):
+            day = f"2026-07-{index + 1:02d}"
+            pm.record_measurement(
+                state, metric_id, window=day, value=value, date=day
+            )
+    pm.save_state(state, state_path)
+
+
+def _rows_by_metric_id(report: str) -> dict[str, list[str]]:
+    by_label = {metric.label.strip(): metric.id for metric in pm.METRIC_REGISTRY}
+    rows = _summary_rows(report)
+    assert len(rows) == len(by_label)
+    return {by_label[cells[0]]: cells for cells in rows}
+
+
+def _targets(rows: dict[str, list[str]]) -> dict[str, str]:
+    return {metric_id: cells[2] for metric_id, cells in rows.items()}
+
+
+@needs_cli
+class TestEndToEndDefaultRuns:
+    def test_second_default_run_over_the_same_window_is_idempotent(self, tmp_path):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+        out_dir.mkdir()
+        state_path = out_dir / STATE_FILENAME
+        defaults_before = DEFAULTS_PATH.read_bytes()
+        # fallback_rate (lower is better): the fixture window's 33.3% is worse
+        # than all three seeds, so the retained best three are unchanged.
+        # stream_error_rate (lower is better): the window's measured 0.0% beats
+        # every seed, so it enters retention and moves the target — the
+        # observable evidence that the target is recomputed from the best three
+        # rather than frozen from history.
+        _seed_history(
+            state_path,
+            {
+                "fallback_rate": [10.0, 20.0, 30.0],
+                "stream_error_rate": [5.0, 10.0, 20.0],
+            },
+        )
+
+        assert _run_cli(log_dir, out_dir, "--quiet") == 0
+        first_rows = _rows_by_metric_id((out_dir / "report.md").read_text())
+        first_state = pm.load_state(state_path)
+        first_counts = {
+            metric_id: len(_measurements(first_state, metric_id))
+            for metric_id in METRIC_IDS
+        }
+
+        # 5.0 / 10.0 / 20.0 seeded plus this window's 0.0 -> best three are
+        # 0.0, 5.0, 10.0, so the target moves to their mean.
+        assert first_rows["stream_error_rate"][3] == "0.0 %"
+        assert first_rows["stream_error_rate"][2] == f"{sum([0.0, 5.0, 10.0]) / 3:.1f} %"
+        # 10.0 / 20.0 / 30.0 stay the best three behind a 33.3% window.
+        assert first_rows["fallback_rate"][2] == f"{sum([10.0, 20.0, 30.0]) / 3:.1f} % of requests"
+
+        assert _run_cli(log_dir, out_dir, "--quiet") == 0
+        second_rows = _rows_by_metric_id((out_dir / "report.md").read_text())
+        second_state = pm.load_state(state_path)
+
+        assert {
+            metric_id: len(_measurements(second_state, metric_id))
+            for metric_id in METRIC_IDS
+        } == first_counts, "re-running the same window must not append a measurement"
+        for metric_id in METRIC_IDS:
+            windows = [m["window"] for m in _measurements(second_state, metric_id)]
+            assert len(windows) == len(set(windows)), f"{metric_id}: duplicated window"
+            assert windows.count("2026-08-02") <= 1
+        assert _targets(second_rows) == _targets(first_rows), (
+            "a repeated window must not disturb the recomputed targets"
+        )
+        assert second_rows == first_rows, "the scorecard must render identically"
+        assert DEFAULTS_PATH.read_bytes() == defaults_before
+
+    def test_metric_with_no_samples_renders_na_never_zero_or_a_false_verdict(
+        self, tmp_path
+    ):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+        out_dir.mkdir()
+        state_path = out_dir / STATE_FILENAME
+        # Full history behind the metric, so the only reason it cannot be
+        # judged is the missing sample in *this* window (the fixture logs carry
+        # no GPU telemetry sampler output).
+        _seed_history(state_path, {"gpu_busy": [60.0, 66.4, 70.0]})
+
+        assert _run_cli(log_dir, out_dir, "--quiet") == 0
+        cells = _rows_by_metric_id((out_dir / "report.md").read_text())["gpu_busy"]
+
+        assert cells[3] == "n/a", "an unmeasured window must not render as 0"
+        assert cells[4] == "Insufficient history"
+        assert cells[4] not in ("Met", "Unmet")
+        # The baseline and target still come from the seeded history, so the
+        # missing figure is named as missing rather than blanking the row.
+        assert cells[1] != "n/a" and cells[2] != "n/a"
+        # Nothing is fabricated into the history: no measurement for this window.
+        state = pm.load_state(state_path)
+        assert [m["window"] for m in _measurements(state, "gpu_busy")] == [
+            "2026-07-01",
+            "2026-07-02",
+            "2026-07-03",
+        ]
+
+
+# ---------------------------------------------------------------------------
 # --json contract
 # ---------------------------------------------------------------------------
 
