@@ -19,6 +19,7 @@ import gc
 import logging
 import time
 
+import httpx
 import pytest
 
 from proxy import observability as obs
@@ -494,4 +495,125 @@ async def test_leader_failure_without_follower_logs_no_never_retrieved(caplog):
     assert obs._slots_poll_inflight.get(_URL) is None, (
         "the single-flight registry entry must not leak after a failed leader "
         "with no followers"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Status-path fan-out (LP-0MVVXGHHB0073W1B AC2 / F3 AC1)
+#
+# Every herdr client polls ``GET /llama/local/status``; on the pre-fix path each
+# poll performs its OWN counts query (2 s budget) and its OWN detail query
+# (``STATUS_QUERY_TIMEOUT``) in series. When llama-server answers slower than
+# the per-query budgets, every bounded-await expiry promotes the follower to a
+# fresh upstream ``/slots`` leader — measured: 5 concurrent polls issue 5
+# upstream fetches. The contract the shared-snapshot read path (F3) implements:
+# N concurrent status polls issued inside the freshness window share exactly
+# one upstream ``/slots`` request. The count is taken at
+# ``obs._do_slots_fetch`` — the single primitive every coalesced upstream fetch
+# reaches (``_run_slots_fetch_as_leader``) — so the exact-count assertion
+# measures real upstream amplification, not which client object performed it.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SLOTS_PAYLOAD = [
+    {"id": 0, "is_processing": False, "next_token": None, "n_past": 0},
+    {
+        "id": 1,
+        "is_processing": True,
+        "next_token": {"n_decoded": 7},
+        "n_past": 128,
+    },
+]
+
+
+class _FanoutBackend:
+    """Raw /slots fetch stub that answers AFTER the per-query budgets.
+
+    llama-server answers ``/slots`` in ~3 s under load — after the counts
+    (2 s) and detail (``STATUS_QUERY_TIMEOUT``, 1 s) budgets expire — which is
+    exactly the condition that makes the pre-fix follower-promotion cascade
+    amplify one poll cycle into one upstream fetch per poll. The stub records
+    every upstream attempt so the test can count them.
+    """
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    async def __call__(self, url: str, timeout: float, client=None):
+        self.calls.append(url)
+        await asyncio.sleep(3.0)
+        return (200, _SLOTS_PAYLOAD)
+
+
+class _FakeLock:
+    def locked(self):
+        return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LP-0MVVXGHHB0073W1B red-first (AC1): the pre-fix path fans out to one "
+        "upstream /slots fetch per poll (counts + detail cascade), so 5 concurrent "
+        "polls issue 5 fetches; the shared snapshot read path "
+        "(LP-0MVVXGLTM008ROJ9) must collapse this to exactly 1 — remove the "
+        "xfail when the contract lands."
+    ),
+)
+async def test_status_path_fanout_exactly_one_upstream_fetch_for_5_concurrent_polls():
+    """AC2: 5 concurrent status polls inside the freshness window issue exactly
+    one upstream /slots request (exact call count, not a ``<=`` bound).
+    """
+    from unittest.mock import patch as _patch
+
+    from proxy.server import app
+
+    from proxy import server
+
+    backend = _FanoutBackend()
+
+    async def fake_query():
+        return {"llama_server_running": True}
+
+    transport = httpx.ASGITransport(app=app)
+    with _patch("proxy.server.query_llama_status", side_effect=fake_query):
+        with _patch.object(server, "current_model", "test-model"):
+            with _patch.object(server, "model_switch_refcount", 0):
+                with _patch.object(server, "model_switch_lock", _FakeLock()):
+                    with _patch.object(server, "background_loads", {}):
+                        with _patch.object(server, "local_dispatch_records", {}):
+                            with _patch.object(
+                                server, "local_dispatch_records_lock", _FakeLock()
+                            ):
+                                with _patch.object(
+                                    server,
+                                    "config",
+                                    {"server": {"llama_server_port": 8080}},
+                                ):
+                                    with _patch(
+                                        "proxy.observability._do_slots_fetch", backend
+                                    ):
+                                        async with httpx.AsyncClient(
+                                            transport=transport, base_url="http://test"
+                                        ) as ac:
+                                            responses = await asyncio.gather(
+                                                *[
+                                                    ac.get("/llama/local/status")
+                                                    for _ in range(5)
+                                                ]
+                                            )
+
+    assert [r.status_code for r in responses] == [200] * 5
+    assert all(
+        "/slots" in url for url in backend.calls
+    ), f"upstream calls must target /slots: {backend.calls}"
+    assert len(backend.calls) == 1, (
+        f"5 concurrent status polls inside the freshness window must issue exactly "
+        f"one upstream /slots request, got {len(backend.calls)}: {backend.calls}"
     )

@@ -225,9 +225,47 @@ async def _try_adopt_running_llama_server(
             _verify_adopted_log_relay(srv)
         except Exception:
             pass
+        # LP-0MVZ810NG008A3EW AC1: an adopted backend may predate this proxy and
+        # keep score 0, so re-apply the OOM ranking to the running llama-server
+        # (the sentinel handle has pid 0; the real pid is discovered from the
+        # backend port). Best-effort — discovery may legitimately find nothing.
+        try:
+            from types import SimpleNamespace
+
+            from proxy.backend_rss import discover_llama_pids
+
+            for _backend_pid in discover_llama_pids(llama_port):
+                _apply_backend_oom_protection(SimpleNamespace(pid=_backend_pid))
+        except Exception:
+            pass
         return True
     except Exception:
         return False
+
+
+def _apply_backend_oom_protection(proc) -> None:
+    """Rank a llama-server backend above the proxy for the OOM killer (AC1).
+
+    LP-0MVZ810NG008A3EW: on 2026-11-02 both the proxy and its backend had
+    ``oom_score_adj`` 0, so a global OOM killed both (30 kill lines, one
+    timestamp). Raising the backend's score is always permitted (only lowering
+    below 0 needs privileges), so this half of the protection works in an
+    unprivileged deployment. The score is inherited by the backend's children
+    and, best-effort, never blocks a model load.
+    """
+    if proc is None:
+        return
+    try:
+        srv = _srv()
+        from proxy.host_pressure import protect_backend_process
+
+        protect_backend_process(
+            proc,
+            getattr(srv, "config", None),
+            getattr(srv, "logger", None),
+        )
+    except Exception:
+        pass
 
 
 def _resolve_llama_log_path(srv) -> Path:
@@ -1030,6 +1068,48 @@ def _extract_router_model_ids(router_models: dict | None) -> list[str]:
 
 
 
+#: ``status.value`` strings a router/llama-server build uses for a model
+#: that is resident and ready to serve.
+_LOADED_STATUS_VALUES = {"loaded", "ready", "running", "active"}
+
+#: ``status.value`` strings that positively mean "not ready to serve".
+_UNLOADED_STATUS_VALUES = {"loading", "unloaded", "error", "failed"}
+
+
+def _model_entry_is_loaded(entry: dict) -> bool:
+    """Whether one ``/models`` entry describes a loaded, ready model.
+
+    The single source of truth for "is this model loaded" readiness, shared by
+    :func:`router_is_model_loaded` (async) and the synchronous loaded-set
+    snapshot in :mod:`proxy.router_helpers` (LP-0MVWBX2YT001OEYE), so the two
+    views cannot disagree.
+
+    Different llama-server/router builds expose readiness with varying
+    schemas. Model **presence with no explicit status** is treated as loaded to
+    avoid false negatives that can pin ``srv.background_loads`` and keep
+    returning ``scheduled=False`` + 503. An unrecognised status shape/value is
+    likewise treated as loaded (presence wins over an unknown vocabulary).
+    """
+    status = entry.get("status")
+    if status is None:
+        return True
+
+    if isinstance(status, dict):
+        value = str(status.get("value", "")).strip().lower()
+    elif isinstance(status, str):
+        value = status.strip().lower()
+    else:
+        # Presence with unrecognized status shape/value: consider loaded.
+        return True
+
+    if value in _LOADED_STATUS_VALUES:
+        return True
+    if value in _UNLOADED_STATUS_VALUES:
+        return False
+    # Unknown status value: fall back to presence as loaded.
+    return True
+
+
 async def router_is_model_loaded(model_name: str) -> bool:
     srv = _srv()
     router_models = await srv.router_list_models()
@@ -1043,32 +1123,7 @@ async def router_is_model_loaded(model_name: str) -> bool:
        if not (isinstance(m, dict) and m.get("id") == model_name):
            continue
 
-       # Different llama-server/router builds expose model readiness with
-       # varying schemas. Treat model presence as loaded when no explicit
-       # status is provided to avoid false negatives that can pin
-       # srv.background_loads and keep returning scheduled=False + 503.
-       status = m.get("status")
-       if status is None:
-           return True
-
-       if isinstance(status, dict):
-           value = str(status.get("value", "")).strip().lower()
-           if value in {"loaded", "ready", "running", "active"}:
-               return True
-           if value in {"loading", "unloaded", "error", "failed"}:
-               return False
-           # Unknown status value: fall back to presence as loaded.
-           return True
-
-       if isinstance(status, str):
-           value = status.strip().lower()
-           if value in {"loaded", "ready", "running", "active"}:
-               return True
-           if value in {"loading", "unloaded", "error", "failed"}:
-               return False
-
-       # Presence with unrecognized status shape/value: consider loaded.
-       return True
+       return _model_entry_is_loaded(m)
 
     return False
 
@@ -1616,6 +1671,56 @@ def stop_llama_log_tailer() -> None:
             pass
 
 
+# Markers llama-server / llama.cpp emits when the listen socket is taken.
+_PORT_BIND_CONFLICT_MARKERS = (
+    "couldn't bind",
+    "could not bind",
+    "cannot bind",
+    "address already in use",
+    "eaddrinuse",
+    "bind http server socket",
+)
+
+
+def _is_port_bind_conflict(output: str | None) -> bool:
+    """True when spawn output reports a port-bind conflict.
+
+    LP-0MVZT9L3N001XABB AC4: only a bind conflict is worth paying for the
+    port-holder lookup, so the detection is a pure string match on the
+    documented llama.cpp / start-script diagnostics.
+    """
+    text = (output or "").lower()
+    return any(marker in text for marker in _PORT_BIND_CONFLICT_MARKERS)
+
+
+def _describe_port_holder(port: int) -> str:
+    """Name the process holding *port*, so an orphan is identifiable without ``ss``.
+
+    LP-0MVZT9L3N001XABB AC4: the 2026-11-02 restart burst logged
+    ``start: couldn't bind HTTP server socket ... port: 8080`` with no
+    indication of *who* held the port, so the orphan had to be found by hand
+    (``ss -ltnp``) before it could be killed.
+    """
+    try:
+        found = _find_pid_on_port(int(port))
+    except Exception:
+        found = None
+    if found is None:
+        return "not identifiable"
+    pids = found if isinstance(found, list) else [found]
+    described: list[str] = []
+    for pid in pids:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            continue
+        comm = ""
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+        except Exception:
+            comm = ""
+        described.append(f"pid={pid}" + (f" ({comm})" if comm else ""))
+    return ", ".join(described) or "not identifiable"
+
+
 def start_llama_server(model: str | None, display_name: str | None = None) -> subprocess.Popen | None:
     """Start the llama-server with the specified model.
 
@@ -1672,6 +1777,23 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
 
     mode_label = "router" if router_mode else f"model: {model}"
     srv.logger.info(f"Starting llama-server with {mode_label}")
+
+    def _log_bind_conflict(source: str, output: str | None) -> None:
+        """Name the conflicting listener when a spawn dies on the port (AC4)."""
+        if not _is_port_bind_conflict(output):
+            return
+        try:
+            holder = _describe_port_holder(int(llama_port))
+        except Exception:
+            holder = "not identifiable"
+        srv.logger.error(
+            "llama-server could not bind port %s (%s): conflicting listener %s — "
+            "an unadopted or orphaned backend is holding the port",
+            llama_port,
+            source,
+            holder,
+        )
+
     # LP-0MUCEFCL6001ZXYN: record what we started so a later proxy-only
     # restart can detect an unchanged local backend and preserve it.
     _write_llama_server_signature(model, slot_pool_size, router_mode)
@@ -1731,6 +1853,8 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
 
         if host_proc is not None:
             srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
+            # LP-0MVZ810NG008A3EW AC1: make the backend the OOM killer's first choice.
+            _apply_backend_oom_protection(host_proc)
             # LP-0MVECX47Z004LJAQ: recover prefill progress lines by tailing the
             # log the backend now writes to directly.
             start_llama_log_tailer(srv, model_name=_display)
@@ -1740,6 +1864,7 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
             f"Host-first startup failed (falling back to configured script "
             f"'{script_path}'): {host_out}"
         )
+        _log_bind_conflict("host-first startup", host_out)
 
     # Retry loop configuration
     retries = 4
@@ -1751,11 +1876,14 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
+           # LP-0MVZ810NG008A3EW AC1: rank the backend above the proxy for the OOM killer.
+           _apply_backend_oom_protection(proc)
            # LP-0MVECX47Z004LJAQ: recover prefill progress lines by tailing the
            # log the backend now writes to directly.
            start_llama_log_tailer(srv, model_name=_display)
            return proc
        srv.logger.warning(f"Attempt {attempt+1} failed quickly: {out}")
+       _log_bind_conflict(f"attempt {attempt + 1}/{retries}", out)
        time.sleep(backoff * (2 ** attempt))
 
     # All attempts failed — assemble diagnostic
@@ -1859,6 +1987,18 @@ def stop_llama_server():
     Verifies that port 8080 is released after stopping.
     """
     srv = _srv()
+
+    # LP-0MVZVZLCS000LQNB AC3: a deliberate stop/restart abandons whatever
+    # prefills are in flight. Record them as ``backend_restart`` evictions so
+    # the churn is visible in the eviction accounting instead of looking like a
+    # capacity problem. Idempotent per dispatch record, so the self-heal path
+    # recording the same restart cannot double-count.
+    try:
+        from proxy.admission_events import record_backend_restart_evictions
+
+        record_backend_restart_evictions(srv, restart_reason="manual_restart")
+    except Exception:
+        pass
 
     if srv.llama_process is not None:
        pid = getattr(srv.llama_process, 'pid', 'N/A')

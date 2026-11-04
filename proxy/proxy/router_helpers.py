@@ -1186,7 +1186,12 @@ def _get_first_byte_timeout_seconds(srv) -> float:
 
 
 def _get_prefill_deadline_seconds(srv) -> float:
-    """Return the prefill deadline in seconds (default 90; 0 disables).
+    """Return the prefill deadline in seconds; 0 disables.
+
+    The fallback used when the key is absent is
+    :data:`proxy.prefill_eta.DEFAULT_PREFILL_DEADLINE_SECONDS` — one module-level
+    constant shared with the documented default, so the two cannot disagree
+    (LP-0MW1V0LPM000QLUC).
 
     A hard backstop *independent of ETA-estimator quality*
     (LP-0MVIQ0G2M0006QF6 AC3): if a local dispatch has produced no first byte
@@ -1202,12 +1207,15 @@ def _get_prefill_deadline_seconds(srv) -> float:
     that actually fires. Precedence: the prefill deadline wins over the wedge
     bound; both are bounded by ``local_dispatch_max_prefill_seconds``.
     """
+    from proxy.prefill_eta import DEFAULT_PREFILL_DEADLINE_SECONDS
+
+    fallback = float(DEFAULT_PREFILL_DEADLINE_SECONDS)
     try:
         server_cfg = srv.config.get("server", {})
-        raw = server_cfg.get("local_prefill_deadline_seconds", 90)
-        return float(raw) if raw is not None else 90.0
+        raw = server_cfg.get("local_prefill_deadline_seconds", fallback)
+        return float(raw) if raw is not None else fallback
     except Exception:
-        return 90.0
+        return fallback
     try:
         server_cfg = srv.config.get("server", {})
         raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)
@@ -1782,6 +1790,79 @@ _LOCAL_DISPATCH_TERMINAL_ATTR = "_local_dispatch_post_deadline_ts"
 #: request instead of quarantining the whole ``local`` entry for every session.
 LOCAL_GATE_REASON_POST_DEADLINE_TERMINAL = "post_deadline_terminal"
 LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN = "prefill_thrash_cooldown"
+#: The session's own abandonment is still draining on its pinned slot
+#: (LP-0MVVEQW5Y00962T2 AC3, mechanism (c) from
+#: ``docs/dev/abandoned-prefill-release-cancel.md``): a retry must not be
+#: admitted into a slot that still runs work the proxy itself abandoned, or it
+#: would burn its lease with zero ``prefill_progress_measured``. The refusal
+#: carries the remaining recorded drain window as its retry-after so the wait
+#: is bounded by the observed drain, never a fixed sleep.
+LOCAL_GATE_REASON_ABANDONED_DRAIN = "abandoned_slot_drain"
+
+
+def _abandoned_drain_remaining_for_session(
+    session_key: str | None,
+) -> float:
+    """Seconds until the session's own abandoned drain window is expected to clear.
+
+    Consumes the published abandoned-slot registry (LP-0MVRMI5HK00558TB / the
+    identity annotation LP-0MVUVHAQP001IRKK): when *session_key* has a live
+    abandoned entry — recorded when the proxy gave up on a dispatch for this
+    session — the proxy itself abandoned work there, and this session's
+    immediate retry would land behind that drain. Returns 0 when no own
+    abandoned entry is live (warm path — the gate then behaves exactly as
+    before, LP-0MVD8S8DH008E4W4 AC4).
+
+    The returned value is the **remaining recorded drain window** (entry
+    ``abandoned_at + ttl - now``): a bounded wait (mechanism (c)), never a
+    fixed sleep. Expired entries are pruned lazily exactly as by every other
+    registry reader, so a drain that has already cleared (or a fresh
+    ``/slots`` poll that cleared it — observability clears with
+    :func:`_clear_abandoned_slot`) unblocks the next gate call. Read-only with
+    respect to capacity; never assigns a slot.
+    """
+    if not session_key:
+        return 0.0
+    now = time.monotonic()
+    _prune_abandoned_slots(now=now)
+    best = 0.0
+    own_slot = None
+    try:
+        from proxy.session import _assigned_slot_for_session
+
+        own_slot = _assigned_slot_for_session(session_key)
+    except Exception:
+        own_slot = None
+    for entry in _abandoned_slots.values():
+        # Only the session's own abandonment counts as its drain: another
+        # session's ghost on the same slot is that session's drain, not this
+        # retry's (capacity, not starvation — the AC1 record's H5 verdict).
+        if entry.get("session_id") != session_key:
+            continue
+        # Only a **real-slot** entry can defer: an endpoint-wide ghost (no
+        # resolvable slot identity) cannot name the slot this retry would land
+        # on, and refusing a dispatch on an unidentifiable ghost would be a
+        # worse over-refusal than the starvation it protects (LP-0MVW8S8DH008E4W4
+        # — the wedge/deadline paths legitimately record endpoint-wide entries
+        # for sessions whose identity was never pinned, and those sessions must
+        # stay admissible). The parent AC3's drain is a slot, not an endpoint.
+        if not _abandoned_slot_is_real_id(entry.get("slot_id")):
+            continue
+        # Prefer the entry on the session's own pinned slot when one exists.
+        entry_slot = entry.get("slot_id")
+        if own_slot is not None and entry_slot is not None and entry_slot != own_slot:
+            continue
+        try:
+            ttl = float(entry.get("ttl_seconds", 0.0))
+        except (TypeError, ValueError):
+            ttl = 0.0
+        try:
+            started = float(entry.get("abandoned_at", 0.0))
+        except (TypeError, ValueError):
+            started = 0.0
+        remainder = max(0.0, (started + ttl) - now)
+        best = max(best, remainder)
+    return best
 
 
 def _mark_local_dispatch_terminal(request, now=None) -> float | None:
@@ -1890,6 +1971,22 @@ def _local_dispatch_gate(
             entry,
         )
         return (True, LOCAL_GATE_REASON_PREFILL_THRASH_COOLDOWN, remaining)
+    # Own-drain deferral (LP-0MVW8S8DH008E4W4 / parent AC3, mechanism (c) from
+    # the AC1 record): a retry must never be admitted into a slot that is still
+    # draining work the proxy abandoned for this session. The refusal is a
+    # bounded wait (cap = one batch tail, measured at p90 6.6 s) — it expends
+    # no lease and never expires a dispatch with zero measured progress. Warm
+    # path untouched: no own abandoned entry ⇒ 0 ⇒ admitted exactly as before.
+    drain_remaining = _abandoned_drain_remaining_for_session(session_key)
+    if drain_remaining > 0:
+        _log_local_dispatch_gate_skip(
+            srv,
+            session_key,
+            LOCAL_GATE_REASON_ABANDONED_DRAIN,
+            drain_remaining,
+            entry,
+        )
+        return (True, LOCAL_GATE_REASON_ABANDONED_DRAIN, drain_remaining)
     return (False, "", 0.0)
 
 
@@ -2568,22 +2665,27 @@ async def _query_prefill_progress(
             # LP-0MVP7525P008RXMF AC2: this probe runs *during* the prefill it
             # observes, so it must never traverse the router (the router
             # serializes /slots behind the busy child and 500s on cancel).
+            # LP-0MVWBXEAI008YZ7B: a definitively unloaded model has nothing
+            # to probe — the resolver's (None, None) skip sentinel means no
+            # /slots request and no router traversal; fall through to the
+            # /status aggregation below.
             _slots_endpoint, _slots_port = _resolve_local_slots_target(
                 srv, model=model_name, endpoint=endpoint, router_port=llama_port
             )
-            states = await asyncio.wait_for(
-                _query_slots_progress(
-                    _slots_port, timeout=timeout, model=model_name,
-                    endpoint=_slots_endpoint,
-                ),
-                timeout=timeout + 0.5,
-            )
-            state = states.get(slot_id)
-            if isinstance(state, dict):
-                alive = bool(state.get("processing", False))
-                value = state.get("progress")
-                if isinstance(value, (int, float)) and value >= 0:
-                    return int(value), alive
+            if _slots_port is not None:
+                states = await asyncio.wait_for(
+                    _query_slots_progress(
+                        _slots_port, timeout=timeout, model=model_name,
+                        endpoint=_slots_endpoint,
+                    ),
+                    timeout=timeout + 0.5,
+                )
+                state = states.get(slot_id)
+                if isinstance(state, dict):
+                    alive = bool(state.get("processing", False))
+                    value = state.get("progress")
+                    if isinstance(value, (int, float)) and value >= 0:
+                        return int(value), alive
         except Exception:
             pass
 
@@ -4033,14 +4135,10 @@ async def _try_acquire_local_dispatch(
                     backend if (isinstance(record_key, tuple) and backend and backend != "local")
                     else ""
                 )
-                for existing_key, record in list(srv.local_dispatch_records.items()):
-                    if not record.get("active") and record.get("expires_at", 0) <= now:
-                        del srv.local_dispatch_records[existing_key]
-                        try:
-                            from proxy.session import _free_slot_assignment
-                            _free_slot_assignment(_dispatch_key_session_id(existing_key))
-                        except Exception:
-                            pass
+                # AC1 (LP-0MW0KZTWC004HXQ5): clean expired/inactive records
+                # *before* counting, so a stale record can never block a live
+                # dispatch. Named so the invariant has a unit-test seam.
+                _prune_stale_dispatch_records(srv, now)
 
                 own_record = srv.local_dispatch_records.get(record_key)
                 own_has_lease = (
@@ -5781,9 +5879,14 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
         # LP-0MVP7525P008RXMF AC2: lease-liveness probes must not traverse the
         # router — resolve to the discovered child port (the pool of this probe
         # is exactly the giant prefill that makes the router 500).
+        # LP-0MVWBXEAI008YZ7B: a definitively unloaded model has no live slot
+        # to observe — the (None, None) skip sentinel yields no probe (same
+        # outcome as today's probe-failure path: not verified processing).
         _slots_endpoint, _slots_port = _resolve_local_slots_target(
             srv, model=model_name, endpoint=endpoint, router_port=llama_port
         )
+        if _slots_port is None:
+            return False
         states = await asyncio.wait_for(
             _query_slots_progress(
                 _slots_port, timeout=timeout, model=model_name,
@@ -6564,6 +6667,249 @@ def _count_active_local_dispatch_records(srv) -> int | None:
         )
     except Exception:
         return None
+
+
+# ===================================================================
+# Local dispatch-lease occupancy: prune, evidence, divergence
+# (LP-0MW0KZTWC004HXQ5)
+#
+# On 2026-11-03 08:49:31 a dispatch was refused (``local_dispatch_denied
+# session=audit-... owner=herdr-... active=1``) while ``/llama/local/status``
+# reported ``available_slots=2`` on a 2-slot pool. The line named the owner and
+# a count, but not *which* of the lease gate's inputs refused, nor whether
+# llama-server agreed there was no capacity — so the refusal could not be
+# diagnosed without a repro. These three functions make the occupancy view
+# explicit: one prune of stale records (AC1), one shared evidence snapshot
+# (AC2) and one divergence verdict (AC3).
+# ===================================================================
+
+#: Divergence reasons published on the ``local_occupancy_divergence`` line.
+#: Each names a way the refusal contradicts the occupancy evidence at the
+#: moment it was taken, so a poll reader can tell a genuinely full pool from a
+#: bookkeeping disagreement (LP-0MW0KZTWC004HXQ5 AC3).
+LOCAL_OCCUPANCY_DIVERGENCE_LLAMA_FREE_SLOTS = "llama_reports_free_slots"
+LOCAL_OCCUPANCY_DIVERGENCE_UNEXPLAINED = "occupancy_unexplained"
+
+#: Aggregate fields :func:`_format_occupancy_evidence` always emits. Exposed
+#: so the denial-log contract test asserts the vocabulary rather than a
+#: rendered string, and so a future field cannot be added on one side only.
+OCCUPANCY_EVIDENCE_FIELDS: tuple[str, ...] = (
+    "records_total",
+    "records_active",
+    "records_unexpired",
+    "records_stale",
+    "active_counter",
+    "max_local",
+    "generating",
+    "prefill_in_flight",
+    "prefill_cap",
+    "llama_available_slots",
+    "llama_total_slots",
+)
+
+
+def _prune_stale_dispatch_records(srv, now: float) -> list:
+    """Delete dispatch records that are inactive *and* past their expiry.
+
+    AC1 (LP-0MW0KZTWC004HXQ5): the occupancy check runs this **before** it
+    counts, so a stale record can never block a live dispatch. A record is
+    stale only when it is both ``active=False`` (the request finished) and
+    past ``expires_at`` (its post-request cooldown elapsed); an ``active``
+    record past its expiry is live work whose lease lapsed — the no-progress
+    watchdog's concern, never the admission gate's — so it is left alone.
+
+    The freed session-slot assignment is released alongside the record so the
+    registry cannot describe a slot the gate has already forgotten.
+
+    Returns the keys removed (for diagnostics/tests).
+    """
+    removed: list = []
+    records = getattr(srv, "local_dispatch_records", None)
+    if not records:
+        return removed
+    for existing_key, record in list(records.items()):
+        if not isinstance(record, dict):
+            continue
+        if record.get("active"):
+            continue
+        try:
+            expires_at = float(record.get("expires_at", 0) or 0)
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        if expires_at > now:
+            continue
+        del records[existing_key]
+        removed.append(existing_key)
+        try:
+            from proxy.session import _free_slot_assignment
+
+            _free_slot_assignment(_dispatch_key_session_id(existing_key))
+        except Exception:
+            pass
+    return removed
+
+
+def _dispatch_key_label(key) -> str:
+    """Render a dispatch-lease key as ``<endpoint>|<session>`` (or session)."""
+    if isinstance(key, tuple) and len(key) == 2:
+        return f"{key[0]}|{key[1]}"
+    return str(key)
+
+
+async def _local_dispatch_occupancy_evidence(srv, max_local: int | None = None) -> dict:
+    """Snapshot every input the local dispatch-lease gate refuses on.
+
+    AC2 (LP-0MW0KZTWC004HXQ5): the ``local_dispatch_denied`` line carries this
+    snapshot, so a refusal is diagnosable from the log alone — record keys with
+    their ``active``/expiry state, the ``local_active_queries`` counter,
+    ``max_local``, the generating-only and prefill-in-flight counts with the
+    effective prefill cap, and llama-server's last known slot counts (which
+    makes an AC3 divergence visible on the same line).
+
+    Read-only: it takes ``local_dispatch_records_lock`` only to snapshot the
+    registry, never mutates it, and never prunes (AC1's prune belongs to the
+    admission path, not to diagnostics). Best-effort throughout — every field
+    degrades to ``None`` rather than raising on a legacy/partial server object.
+    """
+    evidence: dict = {field: None for field in OCCUPANCY_EVIDENCE_FIELDS}
+    evidence["records"] = []
+    evidence["max_local"] = max_local
+    now = time.monotonic()
+
+    snapshot: list = []
+    try:
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        records = getattr(srv, "local_dispatch_records", None) or {}
+        if lock is not None:
+            async with lock:
+                snapshot = list(records.items())
+        else:
+            snapshot = list(records.items())
+    except Exception:
+        snapshot = []
+
+    rendered: list[dict] = []
+    for key, record in snapshot:
+        if not isinstance(record, dict):
+            continue
+        active = bool(record.get("active"))
+        try:
+            expires_at = float(record.get("expires_at", 0) or 0)
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        try:
+            started_at = float(record.get("started_at", now) or now)
+        except (TypeError, ValueError):
+            started_at = now
+        rendered.append(
+            {
+                "key": _dispatch_key_label(key),
+                "session": _dispatch_key_session_id(key),
+                "endpoint": key[0] if isinstance(key, tuple) else "",
+                "active": active,
+                "expired": expires_at <= now,
+                "expires_in_s": round(max(0.0, expires_at - now), 1),
+                "age_s": round(max(0.0, now - started_at), 1),
+            }
+        )
+    evidence["records"] = rendered
+    evidence["records_total"] = len(rendered)
+    evidence["records_active"] = sum(1 for r in rendered if r["active"])
+    evidence["records_unexpired"] = sum(1 for r in rendered if not r["expired"])
+    evidence["records_stale"] = sum(
+        1 for r in rendered if not r["active"] and r["expired"]
+    )
+    try:
+        evidence["active_counter"] = int(getattr(srv, "local_active_queries", 0) or 0)
+    except (TypeError, ValueError):
+        evidence["active_counter"] = 0
+    evidence["generating"] = _get_generating_only_count(srv)
+    evidence["prefill_in_flight"] = _get_prefill_in_flight_count(srv)
+    try:
+        evidence["prefill_cap"] = _effective_prefill_cap(
+            _server_config_of(srv), max_local or 1
+        )
+    except Exception:
+        evidence["prefill_cap"] = None
+    try:
+        from proxy.observability import last_known_slot_counts
+
+        known = last_known_slot_counts()
+    except Exception:
+        known = None
+    if known is not None:
+        try:
+            evidence["llama_available_slots"], evidence["llama_total_slots"] = (
+                int(known[0]),
+                int(known[1]),
+            )
+        except (TypeError, ValueError, IndexError):
+            pass
+    return evidence
+
+
+def _format_occupancy_evidence(evidence: dict) -> str:
+    """Render occupancy evidence as a single ``key=value`` log-line suffix.
+
+    The aggregate fields always appear (``None`` when unavailable) so a reader
+    can tell "no data" from "zero", and the per-record detail follows as
+    ``records=<key>:<active|idle>:<expires_in=Ns|expired>,...`` (``records=none``
+    when the registry is empty).
+    """
+    parts = [f"{field}={evidence.get(field)}" for field in OCCUPANCY_EVIDENCE_FIELDS]
+    tokens: list[str] = []
+    for record in evidence.get("records") or []:
+        token = f"{record.get('key')}:{'active' if record.get('active') else 'idle'}"
+        if record.get("expired"):
+            token += ":expired"
+        else:
+            token += f":expires_in={record.get('expires_in_s')}"
+        tokens.append(token)
+    parts.append("records=" + (",".join(tokens) if tokens else "none"))
+    return " ".join(parts)
+
+
+def _occupancy_divergence_reason(evidence: dict) -> str | None:
+    """Name why a refusal contradicts the occupancy evidence, or ``None``.
+
+    AC3 (LP-0MW0KZTWC004HXQ5): a divergence is logged rather than left for a
+    poll reader to notice. Two shapes are recognised, in order:
+
+    - ``llama_reports_free_slots`` — llama-server's last known slot counts say
+      a slot is free while the lease gate refused. This is the 2026-11-03
+      08:49:31 shape (``available_slots=2``, two-slot pool, dispatch denied).
+    - ``occupancy_unexplained`` — the refusal cannot be reproduced from any
+      gate input in the snapshot (generating, prefill and unexpired-record
+      counts are all below their caps), so something outside the evidence
+      decided it.
+
+    ``None`` means the evidence explains the refusal truthfully, which is the
+    overwhelmingly common case (a genuinely full pool). Never infers a
+    divergence from missing data: an absent llama count is not a disagreement.
+    """
+    available = evidence.get("llama_available_slots")
+    if isinstance(available, int) and available > 0:
+        return LOCAL_OCCUPANCY_DIVERGENCE_LLAMA_FREE_SLOTS
+
+    def _int_or_zero(value) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    max_local = evidence.get("max_local")
+    if not isinstance(max_local, int) or max_local <= 0:
+        return None
+    prefill_cap = evidence.get("prefill_cap")
+    if not isinstance(prefill_cap, int) or prefill_cap <= 0:
+        return None
+    if (
+        _int_or_zero(evidence.get("generating")) < max_local
+        and _int_or_zero(evidence.get("prefill_in_flight")) < prefill_cap
+        and _int_or_zero(evidence.get("records_unexpired")) < max_local
+    ):
+        return LOCAL_OCCUPANCY_DIVERGENCE_UNEXPLAINED
+    return None
 
 
 async def _recover_stuck_global_active_queries(srv) -> None:
@@ -7520,14 +7866,30 @@ _CHILD_PORT_FALLBACK_WARN_INTERVAL = 300.0
 _last_child_port_fallback_warn_ts = 0.0
 """Monotonic timestamp of the last child-port fallback warning (throttle)."""
 
+_last_child_port_skip_debug_ts = 0.0
+"""Monotonic timestamp of the last unloaded-model skip debug line (throttle).
+
+LP-0MVWBXEAI008YZ7B AC6: the skip signal is observable in two places — the
+``llama_slots_child_port_skipped_total`` counter (every skip) and a throttled
+debug log naming the skipped model (one line per
+:data:`_CHILD_PORT_FALLBACK_WARN_INTERVAL`, mirroring the fallback warning).
+"""
+
 _router_model_ids_snapshot: dict[str, Any] = {}
-"""Cached router ``/models`` id snapshot (LP-0MVU7ZZIA0092AXW).
+"""Cached router ``/models`` snapshot (LP-0MVU7ZZIA0092AXW).
 
 Keys: ``ids`` (``list[str]``), ``solo`` (the sole non-embed id, or ``None``),
-``at`` (``time.monotonic()`` fetch time) and ``key`` (router port,
-llama-server pid, ``srv.current_model``). A changed key (restart or model
-switch) invalidates it; :func:`ensure_router_model_ids` refreshes it when the
-TTL (:func:`_child_port_cache_ttl`, mirroring the child-port cache) expires.
+``loaded`` (``list[str]`` of ids whose ``/models`` entry reports a loaded
+status, or ``None`` when the last probe was unparseable — see
+:func:`_loaded_models_snapshot`), ``at`` (``time.monotonic()`` fetch time) and
+``key`` (router port, llama-server pid, ``srv.current_model``). A changed key
+(restart or model switch) invalidates it; :func:`ensure_router_model_ids`
+refreshes it when the TTL (:func:`_child_port_cache_ttl`, mirroring the
+child-port cache) expires.
+
+LP-0MVWBX2YT001OEYE (slice 2 of LP-0MVVCY3HQ0009F0K) added ``loaded`` so the
+synchronous "is this model loaded?" guard reads this **same** cached
+``/models`` snapshot instead of opening a second ``/models`` cache (Q3 = B).
 """
 
 _child_model_signal_cache: dict[Any, tuple[str | None, float]] = {}
@@ -7834,6 +8196,123 @@ def _cached_router_model_ids(srv) -> list[str]:
     return ids
 
 
+def _extract_router_loaded_ids(payload) -> set[str] | None:
+    """Loaded-model ids from a router ``/models`` payload.
+
+    Returns ``None`` (indeterminate) when the payload is not a parseable
+    ``/models`` document — a non-dict, a non-list model array, or a payload the
+    lifecycle readiness rules cannot be imported for. That distinction is the
+    whole point: an unparseable/failed probe must never be mistaken for "no
+    models are loaded", which would turn a transient probe failure into a
+    false skip of a real availability gate (LP-0MVWBX2YT001OEYE AC2).
+
+    A parseable payload with an **empty** model array is a genuine "nothing is
+    loaded" answer and yields ``set()``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    models_payload = payload.get("data") or payload.get("models") or []
+    if not isinstance(models_payload, list):
+        return None
+    try:
+        from proxy.lifecycle import _model_entry_is_loaded
+    except Exception:
+        return None
+    loaded: set[str] = set()
+    for entry in models_payload:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not model_id:
+            continue
+        if _model_entry_is_loaded(entry):
+            loaded.add(str(model_id))
+    return loaded
+
+
+def _loaded_models_snapshot(srv) -> set[str] | None:
+    """Synchronously readable loaded-model id set from the cached snapshot.
+
+    Never performs an HTTP round trip: it reads
+    :data:`_router_model_ids_snapshot` (warmed by
+    :func:`ensure_router_model_ids` on the async dispatch path) so the hot
+    ``/slots`` resolution path adds **zero** ``/models`` requests once warm
+    (LP-0MVWBX2YT001OEYE AC1/AC3).
+
+    Returns the set of ids whose ``/models`` entry reports a loaded status, or
+    ``None`` (indeterminate) when the snapshot is absent, belongs to another
+    router/pid/model, has outlived its TTL, or was produced by an unparseable
+    probe. Callers must **fail open** on ``None`` — poll as today — and never
+    treat it as "nothing is loaded".
+    """
+    _ids, _solo = _router_models_snapshot_meta(srv)  # clears a stale key
+    snapshot = _router_model_ids_snapshot
+    if not snapshot:
+        return None
+    at = float(snapshot.get("at", 0.0) or 0.0)
+    if time.monotonic() - at >= _child_port_cache_ttl():
+        return None
+    loaded = snapshot.get("loaded")
+    if loaded is None:
+        return None
+    return {str(model_id) for model_id in loaded}
+
+
+def is_model_known_unloaded(srv, model_name: str | None) -> bool | None:
+    """Tri-state "is *model_name* definitively not loaded?" for the guard.
+
+    ``True`` — the cached ``/models`` snapshot is trustworthy and
+    *model_name* is **not** in the loaded set (skip the poll). ``False`` — the
+    model is loaded. ``None`` — indeterminate (no successful probe, stale
+    snapshot, or an unresolved/empty name); the caller must fail open and poll
+    as today.
+
+    Matching is case-insensitive membership against the router's own ids. The
+    caller is expected to pass an id resolved from ``/models``
+    (:func:`resolve_local_model_id` guarantees that), so an alias/preset
+    mismatch is not guessed here — guessing would risk a false skip.
+
+    Readiness uses the same rules as ``srv.router_is_model_loaded()``
+    (:func:`proxy.lifecycle._model_entry_is_loaded`), so the async and
+    synchronous "is it loaded" views cannot disagree
+    (LP-0MVWBX2YT001OEYE AC5).
+
+    ``True`` additionally requires the model to be **listed** in the router's
+    ``/models`` ids: a model the router does not list at all is *indeterminate*
+    (``None``), never a skip. The loaded-subset alone cannot distinguish "the
+    router reports this model with an unloaded/error status" from "the model
+    is absent from ``/models`` entirely", and a false skip on the latter
+    would remove a real availability gate (LP-0MVVCY3HQ0009F0K Risks: treat
+    "unknown/not present" as *not* evidence of unloaded and poll as today).
+    """
+    name = str(model_name or "").strip()
+    if not name:
+        return None
+    loaded = _loaded_models_snapshot(srv)
+    if loaded is None:
+        return None
+    want = name.lower()
+    ids, _solo = _router_models_snapshot_meta(srv)
+    if not any(str(model_id).strip().lower() == want for model_id in ids):
+        # Not present in the router's /models at all: cannot prove absence.
+        return None
+    return not any(str(model_id).strip().lower() == want for model_id in loaded)
+
+
+async def ensure_loaded_models_snapshot(srv) -> set[str] | None:
+    """Refresh the shared ``/models`` snapshot and return the loaded-id set.
+
+    Async entry point for callers that already have a place to await (the
+    dispatch path calls :func:`ensure_router_model_ids` directly); it exists so
+    a caller can express "warm the loaded set now" without reaching into the
+    snapshot internals. It reuses :func:`ensure_router_model_ids`, so it never
+    adds a second ``/models`` cache or an extra request while warm
+    (LP-0MVWBX2YT001OEYE AC3/AC4).
+    """
+    await ensure_router_model_ids(srv)
+    return _loaded_models_snapshot(srv)
+
+
 async def ensure_router_model_ids(srv) -> list[str]:
     """Refresh the cached router ``/models`` id snapshot when it is stale.
 
@@ -7844,6 +8323,11 @@ async def ensure_router_model_ids(srv) -> list[str]:
     the child-port cache), and when *srv* exposes no lister (unit-test stubs),
     so the hot ``/slots`` path costs **zero** ``/models`` requests once warm
     (LP-0MVU7ZZIA0092AXW).
+
+    The same fetch also populates the snapshot's ``loaded`` key (via
+    :func:`_extract_router_loaded_ids`), so the synchronous
+    :func:`_loaded_models_snapshot` view is served from this one request rather
+    than a second ``/models`` cache (LP-0MVWBX2YT001OEYE AC3).
     """
     ids, _solo = _router_models_snapshot_meta(srv)
     if _router_model_ids_snapshot:
@@ -7863,6 +8347,10 @@ async def ensure_router_model_ids(srv) -> list[str]:
         fetched = _extract_router_model_ids(payload)
     except Exception:
         fetched = []
+    # The loaded set shares this snapshot (Q3 = B). ``None`` here means the
+    # probe was unparseable/failed, so the synchronous guard must fail open
+    # rather than conclude that nothing is loaded (LP-0MVWBX2YT001OEYE AC2).
+    loaded = _extract_router_loaded_ids(payload)
     non_embed = _non_embed_model_ids(fetched)
     solo = non_embed[0] if len(non_embed) == 1 else None
     _router_model_ids_snapshot.clear()
@@ -7870,6 +8358,7 @@ async def ensure_router_model_ids(srv) -> list[str]:
         {
             "ids": list(fetched),
             "solo": solo,
+            "loaded": sorted(loaded) if loaded is not None else None,
             "at": time.monotonic(),
             "key": _router_models_snapshot_key(srv),
         }
@@ -8044,6 +8533,18 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     :func:`_child_port_miss_ttl`, so a signal that appears later (e.g. the
     first proxied request after a restart) is picked up instead of being
     pinned for the life of the pid. A new pid (restart) re-parses.
+
+    The *loadedness* classification is **layered above** this function
+    (LP-0MVWBXEAI008YZ7B): a model the router's cached ``/models`` snapshot
+    definitively reports as not loaded is skipped by
+    :func:`_resolve_local_slots_target` **before** discovery runs. The
+    three-way outcome is therefore: **loaded** ⇒ poll (this function), i.e.
+    return the child port or ``None``; **definitively not loaded** ⇒ skip with
+    the ``llama_slots_child_port_skipped_total{reason="model_not_loaded"}``
+    signal and no request; **indeterminate** ⇒ fail open to polling. Semantics
+    here are unchanged — a missing child-port signal is still "no port"
+    (``None``), never "the model is unloaded", and a caller that is not the
+    shared resolver keeps falling back to the router port exactly as before.
     """
     try:
         proc = getattr(srv, "llama_process", None)
@@ -8179,6 +8680,40 @@ def _warn_child_port_fallback(srv, model: str | None, router_port: int) -> None:
         pass
 
 
+def _record_slots_skip(srv, model: str, source: str) -> None:
+    """Throttled debug log + counter when a proxy ``/slots`` poll is skipped.
+
+    A poll for a model the router's cached ``/models`` snapshot definitively
+    reports as **not loaded** is skipped before any request
+    (LP-0MVWBXEAI008YZ7B AC1/AC6): the signal is the
+    ``llama_slots_child_port_skipped_total{reason="model_not_loaded"}`` counter
+    (every skip) plus a throttled debug line naming the skipped model — so a
+    skipped poll is distinguishable from a poll that was never attempted,
+    while the genuine loaded-model fallback signal
+    (``_warn_child_port_fallback``, ``no_child_port_router_mode``) stays
+    untouched.
+    """
+    global _last_child_port_skip_debug_ts
+    try:
+        from proxy.metrics import record_slots_child_port_skipped
+
+        record_slots_child_port_skipped("model_not_loaded")
+    except Exception:
+        pass
+    now = time.monotonic()
+    if now - _last_child_port_skip_debug_ts < _CHILD_PORT_FALLBACK_WARN_INTERVAL:
+        return
+    _last_child_port_skip_debug_ts = now
+    message = (
+        "slots_child_port_skipped: model not loaded — skipping /slots poll "
+        f"for model={model} (source={source}) (LP-0MVWBXEAI008YZ7B AC6)"
+    )
+    try:
+        srv.logger.debug(message)
+    except Exception:
+        pass
+
+
 def _resolve_local_slots_target(
     srv,
     model: str | None = None,
@@ -8197,6 +8732,20 @@ def _resolve_local_slots_target(
       (non-loopback host, or a loopback port that is not the configured router
       port — e.g. it is already a child port), the endpoint is returned
       untouched.
+    - When the router's cached ``/models`` snapshot **definitively** reports
+      the model as not loaded (:func:`is_model_known_unloaded`), the poll is
+      **skipped**: the ``(None, None)`` skip sentinel is returned, the
+      ``llama_slots_child_port_skipped_total{reason="model_not_loaded"}``
+      counter is incremented once and a throttled debug line names the model
+      (``_record_slots_skip``, LP-0MVWBXEAI008YZ7B AC1/AC6). Callers must
+      **not** issue the ``/slots`` request on the sentinel — the current
+      definitive-400 fall-through is behaviourally equivalent, so skipping
+      never refuses or blocks a request (AC7). An *indeterminate* loadedness
+      answer (``None``) fails open: discovery proceeds exactly as today. The
+      guard reads the shared TTL-cached ``/models`` snapshot
+      (:func:`_loaded_models_snapshot`) — there is no second cache and no new
+      hot-path round trip while it is warm — and compares against the router's
+      own ids so an alias/preset spelling can never be misread as unloaded.
     - When *endpoint* is the local router (loopback host on
       ``server.llama_server_port``) or omitted, the discovered child port is
       returned as ``(None, child_port)``; when discovery yields nothing, the
@@ -8205,7 +8754,22 @@ def _resolve_local_slots_target(
 
     Returns ``(endpoint_or_None, port)``: pass the tuple to
     ``_query_slots*`` so it builds the URL from the resolved port instead of
-    the router.
+    the router. The ``(None, None)`` tuple is the documented **skip
+    sentinel** — a port of ``None`` can never be a real llama-server port, so
+    a call site that ignores the sentinel fails loudly (it would build a
+    ``None``-port URL) instead of silently traversing the router.
+
+    The three-way outcome (loaded ⇒ poll, definitively not loaded ⇒ skip with
+    signal, indeterminate ⇒ fail open) is pinned by
+    ``proxy/tests/test_slots_unloaded_model_skip.py``
+    (``TestUnloadedModelSkipSignal`` = AC1/AC6,
+    ``TestLoadedModelFallbackSignal`` = AC2, ``TestFailOpenCharacterisation``,
+    ``TestAdmissionUnchanged`` = AC7) and documented for operators in
+    ``docs/dev/slots-500-triage.md`` (*Observability signal* / *Target signal
+    going forward*) and ``proxy/README.md`` (*Child-port discovery* →
+    *Unloaded-model skip*). :func:`_discover_local_child_port` keeps its
+    unchanged semantics — a missing signal is still "no port"; the unloaded
+    classification is layered above it.
     """
     cfg = getattr(srv, "config", None)
     server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}
@@ -8222,6 +8786,20 @@ def _resolve_local_slots_target(
             # A genuinely different instance — the router-proxied-500 problem
             # does not apply, never rewrite it.
             return endpoint, port
+    # LP-0MVWBXEAI008YZ7B: consult the synchronous loaded-set guard *before*
+    # discovery. ``resolve_local_model_id()`` may return a preset/alias
+    # spelling (explicit arg, ``srv.current_model``) while the router lists
+    # the actual id, so canonicalise against the router's own /models ids
+    # first — an alias must never be misread as an unloaded model (a false
+    # skip would swallow the loaded-model fallback signal,
+    # LP-0MVVCY3HQ0009F0K AC2). An indeterminate (``None``) answer fails
+    # open: poll as today.
+    resolved_model, model_source = resolve_local_model_id(srv, model)
+    _ids, _solo = _router_models_snapshot_meta(srv)
+    canonical = _match_model_preset(resolved_model, _ids) or resolved_model
+    if is_model_known_unloaded(srv, canonical) is True:
+        _record_slots_skip(srv, canonical, model_source)
+        return None, None
     child = _discover_local_child_port(srv, model=model)
     if child is not None:
         return None, child
@@ -8290,6 +8868,14 @@ async def _check_slot_availability(
         slots_endpoint, slots_port = _resolve_local_slots_target(
             srv, model=slot_model, endpoint=endpoint, router_port=llama_port
         )
+        if slots_port is None:
+            # LP-0MVWBXEAI008YZ7B AC7: the resolver's (None, None) skip
+            # sentinel — the model is definitively not loaded. Skipping the
+            # availability check returns the same admission result (``None``)
+            # as today's definitive-400 fall-through (a /slots 400 never
+            # produced a 503): the fix must never start refusing or blocking
+            # requests for an unloaded model.
+            return None
         if slots_endpoint:
             slots_url = f"{slots_endpoint.rstrip('/')}/slots?model={slot_model}"
         else:

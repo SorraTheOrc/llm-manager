@@ -695,7 +695,11 @@ class TestPerSlotDetails:
         for served, base in zip(j["slots"], self._FAKE_SLOTS):
             for key in ("slot_id", "is_processing", "n_decoded"):
                 assert served[key] == base[key]
-        assert j["total_slots"] == 0  # counts path unchanged (stubbed)
+        # From LP-0MW1VDZIX0011D8M ``total_slots`` covers the served ``slots[]``
+        # (never smaller than the list it summarises), so the derived summary
+        # agrees with the detail instead of the stubbed 0/0 counts.
+        assert j["total_slots"] == len(self._FAKE_SLOTS)
+        assert j["availability_unknown"] is False
         detail_mock.assert_awaited_once()
         _, kwargs = detail_mock.await_args
         assert kwargs["model"] == "test-model"
@@ -796,7 +800,10 @@ class TestPerSlotDetails:
                 slot["prefill_eta_seconds"], (int, float)
             )
         # v5 (LP-0MVWFKIKJ005XHAY): the three ``local_route_*`` fields.
-        assert j["status_schema_version"] == 5  # AC1: additive + versioned
+        # v6 (LP-0MW1VVIPG008896N): additive ``slots_stale_reason``.
+        # v7 (LP-0MW1VDZIX0011D8M): ``available_slots`` derived from
+        # ``slots[]`` + ``availability_unknown``.
+        assert j["status_schema_version"] == 7  # AC1: additive + versioned
 
 
 # ======================================================================
@@ -1170,21 +1177,28 @@ async def test_new_capacity_fields_are_additive_and_versioned():
 
     # v4 (LP-0MVRMI5HK00558TB): per-slot abandonment annotation, the additive
     # ``abandoned_busy`` hint value and ``local_abandoned_slots``.
-    # v5 (LP-0MVWFKIKJ005XHAY): ``local_route_available`` /
-    # ``local_route_reason`` / ``local_route_cooldown_remaining_s``.
-    assert j["status_schema_version"] == 5
+    # v6 (LP-0MW1VVIPG008896N): additive ``slots_stale_reason``.
+    # v7 (LP-0MW1VDZIX0011D8M): ``available_slots`` derived from ``slots[]``,
+    # ``availability_unknown`` and the additive ``unknown`` capacity hint.
+    assert j["status_schema_version"] == 7
     assert j["capacity_hint"] in (
         "idle",
         "prefill_bound",
         "saturated",
         "abandoned_busy",
+        "unknown",
     )
     assert j["local_abandoned_slots"] == 0
     assert "prefill_budget_seconds" in j
     for slot in j["slots"]:
         assert {"lease_state", "phase", "owner_session_id", "prefill_eta_seconds"} <= set(slot)
-    # ...and the legacy view is unchanged in value and type.
-    assert j["available_slots"] == 0 and j["total_slots"] == 0
+    # ...and the legacy view is unchanged in value and type. From v6
+    # (LP-0MW1VDZIX0011D8M) ``available_slots`` is derived from the served
+    # ``slots[]`` by construction: one of the two detail slots is free, so the
+    # summary agrees with the detail rather than with the independent counts
+    # mock ``(0, 0)``.
+    assert j["available_slots"] == 1 and j["total_slots"] == 2
+    assert j["availability_unknown"] is False
     assert isinstance(j["llama_server_running"], bool)
     legacy = [
         {k: s[k] for k in ("slot_id", "is_processing", "n_decoded")}
@@ -1479,21 +1493,24 @@ def _stale_decode_slot():
 
 
 @pytest.mark.asyncio
-async def test_stale_detail_without_live_work_reports_idle_capacity():
-    """AC3: a stale snapshot that looks saturated, with no in-flight local
-    request, degrades to ``idle`` and reconciles ``available_slots`` upward so
-    a dispatcher polling both fields sees an open gate."""
+async def test_stale_detail_without_live_work_is_unknown_not_idle():
+    """AC3 (LP-0MW1VDZIX0011D8M): a stale snapshot that looks saturated, with
+    no in-flight local request, proves neither availability nor saturation.
+    It must report ``unknown`` and must NOT assert availability — the earlier
+    ``idle`` reconciliation is the contradiction the item removes."""
     j = await _CapacityStatusHarness().get(
         slots_detail=[], stale_cache=[_stale_decode_slot()]
     )
 
     assert j["slots_stale"] is True
     assert j["slots_detail_stale"] is True
-    assert j["capacity_hint"] == "idle"
-    # total_slots (0) is reconciled to the configured pool when no current
-    # counts are known, and the whole pool is reported available.
-    assert j["total_slots"] == 3
-    assert j["available_slots"] == 3
+    assert j["capacity_hint"] == "unknown"
+    assert j["capacity_hint"] != "idle"
+    # No availability is asserted from the stale list (AC2/AC3); the explicit
+    # flag says why, and total_slots still covers the one served slot.
+    assert j["availability_unknown"] is True
+    assert j["available_slots"] == 0
+    assert j["total_slots"] == 1
 
 
 @pytest.mark.asyncio
@@ -1566,7 +1583,7 @@ async def test_stale_detail_ignores_leaked_counter_but_flags_in_flight_truthfull
         },
     )
 
-    assert j["capacity_hint"] == "idle"
+    assert j["capacity_hint"] == "unknown"
     assert j["local_active_query"] is False
     assert j["local_in_flight_requests"] == 0
 
@@ -1586,8 +1603,8 @@ def test_downgrade_stale_capacity_hint_leaves_fresh_hints_alone():
 @pytest.mark.parametrize(
     "live,source,idle,expected",
     [
-        (0, None, None, "idle"),
-        (0, "chunk", 1.0, "idle"),  # no live request: a counter is not work
+        (0, None, None, "unknown"),
+        (0, "chunk", 1.0, "unknown"),  # no live request: a counter is not work
         (1, None, None, "prefill_bound"),
         (1, "dispatch", 1.0, "prefill_bound"),
         (1, "chunk", 2.0, "saturated"),
@@ -1609,6 +1626,173 @@ def test_downgrade_stale_capacity_hint_decision_table(
         )
         == expected
     )
+
+
+# ======================================================================
+# Summary/detail consistency, staleness honesty and idle truthfulness
+# (LP-0MW1VDZIX0011D8M)
+#
+# The summary fields must never contradict the ``slots[]`` they summarise.
+# ======================================================================
+
+
+@pytest.mark.parametrize(
+    "processing",
+    [
+        (False,),
+        (True,),
+        (False, False),
+        (True, True),
+        (False, True),
+        (True, True, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_available_slots_equals_free_slot_count(processing):
+    """AC1: ``available_slots == count(slots[] where is_processing == false)``
+    by construction, across a matrix of slot states."""
+    from proxy.observability import count_available_slots
+
+    slots_detail = [
+        _slot(i, is_processing=p, n_decoded=(9 if p else None))
+        for i, p in enumerate(processing)
+    ]
+    j = await _CapacityStatusHarness().get(slots_detail=slots_detail)
+
+    expected = sum(1 for p in processing if not p)
+    assert j["availability_unknown"] is False
+    assert j["available_slots"] == expected
+    # ...and the published value is exactly the shared derivation over the
+    # detail the client also receives, so summary and detail cannot diverge.
+    assert j["available_slots"] == count_available_slots(j["slots"])
+    assert j["total_slots"] == len(processing)
+    assert 0 <= j["available_slots"] <= j["total_slots"]
+
+
+@pytest.mark.asyncio
+async def test_stale_all_slots_processing_and_abandoned_reports_zero_and_not_idle(
+    endpoint_wide_abandonment,
+):
+    """AC2: the 2026-11-04 body — both snapshot slots ``is_processing: true``
+    and ``abandoned: true`` — must report ``available_slots == 0`` with an
+    explicit unknown flag and a ``capacity_hint`` that is not ``idle``. The
+    defect it removes read ``available_slots: 2`` beside this exact detail."""
+    cached = [
+        {
+            "slot_id": 0,
+            "is_processing": True,
+            "n_decoded": 65,
+            "context_tokens": None,
+        },
+        {
+            "slot_id": 1,
+            "is_processing": True,
+            "n_decoded": 368,
+            "context_tokens": None,
+        },
+    ]
+    j = await _CapacityStatusHarness().get(slots_detail=[], stale_cache=cached)
+
+    assert j["slots_stale"] is True
+    assert j["slots_detail_stale"] is True
+    assert j["availability_unknown"] is True
+    assert j["available_slots"] == 0
+    assert j["capacity_hint"] != "idle"
+    # Abandonment reduces availability instead of sitting beside it (AC4):
+    # both processing ghosts are published AND counted as unavailable.
+    assert j["local_abandoned_slots"] == 2
+    assert all(
+        s["is_processing"] and s["abandoned"] for s in j["slots"]
+    )
+    assert j["available_slots"] == 0
+
+
+@pytest.mark.parametrize(
+    "counts_outcome,use_detail_cache,stale_counts,expect_slots_stale",
+    [
+        # Fresh counts + fresh detail: availability may be asserted.
+        (None, False, False, False),
+        # Detail served from the last-known cache (counts fresh).
+        (None, True, False, True),
+        # Counts served from the last-known cache (detail fresh/empty).
+        ({"status": 500, "reason": "http_500"}, False, True, True),
+        # Both stale.
+        ({"status": 500, "reason": "http_500"}, True, True, True),
+        # A definitive model-absent answer is fresh, not stale.
+        ({"status": 400, "reason": "http_400"}, False, False, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stale_summary_never_asserts_availability(
+    counts_outcome, use_detail_cache, stale_counts, expect_slots_stale
+):
+    """AC3: for any staleness/staleness-reason combination, a stale payload
+    asserts no availability and never contradicts the detail it serves."""
+    import time as _time
+    from unittest.mock import patch as _patch
+
+    cached = [_stale_decode_slot()]
+    kwargs = {
+        "slots_detail": [],
+        "counts_outcome": counts_outcome,
+    }
+    if use_detail_cache:
+        kwargs["stale_cache"] = cached
+    if stale_counts:
+        # A fresh last-known counts cache makes the failed counts query
+        # degrade to cached counts (counts_stale=true) instead of 0/0.
+        with _patch(
+            "proxy.observability._last_slot_counts_cache",
+            (2, 2, _time.monotonic()),
+        ):
+            j = await _CapacityStatusHarness().get(**kwargs)
+    else:
+        j = await _CapacityStatusHarness().get(**kwargs)
+
+    assert j["slots_stale"] is expect_slots_stale
+    if j["slots_stale"]:
+        assert j["availability_unknown"] is True
+        assert j["available_slots"] == 0
+        assert j["capacity_hint"] != "idle"
+    # Non-contradiction: whenever a detail list is served, a processing slot
+    # can never be reported available.
+    processing = sum(1 for s in j["slots"] if s.get("is_processing"))
+    if processing and not j["availability_unknown"]:
+        assert j["available_slots"] == 0
+
+
+@pytest.mark.asyncio
+async def test_local_idle_seconds_holds_while_a_slot_is_processing():
+    """AC4: the published idle age must not climb while any slot reports
+    ``is_processing: true`` (advance the clock and assert it holds)."""
+    from unittest.mock import patch as _patch
+
+    processing_detail = [_slot(0, is_processing=True, n_decoded=65)]
+    for idle in (120.0, 480.0):
+        with _patch(
+            "proxy.local_activity.activity_snapshot",
+            return_value={
+                "idle_seconds": idle,
+                "last_activity_at": None,
+                "last_activity_source": "startup",
+            },
+        ):
+            j = await _CapacityStatusHarness().get(slots_detail=processing_detail)
+        assert j["local_idle_seconds"] == 0.0
+
+    # With no slot processing the true idle age is still published.
+    with _patch(
+        "proxy.local_activity.activity_snapshot",
+        return_value={
+            "idle_seconds": 480.0,
+            "last_activity_at": None,
+            "last_activity_source": "startup",
+        },
+    ):
+        j = await _CapacityStatusHarness().get(
+            slots_detail=[_slot(0, is_processing=False)]
+        )
+    assert j["local_idle_seconds"] == 480.0
 
 
 @pytest.mark.asyncio
@@ -1662,7 +1846,8 @@ async def test_unloaded_model_is_fresh_absence_not_stale_saturation():
 @pytest.mark.asyncio
 async def test_server_error_still_uses_graceful_degradation():
     """A transient 500 keeps the existing cache fallback, so the fossil is
-    still served (with slots_stale) — but the hint is reconciled to idle."""
+    still served (with slots_stale) — but the hint is ``unknown``: a stale
+    list asserts neither availability nor saturation (LP-0MW1VDZIX0011D8M)."""
     j = await _CapacityStatusHarness().get(
         slots_detail=[],
         stale_cache=[_stale_decode_slot()],
@@ -1671,7 +1856,7 @@ async def test_server_error_still_uses_graceful_degradation():
 
     assert j["slots_stale"] is True
     assert j["slots_detail_stale"] is True
-    assert j["capacity_hint"] == "idle"
+    assert j["capacity_hint"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -1762,7 +1947,7 @@ async def test_endpoint_wide_entry_annotates_the_draining_slot(
         slots_detail=[_slot(1, is_processing=True, n_decoded=7)],
     )
 
-    assert j["status_schema_version"] == 5
+    assert j["status_schema_version"] == 7
     assert j["capacity_hint"] == "abandoned_busy"
     assert j["capacity_hint"] != "saturated"
     assert j["capacity_hint"] != "idle"
@@ -1939,7 +2124,7 @@ class TestLocalRouteAvailability:
             config=_route_config(), current_model="Qwen3"
         )
 
-        assert j["status_schema_version"] == 5
+        assert j["status_schema_version"] == 7
         assert j["local_route_available"] is True
         assert j["local_route_reason"] is None
         # ``None`` — a fabricated ``0`` would read as "armed and expiring now".
@@ -2071,7 +2256,7 @@ class TestLocalRouteAvailability:
         """AC10b: a config with no resolvable local entry stays well-formed."""
         j = await _CapacityStatusHarness().get(config=_route_config(with_models=False))
 
-        assert j["status_schema_version"] == 5
+        assert j["status_schema_version"] == 7
         assert j["local_route_available"] is True
         assert j["local_route_reason"] is None
         assert j["local_route_cooldown_remaining_s"] is None
@@ -2232,3 +2417,323 @@ class TestLocalRouteAvailability:
         )
         assert embed["local_route_available"] is False
         assert embed["local_route_reason"] == "local_provider_cooldown"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# /slots read-path latency bound (LP-0MVVXGHHB0073W1B AC3 / F3 AC2)
+#
+# Pre-fix the status handler awaits ``query_llama_status()`` (1 s) then the
+# counts query (2 s) then the detail query (``STATUS_QUERY_TIMEOUT``, 1 s) in
+# series, so a /slots backend that never answers makes a poll last ~3 s — far
+# beyond the configured budget. The shared-snapshot read path must bound the
+# WHOLE handler by ``STATUS_QUERY_TIMEOUT`` + 250 ms (F3 AC2): at most one
+# bounded upstream fetch per poll, served from the shared snapshot afterwards.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _HangingSlotsBackend:
+    """Raw /slots fetch stub that records attempts and never answers within
+    the caller's own timeout (mirroring the real primitive's bounded fetch, so
+    the leader itself terminates at its budget instead of hanging the test).
+    """
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    async def __call__(self, url: str, timeout: float, client=None):
+        self.calls.append(url)
+        await asyncio.wait_for(
+            asyncio.sleep(3600.0), timeout=max(timeout or 0.01, 0.01)
+        )
+        return (200, [])
+
+
+class _FakeLock:
+    def locked(self):
+        return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+
+async def _status_poll_with_hanging_fetch(backend):
+    """GET /llama/local/status with the REAL slots query path (only the raw
+    upstream fetch is stubbed) and a controlled backend.
+
+    Returns ``(json, elapsed_seconds, backend_calls)``. The fallback caches are
+    pinned empty so a sibling test's leftover snapshot cannot mask the verdict.
+    """
+    import time as _time
+
+    from proxy.server import app
+
+    from proxy import observability as _obs
+    from proxy import server
+
+    async def fake_query():
+        return {"llama_server_running": True}
+
+    with patch.object(_obs, "_last_slot_details_cache", []):
+        with patch.object(_obs, "_last_slot_details_at", 0.0):
+            start = _time.monotonic()
+            transport = httpx.ASGITransport(app=app)
+            with patch("proxy.server.query_llama_status", side_effect=fake_query):
+                with patch.object(server, "active_queries", 0):
+                    with patch.object(server, "active_queries_lock", asyncio.Lock()):
+                        with patch.object(server, "local_active_queries", 0):
+                            with patch.object(
+                                server, "local_active_queries_lock", asyncio.Lock()
+                            ):
+                                with patch.object(server, "current_model", "test-model"):
+                                    with patch.object(server, "model_switch_refcount", 0):
+                                        with patch.object(
+                                            server, "model_switch_lock", _FakeLock()
+                                        ):
+                                            with patch.object(server, "background_loads", {}):
+                                                with patch.object(
+                                                    server, "local_dispatch_records", {}
+                                                ):
+                                                    with patch.object(
+                                                        server,
+                                                        "local_dispatch_records_lock",
+                                                        _FakeLock(),
+                                                    ):
+                                                        with patch.object(
+                                                            server,
+                                                            "config",
+                                                            {"server": {"llama_server_port": 8080}},
+                                                        ):
+                                                            with patch(
+                                                                "proxy.observability._do_slots_fetch",
+                                                                backend,
+                                                            ):
+                                                                async with httpx.AsyncClient(
+                                                                    transport=transport,
+                                                                    base_url="http://test",
+                                                                ) as ac:
+                                                                    resp = await ac.get(
+                                                                        "/llama/local/status"
+                                                                    )
+            elapsed = _time.monotonic() - start
+    assert resp.status_code == 200
+    return resp.json(), elapsed, backend.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LP-0MVVXGHHB0073W1B red-first (AC1): the pre-fix path serialises the "
+        "counts (2 s) + detail (1 s) awaits, so a hanging backend makes the "
+        "handler take ~3 s; the shared snapshot read path (LP-0MVVXGLTM008ROJ9) "
+        "must bound the handler by STATUS_QUERY_TIMEOUT + 250 ms — remove the "
+        "xfail when it lands."
+    ),
+)
+async def test_status_handler_within_budget_when_slots_never_answers():
+    """AC3: a never-answering /slots backend must not serialise the counts
+    (2 s) + detail (1 s) awaits; the handler returns within
+    ``STATUS_QUERY_TIMEOUT`` + 250 ms and the payload stays well-formed.
+    """
+    import os
+
+    with patch.dict(os.environ, {"STATUS_QUERY_TIMEOUT": "1.0"}):
+        backend = _HangingSlotsBackend()
+        j, elapsed, _calls = await _status_poll_with_hanging_fetch(backend)
+
+    budget = 1.0
+    assert elapsed < budget + 0.25, (
+        f"handler took {elapsed:.2f}s with a /slots backend that never answers; "
+        f"it must fit inside STATUS_QUERY_TIMEOUT ({budget}s) + 250 ms slack "
+        f"instead of serialising counts (2 s) + detail (1 s) awaits"
+    )
+    # Failure paths stay well-formed and the response is never a hang.
+    assert j["llama_server_running"] is True
+    assert j["available_slots"] == 0
+    assert j["total_slots"] == 0
+    assert j["slots"] == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# slots_stale from snapshot age (LP-0MVVXGHHB0073W1B AC4 / F4 AC1)
+#
+# Once the poll path serves a warm shared snapshot by design, "served from
+# cache" is true for almost every poll and ``slots_stale`` must stop meaning
+# that. The contract: ``slots_stale`` = served-snapshot-age >
+# ``SLOTS_SNAPSHOT_MAX_AGE_SECONDS`` (missing snapshot ⇒ stale), with the age
+# published on the payload. The pre-fix path derives the flag from cache use,
+# so the ``< budget`` / ``== budget`` / missing-snapshot rows are red against
+# dev. The shared-snapshot stamp (``observability._last_slot_details_at``, the
+# F4-reused stamp) is seeded and the clock frozen so the served age is exact;
+# the fresh /slots query is made to fail so the poll is served from the seeded
+# snapshot (F4's serve-on-refresh-failure path).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SNAPSHOT_AGE_BUDGET = 2.0
+_AGE_SNAPSHOT_SLOTS = [
+    {"slot_id": 0, "is_processing": True, "n_decoded": 7, "context_tokens": 4096}
+]
+
+
+@pytest.mark.parametrize(
+    "seeded_age,has_snapshot,expected_stale",
+    [
+        pytest.param(
+            1.0,
+            True,
+            False,
+            id="age_lt_budget",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "LP-0MVVXGHHB0073W1B red-first (AC1): pre-fix slots_stale is a "
+                    "cache-use flag (True whenever the detail cache is served), so an "
+                    "age-fresh snapshot still reports stale; F4 derives it from the "
+                    "snapshot age — remove the xfail when it lands."
+                ),
+            ),
+        ),
+        pytest.param(
+            2.0,
+            True,
+            False,
+            id="age_eq_budget",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "LP-0MVVXGHHB0073W1B red-first (AC1): see age_lt_budget; "
+                    "age == budget must not be stale (F4 AC1) — remove the xfail "
+                    "when it lands."
+                ),
+            ),
+        ),
+        pytest.param(3.0, True, True, id="age_gt_budget"),
+        pytest.param(
+            None,
+            False,
+            True,
+            id="missing_snapshot",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "LP-0MVVXGHHB0073W1B red-first (AC1): pre-fix an absent snapshot "
+                    "reports slots_stale=false (fail-open on the pool); F4 defines "
+                    "missing ⇒ stale — remove the xfail when it lands."
+                ),
+            ),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_slots_stale_follows_snapshot_age(
+    seeded_age, has_snapshot, expected_stale
+):
+    """AC4: the age-derivation table — a served snapshot older than the
+    freshness budget is stale, equal-or-fresher is not, and a missing snapshot
+    is stale (one assertion per case)."""
+    from proxy import observability as _obs
+
+    _frozen = 65536.0
+    stamp = _frozen - seeded_age if seeded_age is not None else 0.0
+    with patch("proxy.observability.time.monotonic", lambda: _frozen):
+        with patch("proxy.handlers.time.monotonic", lambda: _frozen):
+            with patch.object(_obs, "_last_slot_details_at", stamp):
+                j = await _CapacityStatusHarness().get(
+                    slots_detail=[],
+                    stale_cache=_AGE_SNAPSHOT_SLOTS if has_snapshot else None,
+                    counts=(0, 0),
+                    counts_outcome={"status": 500, "reason": "http_500"},
+                )
+
+    assert j["slots_stale"] is expected_stale, (
+        f"served snapshot age {seeded_age!r} vs freshness budget "
+        f"{_SNAPSHOT_AGE_BUDGET}s: slots_stale must be {expected_stale!r}, got "
+        f"{j['slots_stale']!r}"
+    )
+    # The published age (F4 AC1) must match the snapshot that was served.
+    published = j.get("slot_snapshot_age_seconds")
+    if published is not None and seeded_age is not None:
+        assert abs(published - seeded_age) <= 0.05, (
+            f"published slot_snapshot_age_seconds {published} must match the "
+            f"seeded snapshot age {seeded_age}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Additive schema (LP-0MVVXGHHB0073W1B matrix 4 / F4 AC2)
+#
+# The read-path change only EVER adds fields (the snapshot age, its source and
+# the bumped schema version): a consumer that ignores unknown fields must
+# observe unchanged ``available_slots`` / ``total_slots`` / ``slots`` semantics
+# and the payload must keep carrying the versioned schema field.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_status_payload_additive_schema_for_unknown_field_consumers():
+    """A consumer that ignores unknown fields sees unchanged base-field
+    semantics, and the payload carries the versioned schema field."""
+    fresh_slots = [
+        {"slot_id": 0, "is_processing": False, "n_decoded": None, "context_tokens": None},
+        {"slot_id": 1, "is_processing": True, "n_decoded": 9, "context_tokens": 512},
+    ]
+    j = await _CapacityStatusHarness().get(
+        slots_detail=fresh_slots,
+        counts=(1, 2),
+    )
+
+    assert isinstance(j["status_schema_version"], int)
+    assert j["status_schema_version"] >= 3
+    # The base fields are backend-derived and unchanged by any additive field.
+    assert j["available_slots"] == 1
+    assert j["total_slots"] == 2
+    base_slots = [
+        {k: s[k] for k in ("slot_id", "is_processing", "n_decoded")}
+        for s in j["slots"]
+    ]
+    assert base_slots == [
+        {"slot_id": 0, "is_processing": False, "n_decoded": None},
+        {"slot_id": 1, "is_processing": True, "n_decoded": 9},
+    ]
+    assert j["slots_stale"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stale reconciliation invariant (LP-0MVVXGHHB0073W1B AC5, F4 AC4 / F5 AC3)
+#
+# LP-0MVKSXR4P001V0CM AC3 must survive the snapshot read-path change: a
+# ``capacity_hint`` computed from a STALE snapshot must never claim
+# ``saturated`` while ``local_in_flight_requests == 0``. This parametrises the
+# invariant across every stale-snapshot fixture shape (all-decode fossil,
+# decode+prefill fossil, idle fossil, single decode fossil).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_STALE_FOSSIL_FIXTURES = [
+    ("all-decode fossil (would be saturated if fresh)", [_slot(0, is_processing=True, n_decoded=11), _slot(1, is_processing=True, n_decoded=22)]),
+    ("decode+prefill fossil", [_slot(0, is_processing=True, n_decoded=0), _slot(1, is_processing=True, n_decoded=7)]),
+    ("idle fossil", [_slot(0, is_processing=False), _slot(1, is_processing=False)]),
+    ("single decode fossil", [_slot(0, is_processing=True, n_decoded=3)]),
+]
+
+
+@pytest.mark.parametrize("fixture", _STALE_FOSSIL_FIXTURES, ids=lambda f: f[0])
+@pytest.mark.asyncio
+async def test_stale_snapshot_never_saturated_without_live_work(fixture):
+    """AC5: across every stale-snapshot fixture, ``capacity_hint`` is never
+    ``saturated`` while ``local_in_flight_requests == 0``."""
+    _, slots = fixture
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[],
+        stale_cache=slots,
+        dispatch_records={},
+    )
+    assert j["slots_detail_stale"] is True
+    assert j["local_in_flight_requests"] == 0
+    assert j["capacity_hint"] != "saturated", (
+        f"stale fixture {fixture[0]!r} reports capacity_hint="
+        f"{j['capacity_hint']!r} with no live local work (LP-0MVKSXR4P001V0CM "
+        f"AC3 must survive the snapshot read-path change)"
+    )

@@ -22,9 +22,51 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from proxy.observability import (
+    SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED,
+    SLOTS_STALE_REASON_ROUTER_MODEL_MISSING,
+)
 from proxy.provider import clear_usage_limit_quarantine, get_model_type
 
 logger = logging.getLogger("llama-proxy")
+
+
+def _snapshot_age_seconds(fetched_at: float | None) -> float | None:
+    """Age (seconds) of a snapshot stamped at monotonic *fetched_at*.
+
+    ``None`` in (never a fabricated 0): the snapshot has no known fetch
+    stamp, so its age cannot be reported truthfully. Never negative — a
+    clock that appears to move backwards yields ``0.0`` rather than a
+    negative age (LP-0MVVXGHT1001I5YX AC1).
+
+    A **non-positive** stamp is also ``None``, not "infinitely old": the
+    module-level caches initialise their stamp to ``0.0``/"never fetched", and
+    reading that as an enormous age would make the snapshot-age ceiling
+    (LP-0MW1VVKPF001ZAV5) withhold a list whose age is simply unknown.
+    """
+    if fetched_at is None:
+        return None
+    try:
+        stamp = float(fetched_at)
+    except (TypeError, ValueError):
+        return None
+    if stamp <= 0.0 or stamp != stamp:  # unset or NaN
+        return None
+    return max(0.0, time.monotonic() - stamp)
+
+
+def _provenance_fetched_at(*provenance: dict) -> float | None:
+    """First known fetch stamp across the given phase provenance dicts.
+
+    Used to age the snapshot a poll was served from: the counts phase and
+    the detail phase share the coalesced ``/slots`` payload, so either one's
+    fetch stamp is the snapshot's age (LP-0MVVXGHT1001I5YX AC2).
+    """
+    for prov in provenance:
+        fetched = prov.get("fetched_at")
+        if fetched is not None:
+            return fetched
+    return None
 
 
 def _resolve_client_ip(request: Request) -> tuple[str, str]:
@@ -254,6 +296,14 @@ async def poll_slots_for_model(
             _ep, _port = _resolve_local_slots_target(
                 srv0, model=model, router_port=llama_port
             )
+            if _port is None:
+                # LP-0MVWBXEAI008YZ7B AC1: the resolver's (None, None) skip
+                # sentinel — the router definitively reports the model as not
+                # loaded, so a poll would only reproduce the definitive-400
+                # noise. Issue **no** /slots request (no router traversal, no
+                # fallback counter, no warning) and leave the polling state
+                # untouched.
+                return None
             if _port:
                 llama_port = _port
     except Exception:
@@ -388,6 +438,7 @@ async def get_llama_local_status(request: Request):
          "current_model": str | None,
          "llama_server_running": bool,
          "available_slots": int,
+         "availability_unknown": bool,
          "total_slots": int,
          "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None,
                     "context_tokens": int | None, "owner_session_id": str | None,
@@ -442,6 +493,19 @@ async def get_llama_local_status(request: Request):
     ``session_slot_pool_size`` is reported instead (fail-open, so
     orchestrators see available capacity during idle windows —
     LP-0MSI06HPB0043MV1).
+
+    **``available_slots`` is derived from ``slots[]`` by construction**
+    (LP-0MW1VDZIX0011D8M, ``status_schema_version: 6``): whenever a per-slot
+    detail list is served it is ``count(slots[] where is_processing ==
+    false)`` — never a separately counted field — so the summary can never
+    contradict its own detail. An abandoned-but-processing slot therefore
+    counts as *not available* (AC4). When no detail list is served the
+    counts/pool fallback above applies (there is nothing to contradict).
+    When the served detail came from the last-known cache (a fossil),
+    ``available_slots`` is published as ``0`` and the additive
+    ``availability_unknown: true`` flag says why: availability is **not**
+    asserted from a stale list (AC3). ``total_slots`` is never smaller than
+    the served ``slots[]`` length, so ``0 <= available_slots <= total_slots``.
 
     When llama-server is running with a model loaded but the ``/slots``
     query fails (e.g. HTTP 500 while the model reloads after a cheap-mode
@@ -534,13 +598,22 @@ async def get_llama_local_status(request: Request):
     (AC7).
 
     When the served slot detail is stale, ``capacity_hint`` is reconciled
-    with live state (LP-0MVKSXR4P001V0CM AC1/AC3) so a fossil snapshot can
-    never starve a dispatcher: with no in-flight local request (counted from
-    active dispatch records in ``local_in_flight_requests``) every verdict
-    degrades to ``idle`` and ``available_slots`` is reconciled upward;
-    in-flight work with fresh chunk activity within
+    with live state (LP-0MVKSXR4P001V0CM AC1/AC3, revised by
+    LP-0MW1VDZIX0011D8M): with no in-flight local request (counted from
+    active dispatch records in ``local_in_flight_requests``) the verdict is
+    ``unknown`` — the fossil proves neither availability nor saturation, and
+    the earlier ``idle`` reconciliation is what let ``available_slots: 2``
+    sit beside two ``is_processing: true`` slots. ``available_slots`` is
+    published as ``0`` with ``availability_unknown: true`` in that case.
+    In-flight work with fresh chunk activity within
     ``STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS`` keeps ``saturated``; any other
     in-flight work is reported ``prefill_bound``, never ``saturated``.
+
+    ``local_idle_seconds`` is held at ``0`` while any slot reports
+    ``is_processing: true`` (LP-0MW1VDZIX0011D8M AC4): a processing slot
+    means the backend is demonstrably not idle, so the published idle age
+    must not climb beside it. The monotonic signal the routing override reads
+    is unchanged — this clamp is read-only observability.
 
     ``local_active_query`` reports whether local model work is genuinely in
     flight, derived from active dispatch records rather than the
@@ -570,10 +643,12 @@ async def get_llama_local_status(request: Request):
     # -- query_llama_status with timeout (non-blocking guarantee) ---------
     srv = _srv()
     timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
+    _status_query_t0 = time.monotonic()
     try:
         status = await asyncio.wait_for(srv.query_llama_status(), timeout=timeout)
     except (TimeoutError, Exception):
         status = {"llama_server_running": False, "n_ctx": None, "kv_cache_tokens": None, "router_mode": False}
+    status_query_ms = int((time.monotonic() - _status_query_t0) * 1000)
 
     llama_running = bool(status.get("llama_server_running", False))
 
@@ -651,6 +726,25 @@ async def get_llama_local_status(request: Request):
     # must be reconciled with live proxy state (LP-0MVKSXR4P001V0CM AC3).
     counts_stale = False
     detail_stale = False
+    # Per-phase read-path instrumentation (LP-0MVVXGHT1001I5YX): each phase's
+    # elapsed time and provenance are published additively on the status_request
+    # line so a stale (> budget) poll can be attributed to a phase instead of
+    # inferred from an aggregate latency. ``None`` means the phase was never
+    # attempted (llama-server down / no model / exception before it started),
+    # 0 upstream calls means the poll was served from a cache.
+    slots_counts_ms: int | None = None
+    slots_detail_ms: int | None = None
+    slots_upstream_calls = 0
+    slots_snapshot_source = "none"
+    slots_snapshot_age_seconds: float | None = None
+    counts_provenance: dict = {}
+    detail_provenance: dict = {}
+    # Enumerated reason contributed by the shared /slots target resolver
+    # (LP-0MW1VVIPG008896N): ``child_port_undiscovered`` when router mode had
+    # to fall back to the router port, ``router_model_missing`` when model-id
+    # resolution fell through to its last resort. ``None`` when the resolver
+    # found a usable target.
+    slots_resolver_reason: str | None = None
     if llama_running:
         try:
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
@@ -667,35 +761,100 @@ async def get_llama_local_status(request: Request):
                 # into an HTTP 500). LP-0MTP1FQXH004JYEF: pass current_model so
                 # the lookup filters to the Qwen3 child, not the first spawn
                 # line (mxbai-embed).
+                # LP-0MVWBXEAI008YZ7B AC3: when the resolver reports a skip
+                # ((None, None)) the model is definitively not loaded — /slots
+                # would answer the same definitive 400 the ``model_absent``
+                # path below already handles (fail-open on the configured
+                # pool, no resurrected fossil counts), so the query is
+                # skipped entirely (no router request, no counts/detail
+                # fetch) and the response reports pool capacity truthfully.
                 from proxy.router_helpers import _resolve_local_slots_target
 
-                _, llama_port = _resolve_local_slots_target(
+                (
+                    _resolved_endpoint,
+                    llama_port,
+                ) = _resolve_local_slots_target(
                     srv, model=cm, router_port=llama_port
                 )
-                client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-                from proxy.observability import (
-                    _last_slot_details_cache,
-                    _query_slots,
-                    _query_slots_detail,
-                    last_known_slot_counts,
-                    slots_failure_is_definitive_model_absent,
+                # The resolver's router-port fallback in router mode is its own
+                # diagnosable condition (the child port could not be
+                # discovered), so it is published as an enumerated reason rather
+                # than collapsing into a generic query error
+                # (LP-0MW1VVIPG008896N).
+                try:
+                    _router_mode = bool(
+                        (srv.config.get("server", {}) or {}).get(
+                            "llama_router_mode", False
+                        )
+                    )
+                except Exception:
+                    _router_mode = False
+                _configured_router_port = int(
+                    (srv.config.get("server", {}) or {}).get(
+                        "llama_server_port", 8080
+                    )
+                    or 8080
                 )
-                # The outcome of the fresh counts query (status + reason) lets
-                # the handler tell a definitive "this model is not loaded"
-                # (HTTP 400/404 from llama-server's router) from a transient
-                # failure, so a fossil cache snapshot is never served as
-                # current capacity (LP-0MVKSXR4P001V0CM AC3).
-                counts_outcome: dict = {}
-                available_slots, total_slots = await _query_slots(
-                    client,
-                    llama_port,
-                    timeout=2.0,
-                    model=cm,
-                    status_out=counts_outcome,
-                )
-                model_absent = slots_failure_is_definitive_model_absent(
-                    counts_outcome
-                )
+                if (
+                    llama_port is not None
+                    and _router_mode
+                    and not _resolved_endpoint
+                    and llama_port == _configured_router_port
+                ):
+                    slots_resolver_reason = (
+                        SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED
+                    )
+                # A `last_resort` model id means the proxy could not determine
+                # which model to ask about at all — the 2026-11-04 failure
+                # mode. It cannot verify the slot surface from live evidence,
+                # so the surface is stale whatever the fetch returns
+                # (LP-0MW1VVIPG008896N).
+                try:
+                    from proxy.router_helpers import resolve_local_model_id
+
+                    _, _model_source = resolve_local_model_id(srv, model=cm)
+                except Exception:
+                    _model_source = None
+                if _model_source == "last_resort":
+                    slots_resolver_reason = SLOTS_STALE_REASON_ROUTER_MODEL_MISSING
+                if llama_port is None:
+                    total_slots = 0
+                    available_slots = 0
+                    model_absent = True
+                    detail = []
+                    slots_counts_ms = 0
+                    slots_detail_ms = 0
+                    counts_provenance = {}
+                    detail_provenance = {}
+                else:
+                    client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
+                    from proxy.observability import (
+                        _last_slot_details_cache,
+                        _query_slots,
+                        _query_slots_detail,
+                        last_known_slot_counts,
+                        slots_failure_is_definitive_model_absent,
+                    )
+                    # The outcome of the fresh counts query (status + reason) lets
+                    # the handler tell a definitive "this model is not loaded"
+                    # (HTTP 400/404 from llama-server's router) from a transient
+                    # failure, so a fossil cache snapshot is never served as
+                    # current capacity (LP-0MVKSXR4P001V0CM AC3).
+                    counts_outcome: dict = {}
+                    counts_provenance: dict = {}
+                    _counts_t0 = time.monotonic()
+                    available_slots, total_slots = await _query_slots(
+                        client,
+                        llama_port,
+                        timeout=2.0,
+                        model=cm,
+                        status_out=counts_outcome,
+                        provenance_out=counts_provenance,
+                    )
+                    slots_counts_ms = int((time.monotonic() - _counts_t0) * 1000)
+                    model_absent = slots_failure_is_definitive_model_absent(
+                        counts_outcome
+                    )
                 # Graceful degradation (LP-0MSVP7XJ6008QPKX): a /slots failure
                 # (e.g. HTTP 500 during a model reload after cheap-mode restart)
                 # previously surfaced as total_slots=0, fail-closing the herdr
@@ -728,10 +887,16 @@ async def get_llama_local_status(request: Request):
                 # STATUS_QUERY_TIMEOUT window via the helper's own httpx
                 # timeout, so a slow /slots response cannot blow the
                 # endpoint's response budget (AC3).
+                detail_provenance: dict = {}
+                _detail_t0 = time.monotonic()
                 try:
-                    detail = await _query_slots_detail(llama_port, timeout=timeout, model=cm)
+                    detail = await _query_slots_detail(
+                        llama_port, timeout=timeout, model=cm,
+                        provenance_out=detail_provenance,
+                    )
                 except Exception:
                     detail = None
+                slots_detail_ms = int((time.monotonic() - _detail_t0) * 1000)
                 if isinstance(detail, list) and detail:
                     slots = detail
                 else:
@@ -762,6 +927,106 @@ async def get_llama_local_status(request: Request):
                 total_slots = 3
             available_slots = total_slots
 
+    # -- per-phase read-path attribution (LP-0MVVXGHT1001I5YX) ------------
+    # Aggregate the per-phase provenance into the three additive fields on
+    # the status_request line so a stale (> budget) poll can be attributed to
+    # a phase and a cache path (parent AC1). ``slots_upstream_calls`` counts
+    # every upstream ``/slots`` fetch this poll caused (0 or 1 today — the
+    # single-flight + TTL coalescing means the detail phase shares the counts
+    # phase's payload). ``slots_snapshot_source`` labels where the served
+    # snapshot came from and ``slots_snapshot_age_seconds`` its age.
+    slots_upstream_calls = int(
+        counts_provenance.get("upstream_calls", 0)
+        if isinstance(counts_provenance, dict)
+        else 0
+    ) + int(
+        detail_provenance.get("upstream_calls", 0)
+        if isinstance(detail_provenance, dict)
+        else 0
+    )
+    if detail_stale or counts_stale:
+        # Served the last-known snapshot (graceful degradation): label it a
+        # snapshot, not a cache hit, and age it from the snapshot's own fetch
+        # stamp (LP-0MVECWYWK000U3E1 — never re-stamped as fresh).
+        slots_snapshot_source = "snapshot"
+        if counts_stale:
+            from proxy.observability import last_known_slot_counts_stamp
+
+            slots_snapshot_age_seconds = _snapshot_age_seconds(
+                last_known_slot_counts_stamp()
+            )
+        else:
+            try:
+                from proxy.observability import _last_slot_details_at
+
+                slots_snapshot_age_seconds = _snapshot_age_seconds(
+                    _last_slot_details_at
+                )
+            except Exception:
+                slots_snapshot_age_seconds = None
+    elif slots_upstream_calls:
+        slots_snapshot_source = "upstream"
+        slots_snapshot_age_seconds = _snapshot_age_seconds(
+            _provenance_fetched_at(
+                counts_provenance
+                if isinstance(counts_provenance, dict)
+                else {},
+                detail_provenance
+                if isinstance(detail_provenance, dict)
+                else {},
+            )
+        )
+    else:
+        # No upstream fetch this poll: label the cache path that served it.
+        for _prov in (
+            counts_provenance if isinstance(counts_provenance, dict) else {},
+            detail_provenance if isinstance(detail_provenance, dict) else {},
+        ):
+            _src = _prov.get("source")
+            if _src in ("failure_backoff", "ttl_cache"):
+                slots_snapshot_source = _src
+                slots_snapshot_age_seconds = _snapshot_age_seconds(
+                    _prov.get("fetched_at")
+                )
+                break
+
+    # -- snapshot age ceiling (LP-0MW1VVKPF001ZAV5) --------------------------
+    # The 2026-11-04 defect: ``slots_snapshot_age_seconds`` was published
+    # (29825.67) but never enforced, so an 8 h 17 m-old snapshot was served
+    # indefinitely *and* availability was claimed from it
+    # (``available_slots=2 capacity_hint=idle``). Past the configured ceiling a
+    # stale snapshot is no longer presented as a live slot list: the slots are
+    # withheld, availability is not claimed from the fossil, and the reason is
+    # the explicit ``snapshot_too_old``. Recovery is automatic — the next
+    # successful ``/slots?model=…`` poll restores a fresh surface, with no
+    # restart.
+    slots_max_snapshot_age_seconds = None
+    slots_snapshot_too_old = False
+    try:
+        from proxy.observability import (
+            local_slots_max_snapshot_age_seconds,
+        )
+        from proxy.observability import (
+            slots_snapshot_too_old as _snapshot_too_old,
+        )
+
+        slots_max_snapshot_age_seconds = local_slots_max_snapshot_age_seconds(
+            srv.config if isinstance(getattr(srv, "config", None), dict) else {}
+        )
+        if slots_snapshot_source == "snapshot":
+            slots_snapshot_too_old = _snapshot_too_old(
+                slots_snapshot_age_seconds, slots_max_snapshot_age_seconds
+            )
+    except Exception:
+        # Fail-open: a ceiling-resolution fault must not break the endpoint,
+        # and must not withhold a snapshot on a guess.
+        slots_snapshot_too_old = False
+    if slots_snapshot_too_old:
+        slots = []
+        detail_stale = True
+        available_slots = 0
+        total_slots = 0
+
     # -- per-slot capacity annotation (LP-0MVGDUVGE0024YAI) -----------------
     # Add owner_session_id / lease_state / phase / context_tokens /
     # prefill_eta_seconds to each slot so a dispatcher can distinguish a slot
@@ -784,6 +1049,42 @@ async def get_llama_local_status(request: Request):
     except Exception:
         # Annotation is best-effort; the base slot fields remain valid.
         pass
+
+    # -- derive availability from the served detail (LP-0MW1VDZIX0011D8M) ---
+    # The summary must never contradict its own ``slots[]``. ``available_slots``
+    # was historically read from a separate counts counter (a different
+    # ``/slots`` read) and reconciled independently, which is how a payload
+    # could assert ``available_slots: 2`` while both listed slots were
+    # ``is_processing: true`` (2026-11-04 incident, 8 h frozen snapshot). From
+    # this change the value is derived from ``slots[]`` by construction:
+    # ``count(not is_processing)`` whenever a detail list is served (AC1), so
+    # abandoned-but-processing slots reduce availability instead of sitting
+    # beside it (AC4).
+    #
+    # A stale list cannot prove availability (AC3), so when ANY slot data
+    # (counts or detail) came from the last-known cache the value is published
+    # as ``0`` and the additive ``availability_unknown`` flag says why — never
+    # a fabricated "free" count read off a fossil. ``total_slots`` is raised to
+    # the served list length so ``0 <= available_slots <= total_slots`` holds.
+    availability_unknown = False
+    try:
+        if slots and total_slots < len(slots):
+            total_slots = len(slots)
+        if counts_stale or detail_stale:
+            # ``slots_stale`` (the union) is client-visible; whenever it is
+            # true no summary field may assert availability (AC3). This covers
+            # the counts-only fallback too: cached counts are a stale list of
+            # slot states with no per-slot detail, and serving them as
+            # availability is the same over-dispatch hazard.
+            available_slots = 0
+            availability_unknown = True
+        elif slots:
+            from proxy.observability import count_available_slots
+
+            available_slots = count_available_slots(slots)
+    except Exception:
+        # Derivation is best-effort; leave the counts-derived value.
+        availability_unknown = bool(counts_stale or detail_stale)
 
     # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
     # The owner id is normalised to its bare session-id string: per-endpoint
@@ -854,6 +1155,22 @@ async def get_llama_local_status(request: Request):
     except Exception:
         _idle_snapshot = {}
 
+    # AC4 (LP-0MW1VDZIX0011D8M): a slot the detail reports as processing means
+    # the backend is demonstrably not idle — the published idle age must not
+    # keep climbing beside ``is_processing: true`` (the 2026-11-04 payload
+    # showed ``local_idle_seconds`` growing while two slots were generating).
+    # Clamp the *published* value to 0 while any slot reports work; the raw
+    # monotonic signal the routing override reads is untouched.
+    published_idle_seconds = _idle_snapshot.get("idle_seconds")
+    try:
+        if any(
+            isinstance(_slot, dict) and bool(_slot.get("is_processing", False))
+            for _slot in slots
+        ):
+            published_idle_seconds = 0.0
+    except Exception:
+        pass
+
     # AC4 (LP-0MVGDUVGE0024YAI): summarise whether the pool is genuinely
     # working — ``idle`` (a free slot, or only idle leases), ``prefill_bound``
     # (no free slot, at least one prefill) or ``saturated`` (no free slot, all
@@ -869,8 +1186,10 @@ async def get_llama_local_status(request: Request):
         capacity_hint = _capacity_hint(slots)
         # LP-0MVKSXR4P001V0CM AC3: a hint derived from cached ``/slots``
         # detail must never claim the pool is saturated without fresh
-        # evidence. Reconcile it with the live dispatch/activity state so a
-        # fossil snapshot cannot starve a dispatcher through an idle window.
+        # evidence — and, since LP-0MW1VDZIX0011D8M, must never claim it is
+        # *available* either. Reconcile it with the live dispatch/activity
+        # state so a fossil snapshot is reported ``unknown`` (neither idle nor
+        # saturated) when the proxy has no live work of its own.
         capacity_hint = _downgrade_stale_hint(
             capacity_hint,
             stale=detail_stale,
@@ -878,24 +1197,22 @@ async def get_llama_local_status(request: Request):
             activity_source=_idle_snapshot.get("last_activity_source"),
             idle_seconds=_idle_snapshot.get("idle_seconds"),
         )
-        if detail_stale and capacity_hint == "idle":
-            # The proxy sees no in-flight local work, so the cached counts
-            # must not report a full pool either: reconcile
-            # ``available_slots`` with the same view (fail-open, mirroring the
-            # no-model-loaded branch LP-0MSI06HPB0043MV1). A dispatcher polls
-            # this pair together and acts on both.
-            if total_slots <= 0:
-                try:
-                    total_slots = int(
-                        server_cfg.get("session_slot_pool_size", 3) or 3
-                    )
-                except (TypeError, ValueError):
-                    total_slots = 3
-            available_slots = max(
-                available_slots, total_slots - (live_local_requests or 0)
-            )
+        if availability_unknown and capacity_hint == "idle":
+            # The summary cannot assert availability from stale evidence, so a
+            # detail-derived ``idle`` becomes ``unknown`` (consumers treat
+            # unrecognised hints as busy — fail-closed, never over-dispatch).
+            from proxy.observability import CAPACITY_UNKNOWN
+
+            capacity_hint = CAPACITY_UNKNOWN
     except Exception:
         capacity_hint = "idle"
+
+    if slots_snapshot_too_old:
+        # An over-age snapshot proves nothing in either direction, so the hint
+        # must not claim availability (LP-0MW1VVKPF001ZAV5 AC3). ``unknown``
+        # is the documented "cannot assert" value; consumers treat an
+        # unrecognised hint as busy, so the failure mode stays fail-closed.
+        capacity_hint = "unknown"
 
     # AC1 (LP-0MVRMI5HK00558TB): count the slots annotated as abandoned so a
     # poll can see the ghost occupancy without re-deriving it from the array.
@@ -962,6 +1279,51 @@ async def get_llama_local_status(request: Request):
     # alongside it so an operator can tell a count fallback from a capacity
     # view built on cached slot detail.
     slots_stale = counts_stale or detail_stale
+    if slots_resolver_reason == SLOTS_STALE_REASON_ROUTER_MODEL_MISSING:
+        # The proxy could not name the model it is observing, so it holds no
+        # live evidence about the slot surface at all (2026-11-04 shape).
+        slots_stale = True
+    # Enumerated staleness reason (LP-0MW1VVIPG008896N): a bare boolean forced
+    # an operator to decode /metrics counter labels to learn *why* the surface
+    # was stale during the 2026-11-04 freeze. ``slots_stale_reason`` carries
+    # the cause machine-readably; ``None`` when the surface is fresh.
+    # Precedence (``snapshot_too_old`` > detail phase > counts phase) lives in
+    # ``observability.select_slots_stale_reason``, not here. ``slots_resolver_reason``
+    # is the failure the shared /slots target resolver observed this poll
+    # (``child_port_undiscovered`` / ``router_model_missing``); the transport
+    # reasons arrive through the recorder inside the fetch helpers.
+    slots_stale_reason = None
+    try:
+        from proxy.observability import (
+            last_slots_stale_reason,
+            select_slots_stale_reason,
+        )
+
+        slots_stale_reason = select_slots_stale_reason(
+            detail_reason=last_slots_stale_reason(),
+            counts_reason=None,
+            # An over-age snapshot dominates every transport reason: it is the
+            # condition a consumer must act on regardless of why the last
+            # fetch failed (LP-0MW1VVKPF001ZAV5).
+            snapshot_too_old=slots_snapshot_too_old,
+        )
+    except Exception:
+        # Fail-open: a recorder/evaluator fault publishes ``None`` rather than
+        # breaking the status endpoint.
+        slots_stale_reason = None
+    if slots_resolver_reason is not None:
+        # The resolver's own failure (child port undiscovered, model id
+        # unusable) is more specific than a generic transport error.
+        slots_stale_reason = slots_resolver_reason
+    # Publish the resolved reason into the shared recorder so ``/health``
+    # reports exactly what this endpoint reports (LP-0MW1VVMI1005XU0J AC3:
+    # one evaluation, one answer). A healthy poll clears it.
+    try:
+        from proxy.observability import record_slots_stale_reason
+
+        record_slots_stale_reason(slots_stale_reason)
+    except Exception:
+        pass
     client_ip, client_ip_source = _resolve_client_ip(request)
     status_extra = {
         "client_ip": client_ip,
@@ -974,8 +1336,22 @@ async def get_llama_local_status(request: Request):
         "model_switch_in_progress": switch_in_progress,
         "current_model": cm,
         "available_slots": available_slots,
+        "availability_unknown": bool(availability_unknown),
         "total_slots": total_slots,
         "slots_stale": slots_stale,
+        "slots_stale_reason": slots_stale_reason,
+        "slots_max_snapshot_age_seconds": slots_max_snapshot_age_seconds,
+        # Per-phase read-path timing + provenance (LP-0MVVXGHT1001I5YX
+        # AC1/AC2): additive fields that let a stale (> budget) poll be
+        # attributed to the status query, the counts query, the detail query
+        # or a cache path. ``null`` means the phase was never attempted
+        # (llama-server down / no model / exception before it started).
+        "status_query_ms": status_query_ms,
+        "slots_counts_ms": slots_counts_ms,
+        "slots_detail_ms": slots_detail_ms,
+        "slots_upstream_calls": slots_upstream_calls,
+        "slots_snapshot_age_seconds": slots_snapshot_age_seconds,
+        "slots_snapshot_source": slots_snapshot_source,
         "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
         "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
         # LP-0MVSD5RJW008F1IB AC6: the calibration context the metric needs is
@@ -999,7 +1375,7 @@ async def get_llama_local_status(request: Request):
         ),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
-        "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
+        "local_idle_seconds": published_idle_seconds,
         "capacity_hint": capacity_hint,
         "local_in_flight_requests": live_local_requests,
         "local_abandoned_slots": abandoned_slots,
@@ -1017,7 +1393,7 @@ async def get_llama_local_status(request: Request):
         "local_route_failure_count": local_route.get(
             "local_route_failure_count", 0
         ),
-        "status_schema_version": 5,
+        "status_schema_version": 7,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -1033,6 +1409,7 @@ async def get_llama_local_status(request: Request):
         "current_model": cm,
         "llama_server_running": bool(llama_running),
         "available_slots": available_slots,
+        "availability_unknown": bool(availability_unknown),
         "total_slots": total_slots,
         # True when the served slot data (counts or per-slot detail) came from
         # the last-known cache because the fresh /slots query failed
@@ -1045,6 +1422,16 @@ async def get_llama_local_status(request: Request):
         # evidence) and ``slot_counts_stale`` only affects the counts.
         "slots_detail_stale": bool(detail_stale),
         "slot_counts_stale": bool(counts_stale),
+        # Enumerated, machine-readable cause of ``slots_stale``
+        # (LP-0MW1VVIPG008896N): one of ``SLOTS_STALE_REASONS``, or ``None``
+        # when the surface is fresh. Additive field; consumers that ignore it
+        # behave exactly as before. Treat an unrecognised value as stale.
+        "slots_stale_reason": slots_stale_reason,
+        # The applied snapshot-age ceiling (LP-0MW1VVKPF001ZAV5): published so
+        # a consumer can judge ``slots_snapshot_age_seconds`` against it
+        # without knowing the config, and so ``snapshot_too_old`` is
+        # self-explanatory.
+        "slots_max_snapshot_age_seconds": slots_max_snapshot_age_seconds,
         # Truthful in-flight local request count, derived from live dispatch
         # records (``None`` in legacy mode with no record registry).
         # ``local_active_query`` mirrors ``> 0``; ``Null`` is never emitted.
@@ -1111,14 +1498,27 @@ async def get_llama_local_status(request: Request):
         # v5 (LP-0MVWFKIKJ005XHAY): ``local_route_available`` /
         # ``local_route_reason`` / ``local_route_cooldown_remaining_s`` publish
         # the local entry's routing availability beside its capacity.
-        "status_schema_version": 5,
+        # v6 (LP-0MW1VVIPG008896N): additive enumerated
+        # ``slots_stale_reason`` states *why* the slot surface is degraded
+        # (``router_model_missing`` / ``child_port_undiscovered`` /
+        # ``query_timeout`` / ``query_error`` / ``snapshot_too_old``), so an
+        # operator no longer has to decode ``/metrics`` counter labels.
+        # v7 (LP-0MW1VDZIX0011D8M): ``available_slots`` is DERIVED from
+        # ``slots[]`` (``count(not is_processing)``) rather than a separate
+        # counts counter, so the summary can never contradict the detail; a
+        # stale detail list publishes ``available_slots: 0`` with the additive
+        # ``availability_unknown: true`` flag instead of asserting capacity,
+        # ``capacity_hint`` gains the additive ``unknown`` value in that case,
+        # and ``local_idle_seconds`` is held at ``0`` while any slot reports
+        # ``is_processing: true``.
+        "status_schema_version": 7,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local
         # backend has been idle (monotonic-derived) and when it last worked.
         # ``idle_seconds`` is the signal the routing override reads; the
         # timestamps are for operators.
-        "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
+        "local_idle_seconds": published_idle_seconds,
         "local_last_activity_at": _idle_snapshot.get("last_activity_at"),
         "local_last_activity_source": _idle_snapshot.get("last_activity_source"),
         # Prefill serialisation (LP-0MVGDUUV3001XFRJ AC4): in-flight prefills,
@@ -1286,9 +1686,27 @@ async def health_check():
         router_models = await srv.router_list_models()
         loaded_models = srv._extract_router_model_ids(router_models)
 
-    llama_running = srv.llama_process is not None and srv.llama_process.poll() is None
     llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-    backend_reachable = bool(llama_running and await srv._probe_backend_reachable(llama_port))
+    llama_server_managed = (
+        srv.llama_process is not None and srv.llama_process.poll() is None
+    )
+    # LP-0MVZT9L3N001XABB AC2: in router mode a backend can serve the local
+    # route while this proxy holds no process handle for it (a self-heal spawn
+    # that outlived its readiness wait, or a host-first server started outside
+    # the proxy). Deriving liveness from the handle alone left /health
+    # reporting ``degraded`` / ``llama_server_running: false`` for ~20 minutes
+    # on 2026-11-02 while an orphan answered every request on :8080, so every
+    # health consumer (dashboards, slot_sweep_preflight.py, machine-hygiene)
+    # took the wrong action. Reachability is now the signal in router mode and
+    # ``llama_server_managed`` keeps an unmanaged backend distinguishable.
+    backend_reachable = False
+    if llama_server_managed or router_mode:
+        backend_reachable = bool(
+            await srv._probe_backend_reachable(llama_port)
+        )
+    llama_running = bool(
+        llama_server_managed or (router_mode and backend_reachable)
+    )
     self_healing = srv._is_self_healing_active()
     gpu_wedge_detected = bool(getattr(srv, "gpu_wedge_detected", False))
     gpu_wedge_detection_disabled = bool(
@@ -1317,13 +1735,58 @@ async def health_check():
     if tts_enabled and tts_process_alive:
         tts_server_healthy = await _probe_tts_health(tts_host, tts_port, timeout=2.0)
 
+    # -- slot-surface staleness (LP-0MW1VVMI1005XU0J) ----------------------
+    # A stale slot surface was invisible to every health consumer during the
+    # 2026-11-04 freeze: /health reported healthy while
+    # /llama/local/status carried slots_stale=true and an 8 h 17 m-old
+    # snapshot, so dashboards, slot_sweep_preflight.py and machine-hygiene all
+    # saw a healthy proxy while the dispatcher was starved.
+    #
+    # ``ready`` and the top-level ``status`` are DELIBERATELY unchanged: ready
+    # gates request admission, and an unobservable slot surface does not make
+    # the proxy unable to serve a request. Flipping ready here would
+    # fail-closed every consumer that reads it for liveness — the 2026-11-02
+    # orphan-backend regression (LP-0MVZT9L3N001XABB AC2) is the cautionary
+    # precedent. The non-OK signal is ``slots_surface_status``.
+    try:
+        from proxy.observability import evaluate_slots_surface
+
+        slots_surface = evaluate_slots_surface(
+            srv.config if isinstance(srv.config, dict) else {},
+            backend_available=bool(llama_running and backend_reachable),
+        )
+    except Exception:
+        # Fail-open: never break /health over a slot-staleness evaluation.
+        slots_surface = {
+            "status": "unknown",
+            "slots_stale": False,
+            "slots_stale_reason": None,
+            "snapshot_age_seconds": None,
+            "max_snapshot_age_seconds": None,
+        }
+
     return {
         "status": "healthy" if ready else "degraded",
         "ready": ready,
+        # Slot-surface condition (additive). ``ok`` when the surface is fresh,
+        # ``stale`` when it is degraded (see ``slots_stale_reason`` for why),
+        # ``unknown`` when the backend is unreachable so nothing can be
+        # asserted. Consumers should treat any unrecognised value as non-ok.
+        "slots_surface_status": slots_surface["status"],
+        "slots_stale": bool(slots_surface["slots_stale"]),
+        "slots_stale_reason": slots_surface["slots_stale_reason"],
+        "slots_snapshot_age_seconds": slots_surface["snapshot_age_seconds"],
+        "slots_max_snapshot_age_seconds": slots_surface[
+            "max_snapshot_age_seconds"
+        ],
         "current_model": srv.current_model,
         "loaded_models": loaded_models,
         "llama_server_running": llama_running,
         "backend_reachable": backend_reachable,
+        # LP-0MVZT9L3N001XABB AC2 (additive): True when the running backend is
+        # owned by this proxy (live process handle), False when it is reachable
+        # but unmanaged. ``llama_server_running`` is True in both cases.
+        "llama_server_managed": bool(llama_server_managed),
         "self_healing_in_progress": self_healing,
         "gpu_wedge_detected": gpu_wedge_detected,
         "gpu_wedge_detection_disabled": gpu_wedge_detection_disabled,

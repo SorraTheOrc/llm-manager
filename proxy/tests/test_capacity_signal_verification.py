@@ -83,13 +83,18 @@ def status_line(
     schema: int = 3,
     detail_stale: str | None = None,
     latency_ms: int = 3,
+    per_phase: dict | None = None,
 ) -> str:
     """One ``status_request`` log line, as the proxy writes it.
 
     ``detail_stale`` emits the per-source freshness flag the v3 status surface
     publishes next to the legacy ``slots_stale`` union; ``latency_ms`` is the
     handler's own response latency, the evidence that separates a fast fresh
-    poll from one that exhausted the ``/slots`` query budget.
+    poll from one that exhausted the ``/slots`` query budget. ``per_phase``
+    optionally appends the F1 instrumented surface
+    (``status_query_ms``/``slots_counts_ms``/``slots_detail_ms``/
+    ``slots_upstream_calls``/``slots_snapshot_source``) exactly as the
+    KeyValueFormatter renders it, so a test can model a post-F1 window.
     """
     fields = [
         f"active_query={active}",
@@ -112,6 +117,8 @@ def status_line(
         f"status_schema_version={schema}",
         "total_slots=2",
     ]
+    for key, value in (per_phase or {}).items():
+        fields.append(f"{key}={value if value is not None else 'None'}")
     return f"{ts},000 - INFO - status_request " + " ".join(fields) + "\n"
 
 
@@ -892,6 +899,224 @@ def test_stale_polls_attributed_to_cache_source_and_latency_band(csv, tmp_path):
         "unknown": 1,
     }
     assert attribution["unattributed"] == 1
+
+
+def test_per_phase_read_path_crosstabs_stale_vs_fresh(csv, tmp_path):
+    """AC3: the per-phase block separates stale from fresh polls per phase.
+
+    An instrumented window (F1 surface present) reports per-phase p50/p90/p99
+    for stale and fresh buckets, the per-poll upstream fan-out and the snapshot
+    source. None-valued phases (not attempted) are counted, never fabricated.
+    """
+    log_dir = tmp_path / "logs"
+    pp = {"status_query_ms": 3, "slots_counts_ms": 2, "slots_detail_ms": 1800}
+    write_log(
+        log_dir / "proxy.log",
+        # Stale poll with a slow detail phase (the > budget shape):
+        status_line(
+            "2026-10-29 00:00:01",
+            stale="true",
+            detail_stale="true",
+            latency_ms=2100,
+            per_phase=pp,
+        )
+        # Stale poll, even slower detail:
+        + status_line(
+            "2026-10-29 00:00:02",
+            stale="true",
+            detail_stale="true",
+            latency_ms=3100,
+            per_phase={**pp, "slots_detail_ms": 2900},
+        )
+        # Stale poll, fast (failure-backoff cache hit):
+        + status_line(
+            "2026-10-29 00:00:03",
+            stale="true",
+            detail_stale="false",
+            latency_ms=4,
+            per_phase={**pp, "slots_detail_ms": 3},
+        )
+        # Fresh poll: fast all round:
+        + status_line(
+            "2026-10-29 00:00:04",
+            stale="false",
+            detail_stale="false",
+            latency_ms=4,
+            per_phase={**pp, "slots_detail_ms": 2},
+        )
+        # Fresh poll where the detail phase was never attempted (None):
+        + status_line(
+            "2026-10-29 00:00:05",
+            stale="false",
+            detail_stale="false",
+            latency_ms=4,
+            per_phase={**pp, "slots_detail_ms": None},
+        ),
+    )
+
+    block = csv.analyse_status_stream(
+        log_dir,
+        since=dt.datetime(2026, 10, 29, 0, 0),
+        until=dt.datetime(2026, 10, 30, 0, 0),
+    )["per_phase_read_path"]
+
+    assert block["instrumented"] is True
+    assert block["polls_with_fields"] == 5
+    # Stale detail phase latencies [1800, 2900, 3]: p50=1800, p99=2900.
+    stale_detail = block["phases"]["slots_detail_ms"]["stale"]
+    assert stale_detail["count"] == 3
+    assert stale_detail["not_attempted"] == 0
+    assert stale_detail["p50"] == 1800
+    assert stale_detail["p90"] == 2900
+    assert stale_detail["p99"] == 2900
+    # Fresh detail latencies [2, None]: the None is counted, not averaged.
+    fresh_detail = block["phases"]["slots_detail_ms"]["fresh"]
+    assert fresh_detail["count"] == 1
+    assert fresh_detail["not_attempted"] == 1
+    assert fresh_detail["p50"] == 2
+    # The status phase is identical for all five polls.
+    assert block["phases"]["status_query_ms"]["stale"]["p50"] == 3
+    assert block["phases"]["status_query_ms"]["stale"]["count"] == 3
+    assert block["phases"]["status_query_ms"]["fresh"]["count"] == 2
+
+
+def test_per_phase_read_path_reports_fan_out_and_snapshot_source(csv, tmp_path):
+    """AC3: per-poll fan-out and snapshot source are crosstabbed too.
+
+    ``slots_upstream_calls`` counts how many upstream ``/slots`` fetches a poll
+    caused (0 = served from a cache, 1 = fresh); ``slots_snapshot_source``
+    labels what served it. Both are required evidence for the poll-path
+    serialisation/fan-out question (parent AC1 of LP-0MVVCO1N7004TNGY).
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        status_line(
+            "2026-10-29 00:00:01",
+            stale="true",
+            per_phase={
+                "status_query_ms": 3,
+                "slots_counts_ms": 2,
+                "slots_detail_ms": 400,
+                "slots_upstream_calls": 1,
+                "slots_snapshot_source": "upstream",
+            },
+        )
+        + status_line(
+            "2026-10-29 00:00:02",
+            stale="true",
+            per_phase={
+                "status_query_ms": 3,
+                "slots_counts_ms": 2,
+                "slots_detail_ms": 400,
+                "slots_upstream_calls": 0,
+                "slots_snapshot_source": "ttl_cache",
+            },
+        )
+        + status_line(
+            "2026-10-29 00:00:03",
+            stale="false",
+            per_phase={
+                "status_query_ms": 3,
+                "slots_counts_ms": 2,
+                "slots_detail_ms": 400,
+                "slots_upstream_calls": 1,
+                "slots_snapshot_source": "upstream",
+            },
+        ),
+    )
+
+    block = csv.analyse_status_stream(
+        log_dir,
+        since=dt.datetime(2026, 10, 29, 0, 0),
+        until=dt.datetime(2026, 10, 30, 0, 0),
+    )["per_phase_read_path"]
+
+    assert block["upstream_calls"] == {"stale": {"0": 1, "1": 1}, "fresh": {"1": 1}}
+    assert block["snapshot_source"] == {
+        "stale": {"ttl_cache": 1, "upstream": 1},
+        "fresh": {"upstream": 1},
+    }
+
+
+def test_per_phase_read_path_absent_polls_excluded_from_crosstab(csv, tmp_path):
+    """AC3: a poll with no ``slots_stale`` field stays out of the crosstab.
+
+    The stale/fresh split is the same denominator rule as the rate: a schema 1
+    poll (no ``slots_stale`` field) is excluded from the per-phase buckets
+    exactly as it is excluded from the rate, so an instrumented poll never
+    enters a bucket it cannot be classified into.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        status_line(
+            "2026-10-29 00:00:01",
+            stale="true",
+            per_phase={
+                "status_query_ms": 3,
+                "slots_counts_ms": 2,
+                "slots_detail_ms": 10,
+                "slots_upstream_calls": 1,
+                "slots_snapshot_source": "upstream",
+            },
+        )
+        # No slots_stale field at all (schema 1) despite the instrumentation:
+        + (
+            "2026-10-29 00:00:02,000 - INFO - status_request "
+            "capacity_hint=idle available_slots=2 current_model=Qwen3 "
+            "latency_ms=4 llama_server_running=true status_schema_version=1 "
+            "total_slots=2 status_query_ms=3 slots_counts_ms=2 "
+            "slots_detail_ms=10 slots_upstream_calls=1 "
+            "slots_snapshot_source=upstream\n"
+        ),
+    )
+
+    block = csv.analyse_status_stream(
+        log_dir,
+        since=dt.datetime(2026, 10, 29, 0, 0),
+        until=dt.datetime(2026, 10, 30, 0, 0),
+    )["per_phase_read_path"]
+
+    assert block["instrumented"] is True
+    assert block["polls_with_fields"] == 2
+    # Only the classifiable poll entered the stale bucket.
+    assert block["phases"]["status_query_ms"]["stale"]["count"] == 1
+    assert block["phases"]["status_query_ms"]["fresh"]["count"] == 0
+    assert block["upstream_calls"] == {"stale": {"1": 1}, "fresh": {}}
+
+
+def test_per_phase_read_path_pre_f1_window_is_honest_not_zero(csv, tmp_path):
+    """AC3: a pre-F1 window reports not-instrumented instead of zeros.
+
+    Every recorded window (including the 2026-10-29 24 h re-measurement)
+    predates the F1 instrumentation, so the block must state the surface is
+    absent rather than publish an empty distribution as if the phases were
+    instant — a zero is a fabricated measurement.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        status_line("2026-10-29 00:00:01", stale="true", latency_ms=2400)
+        + status_line("2026-10-29 00:00:02", stale="false", latency_ms=4),
+    )
+
+    block = csv.analyse_status_stream(
+        log_dir,
+        since=dt.datetime(2026, 10, 29, 0, 0),
+        until=dt.datetime(2026, 10, 30, 0, 0),
+    )["per_phase_read_path"]
+
+    assert block["instrumented"] is False
+    assert block["polls_with_fields"] == 0
+    assert "predates" in (block.get("note") or "")
+    for phase, dist in block["phases"].items():
+        assert dist["stale"]["count"] == 0
+        assert dist["stale"]["p50"] is None
+        assert dist["fresh"]["count"] == 0
+        assert dist["fresh"]["p50"] is None
+    assert block["upstream_calls"] == {"stale": {}, "fresh": {}}
+    assert block["snapshot_source"] == {"stale": {}, "fresh": {}}
 
 
 def test_abandonment_events_are_local_lease_releases_and_restarts(csv, tmp_path):

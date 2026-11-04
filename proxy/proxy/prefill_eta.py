@@ -154,10 +154,11 @@ DEFAULT_POLICY = POLICY_REJECT
 #
 # NOTE ON THE 1.1 ms FIGURE in the intake brief: applying 1.1 ms to *cached*
 # tokens rejects the AC5 case (a 90 %-cached 100k prompt costs
-# 0.9*100k*1.1 ms + 0.1*100k*3.9 ms = 138 s > the 120 s budget). The cached
+# 0.9*100k*1.1 ms + 0.1*100k*3.9 ms = 138 s > the deadline budget then
+# shipped, 120 s). The cached
 # term is therefore calibrated from warm dispatches with a cheap default,
 # which keeps cache-warm prompts admissible while still rejecting the
-# cache-cold 100k prompt (390 s > 120 s).
+# cache-cold 100k prompt (390 s > the then-shipped 120 s deadline).
 # ---------------------------------------------------------------------------
 
 DEFAULT_CODED_MS_PER_TOKEN = 0.5
@@ -259,8 +260,10 @@ ETA_PERCENTILE_MIN_TOKENS_KEY = "local_admission_guard_eta_percentile_min_tokens
 DEFAULT_ETA_PERCENTILE_MIN_TOKENS = CONSERVATIVE_MIN_TOKENS
 
 #: Fraction of the prefill deadline a budgeted prompt's conservative ETA must
-#: fit inside (0.95 of 120 s = 114 s). 0.0 disables the bound and leaves the
-#: bare token budget (legacy/rollback).
+#: fit inside (``budget_safety_fraction x local_prefill_deadline_seconds``; the
+#: derivation is stated once in ``proxy/config.yaml`` at
+#: ``local_admission_guard_budget_safety_fraction``). 0.0 disables the bound and
+#: leaves the bare token budget (legacy/rollback).
 BUDGET_SAFETY_FRACTION_KEY = "local_admission_guard_budget_safety_fraction"
 DEFAULT_BUDGET_SAFETY_FRACTION = 0.0
 
@@ -393,7 +396,9 @@ class GuardConfig:
     #: Prompt size from which percentile pricing engages (default 32 768).
     eta_percentile_min_tokens: int = DEFAULT_ETA_PERCENTILE_MIN_TOKENS
     #: Fraction of the deadline a budgeted prompt's conservative ETA must fit
-    #: inside (0.95 x 120 s = 114 s); 0.0 disables the bound.
+    #: inside
+    #: (``budget_safety_fraction * local_prefill_deadline_seconds``); 0.0
+    #: disables the bound.
     budget_safety_fraction: float = DEFAULT_BUDGET_SAFETY_FRACTION
     #: Rolling-median window for the published reference prompt
     #: (LP-0MVSD5RJW008F1IB AC4); 0 restores the single-most-recent-dispatch
@@ -1115,12 +1120,17 @@ class AdmissionDecision:
 
 
 def wait_budget_seconds(config: dict | None, priority: str | None = None) -> float:
-    """The caller's local wait budget (seconds).
+    """The caller's local queue-wait budget (seconds).
 
-    ``high`` priority never queues, so its budget is 0 (the guard is inert for
-    it — the pre-existing "never queue" behaviour is preserved). Otherwise the
-    budget is ``contention_queue_max_wait_seconds`` resolved through the
-    canonical queue config (so clamps and warnings match the queue).
+    ``high`` priority never queues, so its *queue* budget is 0 (the
+    pre-existing "never queue" behaviour). That does not make it unbounded:
+    ``evaluate_admission`` still applies the prefill deadline and its
+    deadline-relative safety budget to it, exactly as it does for every other
+    priority (LP-0MVZF3JZ9009LTN2) — those bounds are what actually cancel an
+    accepted dispatch, so refusing at admission is strictly cheaper than
+    accepting and detouring at the deadline. Otherwise the budget is
+    ``contention_queue_max_wait_seconds`` resolved through the canonical queue
+    config (so clamps and warnings match the queue).
     """
     try:
         from proxy.priority import PRIORITY_HIGH, parse_priority
@@ -1163,7 +1173,8 @@ def evaluate_admission(
 
     2. **Deadline bound (LP-0MVKUKEU80022C3U).** The projected time to first
        byte — own-prefill ETA plus the occupied gate — is compared against
-       ``local_prefill_deadline_seconds`` (default 120 s). When it would
+       ``local_prefill_deadline_seconds`` (default
+       ``DEFAULT_PREFILL_DEADLINE_SECONDS``). When it would
        exceed the deadline the guard refuses so we never start a dispatch
        that the deadline will later cancel. Including the occupancy term is
        the LP-0MVOFVCA2008DQVE residual fix: a warm 7 s prompt admitted
@@ -1209,10 +1220,17 @@ def evaluate_admission(
     "the prefill gate is busy" is legible from the log.
 
     Fail-open by construction: the guard is inert (``admit=True``) when the
-    policy is ``off``, the priority never queues, the bucket is not yet
-    calibrated, or no budget can be resolved. Only a calibrated projected
-    wait that exceeds a bound refuses admission, and only when the policy is
-    ``reject`` (``observe`` logs the same verdict without refusing).
+    policy is ``off``, the bucket is not yet calibrated, or **no bound can be
+    resolved at all** (no queue-wait budget *and* neither the deadline nor the
+    deadline-relative safety budget enabled). Only a calibrated projected
+    wait, or a calibrated ETA, that exceeds a bound refuses admission, and only
+    when the policy is ``reject`` (``observe`` logs the same verdict without
+    refusing).
+
+    ``high`` priority is bounded exactly like every other priority
+    (LP-0MVZF3JZ9009LTN2): it never queues, so only the queue-wait comparison
+    is inapplicable — the prefill deadline and the safety budget still apply,
+    because those are what actually cancel an accepted dispatch.
     """
     guard_cfg = resolve_config(config)
 
@@ -1305,8 +1323,15 @@ def evaluate_admission(
             deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
         )
     budget = wait_budget_seconds(config, priority)
-    if budget <= 0:
-        return _inert("no_budget")
+    # No queue-wait budget means the caller never queues (``high`` priority, or
+    # an unresolvable queue config): there is no queue wait to compare against,
+    # so that one comparator is skipped. The prefill deadline and its
+    # deadline-relative safety budget are a different question — they bound
+    # every accepted dispatch, because they are what cancels it — so they are
+    # still evaluated below (LP-0MVZF3JZ9009LTN2). Measured evidence: 43 of 126
+    # ``prefill_deadline`` evictions in 24 h were ``priority=high`` with no bound
+    # enforced at all (LP-0MVZ5WV6W008UO5F AC1).
+    has_queue_budget = budget > 0.0
     # Co-residency selector (LP-0MVS9Y76R004B5M8): a contended admission
     # (occupied gate ahead) must be priced from the contended calibration
     # window when calibrated; an explicit override wins over the derivation.
@@ -1353,7 +1378,20 @@ def evaluate_admission(
         and deadline_budget > 0.0
     ):
         bound = max(bound, deadline_budget)
-    within = projected.projected_seconds <= bound
+    if has_queue_budget:
+        within = projected.projected_seconds <= bound
+    else:
+        # Nothing queues, so the queue-wait comparison is inapplicable; the
+        # time bounds below are the governing comparators. With every bound
+        # disabled (no queue budget, no deadline, no safety budget) nothing can
+        # refuse the dispatch and the guard stays inert — the documented
+        # rollback path keeps its exact pre-change meaning.
+        if deadline <= 0 and deadline_budget <= 0.0:
+            return _inert("no_budget")
+        within = True
+        # Report the bound actually enforced: the tighter time bound, since
+        # ``budget_seconds`` stays 0 by definition for a never-queue dispatch.
+        bound = deadline_budget if deadline_budget > 0.0 else deadline
     reason = "within_budget" if within else "eta_exceeds_budget"
     admit = within or guard_cfg.policy == POLICY_OBSERVE
     # Second independent bound: deadline check (LP-0MVKUKEU80022C3U).
@@ -1370,7 +1408,7 @@ def evaluate_admission(
         admit = guard_cfg.policy == POLICY_OBSERVE
     # Third bound, deadline-RELATIVE (LP-0MVN4LBZ500281Z7 / parent AC3): when a
     # budget is configured, a prompt must fit inside
-    # ``budget_safety_fraction * deadline`` (0.95 x 120 s = 114 s), not merely
+    # ``budget_safety_fraction * local_prefill_deadline_seconds``, not merely
     # inside the deadline. This is what stops a prompt whose BAND is slow from
     # slipping past the flat token cap priced at the fast band's rate.
     if deadline_budget > 0.0 and eta > deadline_budget:
@@ -1437,12 +1475,14 @@ def prefill_deadline_budget_seconds(config: dict | None) -> float | None:
 
     Public single source of truth for the comparator the measured-cache
     benefit gate (``proxy.measured_cache_abort``) prices against: the
-    admission guard's ``budget_safety_fraction * local_prefill_deadline_seconds``
-    (0.95 x 120 s = 114 s with the shipped ``proxy/config.yaml``), falling back
-    to the bare ``local_prefill_deadline_seconds`` when the fraction is
-    explicitly ``0`` (the documented "no safety margin" rollback — *not* a
-    disabled budget). Both the advertised threshold and the enforced one come
-    from here, so they can never drift.
+    admission guard's
+    ``budget_safety_fraction * local_prefill_deadline_seconds`` (the derivation
+    is stated once, in ``proxy/config.yaml`` at
+    ``local_admission_guard_budget_safety_fraction``), falling back to the bare
+    ``local_prefill_deadline_seconds`` when the fraction is explicitly ``0``
+    (the documented "no safety margin" rollback — *not* a disabled budget).
+    Both the advertised threshold and the enforced one come from here, so they
+    can never drift.
 
     Returns ``None`` when the budget is unusable: either key absent, empty, a
     bool/string that is not numeric, NaN/inf, or negative — and a deadline of

@@ -20,7 +20,12 @@ import json
 
 import pytest
 from config_test_utils import get_merged_config, load_profile
-from proxy.provider import _build_resolved_model_value, _provider_context_limit
+from proxy.provider import (
+    _build_resolved_model_value,
+    _is_within_allowed_window,
+    _parse_available_times,
+    _provider_context_limit,
+)
 
 #: The exact provider entry the chains must carry right after local.
 #: ``display_name`` marks the free tier (``MunitoAI Free``) so the
@@ -71,6 +76,8 @@ MUNITOAI_ENTRY = {
     # probed from the live endpoint 2026-10-19. Same upstream model as the
     # free tier but a larger allowance, hence the deliberate higher limit.
     "max_context_tokens": 400000,
+    # Paid tier restricted to business hours: eligible only 10:00-23:00 UTC.
+    "available_times": ["10:00-23:00"],
     # Honour x-ratelimit-reset-* headers on 429 (LP-0MVBHDNLB007ALLJ).
     "respect_ratelimit_headers": True,
 }
@@ -148,6 +155,30 @@ def test_munitoai_free_is_always_available():
     entry = _providers(load_profile("config.yaml"), "plan")[1]
     assert entry["name"] == "munitoai-free"
     assert "available_times" not in entry
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_munitoai_paid_tier_is_restricted_to_business_hours(model):
+    """The paid tier is eligible only 10:00-23:00 UTC (end-exclusive).
+
+    The free tier stays around the clock; the paid ``munitoai`` entry carries
+    the 10:00-23:00 window so paid dispatches fall within business hours.
+    """
+    entry = _entry(_providers(load_profile("config.yaml"), model), "munitoai")
+    assert entry["available_times"] == ["10:00-23:00"]
+    windows = _parse_available_times(entry)
+    assert windows == ((10 * 60, 23 * 60),)
+    # Window start inclusive, end exclusive, interpreted in UTC.
+    assert _is_within_allowed_window(entry, _utc(9, 59)) is False
+    assert _is_within_allowed_window(entry, _utc(10, 0)) is True
+    assert _is_within_allowed_window(entry, _utc(22, 59)) is True
+    assert _is_within_allowed_window(entry, _utc(23, 0)) is False
+
+
+def _utc(hour: int, minute: int):
+    import datetime as _dt
+
+    return _dt.datetime(2026, 10, 20, hour, minute, tzinfo=_dt.UTC)
 
 
 @pytest.mark.parametrize("model", CHAINS)

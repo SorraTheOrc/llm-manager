@@ -214,7 +214,17 @@ async def test_proxy_to_local_rejects_when_other_session_holds_unexpired_lease(m
 
     resp = await proxy_to_local(req, "v1/chat/completions")
     # Must NOT be a dispatch-gate denial when no generating slot is held.
-    assert resp.status_code != 503, "Inactive-lease-only must not dispatch-gate 503; generating-only pool not full"
+    # Assert the *denial reason*, not the status code: a 503 is also what an
+    # unreachable llama-server produces after the backend retries are
+    # exhausted, so a bare ``!= 503`` made this test depend on whether a live
+    # llama-server happened to be up on the host (LP-0MW0KZR7A003UFQK follow-up).
+    _payload = json.loads(resp.body) if resp.status_code == 503 else {}
+    assert _payload.get("reason") != "local_lease_active", (
+        "Inactive-lease-only must not dispatch-gate 503; generating-only pool not full"
+    )
+    assert _payload.get("error", {}).get("code") != "no_slots_available", (
+        "Inactive-lease-only must not be refused by the dispatch lease check"
+    )
 
 
 @pytest.mark.asyncio

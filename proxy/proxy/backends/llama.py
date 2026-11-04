@@ -237,8 +237,168 @@ async def _probe_gpu_wedge(
 # Router self-healing
 # ===================================================================
 
-async def _attempt_router_self_heal() -> bool:
-    """Attempt router-mode self-healing with capped exponential backoff."""
+
+def _proc_handle_alive(proc) -> bool:
+    """True when *proc* is a live process handle (``poll()`` returns None)."""
+    if proc is None:
+        return False
+    poll = getattr(proc, "poll", None)
+    if not callable(poll):
+        return False
+    try:
+        return poll() is None
+    except Exception:
+        return False
+
+
+def _adopt_reachable_backend(srv, llama_port: int) -> bool:
+    """Adopt a reachable backend this proxy holds no process handle for.
+
+    LP-0MVZT9L3N001XABB AC2: the watchdog used to only reset
+    ``backend_ready`` when the port answered with ``llama_process is None``,
+    which left ``/health``'s process-handle based ``llama_server_running``
+    (and therefore ``/llama/local/status`` slot reporting) stuck on the
+    degraded verdict for as long as the orphan served the port. Installing
+    the adopted-port sentinel makes the backend a first-class managed server
+    again: liveness is reported, ``stop_llama_server`` can kill it by port, and
+    the sentinel's ``pid`` of 0 keeps ``_worker_process_unhealthy`` inert.
+
+    Returns True when a sentinel was installed.
+    """
+    if _proc_handle_alive(getattr(srv, "llama_process", None)):
+        return False
+    try:
+        from ..lifecycle import _AdoptedLlamaProcess
+
+        srv.llama_process = _AdoptedLlamaProcess(port=int(llama_port))
+    except Exception:
+        return False
+    try:
+        srv.logger.warning(
+            "watchdog: adopted the reachable but unmanaged llama-server on port %s "
+            "(no process handle); /health and slot reporting now reflect it",
+            llama_port,
+        )
+    except Exception:
+        pass
+    return True
+
+
+async def _settle_unready_self_heal_spawn(srv, proc, llama_port: int) -> bool:
+    """Resolve a self-heal spawn whose readiness wait expired (AC1).
+
+    LP-0MVZT9L3N001XABB: on 2026-11-02 21:39Z a host-first router spawn that
+    was still loading its presets when ``wait_for_llama_server``'s budget ran
+    out was declared failed and left running but unadopted. It kept port 8080,
+    so the next attempt died on ``couldn't bind HTTP server socket`` and
+    self-heal exhausted — while the orphan served the local route fine.
+
+    A spawn is therefore never abandoned:
+
+    * **reachable** — adopt it (the live ``Popen`` when the handle survived,
+      else an adopted-port sentinel for a surviving descendant) and report
+      success, so the work already done is not thrown away;
+    * **unreachable** — terminate its process group so the port is released
+      for the next attempt instead of blocking it.
+
+    Returns True when the spawn was adopted.
+    """
+    try:
+        reachable = bool(await srv._probe_backend_reachable(llama_port))
+    except Exception:
+        reachable = False
+
+    if reachable:
+        live_handle = _proc_handle_alive(proc)
+        if live_handle:
+            srv.llama_process = proc
+        else:
+            _adopt_reachable_backend(srv, llama_port)
+        srv.backend_ready = True
+        srv.backend_recovery_state["last_failure"] = None
+        try:
+            srv.logger.warning(
+                "self-heal: backend on port %s became reachable after the readiness "
+                "wait expired; adopting the spawn (pid=%s, live_handle=%s) instead of "
+                "leaving it unadopted",
+                llama_port,
+                getattr(proc, "pid", "N/A"),
+                live_handle,
+            )
+        except Exception:
+            pass
+        return True
+
+    # Unreachable: the spawn must not be left holding the port.
+    try:
+        kill = getattr(srv, "_kill_process_group", None)
+        if callable(kill):
+            kill(proc, srv.logger)
+        else:  # pragma: no cover - defensive fallback for partial servers
+            terminate = getattr(proc, "terminate", None)
+            if callable(terminate):
+                terminate()
+        # The handle no longer represents a live backend: clear it so the
+        # failure path cannot re-settle (and re-kill) the same spawn.
+        if getattr(srv, "llama_process", None) is proc:
+            srv.llama_process = None
+        srv.logger.warning(
+            "self-heal: terminated the unadopted spawn (pid=%s) that never became "
+            "reachable on port %s, freeing the port for the next attempt",
+            getattr(proc, "pid", "N/A"),
+            llama_port,
+        )
+    except Exception:
+        try:
+            srv.logger.exception(
+                "self-heal: failed to terminate the unadopted spawn on port %s",
+                llama_port,
+            )
+        except Exception:
+            pass
+    return False
+
+
+async def _port_held_by_unmanaged_backend(srv, llama_port: int) -> bool:
+    """True when the port answers but this proxy owns no live process for it.
+
+    LP-0MVZVZLCS000LQNB AC4: the respawn guard. A backend that answers on the
+    configured port while ``llama_process`` is absent (or dead) is already
+    serving the local route — spawning a second one cannot bind and would
+    produce the restart cascade this item exists to stop.
+    """
+    if _proc_handle_alive(getattr(srv, "llama_process", None)):
+        return False
+    try:
+        return bool(await srv._probe_backend_reachable(llama_port))
+    except Exception:
+        return False
+
+
+async def _settle_leftover_spawn(srv, llama_port: int) -> bool:
+    """Settle a spawn left alive by a failed self-heal attempt (AC1).
+
+    ``_settle_unready_self_heal_spawn`` handles the ordinary "readiness wait
+    returned False" path. This wrapper covers the exceptional path (the
+    readiness wait raised, or the attempt failed after the handle was
+    installed): a live leftover spawn is adopted when reachable and terminated
+    when not, so no failure mode leaves it unadopted holding the port.
+    """
+    leftover = getattr(srv, "llama_process", None)
+    if not _proc_handle_alive(leftover):
+        return False
+    return await _settle_unready_self_heal_spawn(srv, leftover, llama_port)
+
+
+async def _attempt_router_self_heal(reason: str = "unspecified") -> bool:
+    """Attempt router-mode self-healing with capped exponential backoff.
+
+    *reason* is the death/cause that triggered this restart attempt. It is
+    logged on every attempt line as ``restart_reason=<reason>`` and recorded in
+    ``backend_recovery_state["last_restart_reason"]`` so a restart is never
+    anonymous (LP-0MVZVZLCS000LQNB AC2), and it is attached to the
+    ``backend_restart`` evictions of the prefills the restart abandons (AC3).
+    """
     srv = _srv()
 
     server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
@@ -253,6 +413,7 @@ async def _attempt_router_self_heal() -> bool:
         float(server_cfg.get("llama_self_heal_backoff_base_seconds", 1.0) or 1.0),
     )
     startup_timeout = int(server_cfg.get("llama_startup_timeout", 300) or 300)
+    llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
     retry_after = srv._self_heal_retry_after_seconds()
 
     now_ts = time.time()
@@ -281,6 +442,7 @@ async def _attempt_router_self_heal() -> bool:
         return False
 
     srv.backend_recovery_state["in_progress"] = True
+    srv.backend_recovery_state["last_restart_reason"] = reason
     remaining = max_attempts - len(attempts)
 
     try:
@@ -291,13 +453,53 @@ async def _attempt_router_self_heal() -> bool:
             attempt_number = len(attempts)
 
             srv.logger.warning(
-                "self-heal attempt %s/%s started (window=%ss)",
+                "self-heal attempt %s/%s started (window=%ss, restart_reason=%s)",
                 attempt_number,
                 max_attempts,
                 window_seconds,
+                reason,
             )
 
             try:
+                # LP-0MVZVZLCS000LQNB AC4: never spawn over a backend that is
+                # already answering on the port. A crashed backend that a
+                # previous (or external) spawn has already replaced is adopted
+                # instead — spawning here is exactly the 21:40:16Z cascade
+                # where a second router died on
+                # "couldn't bind HTTP server socket ... port: 8080".
+                #
+                # Only retries are gated: the first attempt is the watchdog's
+                # deliberate recovery (it has already established that the
+                # backend is unreachable), so a router that answers /models
+                # while its child is dead still gets its restart.
+                if local_attempt > 0 and await _port_held_by_unmanaged_backend(
+                    srv, llama_port
+                ):
+                    adopted = _adopt_reachable_backend(srv, llama_port)
+                    srv.backend_ready = True
+                    srv.backend_recovery_state["last_failure"] = None
+                    srv.logger.warning(
+                        "self-heal: not respawning — port %s is already served by "
+                        "an unmanaged backend (restart_reason=%s, adopted=%s); no "
+                        "new process started",
+                        llama_port,
+                        "port_held_by_unmanaged_backend",
+                        adopted,
+                    )
+                    return True
+
+                # LP-0MVZVZLCS000LQNB AC3: a restart abandons the prefills in
+                # flight; record them so the churn is visible in the eviction
+                # accounting instead of looking like a capacity problem.
+                try:
+                    from .. import admission_events as _admission_events
+
+                    _admission_events.record_backend_restart_evictions(
+                        srv, restart_reason=reason
+                    )
+                except Exception:
+                    pass
+
                 restarted = srv.start_llama_server(None)
                 if restarted is None:
                     raise RuntimeError("start_llama_server returned None")
@@ -313,8 +515,33 @@ async def _attempt_router_self_heal() -> bool:
                     )
                     return True
 
+                # LP-0MVZT9L3N001XABB AC1: a spawn that outlived the readiness
+                # wait is adopted when it is reachable and terminated when it
+                # is not — it is never left unadopted holding the port.
+                if await _settle_unready_self_heal_spawn(srv, restarted, llama_port):
+                    srv.logger.info(
+                        "self-heal succeeded on attempt %s/%s (adopted a "
+                        "late-ready backend)",
+                        attempt_number,
+                        max_attempts,
+                    )
+                    return True
+
                 raise RuntimeError("wait_for_llama_server returned False")
             except Exception as exc:
+                # LP-0MVZT9L3N001XABB AC1: a spawn that is still alive when an
+                # attempt fails must not be abandoned holding the port.
+                try:
+                    if await _settle_leftover_spawn(srv, llama_port):
+                        srv.logger.info(
+                            "self-heal recovered via a leftover spawn on "
+                            "attempt %s/%s",
+                            attempt_number,
+                            max_attempts,
+                        )
+                        return True
+                except Exception:
+                    pass
                 srv.backend_ready = False
                 srv.llama_process = None
                 srv.current_model = None
@@ -388,10 +615,15 @@ async def _backend_watchdog_loop() -> None:
                     # Probe the backend before attempting restart
                     reachable = await srv._probe_backend_reachable(llama_port)
                     if reachable:
+                        # LP-0MVZT9L3N001XABB AC2: adopt the reachable backend
+                        # so /health and slot reporting stop reporting the
+                        # sticky degraded verdict, not just backend_ready.
+                        adopted = _adopt_reachable_backend(srv, llama_port)
                         srv.logger.info(
                             "watchdog: llama_process is None but backend is reachable on port %d, "
-                            "resetting backend_ready to True",
+                            "resetting backend_ready to True (adopted=%s)",
                             llama_port,
+                            adopted,
                         )
                         srv.backend_ready = True
                         srv.backend_recovery_state["last_failure"] = None
@@ -401,7 +633,9 @@ async def _backend_watchdog_loop() -> None:
                         "watchdog: llama_process is None and backend unreachable, "
                         "attempting restart"
                     )
-                    recovered = await srv._attempt_router_self_heal()
+                    recovered = await srv._attempt_router_self_heal(
+                        reason=f"backend_unreachable(port={llama_port})"
+                    )
                     srv.logger.info(
                         "watchdog restart-from-none recovered=%s", recovered
                     )
@@ -455,15 +689,22 @@ async def _backend_watchdog_loop() -> None:
             if router_mode:
                 reachable = await srv._probe_backend_reachable(llama_port)
                 if reachable:
-                    srv.logger.info(
-                        "watchdog: process exited but backend reachable on port %d, "
-                        "resetting backend_ready to True (process exited code=%s)",
-                        llama_port,
-                        code,
-                    )
-                    srv.backend_ready = True
+                    # LP-0MVZT9L3N001XABB AC2: adopt instead of only clearing
+                    # the handle, so /health and slot reporting agree with the
+                    # working route. The exited handle is cleared first: the
+                    # adoption installs the port sentinel that replaces it.
                     srv.llama_process = None
                     srv.current_model = None
+                    adopted = _adopt_reachable_backend(srv, llama_port)
+                    srv.logger.info(
+                        "watchdog: process exited but backend reachable on port %d, "
+                        "resetting backend_ready to True (process exited code=%s, "
+                        "adopted=%s)",
+                        llama_port,
+                        code,
+                        adopted,
+                    )
+                    srv.backend_ready = True
                     srv.backend_recovery_state["last_failure"] = None
                     continue
 
@@ -473,7 +714,13 @@ async def _backend_watchdog_loop() -> None:
             srv.current_model = None
 
             if router_mode:
-                recovered = await srv._attempt_router_self_heal()
+                recovered = await srv._attempt_router_self_heal(
+                    reason=(
+                        "worker_unhealthy"
+                        if code is None
+                        else f"llama_server_exit_code_{code}"
+                    )
+                )
                 srv.logger.info(
                     "watchdog router self-heal recovered=%s", recovered
                 )

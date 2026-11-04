@@ -12,6 +12,7 @@
 rule_files:
   - ../gpu_compute_rules.yaml
   - ../gpu_memory_alerts.yaml
+  - ../host_memory_alerts.yaml
 
 evaluation_interval: 1m
 
@@ -242,3 +243,71 @@ tests:
         exp_samples:
           - labels: '{}'
             value: 1
+
+  # ---------------------------------------------------------------------------
+  # Pre-OOM host memory alerts (LP-0MVZ810NG008A3EW AC3).
+  #
+  # The 2026-11-02T12:03:08Z global OOM ran at MemAvailable 0.2 % of RAM and GTT
+  # 53.7 % of physical RAM. `GpuGttHigh*` (pool-relative: GTT was 53 % of its
+  # 128 GiB pool) could not fire; these thresholds must. Asserted through the
+  # alert expressions rather than `alert_rule_test` so the check pins the
+  # *threshold semantics* without duplicating the `humanizePercentage`
+  # annotations word for word.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      # 124 GiB RAM, 0.2 % available — the incident's MemAvailable.
+      - series: 'node_memory_MemTotal_bytes{instance="localhost:9100",job="node-exporter"}'
+        values: '133626875904x6'
+      - series: 'node_memory_MemAvailable_bytes{instance="localhost:9100",job="node-exporter"}'
+        values: '251469824x6'
+      # GTT 68,482 MiB of that RAM (53.7 %), from the textfile sampler.
+      - series: 'gpu_gtt_used_bytes{gpu="card0",instance="localhost:9100",job="node-exporter"}'
+        values: '71821114368x6'
+
+    promql_expr_test:
+      - expr: '(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.12'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{instance="localhost:9100", job="node-exporter"}'
+            value: 0.0018818805895055163
+      - expr: '(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.06'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{instance="localhost:9100", job="node-exporter"}'
+            value: 0.0018818805895055163
+      - expr: '(sum(gpu_gtt_used_bytes) / sum(node_memory_MemTotal_bytes)) > 0.50'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{}'
+            value: 0.5374750691589737
+      # 53.7 % is below the critical GTT threshold: the pair must be ordered.
+      - expr: '(sum(gpu_gtt_used_bytes) / sum(node_memory_MemTotal_bytes)) > 0.65'
+        eval_time: 3m
+        exp_samples: []
+
+  # ---------------------------------------------------------------------------
+  # A healthy host trips nothing — the pair must not be permanently red.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'node_memory_MemTotal_bytes{instance="localhost:9100",job="node-exporter"}'
+        values: '133626875904x6'
+      - series: 'node_memory_MemAvailable_bytes{instance="localhost:9100",job="node-exporter"}'
+        values: '66813437952x6'
+      - series: 'gpu_gtt_used_bytes{gpu="card0",instance="localhost:9100",job="node-exporter"}'
+        values: '39327752192x6'
+
+    promql_expr_test:
+      - expr: '(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.12'
+        eval_time: 3m
+        exp_samples: []
+      - expr: '(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.06'
+        eval_time: 3m
+        exp_samples: []
+      - expr: '(sum(gpu_gtt_used_bytes) / sum(node_memory_MemTotal_bytes)) > 0.50'
+        eval_time: 3m
+        exp_samples: []
+      - expr: '(sum(gpu_gtt_used_bytes) / sum(node_memory_MemTotal_bytes)) > 0.65'
+        eval_time: 3m
+        exp_samples: []

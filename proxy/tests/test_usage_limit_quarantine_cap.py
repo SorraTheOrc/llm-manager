@@ -552,7 +552,23 @@ class TestAdminClearUsageLimit:
         assert account not in raw["usage_reset_at"]
 
     def test_route_is_registered(self):
-        paths = {getattr(route, "path", None) for route in server.app.routes}
+        # Flatten included routers: FastAPI >= 0.136 exposes them as
+        # ``_IncludedRouter`` entries in ``app.routes`` (no ``.path`` attribute).
+        def _paths(routes):
+            for route in routes:
+                path = getattr(route, "path", None)
+                if path:
+                    yield path
+                source = getattr(route, "original_router", None)
+                nested = (
+                    source.routes
+                    if source is not None and hasattr(source, "routes")
+                    else getattr(route, "routes", None)
+                )
+                if nested:
+                    yield from _paths(nested)
+
+        paths = set(_paths(server.app.routes))
         assert "/admin/clear-usage-limit" in paths
 
 

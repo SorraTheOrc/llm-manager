@@ -24,6 +24,8 @@ contract the acceptance criteria are written against:
     and resume verdict derived.
 """
 
+import datetime as dt
+import json
 import os
 import sys
 import unittest
@@ -176,6 +178,152 @@ class Ac3ResumeTest(unittest.TestCase):
             _lines(), after=last, window_seconds=3600
         )
         self.assertTrue(prv.local_serving_resumed(counts))
+
+
+class Ac3WindowBoundedTest(unittest.TestCase):
+    """LP-0MVX157ZF007QJSU — the AC3 tally is window-bounded.
+
+    ``count_local_finishes_after`` used to tally over the fixed resume window
+    that opens at the last release and could run past the measurement
+    window's ``until``, so live traffic arriving after ``until`` kept
+    inflating the count (28 at 23:21 -> 37 at 23:25 -> 45 once the hour had
+    elapsed on the 2026-10-31 post-deploy window). The tally is now clipped
+    at ``until``: a closed window yields a stable count from the moment it
+    closes.
+    """
+
+    LINES = _lines()  # last release (D) at 10:06:00; local finish F at 10:09:00
+
+    def _after(self):
+        releases = prv.parse_deadline_release_events(self.LINES)
+        return max(r.release_ts for r in releases)
+
+    def test_finish_past_until_inside_resume_window_is_not_counted(self):
+        after = self._after()
+        until = dt.datetime(2026, 10, 23, 10, 11, 0)
+        # A finish at 10:12 lies past `until` but still inside the 1 h resume
+        # window ([10:06, 11:06]) — it must NOT be tallied once the window
+        # is closed (the 10:09 finish is inside [10:06, 10:11) and is).
+        lines = self.LINES + [
+            "2026-10-23 10:12:00,000 - INFO - Stream finished: reason=stop "
+            "tokens=50/5/55 session=G provider=local model=Qwen3",
+        ]
+        self.assertEqual(
+            prv.count_local_finishes_after(
+                lines, after=after, window_seconds=3600, until=until
+            ),
+            1,
+        )
+
+    def test_tally_is_half_open_after_until(self):
+        # F finishes at 10:09:00: counted when until=10:10, excluded (like
+        # ``parse_deadline_release_events``) when until=10:09 exactly.
+        after = self._after()
+        self.assertEqual(
+            prv.count_local_finishes_after(
+                self.LINES, after=after, window_seconds=3600,
+                until=dt.datetime(2026, 10, 23, 10, 10, 0),
+            ),
+            1,
+        )
+        self.assertEqual(
+            prv.count_local_finishes_after(
+                self.LINES, after=after, window_seconds=3600,
+                until=dt.datetime(2026, 10, 23, 10, 9, 0),
+            ),
+            0,
+        )
+
+    def test_until_beyond_the_resume_window_is_a_no_op(self):
+        after = self._after()
+        lines = self.LINES + [
+            "2026-10-23 10:12:00,000 - INFO - Stream finished: reason=stop "
+            "tokens=50/5/55 session=G provider=local model=Qwen3",
+        ]
+        expected = prv.count_local_finishes_after(
+            lines, after=after, window_seconds=3600
+        )
+        self.assertEqual(expected, 2)  # 10:09 and 10:12 finishes
+        clipped = prv.count_local_finishes_after(
+            lines,
+            after=after,
+            window_seconds=3600,
+            until=dt.datetime(2026, 10, 23, 11, 30, 0),
+        )
+        self.assertEqual(clipped, expected)
+
+
+class Ac3ClosedWindowReproducibilityTest(unittest.TestCase):
+    """LP-0MVX157ZF007QJSU AC2 — a closed window re-runs byte-identically.
+
+    Synthetic log lines span past ``until`` (but inside the 1 h resume
+    window): a second run with live 'traffic' lines added past ``until`` must
+    produce a byte-identical report once the tally is window-bounded. Before
+    the fix the added lines changed ``ac3.local_finishes_after_last_release``
+    from one run to the next.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, name, lines):
+        (self.log_dir / name).write_text("".join(lines), encoding="utf-8")
+
+    def _measure(self):
+        return prv.run_measure(
+            log_dir=self.log_dir,
+            since=dt.datetime(2026, 10, 23, 9, 59, 0),
+            until=dt.datetime(2026, 10, 23, 10, 7, 0),
+            hour_records=[],
+            analysis_cmd=[],
+            min_attempts=10,
+            recovery_bound=300,
+            resume_window=3600,
+        )
+
+    def test_closed_window_re_run_is_byte_identical_with_traffic_past_until(self):
+        self._write(
+            "proxy.log.2026-10-23_10",
+            [
+                "2026-10-23 10:00:00,000 - WARNING - prefill_deadline_exceeded "
+                "session=A deadline=90s\n",
+                "2026-10-23 10:00:02,000 - INFO - lease_released session=A "
+                "reason=prefill_deadline endpoint=default\n",
+                "2026-10-23 10:03:00,000 - INFO - Stream finished: reason=stop "
+                "tokens=50/5/55 session=F provider=local model=Qwen3\n",
+            ],
+        )
+        report = self._measure()
+        # Tally = local finishes in [10:00:02, 10:07:00) -> just the 10:03 one.
+        self.assertEqual(report["ac3"]["local_finishes_after_last_release"], 1)
+        baseline = json.dumps(report, indent=2, sort_keys=True)
+
+        # Live 'traffic' lands after `until` but inside the 1 h resume window
+        # (10:00:02 + 3600 = 11:00:02) — a shape the unclipped code would have
+        # tallied, changing the count between runs.
+        self._write(
+            "proxy.log",
+            [
+                "2026-10-23 10:08:00,000 - INFO - Stream finished: reason=stop "
+                "tokens=1/1/2 session=G provider=local model=Qwen3\n",
+                "2026-10-23 10:30:00,000 - INFO - status_request\n",
+            ],
+        )
+        re_run = self._measure()
+        self.assertEqual(re_run["ac3"]["local_finishes_after_last_release"], 1)
+        self.assertEqual(
+            json.dumps(re_run, indent=2, sort_keys=True),
+            baseline,
+            "a re-run of --measure against a closed window must be "
+            "byte-identical once the AC3 tally is clipped at until",
+        )
 
 
 class SessionRecoveryTest(unittest.TestCase):

@@ -125,6 +125,22 @@ RE_PROVIDER_TYPE = re.compile(r"\btype=([A-Za-z0-9_.-]+)")
 # pre-hold cycle, incremented on every hold restart). Tolerant: absent on
 # pre-chain-hold rotated logs → None (treated as cycle 0 downstream).
 RE_CHAIN_HOLD_CYCLE = re.compile(r"\bchain_hold_cycle=(\d+)")
+# Chain-end vocabulary (LP-0MW0KZR7A003UFQK). Exactly one of two lines is
+# emitted when a fallback chain cannot serve:
+#   "Chain exhausted for model=<path>; holding <N>s before restarting cycle
+#    from the first provider (chain_hold_cycle=..., ...)"   <- the HOLD
+#   "chain_planned_unavailable model=<path>
+#    reason=deterministic_residual_chain hold=skipped retry_after=<s>
+#    providers=<n> deterministic_skips=<name:reason,...> terminal=<name,...>"
+#                                                          <- the FAIL-FAST
+# They must classify distinctly: a fail-fast refusal costs no hold latency and
+# must never be counted as one.
+CHAIN_HOLD = "Chain exhausted for model="
+RE_CHAIN_HOLD_MODEL = re.compile(r"Chain exhausted for model=(\S+?);")
+RE_CHAIN_HOLD_SECONDS = re.compile(r"\bholding ([\d.]+)s before restarting cycle")
+CHAIN_PLANNED_UNAVAILABLE = "chain_planned_unavailable"
+RE_CHAIN_HOLD_MARKER = re.compile(r"\bhold=([A-Za-z_]+)")
+RE_CHAIN_PLANNED_RETRY_AFTER = re.compile(r"\bretry_after=(\S+)")
 RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-]+) active=(\d+)")
 # Bare ``reason=<token>`` extractor for lines whose reason is not followed by
 # the routing-skip arrow (e.g. ``contention_queue_fallback_after_queue ...
@@ -573,6 +589,7 @@ class LogEvent:
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
     ``routing_skip``, ``provider_context_skip``, ``dispatch_denied``,
+    ``chain_hold``, ``chain_planned_unavailable``,
     ``local_dispatch``, ``contention_dispatch``,
     ``contention_fallback_after_queue``, ``idle_admit``, ``mode_switch``,
     ``restart``,
@@ -654,6 +671,14 @@ class LogEvent:
     estimated_tokens: int | None = None
     limit: int | None = None
     provider_type: str | None = None
+    # Chain-end fields (LP-0MW0KZR7A003UFQK). ``hold`` is the explicit marker
+    # on ``chain_planned_unavailable`` ("skipped" for a fail-fast refusal);
+    # ``hold_seconds`` is the planned wait on the ``chain_hold`` line; and
+    # ``retry_after`` is the advertised reset on the fail-fast line (None when
+    # no instant was derivable). All None on every other kind.
+    hold: str | None = None
+    hold_seconds: float | None = None
+    retry_after: int | None = None
     # Operating-mode field (mode_switch kind only): "fast" | "cheap".
     mode: str | None = None
     # Restart-marker field (restart kind only): "spawned" | "complete"
@@ -1382,6 +1407,33 @@ def parse_log_line(line: str) -> LogEvent | None:
             ts,
             session=_session_from(msg),
             deadline_seconds=_float(RE_PREFILL_DEADLINE_SECONDS, msg),
+        )
+    if msg.startswith(CHAIN_PLANNED_UNAVAILABLE):
+        # The fail-fast refusal (LP-0MW0KZR7A003UFQK AC3): reported with its
+        # own kind so the report can say "refused in <1 s" instead of folding
+        # it into hold latency.
+        return LogEvent(
+            "chain_planned_unavailable",
+            ts,
+            model=_first(RE_MODEL, msg),
+            reason=_first(RE_REASON_KV, msg),
+            hold=_first(RE_CHAIN_HOLD_MARKER, msg),
+            retry_after=_int(RE_CHAIN_PLANNED_RETRY_AFTER, msg),
+            turn=_turn_from(msg),
+            raw=line,
+        )
+    if msg.startswith(CHAIN_HOLD):
+        # The hold (LP-0MSH94Z7K007VKC9): parsed so the two chain-end outcomes
+        # can be counted side by side rather than inferred from the absence of
+        # the other.
+        return LogEvent(
+            "chain_hold",
+            ts,
+            model=_first(RE_CHAIN_HOLD_MODEL, msg),
+            hold="taken",
+            hold_seconds=_float(RE_CHAIN_HOLD_SECONDS, msg),
+            turn=_turn_from(msg),
+            raw=line,
         )
     if msg.startswith(PROVIDER_EXHAUSTED):
         # "All providers exhausted for model=v1/chat/completions;

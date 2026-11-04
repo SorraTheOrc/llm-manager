@@ -176,6 +176,7 @@ from proxy.utils import (  # noqa: E402
 
 # Imports from sibling router helpers
 from .router_helpers import (  # noqa: E402  # noqa: E402, F401
+    LOCAL_OCCUPANCY_DIVERGENCE_UNEXPLAINED,
     ClientDisconnectedDuringPrefillError,
     _apply_queue_wait_to_timeout,
     _await_first_byte_with_prefill_monitor,
@@ -193,6 +194,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _dispatch_lease_key,
     _estimate_tokens_sent,
     _extend_lease_during_prefill,
+    _format_occupancy_evidence,
     _get_chunk_refresh_buffer_seconds,
     _get_first_byte_timeout_seconds,
     _get_lease_timeout_seconds,
@@ -204,8 +206,10 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_local_active_queries,
     _increment_per_model_query,
     _local_dispatch_gate,
+    _local_dispatch_occupancy_evidence,
     _mark_local_dispatch_terminal,
     _normalize_outgoing_headers,
+    _occupancy_divergence_reason,
     _prefetch_measured_cache_abort,
     _prefill_thrash_fingerprint,
     _record_prefill_thrash_cooldown,
@@ -785,6 +789,21 @@ async def _update_session_and_slot(
                                 cached_tokens=_sidecar_tokens,
                                 prompt_tokens=_sidecar_tokens,
                                 messages=_sidecar_messages,
+                            )
+                        else:
+                            # LP-0MVVX6RAR002QAUT AC2: a 0-token fallback
+                            # used to leave an unseedable snapshot with no log
+                            # evidence at all. Behaviour-neutral (the snapshot
+                            # is saved either way) — the pairing skip is now
+                            # attributable from logs instead of inferred from
+                            # later seed outcomes.
+                            srv.logger.info(
+                                "slot_sidecar_write_skipped "
+                                "reason=no_trustworthy_count source=router "
+                                "session=%s slot=%s model=%s",
+                                session_id[:8] if session_id else "unknown",
+                                slot_id,
+                                srv.current_model,
                             )
                     except Exception:
                         srv.logger.debug(
@@ -1545,14 +1564,49 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         )
         if not acquired:
             _cold = cold_start.is_cold(server_config)
+            # AC2/AC3 (LP-0MW0KZTWC004HXQ5): a refusal must be diagnosable from
+            # the log alone. The evidence snapshot names every input the gate
+            # refuses on (record keys with active/expiry state, the active
+            # counter, max_local, generating/prefill counts and the effective
+            # prefill cap, plus llama-server's last known slot counts), and a
+            # contradiction between the refusal and that view gets its own
+            # ``local_occupancy_divergence`` line instead of being left for a
+            # poll reader to spot. Both are additive suffixes: the
+            # operator-facing prefix of the denial line is unchanged.
+            _occupancy = await _local_dispatch_occupancy_evidence(
+                srv, max_local=local_max
+            )
             srv.logger.info(
-                "local_dispatch_denied session=%s owner=%s active=%s cold_start=%s%s",
+                "local_dispatch_denied session=%s owner=%s active=%s cold_start=%s%s %s",
                 session_id if session_id else "unknown",
                 owner if owner else "none",
                 active_count,
                 _cold,
                 turn_field(),
+                _format_occupancy_evidence(_occupancy),
             )
+            _divergence = _occupancy_divergence_reason(_occupancy)
+            if _divergence:
+                # ``occupancy_unexplained`` is a bookkeeping defect (our
+                # numbers cannot reproduce the refusal) and is worth a
+                # WARNING; ``llama_reports_free_slots`` is an expected
+                # capacity-view disagreement (an idle-leased slot counts as
+                # free to llama while the prefill cap refuses), so it is
+                # logged at INFO beside the denial rather than flooding the
+                # WARNING stream that produced 2,633 denial lines in the
+                # observed window.
+                _log = (
+                    srv.logger.warning
+                    if _divergence == LOCAL_OCCUPANCY_DIVERGENCE_UNEXPLAINED
+                    else srv.logger.info
+                )
+                _log(
+                    "local_occupancy_divergence reason=%s session=%s owner=%s %s",
+                    _divergence,
+                    session_id if session_id else "unknown",
+                    owner if owner else "none",
+                    _format_occupancy_evidence(_occupancy),
+                )
             _record_backend_signal("local_dispatch_denied")
 
             if _cold:
@@ -3556,6 +3610,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             slot_timeout,
                             model=slot_model_payload,
                             endpoint=endpoint,
+                            source="router",
                         )
 
                         if restored:

@@ -721,6 +721,30 @@ def _startup_config_logging():
             _instance_lock.holder_pid,
         )
 
+    # LP-0MVZ810NG008A3EW (AC1, AC2, AC3): record how the previous run ended and
+    # how much headroom this one starts with, then raise the proxy's OOM
+    # ranking. On 2026-11-02 a global OOM killed the proxy with no in-log
+    # trace of the pressure that preceded it and no figure for the ~10.5 min
+    # outage; these three lines close both gaps. Entirely best-effort: a host
+    # without /proc or amdgpu sysfs must still start.
+    try:
+        from proxy import host_pressure
+
+        host_pressure.log_startup_gap(logger, log_dir)
+        _pressure_snapshot = host_pressure.read_memory_snapshot()
+        host_pressure.log_pressure(logger, _pressure_snapshot, context="startup")
+        _oom_score_adj = host_pressure.protect_proxy_process(config, logger)
+        try:
+            from proxy.metrics import record_host_pressure
+
+            record_host_pressure(
+                _pressure_snapshot, time.time(), oom_score_adj=_oom_score_adj
+            )
+        except Exception:
+            pass
+    except Exception:
+        logger.warning("Host memory pressure probe failed", exc_info=True)
+
     # Prompt log (LP-0MVP79OBP002G6Z1): the JSONL writer needs the resolved log
     # directory, which setup_logging() assigns just above. Fail-open — a broken
     # prompt log must never prevent startup.
@@ -1708,6 +1732,7 @@ from .lifecycle import (  # noqa: E402, F401
     _inc_model_switch_refcount,
     _is_retryable_backend_exception,
     _is_self_healing_active,
+    _kill_process_group,
     _model_loading_response,
     _probe_backend_reachable,
     _probe_model_instance,

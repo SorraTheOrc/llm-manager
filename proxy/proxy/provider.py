@@ -6144,7 +6144,7 @@ def _slot_exhaustion_retry_after_seconds(config: dict | None) -> int:
     return max(1, int(math.ceil(fallback)))
 
 
-def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None, config: dict | None = None) -> Response:
+def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None, config: dict | None = None, earliest_retry_after: int | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
     Args:
@@ -6159,6 +6159,11 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         model_config: Optional model config (used to derive window-edge waits).
         config: Optional server config; its ``max_retry_after_seconds`` bounds
                 the advertised wait (LP-0MV0MM5R60025XZE).
+        earliest_retry_after: Optional override for the advertised wait, used
+                when the chain is provably dead and the honest answer is the
+                EARLIEST known reset rather than the maximum candidate
+                (LP-0MW0KZR7A003UFQK AC1). The
+                ``max_retry_after_seconds`` cap still applies.
 
     The JSON body carries a stable ``code`` (``all_exhausted`` or
     ``all_slots_exhausted``) so clients can classify exhaustion without relying
@@ -6222,9 +6227,12 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     if admission_reject is not None:
         return _build_local_admission_reject_response(admission_reject, config)
 
-    retry_after = _compute_retry_after(
-        unavailable_providers, model_config=model_config, config=config
-    )
+    if earliest_retry_after is not None and earliest_retry_after > 0:
+        retry_after = int(earliest_retry_after)
+    else:
+        retry_after = _compute_retry_after(
+            unavailable_providers, model_config=model_config, config=config
+        )
     if retry_after <= 0:
         # Budget-skip-only exhaustion (LP-0MVF0N9SA0071LWM): a free-tier
         # rolling-window skip records no cooldown and no usage-limit reset, so
@@ -6267,6 +6275,7 @@ def _build_time_window_exhausted_response(
     any_provider_tried: bool,
     model_config: dict | None = None,
     config: dict | None = None,
+    earliest_retry_after: int | None = None,
 ) -> Response | None:
     """Return a distinguishable 503 when every provider was skipped solely due
     to its configured ``available_times`` window.
@@ -6309,9 +6318,12 @@ def _build_time_window_exhausted_response(
             if isinstance(p, dict) and p.get("name") not in window_names:
                 return None
 
-    retry_after = _compute_retry_after(
-        unavailable, model_config=model_config, config=config
-    )
+    if earliest_retry_after is not None and earliest_retry_after > 0:
+        retry_after = int(earliest_retry_after)
+    else:
+        retry_after = _compute_retry_after(
+            unavailable, model_config=model_config, config=config
+        )
     client_retry_after = min(retry_after, _max_retry_after_seconds(config))
     payload: dict[str, Any] = {
         "error": "All providers exhausted",
@@ -6441,26 +6453,40 @@ def _get_proxy_to_local():
     raise ImportError('No proxy_to_local implementation available')
 
 
-def _local_concurrency_info(config: dict, endpoint: str | None = None) -> tuple:
+def _local_concurrency_info(
+    config: dict, endpoint: str | None = None, session_id: str | None = None
+) -> tuple:
     """Per-endpoint-aware wrapper around ``_get_local_concurrency_info``.
 
     Tests monkeypatch ``_get_local_concurrency_info`` with callables that only
     accept ``(config)``; passing the endpoint kwarg would break them. This
-    helper inspects the callable signature and only forwards the endpoint when
-    it is accepted (LP-0MRPILSMW004T4H8).
+    helper inspects the callable signature and only forwards the kwargs the
+    target accepts (LP-0MRPILSMW004T4H8).
+
+    *session_id* (LP-0MW0VH2LB008JSKQ) lets the routing gate exclude the
+    requesting session's own idle lease; it is forwarded only when the target
+    accepts it, so ``(config)``-only and ``(config, endpoint=…)`` stubs used by
+    existing tests keep working unchanged.
     """
     fn = _get_local_concurrency_info
     try:
         sig = inspect.signature(fn)
-        accepts_endpoint = (
-            "endpoint" in sig.parameters
-            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        params = sig.parameters
+        accepts_endpoint = "endpoint" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        accepts_session = "session_id" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
     except Exception:
         accepts_endpoint = False
+        accepts_session = False
+    kwargs: dict = {}
     if accepts_endpoint and endpoint is not None:
-        return fn(config, endpoint=endpoint)
-    return fn(config)
+        kwargs["endpoint"] = endpoint
+    if accepts_session and session_id is not None:
+        kwargs["session_id"] = session_id
+    return fn(config, **kwargs)
 
 
 def _dispatch_local(ptr_local, request, path, endpoint: str | None):
@@ -6482,7 +6508,35 @@ def _dispatch_local(ptr_local, request, path, endpoint: str | None):
     return ptr_local(request, path)
 
 
-def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tuple:
+def _is_own_idle_lease(
+    key, record: dict, session_id: str | None
+) -> bool:
+    """True when *key* is the requesting session's own **idle** lease.
+
+    LP-0MW0VH2LB008JSKQ: the routing concurrency gate and the dispatch-lease
+    gate must agree about the requesting session's own record. The lease gate
+    permits same-session re-acquisition (``own_has_lease`` in
+    ``_try_acquire_local_dispatch``), so the 30 s no-preemption retention keeps
+    a returning session's slot for it. Counting that same record as occupancy
+    at routing time defeated the retention: a session coming back inside its
+    own lease window was pushed remote while nothing was generating (measured
+    2026-11-03: 15 of 82 ``local_concurrency_limit`` fall-throughs).
+
+    Only an **inactive** record is excluded. A record that is still ``active``
+    is genuine in-flight work — a second concurrent request from the same
+    session must be gated exactly as before — so active records always count.
+    """
+    if not session_id or not isinstance(record, dict):
+        return False
+    if record.get("active"):
+        return False
+    key_session = key[1] if isinstance(key, tuple) and len(key) == 2 else key
+    return key_session == session_id
+
+
+def _get_local_concurrency_info(
+    config: dict, endpoint: str | None = None, session_id: str | None = None
+) -> tuple:
     """Lazily import and return (current_generating_active, max_local) from config.
 
     Generating-only pool (LP-0MTH7JX82000YS5N): occupancy is measured as the
@@ -6495,6 +6549,12 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
     independently (LP-0MRPILSMW004T4H8). When it is None (legacy
     single-server mode), the global ``local_generating_queries`` counter is
     used.
+
+    *session_id* is the requesting session. Its **own idle lease** is not
+    occupancy (see :func:`_is_own_idle_lease`), so a returning session keeps
+    the slot its lease reserved. ``None`` (anonymous/legacy callers, and the
+    pool-description readers used by the status surface) excludes nothing and
+    keeps today's count exactly (LP-0MW0VH2LB008JSKQ AC3).
 
     Returns the current generating-only count and the configured
     local concurrency limit.  Reads ``session_slot_pool_size`` (same value
@@ -6538,11 +6598,15 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
                     now = time.monotonic()
                     for key, record in records.items():
                         if isinstance(key, tuple) and len(key) == 2 and key[0] == endpoint:
+                            if _is_own_idle_lease(key, record, session_id):
+                                continue
                             if record.get("active") or record.get("expires_at", 0) > now:
                                 cur_active += 1
                         elif not isinstance(key, tuple) and endpoint == default_ep:
                             # Legacy plain-key record occupies the default
                             # server's pool alongside tuple-keyed records.
+                            if _is_own_idle_lease(key, record, session_id):
+                                continue
                             if record.get("active") or record.get("expires_at", 0) > now:
                                 cur_active += 1
             else:
@@ -9428,6 +9492,7 @@ def _resolve_provider_with_exclusions(
     config: dict | None = None,
     reason_sink: Callable[[str | None], None] | None = None,
     preference: str | None = None,
+    skip_sink: Callable[[str, str], None] | None = None,
 ) -> dict | None:
     """Resolve next available provider while excluding names tried this request
     and any entry sharing an already-failed failure domain.
@@ -9452,6 +9517,14 @@ def _resolve_provider_with_exclusions(
     (LP-0MVRMC1W6003MV3Y AC3). The return contract is unchanged for every
     other caller.
 
+    ``skip_sink`` receives ``(provider_name, reason)`` for EVERY chain-resolution
+    skip — remote entries included, unlike ``reason_sink`` which is local-only
+    (LP-0MW0KZR7A003UFQK AC1). It is how a request-scoped record of "what was
+    skipped, and why" survives the cycle: without it the exhaustion tail could
+    only approximate the reasons from attempt statuses, which use a different
+    vocabulary and cannot represent a quota hard stop at all. Optional and
+    best-effort: resolution never fails because a sink raised.
+
     ``preference`` carries the request's parsed ``X-Local-Preference`` so EVERY
     skip line emitted here also logs `` preference=<parsed>``
     (LP-0MVRMC275000R2W6 AC4, completed for the failure-domain /
@@ -9467,6 +9540,15 @@ def _resolve_provider_with_exclusions(
 
     excluded_domains = excluded_domains or set()
 
+    def _note_skip(reason: str, provider_name: str = "") -> None:
+        """Record the skip for the caller (best-effort, never raises)."""
+        if skip_sink is None:
+            return
+        try:
+            skip_sink(provider_name, reason)
+        except Exception:  # pragma: no cover - sinks are best-effort
+            logger.debug("chain-skip sink failed", exc_info=True)
+
     for provider_cfg in providers:
         name = provider_cfg.get("name", "")
         if name in excluded_provider_names:
@@ -9480,6 +9562,7 @@ def _resolve_provider_with_exclusions(
                 matched_domain,
                 _preference_log_suffix(preference),
             )
+            _note_skip("failure_domain", name)
             continue
         # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the ACCOUNT hit an
         # upstream usage-limit error (GoUsageLimitError etc.) and is
@@ -9495,6 +9578,7 @@ def _resolve_provider_with_exclusions(
                 usage_key,
                 _preference_log_suffix(preference),
             )
+            _note_skip("usage_limit_account", name)
             continue
         # Proactive quota state says this account has nothing left to spend
         # (LP-0MVF7KIKE002DZVD): treat it as unavailable.
@@ -9506,6 +9590,11 @@ def _resolve_provider_with_exclusions(
                 quota_reason,
                 _preference_log_suffix(preference),
             )
+            # The proactive quota gate's reason text starts with its class
+            # (``quota_exhausted (...)``); record the class so the fail-fast
+            # verdict can read it as the deterministic account-exhaustion state
+            # it is (LP-0MW0KZR7A003UFQK AC1).
+            _note_skip(str(quota_reason).split(" ")[0], name)
             continue
         reset_remaining = _usage_reset_remaining(usage_key)
         if reset_remaining > 0:
@@ -9526,6 +9615,7 @@ def _resolve_provider_with_exclusions(
                 _reason,
                 _preference_log_suffix(preference),
             )
+            _note_skip("usage_limit_reset_pending", name)
             continue
         # Quota hard stop (LP-0MVF7KO8C005NB59): at-or-near the monthly cap the
         # entry is skipped before any upstream request is attempted. Runs after
@@ -9550,6 +9640,7 @@ def _resolve_provider_with_exclusions(
                 _reason,
                 _preference_log_suffix(preference),
             )
+            _note_skip("quota_hard_stop", name)
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
         if cooldown_key is not None:
@@ -9568,6 +9659,7 @@ def _resolve_provider_with_exclusions(
                 _reason,
                 _preference_log_suffix(preference),
             )
+            _note_skip("provider_cooldown", name)
             continue
         if not _provider_in_allowed_window(provider_cfg, config):
             _reason = _chain_skip_reason(
@@ -9583,6 +9675,7 @@ def _resolve_provider_with_exclusions(
                 _reason,
                 _preference_log_suffix(preference),
             )
+            _note_skip("outside_available_window", name)
             continue
         return provider_cfg
     return None
@@ -11915,6 +12008,432 @@ def _get_chain_hold_consumed(request, default: float = 0.0) -> float:
         return default
 
 
+# ===================================================================
+# Provably dead residual chain: fail fast instead of holding
+# (LP-0MW0KZR7A003UFQK)
+#
+# 2026-11-03 08:41:42: every remote provider was skipped for a deterministic,
+# long-horizon reason (``usage_limit_reset_pending`` ~15.4 h away,
+# ``quota_exhausted`` ~14 days, four entries ``outside_available_window``). The
+# proxy nonetheless logged ``Chain exhausted ... holding 300s before restarting
+# cycle`` three times, because the exhaustion tail returned the first
+# provider's raw 400 — a body with no ``Retry-After`` — and
+# ``_bounded_hold_seconds`` reads an absent ``retry_after`` as "legacy full
+# hold".
+#
+# The verdict below answers the only question the hold needs to ask: can ANY
+# wait inside the hold budget change the outcome? That can only be answered
+# from the per-provider chain-resolution skips, which were *logged* but never
+# *recorded* per request (the vocabulary gap this module now closes).
+# ===================================================================
+
+#: Chain-resolution skip reasons that no wait inside a chain hold can change.
+#: A closed set named by the *operator-facing* reason string the resolution
+#: branches emit — deliberately NOT the attempt ``status`` vocabulary, which
+#: differs (``quota_hard_stop`` vs ``quota_exhausted``,
+#: ``usage_limit_reset_pending`` vs ``usage_limit_reset``). A reason outside
+#: this set is **transient** by contract: a new reason keeps today's bounded
+#: hold, which is the safe direction (LP-0MW0KZR7A003UFQK AC1).
+DETERMINISTIC_CHAIN_SKIP_REASONS: frozenset[str] = frozenset(
+    {
+        # A recorded usage-limit reset, hours or days away.
+        "usage_limit_reset_pending",
+        # The proactive quota gate's class (``quota_exhausted (...)``): the
+        # account has nothing left to spend.
+        "quota_exhausted",
+        # The monthly/rolling hard stop — the same state, caught before any
+        # upstream request.
+        "quota_hard_stop",
+        # A scheduled ``available_times`` window that is closed now.
+        "outside_available_window",
+    }
+)
+
+#: Skip reasons *derived* from another provider's outcome rather than from a
+#: provider's own state: a sibling sharing a failed failure domain, or an
+#: account already exhausted by a sibling entry. They neither prove nor defeat
+#: the verdict — the root provider's own attempt decides it — so a
+#: deterministically skipped chain is not disqualified by one of its members
+#: being skipped twice for two reasons (LP-0MW0KZR7A003UFQK AC1).
+DERIVED_CHAIN_SKIP_REASONS: frozenset[str] = frozenset(
+    {"failure_domain", "usage_limit_account"}
+)
+
+#: ``request.state`` attribute carrying ``{provider: skip_reason}`` for the
+#: request's chain-resolution skips (LP-0MW0KZR7A003UFQK AC1). Request-scoped
+#: by construction: it dies with the request, so it can never leak across
+#: turns, sessions or cycles.
+_CHAIN_SKIP_STATE_ATTR = "chain_resolution_skips"
+
+#: ``request.state`` attribute carrying the fail-fast verdict once reached.
+#: ``_bounded_hold_seconds`` reads its presence to refuse the hold.
+_CHAIN_FAIL_FAST_STATE_ATTR = "chain_planned_unavailable"
+
+#: HTTP 4xx codes that are *not* terminal request-scoped refusals: the request
+#: can succeed on a retry of the same prompt, so a hold (or a later cycle) may
+#: legitimately help. Everything else in 400-499 is a refusal the prompt will
+#: always reproduce (AC1's "terminal request-scoped error").
+_RETRYABLE_4XX_STATUSES = frozenset({408, 425, 429})
+
+
+def _note_chain_resolution_skip(request, provider_name: str, reason: str) -> None:
+    """Record that chain resolution skipped *provider_name* for *reason*.
+
+    The single request-scoped record the fail-fast verdict reads
+    (LP-0MW0KZR7A003UFQK AC1). Chain resolution already *logs* every skip with
+    its operator-facing reason; before this record existed the reason was
+    unavailable after the cycle, so the exhaustion tail could only re-derive
+    an approximation from attempt statuses (which use a different vocabulary
+    and do not represent a quota hard stop at all).
+
+    Fail-open like the other ``request.state`` stamps: a stub request without
+    ``state`` simply carries no record, and the verdict then declines
+    (transient) — a hold is taken, exactly as before.
+    """
+    try:
+        state = request.state
+        current = dict(getattr(state, _CHAIN_SKIP_STATE_ATTR, None) or {})
+        current[str(provider_name)] = str(reason)
+        setattr(state, _CHAIN_SKIP_STATE_ATTR, current)
+    except Exception:
+        pass
+
+
+def _chain_resolution_skips(request) -> dict[str, str]:
+    """Return ``{provider: skip_reason}`` recorded on *request* (never raises)."""
+    try:
+        recorded = getattr(request.state, _CHAIN_SKIP_STATE_ATTR, None)
+    except Exception:
+        return {}
+    if not isinstance(recorded, dict):
+        return {}
+    return {str(k): str(v) for k, v in recorded.items()}
+
+
+def _set_chain_fail_fast_verdict(request, verdict: dict | None) -> None:
+    """Stamp (or clear) the fail-fast verdict on the request (fail-open)."""
+    try:
+        setattr(request.state, _CHAIN_FAIL_FAST_STATE_ATTR, verdict)
+    except Exception:
+        pass
+
+
+def _get_chain_fail_fast_verdict(request) -> dict | None:
+    """Return the fail-fast verdict stamped on *request*, or ``None``."""
+    if request is None:
+        return None
+    try:
+        verdict = getattr(request.state, _CHAIN_FAIL_FAST_STATE_ATTR, None)
+    except Exception:
+        return None
+    return verdict if isinstance(verdict, dict) else None
+
+
+def _attempt_is_terminal_request_scoped(attempt: Any) -> bool:
+    """True when an attempt is a refusal this prompt will always reproduce.
+
+    A non-retryable 4xx (the 08:40 shape: a bare 400 from the first provider)
+    is terminal for the request; a connection error, a timeout, a 5xx, a 429
+    or a budget skip is not, and keeps the hold (LP-0MW0KZR7A003UFQK AC1).
+    """
+    if not isinstance(attempt, dict):
+        return False
+    try:
+        status_code = int(attempt.get("status_code") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not 400 <= status_code < 500:
+        return False
+    return status_code not in _RETRYABLE_4XX_STATUSES
+
+
+def _earliest_deterministic_reset_seconds(
+    skips: dict[str, str],
+    model_config: dict | None,
+    config: dict | None = None,
+) -> int | None:
+    """Earliest known instant at which a deterministically skipped entry can serve.
+
+    AC1 (LP-0MW0KZR7A003UFQK) requires the fail-fast ``Retry-After`` to be the
+    **earliest** known reset, not the maximum: the max is dominated by the
+    slowest skip (measured 2026-11-03: one entry ~15 h out, another ~14 days),
+    so advertising it would park the client far longer than capacity needs.
+
+    Only honestly-derivable instants are considered — a usage-limit reset
+    countdown, the next ``available_times`` window start, the soonest quota
+    window reset for a hard-stopped account. ``None`` when none is derivable
+    (the verdict still fails fast; the caller then keeps the exhaustion
+    payload's own timing).
+    """
+    candidates: list[float] = []
+    providers = [
+        p for p in ((model_config or {}).get("providers") or []) if isinstance(p, dict)
+    ]
+    by_name = {str(p.get("name", "")): p for p in providers}
+    for name, reason in skips.items():
+        provider_cfg = by_name.get(name)
+        waiters = {
+            "usage_limit_reset_pending": lambda: float(
+                _usage_reset_remaining(_usage_limit_account_key(provider_cfg))
+            ),
+            "outside_available_window": lambda: (
+                _seconds_until_next_window(provider_cfg, config=config) or 0.0
+            ),
+            "quota_hard_stop": lambda: _quota_hard_stop_wait_seconds(provider_cfg, config),
+        }
+        compute = waiters.get(reason)
+        if compute is None or provider_cfg is None:
+            continue
+        try:
+            seconds = float(compute())
+        except Exception:
+            continue
+        if seconds > 0:
+            candidates.append(seconds)
+    if not candidates:
+        return None
+    return int(min(candidates))
+
+
+def _quota_hard_stop_wait_seconds(
+    provider_cfg: dict, config: dict | None
+) -> float:
+    """Soonest reset of any quota window on a hard-stopped *provider_cfg*.
+
+    A hard stop blocks the entry until a window frees capacity, so the
+    earliest window reset is the honest "known until". Returns ``0.0`` when no
+    snapshot is available (the skip stays deterministic; only its timing is
+    unknown).
+    """
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None:
+        return 0.0
+    waits = [
+        _window_reset_seconds(snapshot, name) for name in quota_state.WINDOW_NAMES
+    ]
+    waits = [w for w in waits if w > 0]
+    return min(waits) if waits else 0.0
+
+
+def _residual_chain_verdict(
+    request,
+    model_config: dict | None,
+    attempts: list[dict[str, Any]] | None,
+    config: dict | None = None,
+) -> dict | None:
+    """Return the fail-fast verdict when the residual chain is provably dead.
+
+    *Provably dead* means every provider of the model's chain is either
+
+    - **deterministically skipped** (a reason in
+      :data:`DETERMINISTIC_CHAIN_SKIP_REASONS` — a state no wait inside the
+      hold budget can change), or
+    - **terminally refused** for this request (a non-retryable 4xx attempt);
+
+    and at least one deterministic skip exists. A single provider that was
+    merely cooled down, timed out, failed a connection, hit a 5xx/429 or was
+    budget-skipped keeps today's behaviour: the verdict is ``None`` and the
+    bounded hold is taken (LP-0MW0KZR7A003UFQK AC1, constraint 1).
+
+    The 2026-11-03 08:40 shape is the subtle one: a real first-provider error
+    (400) alongside the deterministic skips. A terminal request-scoped refusal
+    does not by itself defeat the verdict, because holding cannot change it.
+
+    Returns ``{"skips", "terminal", "providers", "retry_after_seconds"}`` or
+    ``None``.
+    """
+    skips = _chain_resolution_skips(request)
+    if not skips:
+        return None
+    if any(
+        reason not in DETERMINISTIC_CHAIN_SKIP_REASONS
+        and reason not in DERIVED_CHAIN_SKIP_REASONS
+        for reason in skips.values()
+    ):
+        # At least one provider is skipped for a reason a wait can change
+        # (cooldown, stall breaker, and every unknown/future reason).
+        return None
+    if not any(
+        reason in DETERMINISTIC_CHAIN_SKIP_REASONS for reason in skips.values()
+    ):
+        return None
+
+    providers = [
+        p for p in ((model_config or {}).get("providers") or []) if isinstance(p, dict)
+    ]
+    if not providers:
+        return None
+    terminal = {
+        str(a.get("provider"))
+        for a in (attempts or [])
+        if _attempt_is_terminal_request_scoped(a)
+    }
+    for provider_cfg in providers:
+        name = str(provider_cfg.get("name", "unknown"))
+        if name in skips or name in terminal:
+            continue
+        # A provider with neither a deterministic skip nor a terminal refusal
+        # could be tried again (or become available) inside a hold.
+        return None
+
+    return {
+        "skips": dict(skips),
+        "terminal": sorted(terminal),
+        "providers": len(providers),
+        "retry_after_seconds": _earliest_deterministic_reset_seconds(
+            skips, model_config, config
+        ),
+    }
+
+
+def _remote_chain_has_capacity(
+    request,
+    model_config: dict | None,
+    config: dict | None = None,
+    exclude_name: str | None = None,
+) -> bool:
+    """True when at least one remote provider could serve this request now.
+
+    AC2 (LP-0MW0KZR7A003UFQK): the local prefill-ETA guard's refusal is a
+    *capacity* judgement about the local engine. Moving the request remote is
+    only justified when a remote provider can actually take it — otherwise the
+    refusal pushes a ``remote-ok`` request onto a provably dead chain (measured
+    2026-11-03 08:49:40: refused locally on an enforced ETA bound, routed to a
+    chain where every entry was deterministically skipped, ended ``exhausted``;
+    the identical prompt was admitted 61 s later and produced a first byte in
+    6 s).
+
+    "Has capacity" is the resolution predicate's own vocabulary, applied
+    read-only and in the same order: not deterministically skipped (this
+    request's recorded chain-resolution skips), not in cooldown, no pending
+    usage-limit reset, not quota-hard-stopped, inside its ``available_times``
+    window. Transient states a wait can heal — a cooldown about to expire, a
+    window edge about to roll — are *not* capacity: the point of the check is
+    whether there is somewhere to go **now**.
+
+    Returns ``False`` for a chain with no remote provider at all, which is
+    exactly right: there is no remote chain to bounce to.
+    """
+    skips = _chain_resolution_skips(request)
+    for provider_cfg in (model_config or {}).get("providers") or []:
+        if not isinstance(provider_cfg, dict):
+            continue
+        if provider_cfg.get("type", "remote") != "remote":
+            continue
+        name = str(provider_cfg.get("name", "unknown"))
+        if exclude_name is not None and name == exclude_name:
+            continue
+        if skips.get(name) in DETERMINISTIC_CHAIN_SKIP_REASONS:
+            continue
+        try:
+            cooldown_key = _entry_cooldown_key(provider_cfg)
+            if cooldown_key is not None and _provider_cooldown_remaining(cooldown_key) > 0:
+                continue
+            if _usage_reset_remaining(_usage_limit_account_key(provider_cfg)) > 0:
+                continue
+            if _quota_exhausted(provider_cfg, config)[0]:
+                continue
+            if _quota_unavailable_reason(provider_cfg, config) is not None:
+                continue
+            if not _provider_in_allowed_window(provider_cfg, config):
+                continue
+        except Exception:
+            # Fail-open: an unreadable provider state is not proof of no
+            # capacity, and over-refusing locally is the worse error.
+            return True
+        return True
+    return False
+
+
+def _with_retry_timing(
+    response: Response, retry_after: int | None, config: dict | None = None
+) -> Response:
+    """Return *response* with honest retry timing attached, body preserved.
+
+    AC1 (LP-0MW0KZR7A003UFQK) keeps the first provider's error body and status
+    (the client sees the real ``400``, not a generic ``all_exhausted``) while
+    adding the timing the hold needs: a ``Retry-After`` header and the matching
+    ``retry_after`` body field, both from the **earliest** known reset and both
+    bounded by ``server.max_retry_after_seconds`` (the advertisement cap is
+    unchanged, so the true reset stays visible in diagnostics).
+
+    A response with a non-JSON body keeps its bytes untouched and gains only
+    the header, so an upstream payload is never mangled for the sake of a
+    timer. Returns *response* unchanged when *retry_after* is absent/zero.
+    """
+    if not retry_after or retry_after <= 0:
+        return response
+    capped = min(int(retry_after), _max_retry_after_seconds(config))
+    # Rebuild the header set case-insensitively: the source headers arrive
+    # lower-cased from Starlette, so adding a capitalised ``Retry-After``
+    # beside an existing ``retry-after`` would emit the header twice and leave
+    # the client reading the stale value. ``content-length`` is dropped because
+    # the body is re-serialised below, and ``cache-control`` is set explicitly
+    # (the no-store contract every refusal in this module carries).
+    headers = {
+        k: v
+        for k, v in (getattr(response, "headers", {}) or {}).items()
+        if k.lower() not in {"retry-after", "content-length", "content-type", "cache-control"}
+    }
+    headers["Retry-After"] = str(capped)
+    headers["Cache-Control"] = "no-store"
+    body = _response_body_bytes(response)
+    payload = None
+    if body:
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = None
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        # Forced, not defaulted: the client contract is ``Retry-After`` ==
+        # ``retry_after``, so a payload that carried a different value must be
+        # brought in line with the header rather than left inconsistent.
+        payload["retry_after"] = capped
+        return Response(
+            content=json.dumps(payload).encode("utf-8"),
+            status_code=int(getattr(response, "status_code", 502) or 502),
+            media_type=getattr(response, "media_type", None) or "application/json",
+            headers=headers,
+        )
+    return Response(
+        content=body,
+        status_code=int(getattr(response, "status_code", 502) or 502),
+        media_type=getattr(response, "media_type", None),
+        headers=headers,
+    )
+
+
+def _log_chain_planned_unavailable(
+    path: str, verdict: dict, effect: str = "hold=skipped"
+) -> None:
+    """Log the chain-end line that distinguishes fail-fast from a hold (AC3).
+
+    ``chain_planned_unavailable`` is the ONE vocabulary for "this chain cannot
+    serve until a known instant" (the sibling epic LP-0MVWC9CZH004OZYN owns
+    its extension), so a fail-fast return is distinguished from
+    ``Chain exhausted ... holding`` by the explicit ``hold=skipped
+    reason=deterministic_residual_chain`` marker on the same line.
+    """
+    try:
+        logger.info(
+            "chain_planned_unavailable model=%s reason=%s %s "
+            "retry_after=%s providers=%d deterministic_skips=%s terminal=%s",
+            path,
+            "deterministic_residual_chain",
+            effect,
+            verdict.get("retry_after_seconds"),
+            int(verdict.get("providers") or 0),
+            ",".join(
+                f"{name}:{reason}" for name, reason in (verdict.get("skips") or {}).items()
+            )
+            or "none",
+            ",".join(verdict.get("terminal") or []) or "none",
+        )
+    except Exception:
+        pass
+
+
 def _exhaustion_retry_after(response: Response) -> int | None:
     """Return an exhaustion response's ``Retry-After`` in seconds.
 
@@ -11939,7 +12458,7 @@ def _exhaustion_retry_after(response: Response) -> int | None:
 
 
 def _bounded_hold_seconds(
-    hold_seconds: float, response: Response, max_cycles: int
+    hold_seconds: float, response: Response, max_cycles: int, request=None
 ) -> float | None:
     """Bound a chain hold by the exhaustion response's real ``retry_after``.
 
@@ -11958,7 +12477,15 @@ def _bounded_hold_seconds(
     - ``hold_seconds`` (legacy behaviour) when ``retry_after`` is unknown
       (non-JSON error responses), so existing short-cooldown recovery is
       preserved.
+    - ``None`` when the request carries a fail-fast verdict
+      (LP-0MW0KZR7A003UFQK AC1): every provider of the residual chain is
+      deterministically skipped or terminally refused, so no wait inside the
+      budget can change the outcome. ``request`` is optional for callers (and
+      tests) that bound a hold without one; an unstamped request keeps every
+      behaviour above byte-identically.
     """
+    if _get_chain_fail_fast_verdict(request) is not None:
+        return None
     retry_after = _exhaustion_retry_after(response)
     if retry_after is None:
         return hold_seconds
@@ -12016,7 +12543,7 @@ def _build_streaming_hold_response(
                 yield _response_to_sse_bytes(current_exhaustion)
                 return
             effective_hold = _bounded_hold_seconds(
-                hold_seconds, current_exhaustion, max_cycles
+                hold_seconds, current_exhaustion, max_cycles, request
             )
             if effective_hold is None:
                 # retry_after exceeds the budget — surface the exhaustion
@@ -12128,7 +12655,7 @@ async def _run_chain_cycles(
             if max_cycles != 0 and cycle >= max_cycles:
                 return exc.response
             effective_hold = _bounded_hold_seconds(
-                hold_seconds, exc.response, max_cycles
+                hold_seconds, exc.response, max_cycles, request
             )
             if effective_hold is None:
                 # retry_after exceeds the hold budget (or is 0): holding could
@@ -12333,6 +12860,14 @@ async def _proxy_with_remote_fallback_cycle(
             # intent to those skip lines (LP-0MVRMC275000R2W6 AC4).
             reason_sink=lambda token: _note_local_fallback_reason(request, token),
             preference=_preference,
+            # LP-0MW0KZR7A003UFQK AC1: the request-scoped record of EVERY
+            # chain-resolution skip (remote entries included). The exhaustion
+            # tail reads it to decide whether any wait inside the hold budget
+            # could change the outcome, instead of approximating the reasons
+            # from attempt statuses (a different vocabulary).
+            skip_sink=lambda skip_name, skip_reason: _note_chain_resolution_skip(
+                request, skip_name, skip_reason
+            ),
         )
         if provider_cfg is None:
             break
@@ -12740,19 +13275,33 @@ async def _proxy_with_remote_fallback_cycle(
             status="outside_time_window",
         )
 
+    # Fail-fast verdict (LP-0MW0KZR7A003UFQK AC1): when every provider of the
+    # residual chain is either deterministically skipped (a state no wait
+    # inside the hold budget can change) or terminally refused for THIS
+    # request, the hold cannot help. Stamping the verdict on the request is
+    # what makes _bounded_hold_seconds refuse the hold on both the streaming
+    # and the non-streaming path, and the chain-end line makes the difference
+    # from ``Chain exhausted ... holding`` visible in the log (AC3).
+    _fail_fast = _residual_chain_verdict(request, model_config, attempts, config)
+    _set_chain_fail_fast_verdict(request, _fail_fast)
+    _fail_fast_retry = None
+    if _fail_fast is not None:
+        _log_chain_planned_unavailable(path, _fail_fast)
+        _fail_fast_retry = _fail_fast.get("retry_after_seconds")
+
     # Distinguishable exhaustion: when time windows are the *only* reason no
     # provider could be used, surface a specific message instead of the generic
     # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
     time_window_exhausted = _build_time_window_exhausted_response(
         attempts, unavailable, any_provider_tried, model_config=model_config,
-        config=config,
+        config=config, earliest_retry_after=_fail_fast_retry,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config)
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config, earliest_retry_after=_fail_fast_retry)
         )
 
     if first_model_loading_response is not None:
@@ -13115,6 +13664,14 @@ async def _proxy_with_fallback_cycle(
             # along on those skip lines (LP-0MVRMC275000R2W6 AC4).
             reason_sink=lambda token: _note_local_fallback_reason(request, token),
             preference=_preference,
+            # LP-0MW0KZR7A003UFQK AC1: the request-scoped record of EVERY
+            # chain-resolution skip (remote entries included). The exhaustion
+            # tail reads it to decide whether any wait inside the hold budget
+            # could change the outcome, instead of approximating the reasons
+            # from attempt statuses (a different vocabulary).
+            skip_sink=lambda skip_name, skip_reason: _note_chain_resolution_skip(
+                request, skip_name, skip_reason
+            ),
         )
         if provider_cfg is None and fallback_reason == "local_lease_active":
             # Deferral backstop (LP-0MVSM06BK008FZUE): a pin-local
@@ -13282,8 +13839,7 @@ async def _proxy_with_fallback_cycle(
                 # scoped per-endpoint so each llama-server's own slot pool is
                 # evaluated independently (LP-0MRPILSMW004T4H8).
                 cur_local, max_local = _local_concurrency_info(
-
-                    config, endpoint=local_endpoint
+                    config, endpoint=local_endpoint, session_id=_session_id
                 )
                 if cur_local >= max_local:
                     # Per-mode contention queue (LP-0MSORQVK50012Q4D): in cheap
@@ -14146,29 +14702,93 @@ async def _proxy_with_fallback_cycle(
                                 "priority": _priority,
                             },
                         )
-                    # Only reached on a REAL fall-through: the next provider
-                    # will be tried, so the line may say so
-                    # (LP-0MVNTJQVB007QWEZ AC1 — it used to be emitted before
-                    # the pin-local branch above, claiming routing that never
-                    # happened).
-                    try:
-                        logger.info(
-                            "local_admission_guard_direct_fallback "
-                            "provider=%s model=%s session=%s preference=%s "
-                            "reason=%s free_slot=true → routing to next provider",
-                            provider_name,
-                            _llama_model or "unknown",
-                            _session_id or "unknown",
-                            _preference,
-                            _direct_reason,
+                    # AC2 (LP-0MW0KZR7A003UFQK): an ETA-bound refusal only
+                    # justifies moving the request remote when a remote
+                    # provider can actually take it. When the remote chain
+                    # cannot serve, the request is ADMITTED locally and waits
+                    # for its own prefill instead of being bounced onto a dead
+                    # chain and reported exhausted.
+                    #
+                    # Only the ETA bound is overridable: the request-property
+                    # refusals (``prefill_budget_exceeded``,
+                    # ``context_too_large`` and the deadline/safety-budget
+                    # reasons) say this prompt cannot be served locally at all,
+                    # so admitting it would burn a dispatch that can only fail.
+                    # They keep their own reasons and keep refusing.
+                    _remote_capacity_checked = False
+                    _remote_capacity = True
+                    # The override is about *where to send* a request, so it
+                    # only applies when the chain actually offers a remote
+                    # destination. A local-only model has nothing to bounce to:
+                    # its ETA bound is the only honest answer to a caller whose
+                    # budget cannot cover the prefill, and admitting it would
+                    # blow through that budget silently
+                    # (``test_exhausted_chain_keeps_the_exhaustion_prose``).
+                    _chain_has_remote = any(
+                        isinstance(p, dict) and p.get("type", "remote") == "remote"
+                        for p in (model_config.get("providers") or [])
+                    )
+                    if (
+                        _direct_reason == "eta_exceeds_budget_direct"
+                        and _chain_has_remote
+                    ):
+                        _remote_capacity_checked = True
+                        _remote_capacity = _remote_chain_has_capacity(
+                            request,
+                            model_config,
+                            config,
+                            exclude_name=provider_name,
                         )
-                    except Exception:
-                        pass
-                    fallback_reason = "local_admission_guard"
-                    prev_provider = provider_name
-                    all_slot_exhaustion = False
-                    _note_local_fallback_reason(request, fallback_reason)
-                    continue
+                    if _remote_capacity_checked and not _remote_capacity:
+                        try:
+                            logger.info(
+                                "local_admission_guard_local_wait "
+                                "provider=%s model=%s session=%s preference=%s "
+                                "reason=%s free_slot=true → remote chain has no "
+                                "capacity; admitting locally and waiting for "
+                                "the prefill",
+                                provider_name,
+                                _llama_model or "unknown",
+                                _session_id or "unknown",
+                                _preference,
+                                _direct_reason,
+                            )
+                        except Exception:
+                            pass
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_admission_override",
+                            reason=_direct_reason,
+                            **_local_admission_evidence(_direct_admission),
+                        )
+                        # Deliberately do NOT note a local fallback reason: the
+                        # request is not falling back, it is being served here.
+                    else:
+                        # Only reached on a REAL fall-through: the next provider
+                        # will be tried, so the line may say so
+                        # (LP-0MVNTJQVB007QWEZ AC1 — it used to be emitted
+                        # before the pin-local branch above, claiming routing
+                        # that never happened).
+                        try:
+                            logger.info(
+                                "local_admission_guard_direct_fallback "
+                                "provider=%s model=%s session=%s preference=%s "
+                                "reason=%s free_slot=true → routing to next provider",
+                                provider_name,
+                                _llama_model or "unknown",
+                                _session_id or "unknown",
+                                _preference,
+                                _direct_reason,
+                            )
+                        except Exception:
+                            pass
+                        fallback_reason = "local_admission_guard"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
+                        continue
 
                 # LP-0MVODJ3P6000AIUM AC1: stamp the admission-time pricing
                 # snapshot (the numbers the decision above actually used) ONCE,
@@ -14471,7 +15091,7 @@ async def _proxy_with_fallback_cycle(
                     # through to a remote chain that may be entirely out of
                     # window (LP-0MU5BOMJM008F17C).
                     _lease_cur, _lease_max = _local_concurrency_info(
-                        config, endpoint=local_endpoint
+                        config, endpoint=local_endpoint, session_id=_session_id
                     )
                     _lease_action, _lease_reason, _lease_elapsed = (
                         await _maybe_queue_for_local_slot(
@@ -15228,19 +15848,33 @@ async def _proxy_with_fallback_cycle(
             status="outside_time_window",
         )
 
+    # Fail-fast verdict (LP-0MW0KZR7A003UFQK AC1): when every provider of the
+    # residual chain is either deterministically skipped (a state no wait
+    # inside the hold budget can change) or terminally refused for THIS
+    # request, the hold cannot help. Stamping the verdict on the request is
+    # what makes _bounded_hold_seconds refuse the hold on both the streaming
+    # and the non-streaming path, and the chain-end line makes the difference
+    # from ``Chain exhausted ... holding`` visible in the log (AC3).
+    _fail_fast = _residual_chain_verdict(request, model_config, attempts, config)
+    _set_chain_fail_fast_verdict(request, _fail_fast)
+    _fail_fast_retry = None
+    if _fail_fast is not None:
+        _log_chain_planned_unavailable(path, _fail_fast)
+        _fail_fast_retry = _fail_fast.get("retry_after_seconds")
+
     # Distinguishable exhaustion: when time windows are the *only* reason no
     # provider could be used, surface a specific message instead of the generic
     # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
     time_window_exhausted = _build_time_window_exhausted_response(
         attempts, unavailable, any_provider_tried, model_config=model_config,
-        config=config,
+        config=config, earliest_retry_after=_fail_fast_retry,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config)
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config, earliest_retry_after=_fail_fast_retry)
         )
 
     # If all failures were slot exhaustion, include total slots in message
@@ -15285,7 +15919,15 @@ async def _proxy_with_fallback_cycle(
                 "message for model=%s (status=%s)",
                 path, _first_error_response.status_code,
             )
-            raise ChainExhaustedError(_first_error_response)
+            # AC1 (LP-0MW0KZR7A003UFQK): the 08:40 shape — a real first
+            # provider error (400) alongside deterministic skips. Keep the
+            # error, attach the earliest known reset so the client (and the
+            # hold bound) has honest timing instead of none.
+            raise ChainExhaustedError(
+                _with_retry_timing(
+                    _first_error_response, _fail_fast_retry, config
+                )
+            )
 
     raise ChainExhaustedError(
         _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config)

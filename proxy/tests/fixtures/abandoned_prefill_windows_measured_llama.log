@@ -1,0 +1,49 @@
+# Hermetic llama-server.log slice for the measured abandoned-prefill window
+# model (LP-0MVW8S74G004MFAQ). Covers the same fake window as
+# abandoned_prefill_windows_measured_proxy.log; lines carry no wall-clock
+# timestamp (real llama-server behaviour), so the analyser is only valid when
+# this file covers exactly the analysed window.
+#
+# Real line shapes copied from /var/log/llama-proxy/llama-server.log*:
+#   [pid] slot launch_slot_: id  S | task -1 | sampler chain: ...
+#   [pid] slot launch_slot_: id  S | task T | processing task, is_child = 0
+#   [pid] slot update_slots: id  S | task T | prompt processing progress, n_tokens = N, batch.n_tokens = B, progress = P
+#   [pid] srv          stop: cancel task, id_task = T
+#   [pid] prompt eval time =   <ms> ms / <tokens> tokens ( ... )
+#   [pid] slot      release: id  S | task T | stop processing: n_tokens = N, truncated = 0
+#
+# Ground truth (one segment per release, in release order):
+#   Segment W1 -> task 51 (release user-one 00:00:00): launch -> 2 progress ->
+#       CANCEL -> 2 progress (n_tokens 40000 -> 50000, so 10000 tokens after the
+#       cancel) -> prompt eval time (625 tok/s) -> stop processing. Measured
+#       cancel->stop = 10000 / 625 = 16.0 s: the window is [00:00:00, 00:00:16].
+#   Segment W4 -> task 52 (release user-one 00:02:05): launch -> 2 progress.
+#       NO cancel, NO stop processing: unbounded (legacy estimate only).
+#   Segment W3 -> task 53 (release user-one 00:02:30): launch -> 2 progress.
+#       NO cancel, NO stop processing: unbounded.
+#   Segment W2 -> task 54 (release user-two 00:05:00): launch -> 2 progress.
+#       NO cancel, NO stop processing: unbounded.
+# The needs_measurement discriminator: only task 51 has a cancel + stop pair, so
+# only W1 is bounded=basis measured_stop; a naive all-unbounded or all-bounded
+# model cannot pass the tests in test_abandoned_prefill_windows_measured.py.
+[54819] slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> ?temp-ext -> dist
+[54819] slot launch_slot_: id  0 | task 51 | processing task, is_child = 0
+[54819] slot update_slots: id  0 | task 51 | prompt processing progress, n_tokens = 20000, batch.n_tokens = 8192, progress = 0.357143
+[54819] slot update_slots: id  0 | task 51 | prompt processing progress, n_tokens = 40000, batch.n_tokens = 8192, progress = 0.714286
+[54819] srv          stop: cancel task, id_task = 51
+[54819] slot update_slots: id  0 | task 51 | prompt processing progress, n_tokens = 45000, batch.n_tokens = 8192, progress = 0.803571
+[54819] slot update_slots: id  0 | task 51 | prompt processing progress, n_tokens = 50000, batch.n_tokens = 8192, progress = 0.892857
+[54819] prompt eval time =   32000.00 ms / 20000 tokens (    1.60 ms per token,   625.00 tokens per second)
+[54819] slot      release: id  0 | task 51 | stop processing: n_tokens = 50000, truncated = 0
+[54819] slot launch_slot_: id  1 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> ?temp-ext -> dist
+[54819] slot launch_slot_: id  1 | task 52 | processing task, is_child = 0
+[54819] slot update_slots: id  1 | task 52 | prompt processing progress, n_tokens = 10000, batch.n_tokens = 8192, progress = 0.178571
+[54819] slot update_slots: id  1 | task 52 | prompt processing progress, n_tokens = 20000, batch.n_tokens = 8192, progress = 0.357143
+[54819] slot launch_slot_: id  2 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> ?temp-ext -> dist
+[54819] slot launch_slot_: id  2 | task 53 | processing task, is_child = 0
+[54819] slot update_slots: id  2 | task 53 | prompt processing progress, n_tokens = 5000, batch.n_tokens = 8192, progress = 0.178571
+[54819] slot update_slots: id  2 | task 53 | prompt processing progress, n_tokens = 10000, batch.n_tokens = 8192, progress = 0.357143
+[54819] slot launch_slot_: id  3 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> ?temp-ext -> dist
+[54819] slot launch_slot_: id  3 | task 54 | processing task, is_child = 0
+[54819] slot update_slots: id  3 | task 54 | prompt processing progress, n_tokens = 4000, batch.n_tokens = 8192, progress = 0.2
+[54819] slot update_slots: id  3 | task 54 | prompt processing progress, n_tokens = 8000, batch.n_tokens = 8192, progress = 0.4

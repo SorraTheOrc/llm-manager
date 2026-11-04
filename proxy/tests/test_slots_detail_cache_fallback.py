@@ -340,3 +340,62 @@ class TestSlotsDetailResponseBudget:
         assert resp.json()["slots_stale"] is True
         # No new I/O on the fallback path; allow generous CI headroom.
         assert elapsed < 1.0
+
+
+# ======================================================================
+# AC5: stale reconciliation invariant (LP-0MVVXGHHB0073W1B AC5 / F4 AC4)
+#
+# LP-0MVKSXR4P001V0CM AC3 must survive the snapshot read-path change: for
+# every stale-snapshot fixture (fresh detail query failed or empty, non-empty
+# fallback cache — including a fossil that WOULD be saturated if fresh),
+# ``capacity_hint`` is never ``saturated`` while ``local_in_flight_requests
+# == 0``. These tests re-run the stale-serving variants through the status
+# endpoint with an empty dispatch registry, so the only capacity signal left is
+# the fossil snapshot.
+# ======================================================================
+
+
+class TestStaleVariantsNeverSaturatedWithoutLiveWork(TestSlotsDetailCacheFallback):
+    """capacity_hint != "saturated" whenever local_in_flight_requests == 0,
+    across every stale /slots detail fixture.
+
+    Inherits ``_get`` (the status-call harness) from
+    ``TestSlotsDetailCacheFallback`` so the fixtures stay byte-identical to the
+    stale-serving variants those tests already pin.
+    """
+
+    _SATURATED_FOSSIL = [
+        {"slot_id": 0, "is_processing": True, "n_decoded": 11},
+        {"slot_id": 1, "is_processing": True, "n_decoded": 22},
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "counts, detail, detail_side_effect, cache, variant_id",
+        [
+            ((0, 0), [], None, TestSlotsDetailCacheFallback._FAKE_SLOTS, "fresh-fail-empty-counts"),
+            ((2, 3), [], None, TestSlotsDetailCacheFallback._FAKE_SLOTS, "fresh-fail-with-counts"),
+            ((0, 0), [], TimeoutError("slow /slots"), TestSlotsDetailCacheFallback._FAKE_SLOTS, "detail-timeout"),
+            ((0, 0), [], ConnectionError("connection refused"), TestSlotsDetailCacheFallback._FAKE_SLOTS, "detail-exception"),
+            ((0, 0), [], None, _SATURATED_FOSSIL, "saturated-fossil-served"),
+        ],
+        ids=lambda v: v if isinstance(v, str) else str(v),
+    )
+    async def test_stale_variant_never_saturated_without_live_work(
+        self, counts, detail, detail_side_effect, cache, variant_id
+    ):
+        j, _, _ = await self._get(
+            slots_counts=counts,
+            slots_detail=detail,
+            slots_detail_side_effect=detail_side_effect,
+            cache_value=cache,
+        )
+        assert j["slots_stale"] is True, f"variant {variant_id} must serve a stale flag"
+        assert j["local_in_flight_requests"] == 0, (
+            f"variant {variant_id} must run with no live local work"
+        )
+        assert j["capacity_hint"] != "saturated", (
+            f"variant {variant_id}: a stale snapshot reports capacity_hint="
+            f"{j['capacity_hint']!r} with no live local work "
+            f"(LP-0MVKSXR4P001V0CM AC3 must survive the snapshot read-path change)"
+        )

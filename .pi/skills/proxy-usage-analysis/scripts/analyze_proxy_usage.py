@@ -1,9 +1,32 @@
+
+# <!-- REFACTOR-LP-0MW2CBT7J000AS7B
+# smell: naming
+# severity: medium
+# description: Exception name `AnalysisFailure` should be named with an Error suffix
+# -->
 """Proxy usage analysis — turn the last 24h of llama-proxy logs into
 per-session CSVs (fast/cheap) and an operator-facing report.
 
 Usage:
     python3 analyze_proxy_usage.py --log-dir /var/log/llama-proxy \\
         --hours 24 [--output-dir ~/proxy-usage-reports] [--json]
+
+The daily cron invocation needs no performance-metric flags: the committed
+``metrics/performance_metrics.yaml`` defaults plus a live
+``<output-dir>/performance_metrics_state.yaml`` are used automatically, and
+``--json`` carries a ``performance_metrics`` block with each metric's
+baseline/target/actual/verdict. ``--metrics-config`` / ``--metrics-state``
+relocate those files, ``--no-metrics-update`` renders the section without
+recording the window, and ``--seed-metrics-history [DIR]`` runs the one-off
+backfill from archived reports instead of analysing logs.
+
+Delivery (LP-0MW2BD6G8001E960) is on by default and needs no flag either: a
+successful run posts ``report.md`` as an attachment to the Discord webhook in
+``.worklog/config.yaml`` (``discord.webhook_url``), and a failed run posts a
+short failure notice to the same webhook. ``--no-discord`` suppresses both,
+``--discord-webhook-url`` overrides the credential and ``--discord-config``
+relocates the worklog config. ``--json`` carries a ``discord_delivery`` block
+with the outcome.
 
 See SKILL.md for the full usage and interpretation guide.
 """
@@ -22,11 +45,31 @@ if __package__ in (None, ""):
 
 import capacity_signals
 import config_loader
+import discord_notify
+import performance_metrics
+import recommendations
 import reporting
 
 DEFAULT_LOG_DIR = "/var/log/llama-proxy"
 DEFAULT_HOURS = 24
 DEFAULT_OUTPUT_DIR = "~/proxy-usage-reports"
+#: Default source for the one-off scorecard backfill: one subdirectory per
+#: archived window, each holding that run's ``report.md``.
+DEFAULT_METRICS_ARCHIVE_DIR = "~/proxy-usage-reports"
+
+
+class AnalysisFailure(Exception):
+    """A run that failed in a way worth announcing on the webhook.
+
+    Carries the operator-facing reason and the exit code the run would have
+    returned, so :func:`main` can print, notify and exit identically whether
+    the failure arrived as an exception or as a soft error return.
+    """
+
+    def __init__(self, detail: str, code: int = 1):
+        super().__init__(detail)
+        self.detail = detail
+        self.code = code
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -64,6 +107,69 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--json", action="store_true", help="print a JSON summary instead of the text summary")
     parser.add_argument("--quiet", action="store_true", help="suppress the stdout summary")
+    # Performance scorecard (LP-0MW1BUAQD001WL8X). Every default keeps the
+    # unchanged 05:00 cron invocation working as-is: the committed defaults
+    # file plus a live state file under --output-dir, updated on each run.
+    parser.add_argument(
+        "--metrics-config",
+        default=str(performance_metrics.DEFAULTS_PATH),
+        help=(
+            "path to the performance-metric defaults (metric detail copy and any "
+            "seeded history); read-only at runtime, never written "
+            f"(default: {performance_metrics.DEFAULTS_PATH})"
+        ),
+    )
+    parser.add_argument(
+        "--metrics-state",
+        help=(
+            "path to the live performance-metric history file; this run records "
+            "its window here "
+            f"(default: <output-dir>/{performance_metrics.STATE_FILENAME})"
+        ),
+    )
+    parser.add_argument(
+        "--no-metrics-update",
+        action="store_true",
+        help=(
+            "render the performance metrics section but do not record this "
+            "window (no state write)"
+        ),
+    )
+    parser.add_argument(
+        "--seed-metrics-history",
+        nargs="?",
+        const=DEFAULT_METRICS_ARCHIVE_DIR,
+        metavar="DIR",
+        help=(
+            "one-off backfill: seed the best-3 history from archived reports and "
+            "exit without analysing logs; DIR holds one subdirectory per archived "
+            f"window, each with a report.md (default: {DEFAULT_METRICS_ARCHIVE_DIR})"
+        ),
+    )
+    # Discord delivery (LP-0MW2BD6G8001E960). On by default so the unchanged
+    # 05:00 cron line delivers without a new flag.
+    parser.add_argument(
+        "--no-discord",
+        action="store_true",
+        help=(
+            "do not post the report (or a failure notice) to the Discord "
+            "webhook; the report notes that delivery was disabled"
+        ),
+    )
+    parser.add_argument(
+        "--discord-webhook-url",
+        help=(
+            "Discord webhook URL, overriding discord.webhook_url in the "
+            "worklog config (never written to the report or logs)"
+        ),
+    )
+    parser.add_argument(
+        "--discord-config",
+        help=(
+            "path to the worklog config holding discord.webhook_url "
+            "(default: auto-discovered .worklog/config.yaml)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -72,6 +178,72 @@ def _parse_iso(value: str) -> datetime:
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return datetime.fromisoformat(value)
+
+
+def _metrics_paths(args: argparse.Namespace, out_dir: Path) -> tuple[Path, Path]:
+    """Resolve the committed defaults path and the live state file path.
+
+    ``--metrics-state`` wins when given; otherwise the live history lives in
+    the report output directory, exactly where the unchanged cron invocation
+    expects it (LP-0MW1BUAQD001WL8X AC1).
+    """
+    metrics_config = Path(args.metrics_config).expanduser()
+    metrics_state = (
+        Path(args.metrics_state).expanduser()
+        if args.metrics_state
+        else out_dir / performance_metrics.STATE_FILENAME
+    )
+    return metrics_config, metrics_state
+
+
+def _seed_metrics_history(
+    archive_dir: Path, metrics_config: Path, metrics_state: Path
+) -> dict:
+    """Seed the best-3 history from archived report directories (idempotent).
+
+    Each immediate subdirectory of *archive_dir* holding a ``report.md`` is one
+    archived report; its window id is the report's ``Generated`` date, falling
+    back to the directory name when that header is missing (so run-to-run
+    directory suffixes such as ``2026-08-07_2`` collapse onto one window). Only
+    the live state file is written; the committed defaults file is read, never
+    modified, and re-running the seed never duplicates a window's measurement
+    (LP-0MW1BUB1Z004AK21).
+    """
+    reports: list[tuple[str, str]] = []
+    for report_path in sorted(archive_dir.glob("*/report.md")):
+        try:
+            report_text = report_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        reports.append(
+            (
+                performance_metrics.archived_window_id(
+                    report_text, report_path.parent.name
+                ),
+                report_text,
+            )
+        )
+    state = performance_metrics.load_state(metrics_state, defaults_path=metrics_config)
+    result = performance_metrics.seed_history(state, reports)
+    performance_metrics.save_state(state, metrics_state)
+    result["windows"] = len(reports)
+    result["state_path"] = str(metrics_state)
+    return result
+
+
+def _print_seed_summary(result: dict) -> None:
+    """UK-English summary of a backfill run: seeded / already present / skipped."""
+    print(
+        f"Seeded {result['seeded']} measurement(s) from {result['windows']} archived "
+        f"report window(s); {result['already_present']} measurement(s) were already "
+        f"present and left untouched."
+    )
+    skipped = result.get("skipped_metrics") or {}
+    if skipped:
+        print("Metrics with no parseable value in the archive (history accrues from the next run):")
+        for metric_id, reason in skipped.items():
+            print(f"  {metric_id}: {reason}")
+    print(f"Live state file written: {result['state_path']}")
 
 
 def _summary_output_paths(out_dir: Path) -> list[str]:
@@ -85,9 +257,106 @@ def _summary_output_paths(out_dir: Path) -> list[str]:
     ]
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def _deliver_report(
+    args: argparse.Namespace,
+    run: reporting.AnalysisRun,
+    out_dir: Path,
+    config: dict,
+    data: dict,
+) -> discord_notify.DeliveryResult:
+    """Post ``report.md`` to the Discord webhook and record the outcome.
 
+    The report is already on disk, so every failure here is fail-soft: the
+    outcome is reported through the returned result (and the report's own
+    ``- Discord delivery:`` bullet), never raised (LP-0MW2BD6G8001E960).
+    """
+    report_path = out_dir / "report.md"
+    attachment = discord_notify.attachment_name_for(
+        run.summary.window_start, report_path
+    )
+    message = discord_notify.build_message(
+        data,
+        recommendations.generate_recommendations(run.summary, config, run.mode_map),
+        window_start=run.summary.window_start,
+        window_end=run.summary.window_end,
+        attachment_name=attachment,
+    )
+    delivery = discord_notify.deliver(
+        report_path,
+        message,
+        window_start=run.summary.window_start,
+        enabled=not args.no_discord,
+        webhook_url=args.discord_webhook_url,
+        config_path=args.discord_config,
+    )
+    if delivery.error:
+        print(
+            f"warning: Discord delivery failed — {delivery.error}",
+            file=sys.stderr,
+        )
+    return delivery
+
+
+def _failure_window(args: argparse.Namespace) -> tuple[datetime | None, datetime | None]:
+    """Best-effort window for a failure message (never raises)."""
+    try:
+        window_end = _parse_iso(args.end) if args.end else datetime.now()
+        window_start = (
+            _parse_iso(args.start)
+            if args.start
+            else window_end - timedelta(hours=args.hours)
+        )
+        return window_start, window_end
+    except (TypeError, ValueError, AttributeError):  # pragma: no cover - defensive
+        return None, None
+
+
+def _notify_failure(args: argparse.Namespace, detail: str) -> None:
+    """Announce a failed run on the webhook, never masking the failure.
+
+    ``discord_notify.notify_failure`` is already fail-soft around the HTTP
+    call; this outer guard also covers webhook *discovery* (a config file that
+    cannot be read at the moment everything else is going wrong), because
+    nothing here may ever replace the error the operator needs to see.
+    """
+    try:
+        window_start, window_end = _failure_window(args)
+        discord_notify.notify_failure(
+            detail,
+            window_start=window_start,
+            window_end=window_end,
+            enabled=not getattr(args, "no_discord", False),
+            webhook_url=getattr(args, "discord_webhook_url", None),
+            config_path=getattr(args, "discord_config", None),
+        )
+    except Exception as exc:  # pragma: no cover - defensive, error path only
+        print(
+            f"warning: could not announce the failure on Discord — {exc}",
+            file=sys.stderr,
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: run the analysis, then announce the outcome.
+
+    Any failure — an unexpected exception or one of the soft error returns —
+    posts a short notice to the Discord webhook, so an unattended 05:00 cron
+    failure is never silent (LP-0MW2BD6G8001E960). The original error text,
+    exit code and stderr still reach ``cron.log`` unchanged.
+    """
+    args = parse_args(argv)
+    try:
+        return _run(args)
+    except AnalysisFailure as exc:
+        print(f"error: {exc.detail}", file=sys.stderr)
+        _notify_failure(args, exc.detail)
+        return exc.code
+    except BaseException as exc:
+        _notify_failure(args, f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def _run(args: argparse.Namespace) -> int:
     if args.end:
         window_end = _parse_iso(args.end)
     else:
@@ -98,12 +367,25 @@ def main(argv: list[str] | None = None) -> int:
         window_start = window_end - timedelta(hours=args.hours)
 
     if window_start >= window_end:
-        print("error: window start must be before window end", file=sys.stderr)
-        return 2
+        raise AnalysisFailure("window start must be before window end", 2)
 
     config = config_loader.load_proxy_config(config_loader.find_config_path(args.config))
 
     out_dir = Path(args.output_dir).expanduser().resolve()
+    metrics_config, metrics_state = _metrics_paths(args, out_dir)
+
+    if args.seed_metrics_history:
+        # One-off backfill is an early-exit mode: it reads archived reports and
+        # never needs (or touches) a live log window.
+        archive_dir = Path(args.seed_metrics_history).expanduser()
+        if not archive_dir.is_dir():
+            raise AnalysisFailure(f"archive directory not found: {archive_dir}")
+        result = _seed_metrics_history(archive_dir, metrics_config, metrics_state)
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        elif not args.quiet:
+            _print_seed_summary(result)
+        return 0
 
     try:
         run = reporting.run_analysis(
@@ -114,26 +396,32 @@ def main(argv: list[str] | None = None) -> int:
             config=config,
             llama_log_dir=Path(args.llama_log_dir),
             stale_rate_target=args.stale_rate_target,
+            metrics_config=metrics_config,
+            metrics_state=metrics_state,
+            update_metrics=not args.no_metrics_update,
         )
     except OSError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        raise AnalysisFailure(str(exc)) from exc
+
+    data = reporting.summary_to_json(
+        run.summary,
+        run.mode_map,
+        config,
+        run.stale_rate_target,
+        metrics_config=metrics_config,
+        metrics_state=metrics_state,
+    )
+    # Delivery happens for every successful run — the report is the deliverable,
+    # so a run that produced one is a run that ships it (LP-0MW2BD6G8001E960).
+    # ``--no-discord`` is the only way to keep it local, and it is recorded in
+    # the report's own delivery bullet.
+    delivery = _deliver_report(args, run, out_dir, config, data)
+    data["discord_delivery"] = delivery.to_json()
 
     if args.json:
-        print(
-            json.dumps(
-                reporting.summary_to_json(
-                    run.summary, run.mode_map, config, run.stale_rate_target
-                ),
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        print(json.dumps(data, indent=2, sort_keys=True))
         return 0
     if not args.quiet:
-        data = reporting.summary_to_json(
-            run.summary, run.mode_map, config, run.stale_rate_target
-        )
         decode = data.get("decode_speed") or {}
         decode_summary = (
             f", decode speed {decode.get('samples', 0)} samples "
@@ -188,6 +476,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {line}")
         if run.archived_to:
             print(f"Previous outputs archived to {run.archived_to.resolve()}")
+        if args.no_metrics_update:
+            print("Performance metrics state: not updated (--no-metrics-update)")
+        else:
+            print(f"Performance metrics state written to: {metrics_state}")
+        print(f"Discord delivery: {delivery.note}")
     return 0
 
 

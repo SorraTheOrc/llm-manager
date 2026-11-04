@@ -202,8 +202,8 @@ class TestCitationsStillResolve:
     #: (relative path, 1-based line, needle that must be present on that line)
     CITATIONS: tuple[tuple[str, int, str], ...] = (
         # 1 — pool size exported as --parallel
-        ("proxy/config.yaml", 1753, "session_slot_pool_size: 2"),
-        ("proxy/proxy/lifecycle.py", 1604, "LLAMA_PARALLEL"),
+        ("proxy/config.yaml", 1781, "session_slot_pool_size: 2"),
+        ("proxy/proxy/lifecycle.py", 1710, "LLAMA_PARALLEL"),
         ("start-llama.sh", 239, "LLAMA_PARALLEL:=1"),
         ("start-llama.sh", 252, "--parallel"),
         ("start-llama.sh", 501, "LLAMA_PARALLEL:=1"),
@@ -217,31 +217,33 @@ class TestCitationsStillResolve:
         ("proxy/proxy/provider.py", 2209, "effective_per_slot_threshold"),
         # 4 — persistence cap derived from the same clamp
         ("proxy/proxy/provider.py", 2166, "def compute_hard_routing_cap"),
-        ("proxy/proxy/session.py", 1305, "effective_per_slot_threshold"),
+        ("proxy/proxy/session.py", 1377, "effective_per_slot_threshold"),
         # 5 — dispatch-lease cap
         ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
         ("proxy/proxy/router.py", 1519, "_try_acquire_local_dispatch"),
-        ("proxy/proxy/router_helpers.py", 3915, "async def _try_acquire_local_dispatch"),
-        ("proxy/proxy/provider.py", 6464, "session_slot_pool_size"),
+        ("proxy/proxy/router_helpers.py", 4004, "async def _try_acquire_local_dispatch"),
+        ("proxy/proxy/provider.py", 6627, "session_slot_pool_size"),
         # 6 — slot-ID space
-        ("proxy/proxy/session.py", 1062, "def _slot_id_for_session"),
+        ("proxy/proxy/session.py", 1126, "def _slot_id_for_session"),
         # 7 — persistence on/off gate + eviction planner
         ("proxy/proxy/session.py", 488, "def _slot_persistence_enabled"),
-        ("proxy/proxy/session.py", 1261, "session_slot_pool_size"),
+        ("proxy/proxy/session.py", 1333, "session_slot_pool_size"),
         ("proxy/proxy/session.py", 848, "def plan_eviction_snapshot"),
         # 8 — tenancy default
-        ("proxy/proxy/router_helpers.py", 3566, "def _default_tenants"),
-        ("proxy/config.yaml", 1373, "session_slot_pool_size"),
-        ("proxy/config.yaml", 1381, "local_session_tenants: 2"),
+        ("proxy/proxy/router_helpers.py", 3655, "def _default_tenants"),
+        ("proxy/config.yaml", 1441, "session_slot_pool_size"),
+        ("proxy/config.yaml", 1447, "local_session_tenants: 2"),
         # 9 — capacity admission + status fail-open
         ("proxy/proxy/capacity_admission.py", 124, "def _slots"),
-        ("proxy/proxy/handlers.py", 442, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 714, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 760, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 890, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 482, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 862, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 914, "session_slot_pool_size"),
+        # the fourth handlers.py occurrence (the stale-detail pool reconciliation)
+        # was removed by LP-0MW1VDZIX0011D8M — a stale list no longer fabricates
+        # a pool size beside available_slots=0.
         # geometry-independent retention + per-session snapshot filenames
-        ("proxy/proxy/session.py", 1202, "def _slot_filename_for_session"),
-        ("proxy/proxy/session.py", 1204, "slot_{safe_id}.bin"),
+        ("proxy/proxy/session.py", 1266, "def _slot_filename_for_session"),
+        ("proxy/proxy/session.py", 1268, "slot_{safe_id}.bin"),
         ("scripts/cleanup-slot-cache.sh", 27, "MAX_AGE_DAYS=7"),
         ("scripts/cleanup-slot-cache.sh", 28, "MAX_SIZE_GB=20"),
         # persistence suppression gates named in the bake-off metrics

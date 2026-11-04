@@ -32,6 +32,7 @@ import engine_cross_check
 import gpu_busy
 import llama_log_parser
 import log_parser
+import performance_metrics
 import recommendations
 from aggregation import AnalysisResult, SessionStats
 from llama_log_parser import CHEAP, FAST, TOTAL
@@ -132,6 +133,11 @@ class AnalysisRun:
     # (LP-0MVU8O4EL005IYP9): carried so the ``--json`` output is built with the
     # same target the rendered section used.
     stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET
+    # Scorecard settings this run used (LP-0MW1BUAQD001WL8X): carried so the
+    # ``--json`` block is derived from the same defaults and live state file
+    # the rendered summary table used.
+    metrics_config: str | Path | None = None
+    metrics_state: str | Path | None = None
 
 
 def _fmt_ts(ts: datetime | None) -> str:
@@ -830,6 +836,409 @@ def _ap_fallback_attribution(ap, summary: AnalysisResult) -> None:
     ap("- Session fallback attribution: " + " | ".join(parts))
 
 
+# ---------------------------------------------------------------------------
+# Performance metrics summary (LP-0MW1BUA2M0005QRV)
+# ---------------------------------------------------------------------------
+#
+# The scorecard is the report's first section so a stakeholder reads the held
+# metrics, their evidence-based target and this window's verdict without
+# reading anything else (parent LP-0MW0FU5Z6006A4P3 AC1/AC2/AC3). The table
+# itself hard-codes nothing: metric identity and order come from
+# ``performance_metrics.METRIC_REGISTRY``, the baseline/target/verdict maths
+# from that module, and this window's values from the aggregation helpers.
+
+#: Decimal places per registered unit. A 0-1 ratio is logged to two decimals
+#: and its median keeps three; a per-hour rate is already computed to two.
+_METRIC_UNIT_DECIMALS = {"ratio": 3, "denials/h": 2}
+
+
+def _fmt_metric_value(value: float | None, unit: str) -> str:
+    """Render one metric figure with its unit (``n/a`` when unmeasured).
+
+    An absent measurement never renders as ``0``: ``None`` is ``n/a``, while a
+    genuine measured zero (0.0) keeps its unit and renders as ``0.0 <unit>``,
+    because a measured zero and a missing measurement are different facts.
+    """
+    if value is None:
+        return performance_metrics.NOT_AVAILABLE
+    decimals = _METRIC_UNIT_DECIMALS.get(unit, 1)
+    return f"{float(value):.{decimals}f} {unit}".strip()
+
+
+def _fmt_metric_baseline(baseline: dict | None, unit: str) -> str:
+    """The baseline cell: best recorded value with its measurement date."""
+    if not baseline:
+        return performance_metrics.NOT_AVAILABLE
+    rendered = _fmt_metric_value(baseline.get("value"), unit)
+    date = baseline.get("date")
+    return f"{rendered} ({date})" if date else rendered
+
+
+def _metrics_window_id(summary: AnalysisResult) -> str:
+    """The window id a measurement is recorded under.
+
+    The daily run's window is identified by the date its window opens, which
+    matches the archived-report directory names the backfill seeds (one
+    measurement per window, replaced rather than appended on a re-run).
+    """
+    return summary.window_start.strftime("%Y-%m-%d")
+
+
+def _metrics_fingerprint(config: dict | None) -> str:
+    """Configuration fingerprint for this run's measurements.
+
+    ``slots=<slot count>,ctx=<per-slot context>``, derived from the analysed
+    configuration (``local_model_ctx_size`` is the total; each of the
+    ``session_slot_pool_size`` slots gets an equal share). Unknown geometry
+    yields the engine's unknown-era marker rather than a fabricated era, and
+    unknown eras are ignored by the cross-era check.
+    """
+    slots = (config or {}).get("session_slot_pool_size")
+    ctx = (config or {}).get("local_model_ctx_size")
+    try:
+        slot_count = int(slots)
+        total_ctx = int(ctx)
+    except (TypeError, ValueError):
+        return performance_metrics.UNKNOWN_FINGERPRINT
+    if slot_count <= 0 or total_ctx <= 0:
+        return performance_metrics.UNKNOWN_FINGERPRINT
+    return performance_metrics.configuration_fingerprint(
+        slot_count, total_ctx // slot_count
+    )
+
+
+def _performance_metric_actuals(
+    summary: AnalysisResult,
+    config: dict | None,
+    mode_map: bucketing.ModeScheduleMap | None,
+) -> dict[str, float | None]:
+    """This window's actual per registry metric (``None`` renders ``n/a``).
+
+    Thin wrapper over :func:`aggregation.performance_metric_inputs` that
+    converts the one metric whose aggregation input has the opposite sense to
+    its registry direction: ``prefill_eta_accuracy`` is registered as a
+    higher-is-better percentage, while the aggregation helper reports the
+    median absolute **relative error**. Recording the error would make the
+    direction-aware best-3 retention keep the worst windows, so the scorecard
+    records ``100 - error`` (clamped at 0: an error above 100 % is no accuracy
+    at all) — as the helper's docstring instructs.
+    """
+    actuals = aggregation.performance_metric_inputs(summary, config, mode_map)
+    error = actuals.get("prefill_eta_accuracy")
+    if error is not None:
+        actuals["prefill_eta_accuracy"] = round(max(0.0, 100.0 - float(error)), 1)
+    return actuals
+
+
+def _cross_era_fingerprints(measurements: list[dict], direction: str) -> list[str]:
+    """Configuration eras the retained best-3 span (empty when not cross-era)."""
+    best = performance_metrics.retained(measurements, direction)
+    if not performance_metrics.is_cross_era(best):
+        return []
+    return sorted(
+        {
+            str(measurement.get("fingerprint"))
+            for measurement in best
+            if measurement.get("fingerprint")
+        }
+    )
+
+
+def _append_cross_era_note(ap, state: dict) -> None:
+    """Flag targets whose best three measurements span configuration eras.
+
+    A target averaging across slot/context geometries compares unlike things,
+    so the section names the metric and every fingerprint involved instead of
+    silently presenting a mixed-era target as comparable.
+    """
+    lines: list[str] = []
+    for metric in performance_metrics.METRIC_REGISTRY:
+        measurements = state["metrics"][metric.id]["measurements"]
+        fingerprints = _cross_era_fingerprints(measurements, metric.direction)
+        if not fingerprints:
+            continue
+        named = ", ".join(f"`{fingerprint}`" for fingerprint in fingerprints)
+        lines.append(f"- {metric.label} (`{metric.id}`): {named}")
+    if not lines:
+        return
+    ap("")
+    ap(
+        "**Cross-era note:** the retained best three measurements behind these "
+        "targets span more than one configuration era (slot count / per-slot "
+        "context), so the target averages unlike geometries and the comparison "
+        "is indicative rather than like-for-like:"
+    )
+    ap("")
+    for line in lines:
+        ap(line)
+
+
+def _load_metrics_state(
+    metrics_config: str | Path | None, metrics_state: str | Path | None
+) -> dict:
+    """Load the scorecard history: committed defaults over an existing state file."""
+    defaults_path = (
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
+    return performance_metrics.load_state(metrics_state, defaults_path=defaults_path)
+
+
+def _scorecard_rows(
+    state: dict, actuals: dict[str, float | None]
+) -> list[dict]:
+    """Per-metric baseline/target/actual/verdict, in registry order.
+
+    The **single** derivation behind both scorecard surfaces — the rendered
+    summary table and the ``--json`` ``performance_metrics`` block — so the two
+    views can never disagree (LP-0MW1BUAQD001WL8X, parent AC7).
+    """
+    rows: list[dict] = []
+    for metric in performance_metrics.METRIC_REGISTRY:
+        measurements = state["metrics"][metric.id]["measurements"]
+        actual = actuals.get(metric.id)
+        # The verdict only ever reads Met / Unmet / Insufficient history: a
+        # window with no measurable actual has no verdict to give, and the
+        # engine's ``n/a`` (its "no actual" answer) would be a fourth label the
+        # scorecard contract does not allow. The actual stays ``None``, so both
+        # surfaces still state exactly which evidence is missing.
+        verdict = (
+            performance_metrics.INSUFFICIENT
+            if actual is None
+            else performance_metrics.derive_verdict(actual, measurements, metric.direction)
+        )
+        rows.append(
+            {
+                "metric": metric,
+                "baseline": performance_metrics.baseline_from(
+                    measurements, metric.direction
+                ),
+                "target": performance_metrics.target_from(
+                    measurements, metric.direction
+                ),
+                "actual": actual,
+                "verdict": verdict,
+            }
+        )
+    return rows
+
+
+def _append_performance_metrics_section(
+    ap,
+    summary: AnalysisResult,
+    config: dict | None,
+    mode_map: bucketing.ModeScheduleMap | None,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+    update_metrics: bool = False,
+) -> None:
+    """Render the scorecard as the report's first section.
+
+    The window's measurement is recorded through the engine **before** the
+    rows are derived, so the rendered baseline and target reflect the history
+    this run just extended (parent AC2). Writing happens only when a mutable
+    state path is supplied *and* updates are enabled; the committed defaults
+    file is read-only and is never a write target. A metric whose actual is
+    ``None`` is not recorded at all — never as ``0``.
+
+    This is the only place a run writes scorecard state: it happens once, as
+    the report is built, so a run that fails earlier cannot corrupt history
+    mid-report and the ``--json`` block (which reads the same history) always
+    reflects what was just recorded.
+    """
+    state = _load_metrics_state(metrics_config, metrics_state)
+    actuals = _performance_metric_actuals(summary, config, mode_map)
+
+    if update_metrics and metrics_state is not None:
+        window = _metrics_window_id(summary)
+        fingerprint = _metrics_fingerprint(config)
+        for metric in performance_metrics.METRIC_REGISTRY:
+            value = actuals.get(metric.id)
+            if value is None:
+                continue
+            performance_metrics.record_measurement(
+                state,
+                metric.id,
+                window=window,
+                value=value,
+                date=window,
+                fingerprint=fingerprint,
+            )
+        performance_metrics.save_state(state, metrics_state)
+
+    ap("")
+    ap("## Performance metrics summary")
+    ap("")
+    ap(
+        "**Baseline** is the best recorded value and the date it was measured; "
+        "**Target** is the mean of the three best measurements (direction-aware); "
+        "**Actual** is this window; **Result** compares the actual against the "
+        "target and reads `Met`, `Unmet` or `Insufficient history`."
+    )
+    ap("")
+    ap("| Metric | Baseline | Target | Actual | Result |")
+    ap("|---|---|---|---|---|")
+    for row in _scorecard_rows(state, actuals):
+        metric = row["metric"]
+        ap(
+            f"| {metric.label} | {_fmt_metric_baseline(row['baseline'], metric.unit)} | "
+            f"{_fmt_metric_value(row['target'], metric.unit)} | "
+            f"{_fmt_metric_value(row['actual'], metric.unit)} | {row['verdict']} |"
+        )
+
+    _append_cross_era_note(ap, state)
+
+
+# ---------------------------------------------------------------------------
+# Performance metric details (LP-0MW1BUAEG006FMHX)
+# ---------------------------------------------------------------------------
+#
+# One detail subsection per registry metric, immediately after the scorecard, so
+# an operator reads why a metric matters, how it is calculated, which levers
+# change it and what improving it costs before touching configuration (parent
+# LP-0MW0FU5Z6006A4P3 AC4). Every word of metric prose comes from the committed
+# defaults through ``performance_metrics.detail_copy``: this module hard-codes
+# no metric prose, and the figures stay in the linked data sections rather than
+# being restated here.
+
+#: Rendered in place of a field a custom defaults file omits.
+_MISSING_DETAIL_COPY = "not documented in the committed metrics defaults."
+
+#: Label that opens a metric's cross-configuration (era) caveat.
+_ERA_FLAG = "**Configuration eras:**"
+
+
+def _section_anchor(heading: str) -> str:
+    """In-page anchor for a rendered ``## Title`` heading (GitHub slug rules)."""
+    title = heading.lstrip("#").strip().lower()
+    kept = "".join(char for char in title if char.isalnum() or char in " -")
+    return "#" + kept.replace(" ", "-")
+
+
+def _append_metric_era_flag(ap, metric: performance_metrics.Metric, state: dict) -> None:
+    """Flag a metric whose retained best three span configuration eras.
+
+    A target averaging across slot/context geometries compares unlike things,
+    so the caveat sits in the metric's own subsection — the place an operator
+    reads before acting on that metric — and names every era involved.
+    """
+    measurements = state["metrics"][metric.id]["measurements"]
+    fingerprints = _cross_era_fingerprints(measurements, metric.direction)
+    if not fingerprints:
+        return
+    named = ", ".join(f"`{fingerprint}`" for fingerprint in fingerprints)
+    ap("")
+    ap(
+        f"{_ERA_FLAG} the retained best three measurements behind this target "
+        f"span more than one configuration era ({named}), so the target "
+        "averages unlike configurations and the comparison is indicative "
+        "rather than like-for-like."
+    )
+
+
+def _append_performance_metric_details(
+    ap,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+) -> None:
+    """Render the per-metric detail block after the scorecard.
+
+    One ``###`` subsection per registry metric, in registry order, each stating
+    why the metric matters, how it is calculated (naming its data source), the
+    levers available and the trade-offs of improving it. The copy is read from
+    the committed defaults, so a wording change is a defaults-file change and
+    the renderer stays prose-free; a field a custom file omits is reported as
+    undocumented rather than invented. The subsection links to the data section
+    that reports the figures instead of duplicating its tables.
+    """
+    defaults_path = (
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
+    defaults = performance_metrics.load_defaults(defaults_path)
+    state = _load_metrics_state(metrics_config, metrics_state)
+
+    ap("")
+    ap("## Performance metric details")
+    ap("")
+    ap(
+        "One subsection per scorecard metric, in the summary table's order: why "
+        "the metric matters, how it is calculated and from which data, the "
+        "levers that change it, and the trade-offs of trying to improve it. "
+        "Each subsection links to the data section reporting its figures "
+        "rather than repeating those tables."
+    )
+    for metric in performance_metrics.METRIC_REGISTRY:
+        copy = performance_metrics.detail_copy(metric.id, defaults)
+        ap("")
+        ap(f"### {metric.id} — {metric.label}")
+        ap("")
+        ap(f"**Importance:** {copy.get('why', _MISSING_DETAIL_COPY)}")
+        ap("")
+        ap(f"**Calculation:** {copy.get('calculation', _MISSING_DETAIL_COPY)}")
+        anchor = copy.get("data_section_anchor")
+        if anchor:
+            # The link text is deliberately generic: repeating the section title
+            # verbatim would leak the title into reports where that section is
+            # not rendered at all (tests assert a section's absence by its
+            # title), so only the anchor carries the target's identity.
+            ap("")
+            ap(
+                "**Data:** the figures behind this metric are reported in the "
+                f"[corresponding data section]({_section_anchor(anchor)})."
+            )
+        ap("")
+        ap(f"**Levers:** {copy.get('levers', _MISSING_DETAIL_COPY)}")
+        ap("")
+        ap(f"**Trade-offs:** {copy.get('trade_offs', _MISSING_DETAIL_COPY)}")
+        _append_metric_era_flag(ap, metric, state)
+
+
+def _verdict_counts(block: dict[str, dict]) -> dict[str, int]:
+    """How many metrics landed on each verdict token (all three always present)."""
+    counts = {
+        performance_metrics.MET: 0,
+        performance_metrics.UNMET: 0,
+        performance_metrics.INSUFFICIENT: 0,
+    }
+    for entry in block.values():
+        verdict = entry.get("verdict")
+        if verdict in counts:
+            counts[verdict] += 1
+    return counts
+
+
+def performance_metrics_json(
+    summary: AnalysisResult,
+    config: dict | None = None,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+) -> dict:
+    """The ``--json`` ``performance_metrics`` block, keyed by metric id.
+
+    Read-only: the single state write happens while the report is built, so a
+    ``--json`` consumer can never mutate history. Each entry carries
+    ``baseline`` (``value`` + ``date``), ``target``, ``actual`` and ``verdict``,
+    produced by :func:`_scorecard_rows` — the same derivation the rendered
+    table uses — so the machine-readable block always agrees with the report
+    (parent AC7). A metric without a measurable actual reports ``actual`` as
+    ``null``, never a misleading ``0``.
+    """
+    state = _load_metrics_state(metrics_config, metrics_state)
+    actuals = _performance_metric_actuals(summary, config, mode_map)
+    return {
+        row["metric"].id: {
+            "baseline": row["baseline"],
+            "target": row["target"],
+            "actual": row["actual"],
+            "verdict": row["verdict"],
+        }
+        for row in _scorecard_rows(state, actuals)
+    }
+
+
 def build_report(
     summary: AnalysisResult,
     config: dict | None,
@@ -837,6 +1246,10 @@ def build_report(
     mode_map: bucketing.ModeScheduleMap | None = None,
     profiles: dict | None = None,
     stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+    update_metrics: bool = False,
 ) -> str:
     recs = recommendations.generate_recommendations(summary, config, mode_map)
     hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
@@ -886,6 +1299,25 @@ def build_report(
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
     _ap_fallback_attribution(ap, summary)
+
+    # The performance scorecard is the report's first section
+    # (LP-0MW1BUA2M0005QRV): a stakeholder reads baseline, target, actual and
+    # verdict for every metric before any of the detail sections.
+    _append_performance_metrics_section(
+        ap,
+        summary,
+        config,
+        mode_map,
+        metrics_config=metrics_config,
+        metrics_state=metrics_state,
+        update_metrics=update_metrics,
+    )
+
+    # The per-metric detail block follows the scorecard immediately
+    # (LP-0MW1BUAEG006FMHX), before the data sections it links to.
+    _append_performance_metric_details(
+        ap, metrics_config=metrics_config, metrics_state=metrics_state
+    )
 
     _append_summary_by_hour(ap, summary)
 
@@ -1006,6 +1438,11 @@ def build_report(
     # separately so a stuck hold is not read as repeated client retries.
     _append_hold_cycle_section(ap, summary)
 
+    # Chain-end outcomes (LP-0MW0KZR7A003UFQK AC3): a hold and a fail-fast
+    # refusal are different events with different cost, so they are reported
+    # side by side and never folded together.
+    _append_chain_end_section(ap, summary)
+
     initial = Counter((s.initial_provider, s.initial_model) for s in sessions)
     ap("")
     ap("## Per-model breakdown (initial assignment)")
@@ -1107,8 +1544,9 @@ def build_report(
         "described above."
     )
     ap(
-        "- Related context: work item LP-0MSAOQTJS000FFVM (evaluate increasing local ctx-size) can "
-        "use this report's `large_context_bypass` data. See the skill's SKILL.md for interpretation."
+        "- Related context: the local context ceiling is fixed by the model and the hardware, so "
+        "`large_context_bypass` is read as a capacity signal (prompt compaction, slot rebalancing) "
+        "rather than as a case for a larger context. See the skill's SKILL.md for interpretation."
     )
     ap(
         "- Decode/prompt-eval speeds come from llama-server eval-timing lines, "
@@ -1912,6 +2350,76 @@ def _append_prefill_regression_section(ap, summary: AnalysisResult) -> None:
             ap(f"| {reason} | {count} |")
 
 
+def _append_chain_end_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Chain-end outcomes`` section (LP-0MW0KZR7A003UFQK AC3).
+
+    A model whose whole fallback chain cannot serve ends one of two ways, and
+    the two are *not* interchangeable:
+
+    - ``Chain exhausted ... holding <N>s`` — the proxy waits the bounded hold
+      before retrying the chain. Real latency, counted here as a hold.
+    - ``chain_planned_unavailable ... hold=skipped
+      reason=deterministic_residual_chain`` — every remaining provider was
+      deterministically skipped or terminally refused, so no wait could change
+      the outcome and the error was returned immediately.
+
+    Before the fail-fast existed the second shape was invisible: it took the
+    full ``chain_hold_seconds x chain_hold_max_cycles`` budget and only the
+    hold line remained, so "a call that could never succeed burned 900 s" and
+    "a call was legitimately held" were indistinguishable in the report
+    (measured 2026-11-03 08:41: three holds on a chain where every provider
+    was skipped for a reason hours-to-days away). The table therefore reports
+    the fail-fast count separately and says explicitly that it is **not**
+    hold latency.
+
+    Omitted entirely when the window holds no chain-end event, like the
+    report's other conditional sections.
+    """
+    holds = list(getattr(summary, "chain_hold_events", []) or [])
+    fail_fast = list(getattr(summary, "chain_planned_unavailable_events", []) or [])
+    if not holds and not fail_fast:
+        return
+
+    hold_seconds = sum(float(getattr(ev, "hold_seconds", 0.0) or 0.0) for ev in holds)
+    ap("")
+    ap("## Chain-end outcomes")
+    ap("")
+    ap("`chain_hold` is the bounded wait before retrying a chain that may heal; "
+       "`chain_planned_unavailable` is the fail-fast refusal of a chain that "
+       "provably cannot serve. **A fail-fast refusal costs no hold latency and "
+       "is never counted as one.**")
+    ap("")
+    ap("| Outcome | Count | Meaning |")
+    ap("|---|---|---|")
+    ap(f"| `chain_hold` | {len(holds)} "
+       f"({hold_seconds:.0f} s planned) | "
+       "chain exhausted, holding before the next cycle (may still succeed) |")
+    ap(f"| `chain_planned_unavailable` | {len(fail_fast)} | "
+       "provably dead residual chain: error returned immediately, no hold |")
+    if fail_fast:
+        by_reason = Counter(
+            (getattr(ev, "reason", None) or UNKNOWN_LABEL) for ev in fail_fast
+        )
+        ap("")
+        ap("Fail-fast refusals by reason:")
+        ap("")
+        ap("| Reason | Count |")
+        ap("|---|---|")
+        for reason, count in by_reason.most_common():
+            ap(f"| `{reason}` | {count} |")
+        resets = sorted(
+            {
+                int(ev.retry_after)
+                for ev in fail_fast
+                if getattr(ev, "retry_after", None) is not None
+            }
+        )
+        if resets:
+            ap("")
+            ap("Advertised `Retry-After` on those refusals (earliest known "
+               "reset, seconds): " + ", ".join(str(r) for r in resets) + ".")
+
+
 def _append_admission_bucket_section(ap, summary: AnalysisResult) -> None:
     """Append the ``## Admission verdicts by rate bucket and prompt band`` section.
 
@@ -2117,7 +2625,7 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
     ap(
         f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
         "and the remediation recommendations below (recovery-first silent continue, informative-error "
-        "fallback, ctx-size pressure, upstream HTTP status-specific remediation)."
+        "fallback, local context pressure, upstream HTTP status-specific remediation)."
     )
 
 
@@ -2223,7 +2731,11 @@ def _hourly_session_classification(sessions: list[SessionStats]) -> dict[datetim
 
 
 def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
-    """Append the top-of-report ``## Summary by hour`` table.
+    """Append the ``## Summary by hour`` table (after the scorecard block).
+
+    The performance scorecard and its detail block are the report's first
+    sections (LP-0MW1BUA2M0005QRV, LP-0MW1BUAEG006FMHX); this table follows
+    them and still precedes the Session summary.
 
     One row per **absolute wall-clock hour** of the report window
     (window-bounded buckets, partial first/last hours truncated to the
@@ -2337,8 +2849,9 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     is never overstated). All figures — busy/idle, total compute
     (slot-seconds), concurrency, and the fast/cheap split — are computed on
     the new intervals. The section is omitted when the window has no local
-    traffic. (The former hourly busy profile moved to the top of the report
-    as the ``## Summary by hour`` table, LP-0MTFO210Q0044TTF.)
+    traffic. (The former hourly busy profile moved above the Session summary
+    as the ``## Summary by hour`` table, LP-0MTFO210Q0044TTF; the performance
+    scorecard, LP-0MW1BUA2M0005QRV, now precedes it.)
     """
     if summary.busy is None:
         return
@@ -3594,6 +4107,9 @@ def run_analysis(
     llama_log_dir: Path | None = None,
     mode_map: bucketing.ModeScheduleMap | None = None,
     stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+    update_metrics: bool = False,
 ) -> AnalysisRun:
     """Discover log files, stream-parse them, aggregate sessions, and write
     the CSVs and report into ``output_dir``.
@@ -3619,6 +4135,13 @@ def run_analysis(
     (LP-0MVU8O4EL005IYP9 AC1.6, default 5 %): it is threaded into the rendered
     ``## Local capacity signals`` section and carried on the returned
     :class:`AnalysisRun` so ``--json`` evaluates the same target.
+
+    ``metrics_config`` / ``metrics_state`` / ``update_metrics`` are the
+    performance scorecard settings (LP-0MW1BUAQD001WL8X): the committed
+    defaults path, the live state file path and whether this run records its
+    window. They are threaded into :func:`build_report` (the only state write)
+    and carried on the returned :class:`AnalysisRun` so ``--json`` reads the
+    same history the rendered table used.
     """
     log_dir = Path(log_dir)
     output_dir = Path(output_dir)
@@ -3674,6 +4197,9 @@ def run_analysis(
             mode_map,
             profiles=profiles,
             stale_rate_target=stale_rate_target,
+            metrics_config=metrics_config,
+            metrics_state=metrics_state,
+            update_metrics=update_metrics,
         ),
         encoding="utf-8",
     )
@@ -3683,6 +4209,8 @@ def run_analysis(
         archived_to=archived_to,
         mode_map=mode_map,
         stale_rate_target=stale_rate_target,
+        metrics_config=metrics_config,
+        metrics_state=metrics_state,
     )
 
 
@@ -3727,6 +4255,9 @@ def summary_to_json(
     mode_map: bucketing.ModeScheduleMap | None = None,
     config: dict | None = None,
     stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
 ) -> dict:
     """Machine-readable summary of the analysis (one dict; JSON-serialisable).
 
@@ -3737,6 +4268,11 @@ def summary_to_json(
     ``stale_rate_target`` is the configured ``slots_stale`` rate target the
     ``capacity_signals`` block is evaluated against (LP-0MVU8O4EL005IYP9 AC1.6);
     it defaults to the reference tool's 5 %.
+
+    ``metrics_config`` / ``metrics_state`` locate the scorecard history the
+    ``performance_metrics`` block is derived from (LP-0MW1BUAQD001WL8X AC3);
+    both default to the committed defaults plus whatever live state file
+    exists, and neither is written here.
     """
     sessions = list(summary.sessions.values())
     local_only = sum(1 for s in sessions if s.remote_requests == 0)
@@ -3754,6 +4290,16 @@ def summary_to_json(
     # additive keys below are always consistent with each other.
     _measured_decisions, _unmeasured_reasons = _residency_measurement_breakdown(
         summary
+    )
+    # Performance scorecard (LP-0MW1BUAQD001WL8X AC3): the per-metric
+    # baseline/target/actual/verdict block plus its verdict counts, derived by
+    # the same helpers the rendered table uses.
+    _metrics_block = performance_metrics_json(
+        summary,
+        config,
+        mode_map,
+        metrics_config=metrics_config,
+        metrics_state=metrics_state,
     )
     return {
         "window_start": _fmt_ts(summary.window_start),
@@ -3924,6 +4470,13 @@ def summary_to_json(
         # ``slots_stale`` figures and target verdict the Markdown section
         # renders. ADDITIVE — every key above keeps its value and meaning.
         "capacity_signals": capacity_signals_json(summary, stale_rate_target),
+        # Performance scorecard (LP-0MW1BUAQD001WL8X AC3): keyed by metric id
+        # so an audit can read one metric without scanning a list. ADDITIVE —
+        # every key above keeps its value and meaning. The verdict counts are a
+        # sibling key (not an entry inside the block, which holds exactly one
+        # entry per registered metric) so ``set(block)`` stays the registry.
+        "performance_metrics": _metrics_block,
+        "performance_metrics_counts": _verdict_counts(_metrics_block),
     }
 
 

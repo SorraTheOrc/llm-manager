@@ -17,8 +17,11 @@ LP-0MVF1FQJR000NH2I, which is the only item allowed to touch the file):
   paid tail since LP-0MVY8REC80097HI0), with ``medium``/``high`` untouched.
 - UTC window gating (AC1/AC3): the opencode entries are eligible inside
   ``available_times`` (e.g. 00:00–01:00, 04:00–06:00) and skipped outside
-  them (e.g. 01:00–04:00, 06:00–10:00 gaps), falling through to the
-  around-the-clock ``munitoai`` / ``deepseek-flash`` paid tail.
+  them (e.g. 01:00–04:00, 06:00–10:00 gaps), falling through to the paid
+  tail. The paid ``munitoai`` tier is itself confined to a 10:00–23:00 UTC
+  business-hours window, so outside it the tail serves via ``deepseek-flash``
+  (which keeps its own gaps); when every paid tier is out of window the
+  chain defers rather than spend.
 - behaviour neutrality while the free tier still has budget: the paid tiers
   are never promoted ahead of ``munitoai-free``.
 - per-API-key 429 failover (AC4): a 429 on ``opencode-go-3`` does **not**
@@ -31,9 +34,10 @@ LP-0MVF1FQJR000NH2I, which is the only item allowed to touch the file):
   resilience (LP-0MSG45I8Q0020N1F).
 - paid-tier reachability (LP-0MVY8REC80097HI0): ``munitoai`` and
   ``deepseek-flash`` declare ``low`` and appear in the ``low`` chain tail as
-  around-the-clock fallbacks (operator decision — low-priority requests were
-  left with no paid fallback once the free tier is quarantined and the
-  opencode accounts exhausted).
+  fallbacks (operator decision — low-priority requests were left with no paid
+  fallback once the free tier is quarantined and the opencode accounts
+  exhausted); ``munitoai``'s 10:00-23:00 UTC window confines its paid
+  dispatches to business hours.
 
 The chain-order/window/failover tests are driven through the real routing
 seams (``provider_chain_for_priority`` + ``_resolve_provider_with_exclusions``)
@@ -71,6 +75,8 @@ OPENCODE_WINDOWS = ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
 # Inside the UTC 04:00-06:00 window, and inside the 01:00-04:00 gap.
 INSIDE_WINDOW_UTC = datetime(2026, 1, 5, 4, 30, tzinfo=UTC)
 OUTSIDE_WINDOW_UTC = datetime(2026, 1, 5, 2, 0, tzinfo=UTC)
+# Inside the paid munitoai tier's 10:00-23:00 UTC business-hours window.
+MUNITOAI_WINDOW_UTC = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)
 
 
 class _FakeDatetime:
@@ -182,8 +188,9 @@ class TestLiveConfigInvariants:
     @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
     def test_opencode_entries_in_a_low_chain_are_window_gated(self, model_name):
         # Only the opencode entries keep their ``available_times`` windows; the
-        # around-the-clock paid tail (munitoai / deepseek-flash, added by
-        # LP-0MVY8REC80097HI0) returns pickable even outside the windows.
+        # paid tail (munitoai, deepseek-flash, added by LP-0MVY8REC80097HI0)
+        # returns pickable inside its own windows. munitoai is itself confined
+        # to 10:00-23:00 UTC business hours.
         chain = provider_chain_for_priority(_live_model(model_name), PRIORITY_LOW)
         for entry in chain:
             name = entry.get("name", "")
@@ -194,8 +201,8 @@ class TestLiveConfigInvariants:
 
     def test_paid_tiers_are_reachable_from_a_low_chain(self):
         # LP-0MVY8REC80097HI0: ``munitoai`` and ``deepseek-flash`` declare
-        # ``low`` and appear in the low chain tail (around-the-clock paid
-        # fallback). Membership is declared by each entry's own ``priorities``
+        # ``low`` and appear in the low chain tail (the paid fallback).
+        # Membership is declared by each entry's own ``priorities``
         # label (LP-0MVGPZWY0001JD1D).
         config = _live_config()
         expected = {"munitoai", "deepseek-flash"}
@@ -228,7 +235,7 @@ class TestLiveConfigInvariants:
         # ``[local-qwen3, munitoai-free, opencode-go-3, opencode-go-2,
         # opencode-go, munitoai, deepseek-flash]`` — free tier ordered before
         # any paid entry, the three keys in providers-list order, and the
-        # around-the-clock paid tail last (LP-0MVY8REC80097HI0).
+        # paid tail last (LP-0MVY8REC80097HI0).
         names = [e["name"] for e in provider_chain_for_priority(_live_model(model_name), PRIORITY_LOW)]
         assert names == TARGET_LOW_CHAIN
 
@@ -258,15 +265,35 @@ class TestWindowGating:
         assert picked is not None
         assert picked["name"] in OPENCODE_NAMES
 
-    def test_out_of_window_low_chain_falls_through_to_the_paid_tail(self):
+    def test_out_of_window_low_chain_defers_when_no_paid_tier_is_eligible(self):
         # During the UTC 01:00-04:00 / 06:00-10:00 gaps the opencode entries
-        # are skipped, and the around-the-clock paid tail (munitoai,
-        # deepseek-flash — LP-0MVY8REC80097HI0) absorbs the overflow.
+        # are skipped AND the paid munitoai tier is out of its 10:00-23:00
+        # business-hours window; deepseek-flash has its own gaps too, so the
+        # chain defers (picked is None) rather than spend outside business
+        # hours.
         chain = _target_chain_entries("plan")
         with _patch_utc_now(OUTSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, set())
-        assert picked is not None
-        assert picked["name"] == "munitoai"
+        assert picked is None
+
+    def test_paid_munitoai_tier_serves_inside_its_business_hours_window(self):
+        # Paid munitoai is eligible only 10:00-23:00 UTC: once the opencode
+        # accounts are quota-exhausted at 14:00 UTC it absorbs the overflow.
+        chain = _target_chain_entries("plan")
+        excluded = {provider._usage_limit_account_key(_live_entry("plan", name)) for name in OPENCODE_NAMES}
+        with _patch_utc_now(MUNITOAI_WINDOW_UTC):
+            picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, excluded)
+        assert picked is not None and picked["name"] == "munitoai"
+
+    def test_paid_munitoai_tier_is_skipped_outside_business_hours(self):
+        # Before 10:00 UTC munitoai is skipped even when every earlier tier
+        # is exhausted; the paid tail via deepseek-flash (04:00-06:00 window)
+        # absorbs the request instead.
+        chain = _target_chain_entries("plan")
+        excluded = {provider._usage_limit_account_key(_live_entry("plan", name)) for name in OPENCODE_NAMES}
+        with _patch_utc_now(INSIDE_WINDOW_UTC):
+            picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, excluded)
+        assert picked is not None and picked["name"] == "deepseek-flash"
 
     def test_out_of_window_low_chain_still_serves_local_and_free(self):
         chain = _target_chain_entries("plan")
@@ -318,9 +345,10 @@ class TestFailoverScope:
         excluded = {provider._usage_limit_account_key(_live_entry("plan", name)) for name in OPENCODE_NAMES}
         with _patch_utc_now(INSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, excluded)
-        assert picked is not None and picked["name"] == "munitoai", (
-            "all opencode accounts exhausted → the around-the-clock paid tail "
-            "(LP-0MVY8REC80097HI0) absorbs the request"
+        assert picked is not None and picked["name"] == "deepseek-flash", (
+            "all opencode accounts exhausted at 04:30 UTC → munitoai is out of "
+            "its 10:00-23:00 business-hours window, so the paid tail via "
+            "deepseek-flash absorbs the request"
         )
 
     def test_opencode_siblings_share_one_failure_domain(self):
@@ -334,13 +362,14 @@ class TestFailoverScope:
         # failure domain, so the chain does NOT gain 3x outage resilience —
         # all three opencode entries share ONE domain and are skipped
         # together; the paid tail (different domain) still absorbs the
-        # request.
+        # request (via deepseek-flash at 04:30 UTC, munitoai being out of its
+        # 10:00-23:00 window).
         chain = _target_chain_entries("plan")
         go3 = _live_entry("plan", "opencode-go-3")
         excluded = {provider._failure_domain_key(go3)}
         with _patch_utc_now(INSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, excluded)
-        assert picked is not None and picked["name"] == "munitoai", (
+        assert picked is not None and picked["name"] == "deepseek-flash", (
             "same-gateway siblings skipped after a 5xx on opencode-go-3 (one "
             "failure domain); paid tail serves instead"
         )

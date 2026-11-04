@@ -183,6 +183,108 @@ The 503 body's JSON `retry_after` and the matching `Retry-After` header carry
 the derived value, so clients back off correctly. Regression tests:
 `proxy/tests/test_chain_hold_budget_window.py`.
 
+## Provably dead chains fail fast (LP-0MW0KZR7A003UFQK)
+
+A hold only helps when a wait inside the hold budget can change the outcome.
+When **every** provider of the residual chain is either
+
+- **deterministically skipped** — `usage_limit_reset_pending`,
+  `quota_exhausted` / `quota_hard_stop`, `outside_available_window`: states no
+  wait inside the budget can change; or
+- **terminally refused** for this request — a non-retryable 4xx (anything in
+  400–499 except 408/425/429), which this prompt will always reproduce;
+
+the chain is **not held**: the error is returned immediately and no
+`chain_hold_cycle` is consumed.
+
+Evidence (2026-11-03 08:40–09:05): every remote provider was skipped
+deterministically (`munitoai-free` reset ~15.4 h away, `opencode-go-3`
+`quota_exhausted` ~14 days, four entries `outside_available_window`), yet the
+proxy logged `Chain exhausted ... holding 300s before restarting cycle` three
+times — burning an audit subprocess's 1080 s per-call screen budget on holds
+for a call that could never succeed. The trigger was the exhaustion tail
+substituting the *first provider's raw error* (a bare `400` with no
+`Retry-After`) for the generic exhaustion payload: `_bounded_hold_seconds`
+reads an absent `retry_after` as "legacy full hold".
+
+### How the verdict is reached
+
+`_resolve_provider_with_exclusions` now records every chain-resolution skip on
+the request (`skip_sink` → `_note_chain_resolution_skip`), not just the local
+entry's. At the exhaustion tail `_residual_chain_verdict` decides:
+
+| Condition | Verdict |
+|---|---|
+| every provider is deterministically skipped or terminally refused, and at least one deterministic skip exists | **fail fast** — the verdict is stamped on the request |
+| any provider is skipped for a reason a wait can heal (cooldown, stall breaker) or has a transient attempt (5xx/429/408/timeout/connection error/budget skip) | today's bounded hold, byte-identically |
+| any reason outside the closed deterministic set (a future reason) | transient by contract — today's bounded hold |
+
+Derived skips (`failure_domain`, `usage_limit_account`) are **neutral**: they
+neither prove nor defeat the verdict, because the root provider's own attempt
+already decides it.
+
+`_bounded_hold_seconds(..., request)` returns `None` when the request carries
+the verdict, so the streaming hold generator and the non-streaming hold loop
+both refuse the hold through one code path.
+
+### Honest retry timing
+
+The fail-fast response keeps the first provider's status and body (the client
+sees the real `400`, not a generic `all_exhausted`) and gains a `Retry-After`
+header plus the matching `retry_after` body field, derived from the
+**earliest** known reset — a usage-limit reset countdown, the next
+`available_times` window start, or the soonest quota-window reset. The
+maximum candidate is deliberately **not** used: on 2026-11-03 it would have
+advertised ~14 days because of one dead entry, parking the client long past
+the moment capacity returns. `server.max_retry_after_seconds` still caps the
+advertisement, and the true reset stays visible in `diagnostics`.
+
+### Log vocabulary (AC3)
+
+One line distinguishes the two outcomes, so a fail-fast refusal is never
+counted as hold latency:
+
+```
+chain_planned_unavailable model=<path> reason=deterministic_residual_chain hold=skipped retry_after=<s> providers=<n> deterministic_skips=<name:reason,...> terminal=<name,...>
+```
+
+`Chain exhausted ... holding <N>s ...` remains the hold. Both are classified
+distinctly by `proxy-usage-analysis`.
+
+### Local admission: never bounce onto an empty remote (AC2)
+
+The mirror-image defect on the same incident: at 08:49:40 the local
+prefill-ETA guard refused a `remote-ok` request on an enforced ETA bound and
+routed it to that dead remote chain (outcome `exhausted`); at 08:50:41 the
+identical prompt with the identical ETA was admitted locally and produced a
+first byte in 6 s.
+
+The direct (free-slot) guard now takes the ETA refusal **only when at least
+one remote provider has capacity** — `_remote_chain_has_capacity` applies the
+resolution predicate's own vocabulary read-only: not deterministically
+skipped for this request, not in cooldown, no pending usage-limit reset, not
+quota-hard-stopped, inside its `available_times` window. When the remote chain
+cannot serve, the request is **admitted locally** and waits for its own
+prefill (`local_admission_guard_local_wait`), instead of being handed to a
+chain that will end `exhausted`.
+
+Scope of the override, deliberately narrow:
+
+- only `reason=eta_exceeds_budget_direct` (a capacity judgement about the
+  local engine) is overridable; the request-property refusals
+  (`prefill_budget_exceeded`, `context_too_large`, the deadline and
+  safety-budget reasons) keep refusing — admitting a prompt that cannot fit
+  locally only burns a dispatch;
+- only for a chain that has at least one remote provider: a local-only model
+  has nothing to bounce to, so its ETA bound stays the honest answer to a
+  caller whose budget cannot cover the prefill;
+- pin-local / `local-only` intent and the bounded deferral escalation are
+  untouched (the pin branch runs first).
+
+Regression tests: `proxy/tests/test_chain_fail_fast.py` (verdict, hold
+refusal, retry timing, log line, capacity probe) and the AC2/AC4 rows in
+`proxy/tests/test_local_admission_guard.py`.
+
 ## Acceptance criteria coverage
 
 - **AC1 — bounded failover:** `upstream_retry_failover_budget_seconds`
@@ -230,6 +332,9 @@ covers both directions:
   as an ordinary stall, never classified as an activity expiry).
 
 ## Related items
+
+- LP-0MW0KZR7A003UFQK — provably dead chains fail fast; a local ETA refusal
+  never bounces a request onto a remote chain with no capacity.
 
 - LP-0MSF1PUM90099ZSW / LP-0MSF5I7XN009ENWQ — 240 s idle-timeout raise.
 - LP-0MSF5IAXE005BG33 — stall-gap distribution analysis (keeps 240 s).

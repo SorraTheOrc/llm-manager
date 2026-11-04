@@ -80,8 +80,8 @@ class TestFailurePathInstrumentation:
         assert "busy=" in warning_record.message
         # Busy snapshot reflects the injected load state (slot 1 owned by an
         # active session).
-        busy_json = warning_record.message.split("busy=", 1)[1]
-        busy = json.loads(busy_json)
+        busy_text = warning_record.message.split("busy=", 1)[1].split(" source=", 1)[0]
+        busy = json.loads(busy_text)
         assert busy["active_queries"] == 4
         assert busy["local_active_queries"] == 3
         assert busy["active_sessions"] == 1
@@ -120,8 +120,8 @@ class TestFailurePathInstrumentation:
         assert "timeout=3.0s" in warning_record.message
         assert "elapsed=" in warning_record.message
         assert "busy=" in warning_record.message
-        busy_json = warning_record.message.split("busy=", 1)[1]
-        busy = json.loads(busy_json)
+        busy_text = warning_record.message.split("busy=", 1)[1].split(" source=", 1)[0]
+        busy = json.loads(busy_text)
         assert busy["active_queries"] == 0
         assert busy["slot_busy"] is False
 

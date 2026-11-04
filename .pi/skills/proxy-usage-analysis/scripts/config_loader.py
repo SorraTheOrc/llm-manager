@@ -12,6 +12,7 @@ the module is unavailable, so there are no hard third-party dependencies.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime as _datetime
 from pathlib import Path
@@ -147,14 +148,30 @@ def priority_window_bounds(config: dict | None) -> dict | None:
     return normalize_priority_window(_find_nested(config, "priority_window"))
 
 
-def _parse_config_raw(text: str) -> dict:
-    """Parse config YAML text into a raw dict (yaml, else the regex parser)."""
+def import_yaml():
+    """Return the ``yaml`` module, or ``None`` when PyYAML is unavailable.
+
+    The single guarded-import point for the skill: PyYAML is optional, so every
+    YAML consumer (the proxy-config parser, the performance-metrics state store
+    and its committed defaults) goes through this helper to decide whether the
+    regex/indentation fallbacks are needed (LP-0MW1BU9F8007SE0U).
+    """
     try:
         import yaml  # type: ignore
+    except Exception:  # intentionally broad: an unimportable yaml is absent
+        return None
+    return yaml
 
-        cfg = yaml.safe_load(text)
-    except Exception:  # intentionally broad: fall back to the regex parser
-        cfg = None
+
+def _parse_config_raw(text: str) -> dict:
+    """Parse config YAML text into a raw dict (yaml, else the regex parser)."""
+    yaml = import_yaml()
+    cfg = None
+    if yaml is not None:
+        try:
+            cfg = yaml.safe_load(text)
+        except Exception:  # intentionally broad: fall back to the regex parser
+            cfg = None
     if not isinstance(cfg, dict):
         cfg = _parse_config_text_regex(text)
     return cfg
@@ -382,3 +399,239 @@ def load_proxy_config(path: Path | None) -> dict | None:
         )
         cfg = _deep_merge(base_cfg, cfg)
     return _normalize(cfg)
+
+
+# --- Guarded YAML mapping I/O (LP-0MW1BU9F8007SE0U) --------------------------
+#
+# ``performance_metrics.py`` reads the committed metric defaults and persists a
+# small rolling-history mapping. Both go through this guarded helper so PyYAML
+# stays optional: with ``yaml`` available the real parser/emitter is used, and
+# a minimal subset parser/emitter covers the same plain mappings, lists of
+# scalars and lists of scalar mappings otherwise. Nothing here is specific to
+# the proxy config, so the module keeps one guarded-import decision point.
+
+
+def parse_yaml_mapping(text: str) -> dict:
+    """Parse YAML *text* into a mapping (``{}`` when it cannot be parsed)."""
+    yaml = import_yaml()
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(text)
+        except Exception:  # intentionally broad: fall back to the subset parser
+            data = None
+        if isinstance(data, dict):
+            return data
+    return _parse_yaml_mapping_fallback(text)
+
+
+def load_yaml_mapping(path: str | Path | None) -> dict:
+    """Load a YAML mapping from *path* (``{}`` when absent or unreadable)."""
+    if path is None:
+        return {}
+    candidate = Path(path)
+    if not candidate.is_file():
+        return {}
+    try:
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    return parse_yaml_mapping(text)
+
+
+def dump_yaml_mapping(data: dict, path: str | Path) -> None:
+    """Write *data* to *path* as YAML (creating parent directories)."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    yaml = import_yaml()
+    if yaml is not None:
+        text = yaml.safe_dump(
+            dict(data), sort_keys=True, default_flow_style=False, allow_unicode=True
+        )
+    else:
+        text = _dump_yaml_mapping_fallback(dict(data))
+    target.write_text(text, encoding="utf-8")
+
+
+def _strip_yaml_comment(line: str) -> str:
+    """Drop a trailing ``# ...`` comment that sits outside quoted text."""
+    quote = None
+    for index, char in enumerate(line):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _yaml_entries(text: str) -> list[tuple[int, str]]:
+    """Return ``(indent, content)`` for the significant lines of *text*."""
+    entries: list[tuple[int, str]] = []
+    for raw in text.splitlines():
+        line = _strip_yaml_comment(raw.expandtabs(2))
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        entries.append((indent, line.strip()))
+    return entries
+
+
+def _parse_yaml_scalar(raw: str):
+    """Parse one scalar from a YAML subset (quotes, numbers, booleans, null)."""
+    value = raw.strip()
+    if value == "":
+        return None
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value[1:-1]
+    if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    if value == "[]":
+        return []
+    if value == "{}":
+        return {}
+    lowered = value.lower()
+    if lowered in ("true", "yes", "on"):
+        return True
+    if lowered in ("false", "no", "off"):
+        return False
+    if lowered in ("null", "none", "~"):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _is_yaml_mapping_entry(content: str) -> bool:
+    """True when a sequence item body starts a ``key: value`` mapping."""
+    if content.startswith(("'", '"')):
+        return False
+    return ":" in content
+
+
+def _parse_yaml_block(entries: list[tuple[int, str]], index: int, indent: int):
+    if index < len(entries) and (
+        entries[index][1] == "-" or entries[index][1].startswith("- ")
+    ):
+        return _parse_yaml_sequence(entries, index, indent)
+    return _parse_yaml_map(entries, index, indent)
+
+
+def _parse_yaml_map(entries: list[tuple[int, str]], index: int, indent: int):
+    result: dict = {}
+    while index < len(entries):
+        line_indent, content = entries[index]
+        if line_indent < indent:
+            break
+        if line_indent > indent or content == "-" or content.startswith("- "):
+            break
+        key_text, _, rest = content.partition(":")
+        key = _parse_yaml_scalar(key_text.strip())
+        index += 1
+        if rest.strip():
+            result[key] = _parse_yaml_scalar(rest)
+        elif index < len(entries) and entries[index][0] > indent:
+            result[key], index = _parse_yaml_block(entries, index, entries[index][0])
+        else:
+            result[key] = None
+    return result, index
+
+
+def _parse_yaml_sequence(entries: list[tuple[int, str]], index: int, indent: int):
+    result: list = []
+    while index < len(entries):
+        line_indent, content = entries[index]
+        if line_indent != indent or not (
+            content == "-" or content.startswith("- ")
+        ):
+            break
+        item = content[1:].strip()
+        index += 1
+        if not item:
+            if index < len(entries) and entries[index][0] > indent:
+                value, index = _parse_yaml_block(entries, index, entries[index][0])
+                result.append(value)
+            else:
+                result.append(None)
+            continue
+        if not _is_yaml_mapping_entry(item):
+            result.append(_parse_yaml_scalar(item))
+            continue
+        key_text, _, rest = item.partition(":")
+        mapping: dict = {_parse_yaml_scalar(key_text.strip()): _parse_yaml_scalar(rest)}
+        while index < len(entries) and entries[index][0] > indent:
+            child_indent, child_content = entries[index]
+            if child_content == "-" or child_content.startswith("- "):
+                break
+            parsed, index = _parse_yaml_map(entries, index, child_indent)
+            mapping.update(parsed)
+        result.append(mapping)
+    return result, index
+
+
+def _parse_yaml_mapping_fallback(text: str) -> dict:
+    """Parse the YAML subset used by the metrics defaults/state files."""
+    entries = _yaml_entries(text)
+    if not entries:
+        return {}
+    parsed, _ = _parse_yaml_block(entries, 0, entries[0][0])
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _dump_yaml_scalar(value) -> str:
+    """Render a scalar for the fallback emitter (strings JSON-quoted)."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, list):
+        return "[]"
+    if isinstance(value, dict):
+        return "{}"
+    return json.dumps(str(value))
+
+
+def _dump_yaml_mapping_fallback(data: dict) -> str:
+    """Emit mappings, lists and lists of scalar mappings as YAML text."""
+    lines: list[str] = []
+
+    def emit(mapping: dict, indent: int) -> None:
+        pad = "  " * indent
+        for key, value in mapping.items():
+            if isinstance(value, dict):
+                if value:
+                    lines.append(f"{pad}{key}:")
+                    emit(value, indent + 1)
+                else:
+                    lines.append(f"{pad}{key}: {{}}")
+            elif isinstance(value, list):
+                if not value:
+                    lines.append(f"{pad}{key}: []")
+                    continue
+                lines.append(f"{pad}{key}:")
+                for item in value:
+                    if isinstance(item, dict) and item:
+                        first = True
+                        for item_key, item_value in item.items():
+                            prefix = f"{pad}  - " if first else f"{pad}    "
+                            lines.append(f"{prefix}{item_key}: {_dump_yaml_scalar(item_value)}")
+                            first = False
+                    else:
+                        lines.append(f"{pad}  - {_dump_yaml_scalar(item)}")
+            else:
+                lines.append(f"{pad}{key}: {_dump_yaml_scalar(value)}")
+
+    emit(data, 0)
+    return "\n".join(lines) + "\n"

@@ -34,8 +34,11 @@ What is measured and how (metric provenance):
     with no release within the window is flagged ``unreleased`` (the pre-fix
     ~4 h wedge shape would appear here). Parsed directly from the proxy log
     (pure, deterministic, unit-tested with synthetic lines).
-  * AC3 — ``Stream finished ... provider=local`` events within a window after
-    the last deadline release prove local decode resumed.
+  * AC3 — ``Stream finished ... provider=local`` events after the last
+    deadline release prove local decode resumed. The tally is window-bounded:
+    it counts ``[last release, min(until, last release + resume_window))``,
+    clipped at the measurement window's ``until``, so a closed window yields
+    a stable count immediately (LP-0MVX157ZF007QJSU).
   * Coverage — an adjacent-file gap larger than ``--max-log-gap-seconds``
     inside the requested window fails the verdict, so a lost window (the
     2026-10-23 18:29:12 -> 22:04:16 hole) is reported instead of silently
@@ -525,15 +528,28 @@ def measure_ac1(
 # --------------------------------------------------------------------------
 
 def count_local_finishes_after(
-    lines, after: dt.datetime, window_seconds: int | float = 3600
+    lines,
+    after: dt.datetime,
+    window_seconds: int | float = 3600,
+    until: dt.datetime | None = None,
 ) -> int:
+    """Count local stream finishes over ``[after, border)`` where ``border``
+    is ``until`` when given, else ``after + window_seconds``.
+
+    Window-bounded (LP-0MVX157ZF007QJSU): when the resume window would run
+    past the measurement window's ``until`` the tally is clipped at ``until``,
+    so a closed window yields a stable count from the moment it closes — live
+    traffic arriving after ``until`` (but inside the 1 h resume window) can
+    no longer keep inflating it.
+    """
+    border = until if until is not None else after + dt.timedelta(seconds=window_seconds)
     count = 0
     for line in lines:
         ts = _parse_ts(line)
         if ts is None or ts < after:
             continue
-        if (ts - after).total_seconds() > window_seconds:
-            break  # lines are ordered; the tail is beyond the window
+        if ts >= border:
+            break  # lines are ordered; the tail is beyond the bound
         if _FINISH_LOCAL_RE.search(line):
             count += 1
     return count
@@ -834,7 +850,12 @@ def run_measure(
         max(r.release_ts for r in result.releases) if result.releases else None
     )
     finishes_after = (
-        count_local_finishes_after(lines, after=last_release, window_seconds=resume_window)
+        count_local_finishes_after(
+            lines,
+            after=last_release,
+            window_seconds=resume_window,
+            until=until,
+        )
         if last_release is not None
         else 0
     )

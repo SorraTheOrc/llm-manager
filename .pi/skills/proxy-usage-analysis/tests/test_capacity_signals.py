@@ -48,6 +48,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import types
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -259,6 +260,54 @@ class TestSingleDerivation:
         # The private copies are gone, so there is nothing to drift from.
         assert not hasattr(reference_tool, "_status_fields")
         assert not hasattr(reference_tool, "_STATUS_FIELD_RE")
+
+    def test_reference_tool_survives_a_poisoned_proxy_cache(self):
+        """A prior suite module can leave ``sys.modules["proxy"]`` as a broken
+        top-level namespace package (``<repo>/proxy`` has no ``__init__.py``);
+        the reference tool must still import ``proxy.measured_cache_abort``
+        (LP-0MVYNLWWL009R49W).
+
+        The poisoned entry is **restored**, never simply popped: popping
+        removes the real ``proxy`` package from ``sys.modules`` whenever a
+        proxy test module had already imported it, so the next
+        ``patch("proxy.provider.<name>")`` (or any ``import proxy.x``) builds a
+        *second* module object against a fresh import. Patches then land on the
+        duplicate while the already-imported test module keeps calling the
+        original, and a whole changed-scope selection fails for no reason of
+        its own (measured: 134 spurious failures when this module was collected
+        before ``proxy/tests`` in one pytest invocation,
+        LP-0MW0KZR7A003UFQK)."""
+        # Snapshot the WHOLE ``proxy*`` slice of ``sys.modules`` and restore it
+        # exactly. Restoring only ``sys.modules["proxy"]`` (or popping it) is
+        # not enough: the poisoned import of ``proxy.measured_cache_abort``
+        # leaves duplicate ``proxy.<sub>`` entries behind, so any later
+        # ``patch("proxy.provider.<name>")`` (or a conftest's
+        # ``import proxy.provider``) binds a DIFFERENT module object than the
+        # one the already-imported test modules hold — and every proxy test in
+        # the same pytest invocation fails for a reason of its own (measured:
+        # 65-134 spurious failures when this module was collected before
+        # ``proxy/tests`` in one changed-scope selection, LP-0MW0KZR7A003UFQK).
+        saved = {
+            name: mod
+            for name, mod in sys.modules.items()
+            if name == "proxy" or name.startswith("proxy.")
+        }
+        poisoned = types.ModuleType("proxy")
+        poisoned.__path__ = [str(REPO_ROOT / "proxy")]
+        sys.modules["proxy"] = poisoned
+        try:
+            tool = _load_reference_tool()
+            assert tool.is_status_poll.__module__ == "lib.capacity_signals"
+            assert tool.MEASURED_CACHE_DEFICIT_REASON
+        finally:
+            for name in [
+                n
+                for n in sys.modules
+                if n == "proxy" or n.startswith("proxy.")
+            ]:
+                if name not in saved:
+                    del sys.modules[name]
+            sys.modules.update(saved)
 
     def test_tally_excludes_polls_without_the_field(self):
         # AC1.1: a poll with no ``slots_stale`` field never counts as fresh.
@@ -606,6 +655,9 @@ class TestCli:
                 "2026-10-28 11:00:00",
                 "--output-dir",
                 str(out_dir),
+                # Delivery is exercised in tests/test_discord_notify.py; keeping it
+                # off here leaves these reports free of a delivery bullet.
+                "--no-discord",
                 *extra,
             ]
         )
