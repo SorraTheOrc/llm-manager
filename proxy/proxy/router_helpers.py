@@ -1186,7 +1186,12 @@ def _get_first_byte_timeout_seconds(srv) -> float:
 
 
 def _get_prefill_deadline_seconds(srv) -> float:
-    """Return the prefill deadline in seconds (default 90; 0 disables).
+    """Return the prefill deadline in seconds; 0 disables.
+
+    The fallback used when the key is absent is
+    :data:`proxy.prefill_eta.DEFAULT_PREFILL_DEADLINE_SECONDS` — one module-level
+    constant shared with the documented default, so the two cannot disagree
+    (LP-0MW1V0LPM000QLUC).
 
     A hard backstop *independent of ETA-estimator quality*
     (LP-0MVIQ0G2M0006QF6 AC3): if a local dispatch has produced no first byte
@@ -1202,12 +1207,15 @@ def _get_prefill_deadline_seconds(srv) -> float:
     that actually fires. Precedence: the prefill deadline wins over the wedge
     bound; both are bounded by ``local_dispatch_max_prefill_seconds``.
     """
+    from proxy.prefill_eta import DEFAULT_PREFILL_DEADLINE_SECONDS
+
+    fallback = float(DEFAULT_PREFILL_DEADLINE_SECONDS)
     try:
         server_cfg = srv.config.get("server", {})
-        raw = server_cfg.get("local_prefill_deadline_seconds", 90)
-        return float(raw) if raw is not None else 90.0
+        raw = server_cfg.get("local_prefill_deadline_seconds", fallback)
+        return float(raw) if raw is not None else fallback
     except Exception:
-        return 90.0
+        return fallback
     try:
         server_cfg = srv.config.get("server", {})
         raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)

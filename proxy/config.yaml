@@ -1870,7 +1870,9 @@ server:
   # With both fixed the gate is safe but still not productive: the band it
   # governs starts at `local_large_context_cold_cache_threshold` (38 000 new
   # tokens), and at the guard's conservative ~3.9 ms/token that is >= 148 s —
-  # beyond the 114 s safety budget. So it admits NOTHING until the per-bucket
+  # beyond the safety budget (derived at
+  # `local_admission_guard_budget_safety_fraction` above). So it admits NOTHING
+  # until the per-bucket
   # calibration (a measured, faster rate) makes a band prompt fit, which is
   # exactly the documented precondition. Leave it off; flip it on when
   # `routing_capacity_admit` would fire on a real band prompt.
@@ -2057,7 +2059,8 @@ server:
   # budget instead of by the queue budget. Measured 2026-11-01 13:12-14:00
   # (1 788 requests, local share 2.6 %): 20 of the 76 refusals that had a free
   # prefill gate had a measured own ETA of 36-102 s — inside the 114 s safety
-  # budget — and were refused only against the 30 s queue budget, i.e. a paid
+  # budget then shipped — and were refused only against the 30 s queue budget,
+  # i.e. a paid
   # remote call for work the GPU could have started immediately. Counter-
   # evidence: replaying the 2026-10-23 thrash window with the rung enabled
   # admits those prompts but 6 of the 20 are then cancelled at the deadline
@@ -2085,8 +2088,9 @@ server:
   # (inert admits log nothing, LP-0MVZF4SU10032OZH), 8
   # ``priced_within_queue_budget`` (occupancy priced 0, LP-0MVZF50MJ00654O1)
   # and 2 ``idle_override``. None of the 7 evictions with a stamped ETA above
-  # the 120 s deadline is an ETA-per-token under-prediction: each was priced
-  # over the deadline and admitted by a path that never enforced the bound.
+  # the then-shipped 120 s deadline is an ETA-per-token under-prediction: each
+  # was priced over the deadline and admitted by a path that never enforced the
+  # bound.
   # The rung's accepted rate is therefore 26 / 24 h, not 126 / 24 h.
   local_admission_guard_free_gate_deadline_budget: true
   #
@@ -2172,8 +2176,8 @@ server:
   # ``contended_samples=<n>`` so the residual optimism is visible. Warm prompts
   # (``cached_ratio >= 0.9``) stay on the solitary path byte-for-byte. Scope
   # guardrails (UNCHANGED by this feature): ``contention_queue_max_wait_seconds``
-  # = 30 and ``local_prefill_deadline_seconds`` = 120; the ordering
-  # ``30 < 120 < local_dispatch_first_byte_timeout_seconds (840) <
+  # = 30 and ``local_prefill_deadline_seconds`` = 180; the ordering
+  # ``30 < 180 < local_dispatch_first_byte_timeout_seconds (840) <
   # local_dispatch_max_prefill_seconds (900)`` must keep holding.
   #
   #   reject  — refuse admission when the projected wait exceeds the budget
@@ -2311,24 +2315,37 @@ server:
   local_cold_prefill_budget_tokens: 25000
   # Fraction of local_prefill_deadline_seconds a budgeted prompt's conservative
   # p75 ETA must fit inside before it is admitted (default 0.0 = DISABLED =
-  # documented rollback). 0.95 x 120 s = 114 s: a 25k cold prompt prices ~93 s
-  # at the measured 20-30k band p75 rate (~270 t/s) and is admitted, while a
-  # band-slow 25k (~132 s at ~190 t/s) is refused
+  # documented rollback). CANONICAL DERIVATION for the "safety budget" — the
+  # figure every other mention in this file and in proxy/docs/routing.md
+  # refers to by name rather than by number:
+  #
+  #     safety budget = local_admission_guard_budget_safety_fraction
+  #                     x local_prefill_deadline_seconds
+  #
+  # With the shipped values below that is 0.95 x 180 s = 171 s. A 25k cold
+  # prompt prices ~93 s at the measured 20-30k band p75 rate (~270 t/s) and is
+  # admitted, while a band-slow 25k (~132 s at ~190 t/s) is refused
   # (LP-0MVN4LBEQ005QRVL). This makes the budget deadline-relative instead of a
   # bare token count, so a future deadline change stays consistent.
   local_admission_guard_budget_safety_fraction: 0.95
   # Deadline-aware admission bound (LP-0MVKUKEU80022C3U): the guard ALSO
   # refuses local when the projected first-byte ETA exceeds this hard
   # backstop (seconds; 0 disables the bound). Widened 90 -> 120 s
-  # (LP-0MVN4LBEQ005QRVL): at the measured 20-30k band rate (249 t/s) a 25 000
-  # new-token prefill costs ~100 s (~93 s at the band's p75 of ~270 t/s), so a
-  # 90 s deadline cancels a genuinely feasible prompt while 120 s admits it
-  # with ~16 % margin (~23 % at p75).
+  # (LP-0MVN4LBEQ005QRVL) and then 120 -> 180 s (LP-0MW1V0LPM000QLUC): at the
+  # measured 20-30k band rate (249 t/s) a 25 000 new-token prefill costs
+  # ~100 s (~93 s at the band's p75 of ~270 t/s), so a 90 s deadline cancelled
+  # a genuinely feasible prompt while 120 s admitted it with ~16 % margin
+  # (~23 % at p75). Moving to 180 s widens the safety budget (derived above)
+  # from the 120 s deadline's figure to this one, which newly admits the
+  # mid-size cold prompts priced 117-169 s that the 2026-11-04 overnight window
+  # refused 61 times while the GPU sat idle with both slots free; the derived
+  # figure moves with this value automatically — no other number in the code is
+  # keyed to it.
   #
   # ORDERING (asserted at startup, FATAL on violation by
   # _startup_validate_prefill_timeout_config):
   #   contention_queue_max_wait_seconds (30)
-  #     < local_prefill_deadline_seconds (120)
+  #     < local_prefill_deadline_seconds (180)
   #     < local_dispatch_first_byte_timeout_seconds (840)
   #     < local_dispatch_max_prefill_seconds (900)
   #     < the client's 900 s queue deadline.
@@ -2340,8 +2357,10 @@ server:
   # local_admission_guard_budget_safety_fraction to 0.0 (bound disabled) and
   # local_admission_guard_reference_tokens to 32000. Each is a pure value
   # change — no code change and no restart ordering constraint beyond the
-  # usual process restart.
-  local_prefill_deadline_seconds: 120
+  # usual process restart. Setting this key back to 120 restores the previous
+  # admission behaviour (the comparator derived from that deadline); no code
+  # change is needed.
+  local_prefill_deadline_seconds: 180
   # Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL): when a
   # local dispatch is cancelled by the prefill deadline
   # (``prefill_deadline_exceeded``) or by the measured-cache early abort
@@ -2431,7 +2450,8 @@ server:
   # decisions carry ``n_past_actual=none``, so a slot owner is admitted at
   # ``reuse_ratio=1.0`` even when llama-server is about to re-prefill the prompt
   # from scratch (measured 2026-10-26: 29 of 116 deadline evictions were ~56k
-  # prompts priced at 17-182 new tokens, cancelled at 120 s).
+  # prompts priced at 17-182 new tokens, cancelled at the then-shipped 120 s
+  # deadline).
   #
   # With these keys enabled the proxy asks llama-server (b8782) for
   # ``prompt_progress`` inside the SSE stream (``return_progress: true`` on a
@@ -2439,7 +2459,7 @@ server:
   # the first progress event, compares the MEASURED compute (``total - cache``)
   # with the admission-priced ``new_tokens``. When the measurement proves the
   # dispatch is re-prefilling far more than priced, the proxy releases the
-  # accepted dispatch in SECONDS (not at the 120 s deadline), logs
+  # accepted dispatch in SECONDS (not at the prefill deadline), logs
   # ``local_eviction_after_acceptance reason=measured_cache_deficit`` with the
   # measured evidence (``total``, ``measured_cache``, ``priced_new_tokens``,
   # ``elapsed_s``) and returns the same retryable 503 the deadline returns, so
@@ -2478,7 +2498,7 @@ server:
   # less likely). Nothing in the path can raise: a missing/partial/malformed
   # measurement, a capture or decision error, an unpriceable deficit, an
   # unusable budget, or a stream that never emits ``prompt_progress`` all
-  # degrade to today's behaviour, including the full 120 s deadline path (fail
+  # degrade to today's behaviour, including the full prefill-deadline path (fail
   # open — never a hard local outage).
   #
   # THE BENEFIT GATE (condition 3, LP-0MVWBD91Z004U135). Conditions 1-2 alone
@@ -2492,14 +2512,11 @@ server:
   # exactly the optimism the abort exists to correct) with the admission
   # guard's OWN calibrated model (``proxy.prefill_eta.estimate_prefill_seconds``
   # at ``cached_ratio=0.0``, since a deficit is by definition uncached) and
-  # aborts only when that ETA EXCEEDS:
-  #
-  #   budget_s = local_admission_guard_budget_safety_fraction
-  #              x local_prefill_deadline_seconds
-  #            = 0.95 x 120 s = 114 s (shipped)
-  #
-  # falling back to the bare ``local_prefill_deadline_seconds`` (120 s) when
-  # the fraction is explicitly 0 — the documented "no safety margin" rollback,
+  # aborts only when that ETA EXCEEDS the request's "safety budget" — the
+  # single derivation stated above at
+  # ``local_admission_guard_budget_safety_fraction`` (fraction x deadline) —
+  # falling back to the bare ``local_prefill_deadline_seconds`` when the
+  # fraction is explicitly 0 — the documented "no safety margin" rollback,
   # not a disabled budget. The comparator is resolved by
   # ``proxy.prefill_eta.prefill_deadline_budget_seconds``, the SAME helper the
   # admission guard enforces, so the advertised threshold can never drift from
@@ -2514,8 +2531,9 @@ server:
   # dispatch is accepted and prefilling — ``local_prefill_deadline_seconds`` is
   # what actually cancels an accepted prefill. The distinction is not
   # cosmetic: against a 60 s comparator the incident prompt (84.6 s at the
-  # host p25 rate) still aborts, i.e. the defect survives; against 114 s it
-  # continues at every measured rate with >= 29 s of margin.
+  # host p25 rate) still aborts, i.e. the defect survives; against the
+  # then-shipped 114 s comparator it continued at every measured rate with
+  # >= 29 s of margin.
   #
   # WHY IT MATTERS FOR A PINNED CLIENT: the early abort returns the same
   # retryable 503 the deadline returns so the request detours to the next

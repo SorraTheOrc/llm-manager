@@ -154,10 +154,11 @@ DEFAULT_POLICY = POLICY_REJECT
 #
 # NOTE ON THE 1.1 ms FIGURE in the intake brief: applying 1.1 ms to *cached*
 # tokens rejects the AC5 case (a 90 %-cached 100k prompt costs
-# 0.9*100k*1.1 ms + 0.1*100k*3.9 ms = 138 s > the 120 s budget). The cached
+# 0.9*100k*1.1 ms + 0.1*100k*3.9 ms = 138 s > the deadline budget then
+# shipped, 120 s). The cached
 # term is therefore calibrated from warm dispatches with a cheap default,
 # which keeps cache-warm prompts admissible while still rejecting the
-# cache-cold 100k prompt (390 s > 120 s).
+# cache-cold 100k prompt (390 s > the then-shipped 120 s deadline).
 # ---------------------------------------------------------------------------
 
 DEFAULT_CODED_MS_PER_TOKEN = 0.5
@@ -259,8 +260,10 @@ ETA_PERCENTILE_MIN_TOKENS_KEY = "local_admission_guard_eta_percentile_min_tokens
 DEFAULT_ETA_PERCENTILE_MIN_TOKENS = CONSERVATIVE_MIN_TOKENS
 
 #: Fraction of the prefill deadline a budgeted prompt's conservative ETA must
-#: fit inside (0.95 of 120 s = 114 s). 0.0 disables the bound and leaves the
-#: bare token budget (legacy/rollback).
+#: fit inside (``budget_safety_fraction x local_prefill_deadline_seconds``; the
+#: derivation is stated once in ``proxy/config.yaml`` at
+#: ``local_admission_guard_budget_safety_fraction``). 0.0 disables the bound and
+#: leaves the bare token budget (legacy/rollback).
 BUDGET_SAFETY_FRACTION_KEY = "local_admission_guard_budget_safety_fraction"
 DEFAULT_BUDGET_SAFETY_FRACTION = 0.0
 
@@ -393,7 +396,9 @@ class GuardConfig:
     #: Prompt size from which percentile pricing engages (default 32 768).
     eta_percentile_min_tokens: int = DEFAULT_ETA_PERCENTILE_MIN_TOKENS
     #: Fraction of the deadline a budgeted prompt's conservative ETA must fit
-    #: inside (0.95 x 120 s = 114 s); 0.0 disables the bound.
+    #: inside
+    #: (``budget_safety_fraction * local_prefill_deadline_seconds``); 0.0
+    #: disables the bound.
     budget_safety_fraction: float = DEFAULT_BUDGET_SAFETY_FRACTION
     #: Rolling-median window for the published reference prompt
     #: (LP-0MVSD5RJW008F1IB AC4); 0 restores the single-most-recent-dispatch
@@ -1168,7 +1173,8 @@ def evaluate_admission(
 
     2. **Deadline bound (LP-0MVKUKEU80022C3U).** The projected time to first
        byte — own-prefill ETA plus the occupied gate — is compared against
-       ``local_prefill_deadline_seconds`` (default 120 s). When it would
+       ``local_prefill_deadline_seconds`` (default
+       ``DEFAULT_PREFILL_DEADLINE_SECONDS``). When it would
        exceed the deadline the guard refuses so we never start a dispatch
        that the deadline will later cancel. Including the occupancy term is
        the LP-0MVOFVCA2008DQVE residual fix: a warm 7 s prompt admitted
@@ -1402,7 +1408,7 @@ def evaluate_admission(
         admit = guard_cfg.policy == POLICY_OBSERVE
     # Third bound, deadline-RELATIVE (LP-0MVN4LBZ500281Z7 / parent AC3): when a
     # budget is configured, a prompt must fit inside
-    # ``budget_safety_fraction * deadline`` (0.95 x 120 s = 114 s), not merely
+    # ``budget_safety_fraction * local_prefill_deadline_seconds``, not merely
     # inside the deadline. This is what stops a prompt whose BAND is slow from
     # slipping past the flat token cap priced at the fast band's rate.
     if deadline_budget > 0.0 and eta > deadline_budget:
@@ -1469,12 +1475,14 @@ def prefill_deadline_budget_seconds(config: dict | None) -> float | None:
 
     Public single source of truth for the comparator the measured-cache
     benefit gate (``proxy.measured_cache_abort``) prices against: the
-    admission guard's ``budget_safety_fraction * local_prefill_deadline_seconds``
-    (0.95 x 120 s = 114 s with the shipped ``proxy/config.yaml``), falling back
-    to the bare ``local_prefill_deadline_seconds`` when the fraction is
-    explicitly ``0`` (the documented "no safety margin" rollback — *not* a
-    disabled budget). Both the advertised threshold and the enforced one come
-    from here, so they can never drift.
+    admission guard's
+    ``budget_safety_fraction * local_prefill_deadline_seconds`` (the derivation
+    is stated once, in ``proxy/config.yaml`` at
+    ``local_admission_guard_budget_safety_fraction``), falling back to the bare
+    ``local_prefill_deadline_seconds`` when the fraction is explicitly ``0``
+    (the documented "no safety margin" rollback — *not* a disabled budget).
+    Both the advertised threshold and the enforced one come from here, so they
+    can never drift.
 
     Returns ``None`` when the budget is unusable: either key absent, empty, a
     bool/string that is not numeric, NaN/inf, or negative — and a deadline of

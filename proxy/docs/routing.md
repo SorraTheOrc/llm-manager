@@ -873,8 +873,9 @@ server:
   same conservative estimator the guard uses, so the admission rate is
   whatever the *measured* prefill rate supports. The band starts at
   `local_large_context_cold_cache_threshold` (38 000 new tokens); at the
-  guard's conservative ~3.9 ms/token that is ≥ 148 s, beyond the 114 s safety
-  budget, so with today's pricing the gate admits **nothing** and the key
+  guard's conservative ~3.9 ms/token that is ≥ 148 s, beyond the safety
+  budget (derived from `local_admission_guard_budget_safety_fraction`, see
+  [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135)), so with today's pricing the gate admits **nothing** and the key
   ships **off**. It becomes productive once the per-bucket calibration (a
   measured, faster rate) makes a band prompt fit — that is the documented
   enablement precondition, and `routing_capacity_admit` firing on a real band
@@ -1433,8 +1434,9 @@ calibrated for *queue* losses; a request that starts its prefill immediately
 never queues, so its only wait is its own prefill. Measured 2026-11-01
 13:12-14:00 (1 788 requests, 58 sessions, local share 2.6 %): 20 of the 76
 refusals with a free prefill gate had a measured own ETA of 36-102 s, inside
-the 114 s safety budget, and were refused **only** against the 30 s queue
-budget — a paid remote call for a prefill the GPU could have started at once.
+the safety budget then shipped (114 s), and were refused **only** against the
+30 s queue budget — a paid remote call for a prefill the GPU could have
+started at once.
 Counter-evidence: replaying the 2026-10-23 thrash window with the rung enabled
 admits them, but 6 of the 20 are then cancelled at the deadline
 (`admitted_and_doomed` 0 → 6) — the very invariant the flat cold-prefill
@@ -1508,7 +1510,7 @@ each eviction to its admission evidence at the measured dispatch start
 
 | Admission path | Evictions | Priced new tokens discarded |
 |---|---|---|
-| `rung_accepted` — free-gate rung priced the wait inside the 114 s bound (43.0–112.9 s) but above the 30 s queue budget | 26 | 79,740 |
+| `rung_accepted` — free-gate rung priced the wait inside the comparator then shipped (114 s; measured band 43.0–112.9 s) but above the 30 s queue budget | 26 | 79,740 |
 | `high_priority_inert` — `priority=high` never queues, so the guard was inert (`no_budget`); **no** deadline/safety bound ran (fixed by LP-0MVZF3JZ9009LTN2 — this class must now read 0) | 43 | 257,778 |
 | `inert_unlogged` — guard inert (uncalibrated bucket) and silent at the dispatch instant | 47 | 439,307 |
 | `priced_within_queue_budget` — admitted inside the 30 s queue budget (5.3–28.0 s) yet stalled the full deadline behind another session's prefill (occupancy priced 0) | 8 | 12,954 |
@@ -1518,8 +1520,9 @@ each eviction to its admission evidence at the measured dispatch start
 126 / 24 h: the other 100 events came from admission paths the rung does not
 govern and are tracked separately (LP-0MVZF3JZ9009LTN2 high priority,
 LP-0MVZF4SU10032OZH inert-unlogged, LP-0MVZF50MJ00654O1 occupancy-priced-0).
-(2) None of the 7 events with a stamped (admission-time) ETA above the 120 s
-deadline is an ETA-per-token **under-prediction** — AC1's hypothesis. In all 7
+(2) None of the 7 events with a stamped (admission-time) ETA above the then-
+shipped 120 s deadline is an ETA-per-token **under-prediction** — AC1's
+hypothesis. In all 7
 the pricing, where it ran, already priced the prompt *over* the deadline (6
 high priority: 278.8–325.9 s; 1 inert medium priority: 170.3 s); each was
 admitted because the admission path never enforced the bound. (3) The
@@ -1595,7 +1598,7 @@ line carries `rate_bucket=contended|solitary|solitary_fallback` and
 `contended_samples=<n>`.
 
 Ordering to keep (the guard does not change these values):
-`contention_queue_max_wait_seconds (30) < local_prefill_deadline_seconds (120)
+`contention_queue_max_wait_seconds (30) < local_prefill_deadline_seconds (180)
 < local_dispatch_first_byte_timeout_seconds (840) <
 local_dispatch_max_prefill_seconds (900)` — an admitted request must never be
 cut off by the deadline, and the deadline must fire before the first-byte
@@ -1684,7 +1687,7 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   **Deadline refusal** (LP-0MVKUKEU80022C3U): when the projected **time to
   first byte** — own ETA plus the occupied gate, i.e. the same
   `projected_wait` above — reaches ``local_prefill_deadline_seconds``
-  (default 120 s) the guard also refuses with
+  (default `DEFAULT_PREFILL_DEADLINE_SECONDS`) the guard also refuses with
   ``reason=prefill_eta_exceeds_deadline`` (both paths). The deadline reason
   dominates the budget reason whenever it fires — it names the hard physical
   constraint that would cancel the dispatch; when the projected first byte is
@@ -2492,7 +2495,7 @@ expired` is the reserved-but-unused signal for ticket hoarding.
 ### Prefill deadline (LP-0MVIQ0G2M0006QF6)
 
 Before the first byte, a local dispatch is bounded by
-`server.local_prefill_deadline_seconds` (default **120 s**, 0 disables). The
+`server.local_prefill_deadline_seconds` (0 disables). The
 effective first-byte ceiling is the tighter of this and
 `local_dispatch_first_byte_timeout_seconds` (840 s), so by default the deadline
 is the bound that fires. On expiry the pending upstream request is cancelled
@@ -2558,13 +2561,22 @@ The abort needs **all three** conditions, in this enforced order:
    `cached_ratio=0.0`) **exceeds the request's own prefill-deadline budget**:
 
    ```text
-   budget_s = local_admission_guard_budget_safety_fraction
-              × local_prefill_deadline_seconds
-            = 0.95 × 120 s = 114 s   (shipped)
+   safety budget (the comparator) = local_admission_guard_budget_safety_fraction
+                                    × local_prefill_deadline_seconds
    ```
 
-   falling back to the bare `local_prefill_deadline_seconds` (**120 s**) when
-   the safety fraction is `0` (the "no safety margin" rollback). The
+   This is the **one canonical derivation** for the comparator in this
+   document (the matching canonical block in `proxy/config.yaml` sits at
+   `local_admission_guard_budget_safety_fraction`); every other mention here
+   says "the safety budget" or "the comparator" instead of repeating a number.
+   With the shipped keys it is **171 s**. `proxy/config.yaml` carries the same
+   two keys, so a retune of either moves the figure — and the
+   documentation-drift test in
+   `proxy/tests/test_measured_cache_abort_benefit_docs.py` fails naming the
+   file, the expected figure and the exact string to substitute.
+
+   Falling back to the bare `local_prefill_deadline_seconds` when the safety
+   fraction is `0` (the "no safety margin" rollback). The
    comparator comes from `proxy.prefill_eta.prefill_deadline_budget_seconds` —
    the same helper the admission guard enforces — so the advertised and the
    enforced threshold cannot drift.
@@ -2585,8 +2597,8 @@ the time a dispatch is accepted and prefilling, so
 `local_prefill_deadline_seconds` is what actually cancels it. The choice is
 load-bearing: against a 60 s
 comparator the incident prompt (84.6 s at the host p25 rate) still aborts, i.e.
-the defect survives; against 114 s it continues at every measured rate with
-at least 29 s of margin.
+the defect survives; against the 114 s comparator then shipped it continued at
+every measured rate with at least 29 s of margin.
 
 **A pinned dispatch whose measured ETA fits the budget is never aborted.**
 This is the point of the gate. A `local-preferred` (pin-local) request may not
@@ -2651,8 +2663,9 @@ measured_cache_abort session=<id> model=<model> reason=measured_cache_deficit de
   bound_tokens=<n> measured_eta_s=<s> budget_s=<s> elapsed_s=<s> → cancelling local dispatch early and detouring to the next provider
 ```
 
-`budget_s` is the comparator **actually enforced** (114.0 under the shipped
-config), never the admission wait budget; `measured_eta_s` / `budget_s` render
+`budget_s` is the comparator **actually enforced** (the safety budget, derived
+the same way the guard derives it), never the admission wait budget;
+`measured_eta_s` / `budget_s` render
 `unknown` when the gate did not price the deficit.
 
 **Rollback.** Two independent, value-only rollbacks: set
@@ -2689,8 +2702,10 @@ deadline-relative knobs:
   a startup WARNING says the band guard is silently dead.
 - `local_admission_guard_budget_safety_fraction` (shipped **0.95**, default
   **0.0** = disabled) — a budgeted prompt is admitted only when its
-  conservative p75 ETA fits inside `0.95 × local_prefill_deadline_seconds`
-  (= 114 s at 120 s). A 25k cold prompt prices ~93 s at the band's p75 rate
+  conservative p75 ETA fits inside the safety budget
+  (`fraction × local_prefill_deadline_seconds`; the canonical derivation is in
+  [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135) → *benefit gate*).
+  A 25k cold prompt prices ~93 s at the band's p75 rate
   (~270 t/s) and is admitted; a band-slow 25k (~132 s at ~190 t/s) is refused.
 
 `local_admission_guard_reference_tokens` (shipped **25 000**, previously
@@ -2870,8 +2885,8 @@ Two mechanisms, applied per reason:
 
 A `measured_cache_deficit` abandonment only exists because the benefit gate
 **allowed** the abort: all three conditions held, so the measured cold ETA
-exceeds the request's prefill-deadline budget (`0.95 ×
-local_prefill_deadline_seconds` = 114 s shipped, falling back to the bare
+exceeds the request's safety budget (the comparator, derived from
+`local_admission_guard_budget_safety_fraction`; falling back to the bare
 deadline when the safety fraction is `0`) and waiting could not have succeeded.
 A deficit the gate declines continues the dispatch and abandons nothing (see
 [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135)).
