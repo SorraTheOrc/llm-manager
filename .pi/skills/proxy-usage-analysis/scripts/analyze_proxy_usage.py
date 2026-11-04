@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MW2CBT7J000AS7B
+# smell: naming
+# severity: medium
+# description: Exception name `AnalysisFailure` should be named with an Error suffix
+# -->
 """Proxy usage analysis — turn the last 24h of llama-proxy logs into
 per-session CSVs (fast/cheap) and an operator-facing report.
 
@@ -13,6 +19,14 @@ baseline/target/actual/verdict. ``--metrics-config`` / ``--metrics-state``
 relocate those files, ``--no-metrics-update`` renders the section without
 recording the window, and ``--seed-metrics-history [DIR]`` runs the one-off
 backfill from archived reports instead of analysing logs.
+
+Delivery (LP-0MW2BD6G8001E960) is on by default and needs no flag either: a
+successful run posts ``report.md`` as an attachment to the Discord webhook in
+``.worklog/config.yaml`` (``discord.webhook_url``), and a failed run posts a
+short failure notice to the same webhook. ``--no-discord`` suppresses both,
+``--discord-webhook-url`` overrides the credential and ``--discord-config``
+relocates the worklog config. ``--json`` carries a ``discord_delivery`` block
+with the outcome.
 
 See SKILL.md for the full usage and interpretation guide.
 """
@@ -31,7 +45,9 @@ if __package__ in (None, ""):
 
 import capacity_signals
 import config_loader
+import discord_notify
 import performance_metrics
+import recommendations
 import reporting
 
 DEFAULT_LOG_DIR = "/var/log/llama-proxy"
@@ -40,6 +56,20 @@ DEFAULT_OUTPUT_DIR = "~/proxy-usage-reports"
 #: Default source for the one-off scorecard backfill: one subdirectory per
 #: archived window, each holding that run's ``report.md``.
 DEFAULT_METRICS_ARCHIVE_DIR = "~/proxy-usage-reports"
+
+
+class AnalysisFailure(Exception):
+    """A run that failed in a way worth announcing on the webhook.
+
+    Carries the operator-facing reason and the exit code the run would have
+    returned, so :func:`main` can print, notify and exit identically whether
+    the failure arrived as an exception or as a soft error return.
+    """
+
+    def __init__(self, detail: str, code: int = 1):
+        super().__init__(detail)
+        self.detail = detail
+        self.code = code
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -114,6 +144,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "one-off backfill: seed the best-3 history from archived reports and "
             "exit without analysing logs; DIR holds one subdirectory per archived "
             f"window, each with a report.md (default: {DEFAULT_METRICS_ARCHIVE_DIR})"
+        ),
+    )
+    # Discord delivery (LP-0MW2BD6G8001E960). On by default so the unchanged
+    # 05:00 cron line delivers without a new flag.
+    parser.add_argument(
+        "--no-discord",
+        action="store_true",
+        help=(
+            "do not post the report (or a failure notice) to the Discord "
+            "webhook; the report notes that delivery was disabled"
+        ),
+    )
+    parser.add_argument(
+        "--discord-webhook-url",
+        help=(
+            "Discord webhook URL, overriding discord.webhook_url in the "
+            "worklog config (never written to the report or logs)"
+        ),
+    )
+    parser.add_argument(
+        "--discord-config",
+        help=(
+            "path to the worklog config holding discord.webhook_url "
+            "(default: auto-discovered .worklog/config.yaml)"
         ),
     )
     return parser.parse_args(argv)
@@ -203,9 +257,106 @@ def _summary_output_paths(out_dir: Path) -> list[str]:
     ]
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def _deliver_report(
+    args: argparse.Namespace,
+    run: reporting.AnalysisRun,
+    out_dir: Path,
+    config: dict,
+    data: dict,
+) -> discord_notify.DeliveryResult:
+    """Post ``report.md`` to the Discord webhook and record the outcome.
 
+    The report is already on disk, so every failure here is fail-soft: the
+    outcome is reported through the returned result (and the report's own
+    ``- Discord delivery:`` bullet), never raised (LP-0MW2BD6G8001E960).
+    """
+    report_path = out_dir / "report.md"
+    attachment = discord_notify.attachment_name_for(
+        run.summary.window_start, report_path
+    )
+    message = discord_notify.build_message(
+        data,
+        recommendations.generate_recommendations(run.summary, config, run.mode_map),
+        window_start=run.summary.window_start,
+        window_end=run.summary.window_end,
+        attachment_name=attachment,
+    )
+    delivery = discord_notify.deliver(
+        report_path,
+        message,
+        window_start=run.summary.window_start,
+        enabled=not args.no_discord,
+        webhook_url=args.discord_webhook_url,
+        config_path=args.discord_config,
+    )
+    if delivery.error:
+        print(
+            f"warning: Discord delivery failed — {delivery.error}",
+            file=sys.stderr,
+        )
+    return delivery
+
+
+def _failure_window(args: argparse.Namespace) -> tuple[datetime | None, datetime | None]:
+    """Best-effort window for a failure message (never raises)."""
+    try:
+        window_end = _parse_iso(args.end) if args.end else datetime.now()
+        window_start = (
+            _parse_iso(args.start)
+            if args.start
+            else window_end - timedelta(hours=args.hours)
+        )
+        return window_start, window_end
+    except (TypeError, ValueError, AttributeError):  # pragma: no cover - defensive
+        return None, None
+
+
+def _notify_failure(args: argparse.Namespace, detail: str) -> None:
+    """Announce a failed run on the webhook, never masking the failure.
+
+    ``discord_notify.notify_failure`` is already fail-soft around the HTTP
+    call; this outer guard also covers webhook *discovery* (a config file that
+    cannot be read at the moment everything else is going wrong), because
+    nothing here may ever replace the error the operator needs to see.
+    """
+    try:
+        window_start, window_end = _failure_window(args)
+        discord_notify.notify_failure(
+            detail,
+            window_start=window_start,
+            window_end=window_end,
+            enabled=not getattr(args, "no_discord", False),
+            webhook_url=getattr(args, "discord_webhook_url", None),
+            config_path=getattr(args, "discord_config", None),
+        )
+    except Exception as exc:  # pragma: no cover - defensive, error path only
+        print(
+            f"warning: could not announce the failure on Discord — {exc}",
+            file=sys.stderr,
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: run the analysis, then announce the outcome.
+
+    Any failure — an unexpected exception or one of the soft error returns —
+    posts a short notice to the Discord webhook, so an unattended 05:00 cron
+    failure is never silent (LP-0MW2BD6G8001E960). The original error text,
+    exit code and stderr still reach ``cron.log`` unchanged.
+    """
+    args = parse_args(argv)
+    try:
+        return _run(args)
+    except AnalysisFailure as exc:
+        print(f"error: {exc.detail}", file=sys.stderr)
+        _notify_failure(args, exc.detail)
+        return exc.code
+    except BaseException as exc:
+        _notify_failure(args, f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def _run(args: argparse.Namespace) -> int:
     if args.end:
         window_end = _parse_iso(args.end)
     else:
@@ -216,8 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         window_start = window_end - timedelta(hours=args.hours)
 
     if window_start >= window_end:
-        print("error: window start must be before window end", file=sys.stderr)
-        return 2
+        raise AnalysisFailure("window start must be before window end", 2)
 
     config = config_loader.load_proxy_config(config_loader.find_config_path(args.config))
 
@@ -229,8 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         # never needs (or touches) a live log window.
         archive_dir = Path(args.seed_metrics_history).expanduser()
         if not archive_dir.is_dir():
-            print(f"error: archive directory not found: {archive_dir}", file=sys.stderr)
-            return 1
+            raise AnalysisFailure(f"archive directory not found: {archive_dir}")
         result = _seed_metrics_history(archive_dir, metrics_config, metrics_state)
         if args.json:
             print(json.dumps(result, indent=2, sort_keys=True))
@@ -252,34 +401,27 @@ def main(argv: list[str] | None = None) -> int:
             update_metrics=not args.no_metrics_update,
         )
     except OSError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        raise AnalysisFailure(str(exc)) from exc
+
+    data = reporting.summary_to_json(
+        run.summary,
+        run.mode_map,
+        config,
+        run.stale_rate_target,
+        metrics_config=metrics_config,
+        metrics_state=metrics_state,
+    )
+    # Delivery happens for every successful run — the report is the deliverable,
+    # so a run that produced one is a run that ships it (LP-0MW2BD6G8001E960).
+    # ``--no-discord`` is the only way to keep it local, and it is recorded in
+    # the report's own delivery bullet.
+    delivery = _deliver_report(args, run, out_dir, config, data)
+    data["discord_delivery"] = delivery.to_json()
 
     if args.json:
-        print(
-            json.dumps(
-                reporting.summary_to_json(
-                    run.summary,
-                    run.mode_map,
-                    config,
-                    run.stale_rate_target,
-                    metrics_config=metrics_config,
-                    metrics_state=metrics_state,
-                ),
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        print(json.dumps(data, indent=2, sort_keys=True))
         return 0
     if not args.quiet:
-        data = reporting.summary_to_json(
-            run.summary,
-            run.mode_map,
-            config,
-            run.stale_rate_target,
-            metrics_config=metrics_config,
-            metrics_state=metrics_state,
-        )
         decode = data.get("decode_speed") or {}
         decode_summary = (
             f", decode speed {decode.get('samples', 0)} samples "
@@ -338,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Performance metrics state: not updated (--no-metrics-update)")
         else:
             print(f"Performance metrics state written to: {metrics_state}")
+        print(f"Discord delivery: {delivery.note}")
     return 0
 
 

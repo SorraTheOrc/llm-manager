@@ -55,7 +55,9 @@ Outputs written to:
 - `report.md` — the aggregate report (primary deliverable, listed first). It
   opens with the **Performance metrics summary** scorecard and its
   **Performance metric details** block (see [Performance metrics
-  scorecard](#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3)).
+  scorecard](#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3)). Its header
+  carries one `- Discord delivery:` bullet recording how the report was
+  delivered (see [Discord delivery](#discord-delivery-lp-0mw2bd6g8001e960)).
 - `performance_metrics_state.yaml` — the live performance-metric history: the
   measurements behind each scorecard target, rewritten once per run (see
   [Live state](#live-state-output-dirperformance_metrics_stateyaml)). It is
@@ -534,6 +536,75 @@ overwritten. Only the skill's own artifacts are moved — anything else in the
 output dir (e.g. `cron.log`) stays put, and a pristine output dir is left
 touched-free (no empty archive dirs). The CLI prints the archive path on each
 run (`Previous outputs archived to …`).
+
+## Discord delivery (LP-0MW2BD6G8001E960)
+
+Delivery is the last step of a successful run and is **on by default**, so the
+unchanged 05:00 cron line ships the report without a new flag. The module is
+`scripts/discord_notify.py`; the webhook is resolved by
+`--discord-webhook-url`, else `discord.webhook_url` in `.worklog/config.yaml`
+(auto-discovered upward from the working directory, then from the repository
+root derived from the script path), else `--discord-config PATH`.
+
+**Report delivery.** `report.md` is posted as a multipart attachment
+(`files[0]`, named `proxy-usage-report-YYYY-MM-DD.md` from the window start)
+with a `payload_json` body holding a message of at most 2000 characters: the
+window, sessions/requests, fallback rate, local busy, decode median, error
+count and the top three recommendations by severity. The full report always
+travels as the file; the body only has to make the channel readable.
+
+**The report records its own delivery.** Exactly one `- Discord delivery:`
+bullet is written into the header (replaced in place, never duplicated), with
+one of four values. The bullet describes the **on-disk** copy: the attachment
+is read and posted *before* the outcome is known, so the copy in the channel
+carries whatever bullet the run had at that moment (normally none, or the
+`not configured` / `disabled` note), and the final `sent` / `failed` line is
+written to `report.md` afterwards.
+
+| Value | Meaning |
+|---|---|
+| `report sent as an attachment (…)` | The POST succeeded |
+| `not configured — no \`discord.webhook_url\` in <searched>` | No credential found; nothing was sent |
+| `failed — <reason>` | The POST raised; nothing further was attempted |
+| `disabled (--no-discord)` | Delivery was switched off for this run |
+
+**The credential is never written down.** The webhook URL carries a token, so
+it is excluded from `report.md`, the `--json` summary, `cron.log` and every
+error message; only the *source* (config path or flag name) is named, as
+`discord_delivery.webhook_source`.
+
+**Every request sends a `DiscordBot (…)` User-Agent.** Discord sits behind
+Cloudflare, which answers the default `Python-urllib/x.y` agent with
+`HTTP 403 error code: 1010` (browser-signature ban). That failure reads like a
+dead webhook, so `discord_notify.USER_AGENT` is part of the request contract
+and is pinned by a test — do not remove it while refactoring the headers.
+
+**Failure notification.** `main()` wraps the whole run: an unexpected
+exception is announced (`⚠️ proxy-usage-analysis failed on <host>` with the
+window and the cron log path) and then **re-raised**, while the soft error
+paths (invalid window → exit 2, missing archive directory or unreadable log
+directory → exit 1) announce and return their original code. The notifier is
+fail-soft by construction — it runs on the error path, so it never raises,
+never masks the original failure and never changes the exit code.
+
+**`--json` block.** `discord_delivery` is additive:
+
+```json
+"discord_delivery": {
+  "configured": true,
+  "sent": true,
+  "note": "report sent as an attachment (`proxy-usage-report-2026-11-03.md`) at 05:00:12",
+  "error": null,
+  "report_path": "/home/user/proxy-usage-reports/report.md",
+  "attachment_name": "proxy-usage-report-2026-11-03.md",
+  "webhook_source": "`/home/user/projects/llm/.worklog/config.yaml`"
+}
+```
+
+**Tests never post.** `tests/conftest.py` replaces the network seam
+(`discord_notify._post_multipart`) for the whole suite, so a test reaches
+Discord only by injecting its own `poster`; the delivery contract is pinned in
+`tests/test_discord_notify.py`.
 
 ## Performance metrics scorecard (LP-0MW0FU5Z6006A4P3)
 
@@ -1147,7 +1218,14 @@ entry is a local runtime edit, not a committed artifact.
    the `Context size at fallback` figure whose `n/a` it explains) and as
    `streams_with_usage` / `streams_without_usage` in the per-session CSVs.
 7. **Recommendations** — rule-based heuristics, each citing the data that
-   supports it (see below).
+   supports it (see below). One rule is an invariant rather than a heuristic:
+   **no recommendation ever advises raising the local context size**
+   (LP-0MW2BD6G8001E960). The context is bounded by the model and the
+   hardware, so the large-context rules name prompt compaction, slot-count
+   rebalancing within the fixed total, and the by-design remote bypass
+   instead; `recommendations.FORBIDDEN_CTX_ADVICE` is the single list
+   `tests/test_no_ctx_size_advice.py` pins that to, covering both generated
+   advice and the documentation.
 8. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
    error`) are parsed in the same streaming pass, collected per window, and
@@ -1170,9 +1248,9 @@ entry is a local runtime edit, not a committed artifact.
    429 rate-limit events and 402 balance events are never conflated. The
    `errors.json` artifact includes `upstream_by_status` and
    `upstream_by_status_provider` keys. Remediation recommendations
-   (recovery-first, informative-error, ctx-size pressure, per-status upstream
-   remediation) are generated from these events and link to the relevant work
-   items. The **Server-side compaction** section (LP-0MTHCTLAF00147IT) is
+   (recovery-first, informative-error, local context pressure, per-status
+   upstream remediation) are generated from these events and link to the
+   relevant work items. The **Server-side compaction** section (LP-0MTHCTLAF00147IT) is
    rendered immediately after the Session summary whenever the window has
    compaction telemetry (and otherwise as a "No compactions observed in
    window" note). It covers Total / Fast / Cheap split (using the
@@ -1385,20 +1463,21 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
     slot pool contention → raise `session_slot_pool_size` or the
     `slot_schedule` slot counts (keep llama-server `--parallel` aligned).
   - `large_context_bypass` → prompts exceed the large-context routing
-    thresholds / per-slot context → raise local ctx-size
-    (`models.ini`), `local_large_context_*_threshold`, or
-    `session_slot_max_prompt_tokens`. Related work item:
-    **LP-0MSAOQTJS000FFVM** (evaluate increasing the local ctx-size).
+    thresholds / per-slot context. **The context ceiling is fixed by the
+    model and the hardware available, so no recommendation advises raising
+    it** (LP-0MW2BD6G8001E960): the levers are client-side prompt compaction,
+    slot-count versus per-slot-context rebalancing within the fixed total, and
+    accepting the remote bypass for genuinely oversized prompts.
   - `context_too_large` (legacy `warm_cache_bypass` in rotated logs) →
-    estimated context exceeds the per-slot hard cap → consider raising
-    local ctx-size (`models.ini`) or
-    `local_large_context_warm_cache_threshold`.
+    estimated context exceeds the per-slot hard cap → the same fixed-ceiling
+    levers; prompts above the ceiling are served remotely by design.
   - `provider_budget_exhausted` (legacy `rate_limited*` in rotated logs
     predating LP-0MVMBM8YS003Y2JG) → the proxy's own per-provider RPM
     budget (`rate_limit_rpm`) was exhausted before dispatch, so the request
     passed to the next provider. It is *pacing, not an upstream 429* → if
     the volume is unwanted, raise that entry's `rate_limit_rpm` or reorder
-    the chain (raising `models.ini` ctx-size does NOT help).
+    the chain (raising the local context size does NOT help, and is not
+    possible: the ceiling is fixed by the model and the hardware).
   - `HTTP 4xx/5xx`, `empty_response`, timeouts → remote provider issues
     (credentials, rate limits) — not slot-related.
 - **Provider context skips** (`routing_skip_provider_context`): a remote
@@ -1415,7 +1494,9 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   attributed that skip (`fallback_reason=provider_context_exceeded`) unless it
   also logged a `routing_skip_local` line, which takes precedence.
 - **Context pressure**: sessions whose max context approaches
-  `local_model_ctx_size / slots` can force `large_context_bypass`.
+  `local_model_ctx_size / slots` can force `large_context_bypass`. The
+  ceiling is fixed by the model and the hardware, so the remedy is prompt
+  compaction or slot-count rebalancing, never a larger context.
 - **Decode speed / Prompt eval speed**: when these sections are empty, read
   the **Why no eval-timing samples** block rather than assuming a data
   problem: `verbosity/build` means the files were read but carry no
@@ -1468,7 +1549,8 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   Concurrency bursts beyond `session_slot_pool_size` show as
   `local_concurrency_limit` / `local_lease_active` fallbacks. Note the
   slots-vs-context trade-off: more slots shrink per-slot context and *raise*
-  bypass volume, so do not add slots without a matching ctx-size increase.
+  bypass volume. The total context is capped by the model and the hardware
+  available, so this is a rebalancing decision, never an increase.
 - **Hour state (local availability)**: the **State** column of **Summary by
   hour** answers "was the local model *idle*, or *unable to serve*?" — a
   question busy-% cannot answer, because busy is computed only from paired
@@ -1537,8 +1619,9 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
     reported as "aborted or still running".
   - `Stream error:` — proxy-side stream exception (e.g. `NameError`).
   - `slot_save failed` — local llama-server slot persistence
-    ReadTimeouts; usually context pressure → raise local ctx-size
-    (LP-0MSAOQTJS000FFVM).
+    ReadTimeouts; usually large-context pressure. The fix is prompt
+    compaction, not a larger context: the local context is fixed by the model
+    and the hardware available (LP-0MW2BD6G8001E960).
   - `backend_retry` — upstream connect/read timeouts during retry backoff;
     transient unless clustered.
   - `upstream error` (HTTP 429) — the mechanism depends on the error type,

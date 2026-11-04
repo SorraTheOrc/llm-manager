@@ -26,6 +26,10 @@ proxy.log + llama-server.log
         ▼
   <output-dir>/performance_metrics_state.yaml    live best-3 history,
                                                  rewritten once per run
+
+  report.md ──► discord_notify.py ──► Discord webhook (report as an
+                                      attachment; a failed run posts a
+                                      failure notice instead)
 ```
 
 - **Scorecard.** `report.md` opens with `## Performance metrics summary`: the
@@ -42,6 +46,15 @@ proxy.log + llama-server.log
   history from the archived `report.md` files (idempotent per window), so the
   scorecard is useful on its first run instead of reporting `Insufficient
   history` for three days.
+- **Delivery.** A successful run posts `report.md` to the Discord webhook in
+  `.worklog/config.yaml` as an attachment and records the outcome in the
+  report's own `- Discord delivery:` bullet; a failed run posts a failure
+  notice to the same webhook. `--no-discord` keeps a run local. The webhook
+  URL is a credential and is never written to any artefact.
+- **No ctx-size advice.** The local context is fixed by the model and the
+  hardware, so no recommendation advises raising it — the large-context rules
+  name prompt compaction, slot rebalancing and the by-design remote bypass
+  instead.
 
 Metric definitions, both file schemas and the backfill command:
 [REFERENCE.md](REFERENCE.md#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3).

@@ -66,6 +66,9 @@ Options:
 | `--metrics-state` | `<output-dir>/performance_metrics_state.yaml` | Path to the live performance-metric history file this run records its window in |
 | `--no-metrics-update` | off | Render the performance metrics section but do not record this window (no state write) |
 | `--seed-metrics-history [DIR]` | `~/proxy-usage-reports` | One-off backfill: seed the best-3 history from archived `report.md` files and exit without analysing logs |
+| `--no-discord` | off | Do not post the report (or a failure notice) to the Discord webhook; the report notes `disabled (--no-discord)` |
+| `--discord-webhook-url` | — | Discord webhook URL, overriding `discord.webhook_url` in the worklog config. A credential: never written to the report, `--json` or the logs |
+| `--discord-config` | auto-discovered `.worklog/config.yaml` | Path to the worklog config holding `discord.webhook_url` |
 
 ## Daily cadence (05:00 cron)
 
@@ -78,10 +81,46 @@ loop:
 0 5 * * * cd /home/rgardler/projects/llm && python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py >> ~/proxy-usage-reports/cron.log 2>&1
 ```
 
+That line is unchanged by delivery (LP-0MW2BD6G8001E960): the report is
+posted to Discord by default, so no new flag is needed and a failure is
+announced on the same channel.
+
 Each run archives the previous day's outputs into a dated subdirectory (see
 [Archival](REFERENCE.md#archival)), so a historical daily report accumulates
 under `~/proxy-usage-reports/YYYY-MM-DD/`. `cron.log` is not an analysis
 artifact and stays at the root, untouched by archival.
+
+## Discord delivery (LP-0MW2BD6G8001E960)
+
+The report is pushed to the operator instead of being parked on disk. Three
+outcomes, all recorded in the report's own `- Discord delivery:` header
+bullet so the artefact says how it travelled:
+
+| Situation | What happens | The report says |
+|---|---|---|
+| Webhook configured | `report.md` is posted as a multipart **file attachment** (`proxy-usage-report-YYYY-MM-DD.md`) with a short body — window, headline figures and the top three recommendations by severity | `report sent as an attachment (…)` |
+| No webhook configured | Nothing is sent | `not configured — no \`discord.webhook_url\` in <path searched>; report not sent to Discord` |
+| Send failed | Nothing further is attempted (delivery is fail-soft; the analysis result is never lost) | `failed — <reason>` |
+| `--no-discord` | Nothing is sent | `disabled (--no-discord)` |
+
+**Where the credential comes from.** `--discord-webhook-url`, else
+`discord.webhook_url` in `.worklog/config.yaml` — auto-discovered by walking
+up from the working directory and then from the repository root derived from
+the script path, so a run from any directory finds the project config. The
+URL is a credential and is never written to the report, the `--json` summary,
+`cron.log` or an error message; only its *source* (the config path) is named.
+
+**A failed run announces itself.** Any failure in `main()` — an unexpected
+exception, an invalid window, an unreadable log directory — posts
+`⚠️ proxy-usage-analysis failed on <host>: <reason>` (with the window and the
+cron log path) before the original error text and exit code are preserved.
+The notifier is fail-soft: a dead webhook never masks the real failure. So
+silence on the channel means "ran and was fine", never "crashed at 05:00".
+
+**Tests never post.** The skill's `tests/conftest.py` replaces the network
+seam for the whole suite, so a test can only reach Discord by injecting its
+own `poster`; delivery behaviour is covered in
+`tests/test_discord_notify.py`.
 
 ## Outputs
 
@@ -94,7 +133,10 @@ report. `report.md` also carries the **Provider context skips** section
 (count, share of all skip events, standard/low split, provider breakdown and
 the `limit` ceiling each provider hit) whenever the window contains
 `routing_skip_provider_context` lines; the `--json` summary exposes the same
-figures as `provider_context_skips`.
+figures as `provider_context_skips`. The report's header carries one
+`- Discord delivery:` bullet describing how it was delivered, and `--json`
+exposes the same outcome as `discord_delivery` (`configured`, `sent`, `note`,
+`error`, `report_path`, `attachment_name`, `webhook_source`).
 
 See [REFERENCE.md](REFERENCE.md#outputs) for the full schema of each
 artifact and the archival behaviour.
@@ -587,3 +629,16 @@ recommendation rules, llama-server eval-timing parsing
 (decode + prompt eval, Qwen3 port filtering, fast/cheap speed stats), and an
 end-to-end run, using fixtures copied from real `/var/log/llama-proxy`
 lines (`proxy.log` and `llama-server.log`).
+
+Two invariants have their own dedicated suites:
+
+- `tests/test_no_ctx_size_advice.py` — no generated recommendation and no
+document advises raising the local context size (the ceiling is fixed by the
+model and the hardware), and the completed ctx-size work item is never cited
+as an open action.
+- `tests/test_discord_notify.py` — webhook discovery (flag → worklog config →
+`--discord-config`), the multipart attachment payload, message truncation, the
+report's `- Discord delivery:` bullet in all four states, and the CLI wiring
+for both a delivered report and an announced failure. No test performs network
+I/O: `tests/conftest.py` replaces `discord_notify._post_multipart` for the
+whole suite, and delivery tests inject their own `poster`.

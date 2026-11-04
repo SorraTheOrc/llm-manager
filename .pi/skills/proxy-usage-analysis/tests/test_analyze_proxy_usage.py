@@ -2245,6 +2245,86 @@ def _session(
     }
 
 
+class TestNoContextSizeAdvice:
+    """The context ceiling is fixed by the model and the hardware
+    (LP-0MW2BD6G8001E960), so no generated recommendation may advise raising it."""
+
+    def _comprehensive_recs(self):
+        """Recommendations from a result that fires every large-context rule."""
+        sessions = [
+            _session("bypass", remote_move=True, reason="large_context_bypass", max_context=200000),
+            _session("too-large", remote_move=True, reason="context_too_large", max_context=200000),
+            # 40000 of 262144/6 = 43690 per-slot tokens is 91% of the ceiling.
+            _session("pressure", max_context=40000),
+            _session("denied", remote_move=True, reason="local_concurrency_limit"),
+        ]
+        fallback_events = [
+            log_parser.LogEvent("fallback", WINDOW_START, reason="large_context_bypass"),
+            log_parser.LogEvent("fallback", WINDOW_START, reason="context_too_large"),
+            log_parser.LogEvent("fallback", WINDOW_START, reason="local_concurrency_limit"),
+        ]
+        res = _result_with_sessions(sessions, fallback_events=fallback_events)
+        res.error_events = [
+            log_parser.LogEvent("slot_save_error", WINDOW_START, error="ReadTimeout/ReadTimeout"),
+            log_parser.LogEvent("stream_error", WINDOW_START, error="stream_exception"),
+        ]
+        return recommendations.generate_recommendations(
+            res, config={"local_model_ctx_size": 262144, "session_slot_pool_size": 6}
+        )
+
+    def test_all_four_large_context_rules_fire(self):
+        """The scan below is only meaningful if the rules actually produced advice."""
+        titles = " | ".join(r.title.lower() for r in self._comprehensive_recs())
+
+        assert "large-context bypass" in titles
+        assert "context-too-large" in titles
+        assert "context sizes approaching" in titles
+        assert "slot_save" in titles
+
+    def test_no_recommendation_advises_raising_the_context(self):
+        for rec in self._comprehensive_recs():
+            for field in (rec.title, rec.detail, rec.evidence):
+                offending = recommendations.ctx_advice_in(field)
+                assert offending is None, f"{offending!r} in recommendation {rec.title!r}"
+
+    def test_large_context_rules_name_the_fixed_ceiling_and_real_levers(self):
+        recs = {r.title: r for r in self._comprehensive_recs()}
+        bypass = next(r for t, r in recs.items() if "large-context bypass" in t.lower())
+        too_large = next(r for t, r in recs.items() if "context-too-large" in t.lower())
+        pressure = next(r for t, r in recs.items() if "context sizes approaching" in t.lower())
+
+        for rec in (bypass, too_large, pressure):
+            detail = rec.detail.lower()
+            assert "fixed by the model and the hardware" in detail
+            assert "compaction" in detail or "rebalancing" in detail
+
+    def test_the_completed_ctx_size_work_item_is_never_cited(self):
+        for rec in self._comprehensive_recs():
+            assert "LP-0MSAOQTJS000FFVM" not in f"{rec.title} {rec.detail} {rec.evidence}"
+
+    def test_a_rendered_report_carries_no_context_size_advice(self, tmp_path):
+        """The guard covers the artefact, not just the recommendation objects.
+
+        Reporting prose (the notes block, the error-analysis pointer) is part of
+        the report an operator reads, so it is scanned here too.
+        """
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n", encoding="utf-8")
+
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out",
+            config=None,
+        )
+
+        text = (tmp_path / "out" / "report.md").read_text(encoding="utf-8")
+        assert recommendations.ctx_advice_in(text) is None
+        assert "LP-0MSAOQTJS000FFVM" not in text
+
+
 class TestRecommendations:
     def test_concurrency_limit_dominant_suggests_slot_pool(self):
         res = _result_with_sessions(
@@ -2258,13 +2338,13 @@ class TestRecommendations:
         titles = " | ".join(r.title for r in recs)
         assert "session_slot_pool_size" in titles.lower()
 
-    def test_large_context_bypass_suggests_ctx(self):
+    def test_large_context_bypass_recommends_fixed_ceiling_levers(self):
         res = _result_with_sessions(
             [_session("a", remote_move=True, reason="large_context_bypass")],
         )
         recs = recommendations.generate_recommendations(res, config=None)
         titles = " | ".join(r.title for r in recs)
-        assert "ctx" in titles.lower() or "context" in titles.lower()
+        assert "context" in titles.lower()
 
     def test_context_too_large_suggests_context(self):
         res = _result_with_sessions(
@@ -2504,7 +2584,13 @@ class TestErrorRecommendations:
         recs = recommendations.generate_recommendations(res, config=None)
         titles = " | ".join(r.title.lower() for r in recs)
         assert "slot_save" in titles, f"expected slot_save recommendation, got: {titles}"
-        assert "LP-0MSAOQTJS000FFVM" in " | ".join(r.detail for r in recs)
+        detail = " | ".join(r.detail for r in recs)
+        # The context ceiling is fixed by the model and the hardware, so the
+        # remedy is prompt compaction — never a larger context, and never the
+        # (completed) work item the old copy cited (LP-0MW2BD6G8001E960).
+        assert "prompt compaction" in detail.lower()
+        assert recommendations.ctx_advice_in(detail) is None
+        assert "LP-0MSAOQTJS000FFVM" not in detail
 
     def test_upstream_429_triggers_cooldown_recommendation(self):
         errors = [

@@ -326,6 +326,9 @@ def _run_cli(log_dir: Path, out_dir: Path, *extra: str) -> int:
             "2026-08-02 15:00:00",
             "--output-dir",
             str(out_dir),
+            # Delivery is exercised in tests/test_discord_notify.py; keeping it off
+            # here leaves these reports free of a delivery bullet.
+            "--no-discord",
             *extra,
         ]
     )

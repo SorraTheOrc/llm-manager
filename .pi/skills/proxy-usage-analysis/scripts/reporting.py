@@ -1544,8 +1544,9 @@ def build_report(
         "described above."
     )
     ap(
-        "- Related context: work item LP-0MSAOQTJS000FFVM (evaluate increasing local ctx-size) can "
-        "use this report's `large_context_bypass` data. See the skill's SKILL.md for interpretation."
+        "- Related context: the local context ceiling is fixed by the model and the hardware, so "
+        "`large_context_bypass` is read as a capacity signal (prompt compaction, slot rebalancing) "
+        "rather than as a case for a larger context. See the skill's SKILL.md for interpretation."
     )
     ap(
         "- Decode/prompt-eval speeds come from llama-server eval-timing lines, "
@@ -2624,7 +2625,7 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
     ap(
         f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
         "and the remediation recommendations below (recovery-first silent continue, informative-error "
-        "fallback, ctx-size pressure, upstream HTTP status-specific remediation)."
+        "fallback, local context pressure, upstream HTTP status-specific remediation)."
     )
 
 

@@ -655,6 +655,9 @@ class TestCli:
                 "2026-10-28 11:00:00",
                 "--output-dir",
                 str(out_dir),
+                # Delivery is exercised in tests/test_discord_notify.py; keeping it
+                # off here leaves these reports free of a delivery bullet.
+                "--no-discord",
                 *extra,
             ]
         )
