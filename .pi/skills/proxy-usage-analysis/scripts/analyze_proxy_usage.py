@@ -5,6 +5,15 @@ Usage:
     python3 analyze_proxy_usage.py --log-dir /var/log/llama-proxy \\
         --hours 24 [--output-dir ~/proxy-usage-reports] [--json]
 
+The daily cron invocation needs no performance-metric flags: the committed
+``metrics/performance_metrics.yaml`` defaults plus a live
+``<output-dir>/performance_metrics_state.yaml`` are used automatically, and
+``--json`` carries a ``performance_metrics`` block with each metric's
+baseline/target/actual/verdict. ``--metrics-config`` / ``--metrics-state``
+relocate those files, ``--no-metrics-update`` renders the section without
+recording the window, and ``--seed-metrics-history [DIR]`` runs the one-off
+backfill from archived reports instead of analysing logs.
+
 See SKILL.md for the full usage and interpretation guide.
 """
 
@@ -22,11 +31,15 @@ if __package__ in (None, ""):
 
 import capacity_signals
 import config_loader
+import performance_metrics
 import reporting
 
 DEFAULT_LOG_DIR = "/var/log/llama-proxy"
 DEFAULT_HOURS = 24
 DEFAULT_OUTPUT_DIR = "~/proxy-usage-reports"
+#: Default source for the one-off scorecard backfill: one subdirectory per
+#: archived window, each holding that run's ``report.md``.
+DEFAULT_METRICS_ARCHIVE_DIR = "~/proxy-usage-reports"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -64,6 +77,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--json", action="store_true", help="print a JSON summary instead of the text summary")
     parser.add_argument("--quiet", action="store_true", help="suppress the stdout summary")
+    # Performance scorecard (LP-0MW1BUAQD001WL8X). Every default keeps the
+    # unchanged 05:00 cron invocation working as-is: the committed defaults
+    # file plus a live state file under --output-dir, updated on each run.
+    parser.add_argument(
+        "--metrics-config",
+        default=str(performance_metrics.DEFAULTS_PATH),
+        help=(
+            "path to the performance-metric defaults (metric detail copy and any "
+            "seeded history); read-only at runtime, never written "
+            f"(default: {performance_metrics.DEFAULTS_PATH})"
+        ),
+    )
+    parser.add_argument(
+        "--metrics-state",
+        help=(
+            "path to the live performance-metric history file; this run records "
+            "its window here "
+            f"(default: <output-dir>/{performance_metrics.STATE_FILENAME})"
+        ),
+    )
+    parser.add_argument(
+        "--no-metrics-update",
+        action="store_true",
+        help=(
+            "render the performance metrics section but do not record this "
+            "window (no state write)"
+        ),
+    )
+    parser.add_argument(
+        "--seed-metrics-history",
+        nargs="?",
+        const=DEFAULT_METRICS_ARCHIVE_DIR,
+        metavar="DIR",
+        help=(
+            "one-off backfill: seed the best-3 history from archived reports and "
+            "exit without analysing logs; DIR holds one subdirectory per archived "
+            f"window, each with a report.md (default: {DEFAULT_METRICS_ARCHIVE_DIR})"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -72,6 +124,68 @@ def _parse_iso(value: str) -> datetime:
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return datetime.fromisoformat(value)
+
+
+def _metrics_paths(args: argparse.Namespace, out_dir: Path) -> tuple[Path, Path]:
+    """Resolve the committed defaults path and the live state file path.
+
+    ``--metrics-state`` wins when given; otherwise the live history lives in
+    the report output directory, exactly where the unchanged cron invocation
+    expects it (LP-0MW1BUAQD001WL8X AC1).
+    """
+    metrics_config = Path(args.metrics_config).expanduser()
+    metrics_state = (
+        Path(args.metrics_state).expanduser()
+        if args.metrics_state
+        else out_dir / performance_metrics.STATE_FILENAME
+    )
+    return metrics_config, metrics_state
+
+
+def _seed_metrics_history(
+    archive_dir: Path, metrics_config: Path, metrics_state: Path
+) -> dict:
+    """Seed the best-3 history from archived report directories (idempotent).
+
+    Each immediate subdirectory of *archive_dir* holding a ``report.md`` is one
+    archived window, identified by the directory name (the daily run names its
+    archive directory after the window it covers). Only the live state file is
+    written; the committed defaults file is read, never modified, and
+    re-running the seed never duplicates a window's measurement
+    (LP-0MW1BUB1Z004AK21).
+    """
+    reports: list[tuple[str, str]] = []
+    for report_path in sorted(archive_dir.glob("*/report.md")):
+        try:
+            reports.append(
+                (
+                    report_path.parent.name,
+                    report_path.read_text(encoding="utf-8", errors="replace"),
+                )
+            )
+        except OSError:
+            continue
+    state = performance_metrics.load_state(metrics_state, defaults_path=metrics_config)
+    result = performance_metrics.seed_history(state, reports)
+    performance_metrics.save_state(state, metrics_state)
+    result["windows"] = len(reports)
+    result["state_path"] = str(metrics_state)
+    return result
+
+
+def _print_seed_summary(result: dict) -> None:
+    """UK-English summary of a backfill run: seeded / already present / skipped."""
+    print(
+        f"Seeded {result['seeded']} measurement(s) from {result['windows']} archived "
+        f"report window(s); {result['already_present']} measurement(s) were already "
+        f"present and left untouched."
+    )
+    skipped = result.get("skipped_metrics") or {}
+    if skipped:
+        print("Metrics with no parseable value in the archive (history accrues from the next run):")
+        for metric_id, reason in skipped.items():
+            print(f"  {metric_id}: {reason}")
+    print(f"Live state file written: {result['state_path']}")
 
 
 def _summary_output_paths(out_dir: Path) -> list[str]:
@@ -104,6 +218,21 @@ def main(argv: list[str] | None = None) -> int:
     config = config_loader.load_proxy_config(config_loader.find_config_path(args.config))
 
     out_dir = Path(args.output_dir).expanduser().resolve()
+    metrics_config, metrics_state = _metrics_paths(args, out_dir)
+
+    if args.seed_metrics_history:
+        # One-off backfill is an early-exit mode: it reads archived reports and
+        # never needs (or touches) a live log window.
+        archive_dir = Path(args.seed_metrics_history).expanduser()
+        if not archive_dir.is_dir():
+            print(f"error: archive directory not found: {archive_dir}", file=sys.stderr)
+            return 1
+        result = _seed_metrics_history(archive_dir, metrics_config, metrics_state)
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        elif not args.quiet:
+            _print_seed_summary(result)
+        return 0
 
     try:
         run = reporting.run_analysis(
@@ -114,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
             config=config,
             llama_log_dir=Path(args.llama_log_dir),
             stale_rate_target=args.stale_rate_target,
+            metrics_config=metrics_config,
+            metrics_state=metrics_state,
+            update_metrics=not args.no_metrics_update,
         )
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -123,7 +255,12 @@ def main(argv: list[str] | None = None) -> int:
         print(
             json.dumps(
                 reporting.summary_to_json(
-                    run.summary, run.mode_map, config, run.stale_rate_target
+                    run.summary,
+                    run.mode_map,
+                    config,
+                    run.stale_rate_target,
+                    metrics_config=metrics_config,
+                    metrics_state=metrics_state,
                 ),
                 indent=2,
                 sort_keys=True,
@@ -132,7 +269,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.quiet:
         data = reporting.summary_to_json(
-            run.summary, run.mode_map, config, run.stale_rate_target
+            run.summary,
+            run.mode_map,
+            config,
+            run.stale_rate_target,
+            metrics_config=metrics_config,
+            metrics_state=metrics_state,
         )
         decode = data.get("decode_speed") or {}
         decode_summary = (
@@ -188,6 +330,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {line}")
         if run.archived_to:
             print(f"Previous outputs archived to {run.archived_to.resolve()}")
+        if args.no_metrics_update:
+            print("Performance metrics state: not updated (--no-metrics-update)")
+        else:
+            print(f"Performance metrics state written to: {metrics_state}")
     return 0
 
 

@@ -133,6 +133,11 @@ class AnalysisRun:
     # (LP-0MVU8O4EL005IYP9): carried so the ``--json`` output is built with the
     # same target the rendered section used.
     stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET
+    # Scorecard settings this run used (LP-0MW1BUAQD001WL8X): carried so the
+    # ``--json`` block is derived from the same defaults and live state file
+    # the rendered summary table used.
+    metrics_config: str | Path | None = None
+    metrics_state: str | Path | None = None
 
 
 def _fmt_ts(ts: datetime | None) -> str:
@@ -968,6 +973,55 @@ def _append_cross_era_note(ap, state: dict) -> None:
         ap(line)
 
 
+def _load_metrics_state(
+    metrics_config: str | Path | None, metrics_state: str | Path | None
+) -> dict:
+    """Load the scorecard history: committed defaults over an existing state file."""
+    defaults_path = (
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
+    return performance_metrics.load_state(metrics_state, defaults_path=defaults_path)
+
+
+def _scorecard_rows(
+    state: dict, actuals: dict[str, float | None]
+) -> list[dict]:
+    """Per-metric baseline/target/actual/verdict, in registry order.
+
+    The **single** derivation behind both scorecard surfaces — the rendered
+    summary table and the ``--json`` ``performance_metrics`` block — so the two
+    views can never disagree (LP-0MW1BUAQD001WL8X, parent AC7).
+    """
+    rows: list[dict] = []
+    for metric in performance_metrics.METRIC_REGISTRY:
+        measurements = state["metrics"][metric.id]["measurements"]
+        actual = actuals.get(metric.id)
+        # The verdict only ever reads Met / Unmet / Insufficient history: a
+        # window with no measurable actual has no verdict to give, and the
+        # engine's ``n/a`` (its "no actual" answer) would be a fourth label the
+        # scorecard contract does not allow. The actual stays ``None``, so both
+        # surfaces still state exactly which evidence is missing.
+        verdict = (
+            performance_metrics.INSUFFICIENT
+            if actual is None
+            else performance_metrics.derive_verdict(actual, measurements, metric.direction)
+        )
+        rows.append(
+            {
+                "metric": metric,
+                "baseline": performance_metrics.baseline_from(
+                    measurements, metric.direction
+                ),
+                "target": performance_metrics.target_from(
+                    measurements, metric.direction
+                ),
+                "actual": actual,
+                "verdict": verdict,
+            }
+        )
+    return rows
+
+
 def _append_performance_metrics_section(
     ap,
     summary: AnalysisResult,
@@ -986,11 +1040,13 @@ def _append_performance_metrics_section(
     state path is supplied *and* updates are enabled; the committed defaults
     file is read-only and is never a write target. A metric whose actual is
     ``None`` is not recorded at all — never as ``0``.
+
+    This is the only place a run writes scorecard state: it happens once, as
+    the report is built, so a run that fails earlier cannot corrupt history
+    mid-report and the ``--json`` block (which reads the same history) always
+    reflects what was just recorded.
     """
-    defaults_path = (
-        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
-    )
-    state = performance_metrics.load_state(metrics_state, defaults_path=defaults_path)
+    state = _load_metrics_state(metrics_config, metrics_state)
     actuals = _performance_metric_actuals(summary, config, mode_map)
 
     if update_metrics and metrics_state is not None:
@@ -1022,30 +1078,60 @@ def _append_performance_metrics_section(
     ap("")
     ap("| Metric | Baseline | Target | Actual | Result |")
     ap("|---|---|---|---|---|")
-    for metric in performance_metrics.METRIC_REGISTRY:
-        measurements = state["metrics"][metric.id]["measurements"]
-        actual = actuals.get(metric.id)
-        baseline = performance_metrics.baseline_from(measurements, metric.direction)
-        target = performance_metrics.target_from(measurements, metric.direction)
-        # The Result column only ever reads Met / Unmet / Insufficient history:
-        # a window with no measurable actual has no verdict to give, and the
-        # engine's ``n/a`` (its "no actual" answer) would be a fourth label the
-        # scorecard contract does not allow. The Actual cell already shows
-        # ``n/a``, so the row still states exactly what evidence is missing.
-        verdict = (
-            performance_metrics.INSUFFICIENT
-            if actual is None
-            else performance_metrics.derive_verdict(
-                actual, measurements, metric.direction
-            )
-        )
+    for row in _scorecard_rows(state, actuals):
+        metric = row["metric"]
         ap(
-            f"| {metric.label} | {_fmt_metric_baseline(baseline, metric.unit)} | "
-            f"{_fmt_metric_value(target, metric.unit)} | "
-            f"{_fmt_metric_value(actual, metric.unit)} | {verdict} |"
+            f"| {metric.label} | {_fmt_metric_baseline(row['baseline'], metric.unit)} | "
+            f"{_fmt_metric_value(row['target'], metric.unit)} | "
+            f"{_fmt_metric_value(row['actual'], metric.unit)} | {row['verdict']} |"
         )
 
     _append_cross_era_note(ap, state)
+
+
+def _verdict_counts(block: dict[str, dict]) -> dict[str, int]:
+    """How many metrics landed on each verdict token (all three always present)."""
+    counts = {
+        performance_metrics.MET: 0,
+        performance_metrics.UNMET: 0,
+        performance_metrics.INSUFFICIENT: 0,
+    }
+    for entry in block.values():
+        verdict = entry.get("verdict")
+        if verdict in counts:
+            counts[verdict] += 1
+    return counts
+
+
+def performance_metrics_json(
+    summary: AnalysisResult,
+    config: dict | None = None,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+) -> dict:
+    """The ``--json`` ``performance_metrics`` block, keyed by metric id.
+
+    Read-only: the single state write happens while the report is built, so a
+    ``--json`` consumer can never mutate history. Each entry carries
+    ``baseline`` (``value`` + ``date``), ``target``, ``actual`` and ``verdict``,
+    produced by :func:`_scorecard_rows` — the same derivation the rendered
+    table uses — so the machine-readable block always agrees with the report
+    (parent AC7). A metric without a measurable actual reports ``actual`` as
+    ``null``, never a misleading ``0``.
+    """
+    state = _load_metrics_state(metrics_config, metrics_state)
+    actuals = _performance_metric_actuals(summary, config, mode_map)
+    return {
+        row["metric"].id: {
+            "baseline": row["baseline"],
+            "target": row["target"],
+            "actual": row["actual"],
+            "verdict": row["verdict"],
+        }
+        for row in _scorecard_rows(state, actuals)
+    }
 
 
 def build_report(
@@ -3904,6 +3990,9 @@ def run_analysis(
     llama_log_dir: Path | None = None,
     mode_map: bucketing.ModeScheduleMap | None = None,
     stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+    update_metrics: bool = False,
 ) -> AnalysisRun:
     """Discover log files, stream-parse them, aggregate sessions, and write
     the CSVs and report into ``output_dir``.
@@ -3929,6 +4018,13 @@ def run_analysis(
     (LP-0MVU8O4EL005IYP9 AC1.6, default 5 %): it is threaded into the rendered
     ``## Local capacity signals`` section and carried on the returned
     :class:`AnalysisRun` so ``--json`` evaluates the same target.
+
+    ``metrics_config`` / ``metrics_state`` / ``update_metrics`` are the
+    performance scorecard settings (LP-0MW1BUAQD001WL8X): the committed
+    defaults path, the live state file path and whether this run records its
+    window. They are threaded into :func:`build_report` (the only state write)
+    and carried on the returned :class:`AnalysisRun` so ``--json`` reads the
+    same history the rendered table used.
     """
     log_dir = Path(log_dir)
     output_dir = Path(output_dir)
@@ -3984,6 +4080,9 @@ def run_analysis(
             mode_map,
             profiles=profiles,
             stale_rate_target=stale_rate_target,
+            metrics_config=metrics_config,
+            metrics_state=metrics_state,
+            update_metrics=update_metrics,
         ),
         encoding="utf-8",
     )
@@ -3993,6 +4092,8 @@ def run_analysis(
         archived_to=archived_to,
         mode_map=mode_map,
         stale_rate_target=stale_rate_target,
+        metrics_config=metrics_config,
+        metrics_state=metrics_state,
     )
 
 
@@ -4037,6 +4138,9 @@ def summary_to_json(
     mode_map: bucketing.ModeScheduleMap | None = None,
     config: dict | None = None,
     stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
 ) -> dict:
     """Machine-readable summary of the analysis (one dict; JSON-serialisable).
 
@@ -4047,6 +4151,11 @@ def summary_to_json(
     ``stale_rate_target`` is the configured ``slots_stale`` rate target the
     ``capacity_signals`` block is evaluated against (LP-0MVU8O4EL005IYP9 AC1.6);
     it defaults to the reference tool's 5 %.
+
+    ``metrics_config`` / ``metrics_state`` locate the scorecard history the
+    ``performance_metrics`` block is derived from (LP-0MW1BUAQD001WL8X AC3);
+    both default to the committed defaults plus whatever live state file
+    exists, and neither is written here.
     """
     sessions = list(summary.sessions.values())
     local_only = sum(1 for s in sessions if s.remote_requests == 0)
@@ -4064,6 +4173,16 @@ def summary_to_json(
     # additive keys below are always consistent with each other.
     _measured_decisions, _unmeasured_reasons = _residency_measurement_breakdown(
         summary
+    )
+    # Performance scorecard (LP-0MW1BUAQD001WL8X AC3): the per-metric
+    # baseline/target/actual/verdict block plus its verdict counts, derived by
+    # the same helpers the rendered table uses.
+    _metrics_block = performance_metrics_json(
+        summary,
+        config,
+        mode_map,
+        metrics_config=metrics_config,
+        metrics_state=metrics_state,
     )
     return {
         "window_start": _fmt_ts(summary.window_start),
@@ -4234,6 +4353,13 @@ def summary_to_json(
         # ``slots_stale`` figures and target verdict the Markdown section
         # renders. ADDITIVE — every key above keeps its value and meaning.
         "capacity_signals": capacity_signals_json(summary, stale_rate_target),
+        # Performance scorecard (LP-0MW1BUAQD001WL8X AC3): keyed by metric id
+        # so an audit can read one metric without scanning a list. ADDITIVE —
+        # every key above keeps its value and meaning. The verdict counts are a
+        # sibling key (not an entry inside the block, which holds exactly one
+        # entry per registered metric) so ``set(block)`` stays the registry.
+        "performance_metrics": _metrics_block,
+        "performance_metrics_counts": _verdict_counts(_metrics_block),
     }
 
 

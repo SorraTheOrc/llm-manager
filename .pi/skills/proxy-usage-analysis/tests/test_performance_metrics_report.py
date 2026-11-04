@@ -494,6 +494,37 @@ class TestCliFlags:
 
 
 @needs_cli
+class TestCliHelp:
+    def test_help_documents_every_metrics_flag(self, capsys):
+        with pytest.raises(SystemExit):
+            analyze_proxy_usage.parse_args(["--help"])
+
+        help_text = capsys.readouterr().out
+
+        for flag in (
+            "--metrics-config",
+            "--metrics-state",
+            "--no-metrics-update",
+            "--seed-metrics-history",
+        ):
+            assert flag in help_text, f"--help does not document {flag}"
+
+
+    def test_text_summary_still_prints_without_quiet(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+
+        assert _run_cli(log_dir, out_dir) == 0
+        summary_text = capsys.readouterr().out
+
+        assert "Analyzed" in summary_text
+        assert str(out_dir / STATE_FILENAME) in summary_text
+
+        assert _run_cli(log_dir, out_dir, "--quiet") == 0
+        assert capsys.readouterr().out == "", "--quiet must suppress the text summary"
+
+
+@needs_cli
 class TestDefaultRun:
     def test_default_run_renders_the_section_and_writes_only_the_live_state(self, tmp_path):
         log_dir = _write_log_dir(tmp_path)
@@ -540,6 +571,70 @@ class TestDefaultRun:
 # ---------------------------------------------------------------------------
 # --json contract
 # ---------------------------------------------------------------------------
+
+
+@needs_cli
+class TestJsonCounts:
+    def test_json_reports_one_count_per_verdict_token(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+
+        assert _run_cli(log_dir, out_dir, "--json") == 0
+        data = json.loads(capsys.readouterr().out)
+
+        block = data["performance_metrics"]
+        counts = data["performance_metrics_counts"]
+        assert set(counts) == set(VERDICTS)
+        assert sum(counts.values()) == len(block)
+        for verdict in VERDICTS:
+            assert counts[verdict] == sum(
+                1 for entry in block.values() if entry["verdict"] == verdict
+            )
+
+
+@needs_cli
+class TestMetricsConfigOverride:
+    def test_metrics_config_relocates_the_defaults_history(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+        config_path = tmp_path / "custom_metrics.yaml"
+        seeded = pm.new_state()
+        for value, window in ((94.0, "2026-07-01"), (90.0, "2026-07-15"), (92.0, "2026-07-29")):
+            pm.record_measurement(
+                seeded,
+                "fallback_rate",
+                window=window,
+                value=value,
+                date=window,
+                fingerprint=pm.configuration_fingerprint(2, 131072),
+            )
+        pm.save_state(seeded, config_path)
+        config_before = config_path.read_bytes()
+
+        assert _run_cli(
+            log_dir,
+            out_dir,
+            "--metrics-config",
+            str(config_path),
+            "--no-metrics-update",
+            "--json",
+        ) == 0
+        entry = json.loads(capsys.readouterr().out)["performance_metrics"]["fallback_rate"]
+
+        assert entry["baseline"]["value"] == pytest.approx(90.0)
+        assert entry["target"] == pytest.approx(92.0)
+        assert entry["verdict"] == "Met"
+        # --no-metrics-update writes no state at all, whatever the config says.
+        assert not (out_dir / STATE_FILENAME).exists()
+        assert config_path.read_bytes() == config_before
+
+        # Without --metrics-state the live history still lands under
+        # --output-dir, and the relocated defaults file stays read-only.
+        assert _run_cli(
+            log_dir, out_dir, "--metrics-config", str(config_path), "--quiet"
+        ) == 0
+        assert (out_dir / STATE_FILENAME).exists()
+        assert config_path.read_bytes() == config_before
 
 
 @needs_cli
@@ -622,6 +717,31 @@ class TestJsonBlock:
 
 @needs_backfill
 class TestBackfillCli:
+    def test_seed_metrics_history_json_reports_seeded_and_skipped_counts(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        archive = tmp_path / "archive"
+        (archive / "2026-08-07").mkdir(parents=True)
+        (archive / "2026-08-07" / "report.md").write_text(fixtures.ARCHIVED_REPORT_ERA_A)
+        state_path = tmp_path / "seed_state.yaml"
+
+        assert _run_cli(
+            log_dir,
+            tmp_path / "usage",
+            "--seed-metrics-history",
+            str(archive),
+            "--metrics-state",
+            str(state_path),
+            "--json",
+        ) == 0
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload["windows"] == 1
+        assert payload["seeded"] > 0
+        assert payload["already_present"] == 0
+        assert payload["skipped_metrics"], "unparseable metrics must be reported, not guessed"
+        seeded = pm.load_state(state_path)
+        assert _measurements(seeded, "fallback_rate"), "the parsed value must reach the state file"
+
     def test_seed_metrics_history_reads_the_archive_and_is_idempotent(self, tmp_path):
         log_dir = _write_log_dir(tmp_path)
         out_dir = tmp_path / "usage"
