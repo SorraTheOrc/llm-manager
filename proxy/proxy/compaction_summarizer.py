@@ -114,6 +114,12 @@ def _probe_slot_capacity_sync(
             endpoint, port = _resolve_local_slots_target(
                 target_srv, model=model_name, router_port=llama_port
             )
+            if port is None:
+                # LP-0MVWBXEAI008YZ7B: the resolver's (None, None) skip
+                # sentinel — the model is definitively not loaded, so the
+                # probe issues **no** /slots request and reports the same
+                # (0, 0) default its failure path would have produced.
+                return 0, 0
         url = _build_llama_url(port, "/slots", base_url=endpoint)
         url = f"{url}?model={model_name}"
         with httpx.Client(timeout=httpx.Timeout(2.0)) as client:

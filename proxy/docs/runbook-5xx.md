@@ -161,7 +161,12 @@ An `ERROR` line `local_eviction_after_acceptance session=… reason=…` means a
 3. Cross-check the 24 h report: `local_evictions_after_acceptance_by_reason`
    shows whether the events cluster in one reason (a path regression) or in one
    prompt-size band (a calibration defect).
-4. Rollback if the events are volume-critical: `local_cold_prefill_budget_tokens: 0`,
+4. For a `prefill_deadline` cluster, attribute each event to its admission
+   path before filing (LP-0MVZ5WV6W008UO5F — the free-gate rung's accepted
+   trade is only one of five classes; see the attribution rule in the
+   `proxy-usage-analysis` skill):
+   `attribute_prefill_deadline.py --start <window> --until <window>`.
+5. Rollback if the events are volume-critical: `local_cold_prefill_budget_tokens: 0`,
    `local_prefill_deadline_seconds: 90`,
    `local_admission_guard_eta_percentile_min_tokens: 32768`,
    `local_admission_guard_budget_safety_fraction: 0.0`.

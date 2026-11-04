@@ -32,13 +32,24 @@ CONFIG_PATH = REPO_ROOT / "proxy" / "config.yaml"
 ROUTING_DOC_PATH = REPO_ROOT / "proxy" / "docs" / "routing.md"
 
 #: Shipped values the parent item specifies (LP-0MVN3KMGI009BZ0D proposal).
+#: ``local_prefill_deadline_seconds`` is deliberately NOT here: it is the
+#: retunable knob (LP-0MW1V0LPM000QLUC), so pinning it as a literal would put
+#: this file back in the edit set of every future retune. It is asserted as a
+#: *shipped-vs-resolved consistency* check below instead.
 SHIPPED = {
-    "local_prefill_deadline_seconds": 120,
     "local_cold_prefill_budget_tokens": 25000,
     "local_admission_guard_eta_percentile_min_tokens": 20000,
     "local_admission_guard_budget_safety_fraction": 0.95,
     "local_admission_guard_reference_tokens": 25000,
 }
+
+#: The retunable deadline knob (LP-0MW1V0LPM000QLUC): asserted for existence,
+#: positivity and resolution — never for a frozen number.
+DEADLINE_KEY = "local_prefill_deadline_seconds"
+
+#: A synthetic deadline used as a *test input* (not a claim about the shipped
+#: value) where a non-default is needed.
+SYNTHETIC_DEADLINE = 120.0
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +85,19 @@ def test_shipped_config_declares_the_budget_and_deadline_knobs(key, expected):
     assert server[key] == expected
 
 
+def test_shipped_deadline_knob_is_present_and_not_frozen():
+    """The retunable deadline is checked for sanity, not for a literal value."""
+    server = _shipped_config()["server"]
+
+    assert DEADLINE_KEY in server, f"config.yaml must set {DEADLINE_KEY}"
+    assert float(server[DEADLINE_KEY]) > 0.0
+    # ... and the shipped value is really what the guard resolves: a
+    # consistency assertion that survives any deliberate retune.
+    assert prefill_eta.resolve_config(
+        _shipped_config()
+    ).prefill_deadline_seconds == pytest.approx(float(server[DEADLINE_KEY]))
+
+
 def test_shipped_keys_are_documented_in_place():
     """Each new/retuned key carries a comment stating units and rollback."""
     text = CONFIG_PATH.read_text(encoding="utf-8")
@@ -102,12 +126,14 @@ def test_absent_keys_reproduce_todays_behaviour():
 
 
 def test_present_keys_are_resolved():
-    guard = prefill_eta.resolve_config(_cfg(**SHIPPED))
+    guard = prefill_eta.resolve_config(
+        _cfg(**SHIPPED, **{DEADLINE_KEY: SYNTHETIC_DEADLINE})
+    )
 
     assert guard.cold_prefill_budget_tokens == 25000
     assert guard.eta_percentile_min_tokens == 20000
     assert guard.budget_safety_fraction == pytest.approx(0.95)
-    assert guard.prefill_deadline_seconds == pytest.approx(120.0)
+    assert guard.prefill_deadline_seconds == pytest.approx(SYNTHETIC_DEADLINE)
     assert guard.reference_tokens == 25000
 
 
@@ -189,7 +215,7 @@ def test_shipped_config_passes_the_ordering_validator():
 
 
 def test_ordering_holds_for_the_documented_values():
-    """The documented chain: 60 < 120 < 840 < 900 and deadline < client 900."""
+    """The documented chain: queue wait < deadline < 840 < 900 < client 900."""
     guard = prefill_eta.resolve_config(_shipped_config())
     server = _shipped_config()["server"]
     # The first-byte ceiling and the lifetime wedge are documented defaults
@@ -320,7 +346,7 @@ none is silently ignored by the resolver.
         SHIPPED["local_admission_guard_budget_safety_fraction"]
     )
     assert guard.prefill_deadline_seconds == pytest.approx(
-        SHIPPED["local_prefill_deadline_seconds"]
+        float(_shipped_config()["server"][DEADLINE_KEY])
     )
     assert guard.reference_tokens == SHIPPED[
         "local_admission_guard_reference_tokens"

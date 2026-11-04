@@ -576,3 +576,123 @@ async def test_direct_path_refuses_on_deadline_and_reaches_next_provider(
     assert "local_admission_guard decision=reject" in messages
     assert "reason=prefill_eta_exceeds_deadline" in messages
     assert "free_slot=true" in messages
+
+
+# ---------------------------------------------------------------------------
+# High priority is bounded by the deadline exactly like every other priority
+# (LP-0MVZF3JZ9009LTN2)
+#
+# ``high`` means "never queue", not "unbounded": with no queue to wait in the
+# queue-wait comparison is inapplicable, but the prefill deadline and its
+# deadline-relative safety budget are what actually cancel an accepted
+# dispatch, so they bound a high-priority admission too. Measured evidence
+# (LP-0MVZ5WV6W008UO5F AC1): 43 of 126 ``prefill_deadline`` evictions in 24 h
+# were ``priority=high`` and 6 of them had already been priced ABOVE the
+# deadline — the guard was inert, so nothing enforced the bound.
+# ---------------------------------------------------------------------------
+
+def test_high_priority_is_refused_when_the_prefill_exceeds_the_deadline():
+    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+
+    decision = prefill_eta.evaluate_admission(
+        _cfg(local_prefill_deadline_seconds=120), "Qwen3", 100_000, 0.0, "high"
+    )
+
+    assert decision.admit is False
+    assert decision.active is True, "a high-priority refusal must be logged"
+    assert decision.reason == "prefill_eta_exceeds_deadline"
+    # The queue budget stays 0 by definition (never queues); the enforced
+    # comparator is the deadline.
+    assert decision.budget_seconds == 0.0
+    assert decision.bound_seconds == pytest.approx(120.0)
+
+
+def test_high_priority_is_refused_when_the_prefill_exceeds_the_safety_budget():
+    _seed_samples(tokens=25_000, ratio=0.0, ms_per_token=3.9, count=6)
+
+    decision = prefill_eta.evaluate_admission(
+        _cfg(
+            local_prefill_deadline_seconds=120,
+            local_admission_guard_budget_safety_fraction=0.5,
+        ),
+        "Qwen3", 25_000, 0.0, "high",
+    )
+
+    assert decision.admit is False
+    assert decision.active is True
+    assert decision.reason == "prefill_eta_exceeds_safety_budget"
+    assert decision.bound_seconds == pytest.approx(60.0)
+
+
+def test_high_priority_still_admits_when_both_bounds_fit():
+    _seed_samples(tokens=2_000, ratio=0.0, ms_per_token=3.9, count=6)
+
+    decision = prefill_eta.evaluate_admission(
+        _cfg(
+            local_prefill_deadline_seconds=120,
+            local_admission_guard_budget_safety_fraction=0.95,
+        ),
+        "Qwen3", 2_000, 0.0, "high",
+    )
+
+    assert decision.admit is True
+    assert decision.active is True
+    assert decision.reason == "within_budget"
+    assert decision.budget_seconds == 0.0
+
+
+def test_high_priority_observe_policy_records_without_refusing():
+    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+
+    decision = prefill_eta.evaluate_admission(
+        _cfg(
+            local_prefill_deadline_seconds=120,
+            local_admission_guard_policy="observe",
+        ),
+        "Qwen3", 100_000, 0.0, "high",
+    )
+
+    assert decision.admit is True, "observe never refuses"
+    assert decision.active is True
+    assert decision.reason == "prefill_eta_exceeds_deadline"
+    assert decision.policy == "observe"
+
+
+def test_high_priority_stays_inert_when_every_bound_is_disabled():
+    """The documented rollback: no queue budget AND no time bound => inert."""
+    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+
+    decision = prefill_eta.evaluate_admission(
+        _cfg(
+            local_prefill_deadline_seconds=0,
+            local_admission_guard_budget_safety_fraction=0.0,
+        ),
+        "Qwen3", 100_000, 0.0, "high",
+    )
+
+    assert decision.admit is True
+    assert decision.active is False
+    assert decision.reason == "no_budget"
+
+
+def test_high_priority_refusal_emits_the_guard_log_line(caplog):
+    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    decision = prefill_eta.evaluate_admission(
+        _cfg(local_prefill_deadline_seconds=120), "Qwen3", 100_000, 0.0, "high"
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        prefill_eta.record_guard_decision(
+            decision,
+            provider="local-qwen3",
+            session_id="sess-high",
+            model="Qwen3",
+            priority="high",
+            free_slot=True,
+        )
+
+    line = " ".join(r.getMessage() for r in caplog.records)
+    assert "local_admission_guard decision=reject" in line
+    assert "reason=prefill_eta_exceeds_deadline" in line
+    assert "priority=high" in line
+    assert "session=sess-high" in line

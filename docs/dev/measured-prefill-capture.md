@@ -256,7 +256,39 @@ attributed per event in
 distributions, and cause attribution (occupancy 9 / capacity 8 /
 predicted-warmth 43). Headline result: **none** of the 60 produced a
 `prefill_progress_measured` line inside its own dispatch window, and 58 of 60
-started inside an abandoned-prefill backlog window — an early release detours
-the client but the backend keeps evaluating the abandoned prompt (1,092
-completed prompt evaluations vs 807 consumed local streams for the aligned day,
-i.e. 285 prefills thrown away). Owned by LP-0MVVEQW5Y00962T2.
+started inside an abandoned-prefill backlog window on the **legacy** estimator
+under which the backend keeps evaluating the abandoned prompt for
+`tokens / 43.1` seconds (1,092 completed prompt evaluations vs 807 consumed
+local streams for the aligned day, i.e. 285 prefills thrown away, **26 %**).
+
+That legacy basis is superseded: per-release measurement shows the backend
+stops a released prefill within one `ubatch` (p90 cancel→stop **6.6 s**), so
+the same overlap is **2 / 60 (3.3 %)** on the measured basis and the
+completion/consumption gap is **215 / 1 833 = 11.7 %** over a day-aligned 48 h
+window. Both bases, the H1–H5 verdicts and the chosen fix are recorded in
+[abandoned-prefill-release-cancel.md](abandoned-prefill-release-cancel.md)
+(child `LP-0MVW8S7QY002S7DV` of `LP-0MVVEQW5Y00962T2`). The starvation fix
+itself (mechanism (c), the lease gate refusing a retry into its own draining
+slot) is `LP-0MVW8S8DH008E4W4`, commit `9f3b9c06`.
+
+### Baseline provenance after the abandoned-drain fix (AC3)
+
+**No baseline in this document is claimed to have moved yet, and none is
+substituted.** Every figure above keeps the window it was measured over and
+stays visible exactly as published, so later comparison remains possible.
+
+The post-change baseline is owned by `LP-0MVW8S8OZ00449YR`
+(`[task] Post-change ≥24 h measurement`), which needs a restart-free ≥24 h
+window on a build containing `9f3b9c06`; the window anchor is the proxy
+restart at `2026-11-02T10:39:24Z`, so the earliest it can close is
+**2026-11-03T10:39:24Z** (time gate owned by `LP-0MVZ4R2B20027XK3`). When that
+report lands it updates the affected rows **in place, with its own window and
+provenance**, and the current values remain visible alongside as the
+pre-change column — the same convention already used by the
+reference/post-deploy table above.
+
+Measured statements in this document depend on: the mechanism decision record
+`LP-0MVW8S7QY002S7DV`, the upstream cancel (`LP-0MVRMI5HK00558TB`,
+`LP-0MVT2KSN3007QYFK`), the Option D early release (`LP-0MVR7IN0O000DPXN`),
+the draining-slot annotation (`LP-0MVUTYHG7001S6BM`) and the Option D
+identity/stream plumbing (`LP-0MVUVHAQP001IRKK`).

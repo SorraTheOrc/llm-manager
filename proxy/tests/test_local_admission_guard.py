@@ -3369,3 +3369,117 @@ async def test_deferral_exit_pin_refusal_logs_the_dispatch_context(
     )
     assert fields.get("priority") == "low"
     assert fields.get("route") == "refused"
+
+
+# ---------------------------------------------------------------------------
+# AC2 (LP-0MW0KZR7A003UFQK): never bounce a request onto a chain that cannot
+# serve it. On 2026-11-03 08:49:40 the guard refused a ``remote-ok`` request on
+# an enforced ETA bound and routed it to a chain where every entry was
+# deterministically skipped; at 08:50:41 the identical prompt was admitted and
+# produced a first byte in 6 s.
+# ---------------------------------------------------------------------------
+
+
+def _dead_remote_chain() -> dict:
+    """A hybrid chain whose only remote entry is outside its window right now."""
+    now = datetime.now(UTC)
+    start = (now.hour + 6) % 24
+    end = (start + 1) % 24
+    return {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {
+                "name": "remote-asleep",
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+                "available_times": [f"{start:02d}:00-{end:02d}:00"],
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_direct_eta_refusal_admits_locally_when_no_remote_can_serve(caplog):
+    """AC2: an ETA-bound refusal is only taken when a remote provider can take it.
+
+    With every remote entry deterministically skipped (outside its window) the
+    request must stay local and wait for its own prefill, not be handed to a
+    chain that cannot serve it.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_calibration(tokens=100_000, ms_per_token=3.9)  # ~390 s ≫ 60 s budget
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=100_000),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", _dead_remote_chain(),
+            _free_slot_cfg(),
+        )
+
+    assert result.status_code == 200
+    assert calls == ["local"], (
+        "a request refused locally on an ETA bound must not be bounced onto a "
+        "remote chain that cannot serve it"
+    )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "local_admission_guard_local_wait" in messages
+    assert "→ routing to next provider" not in messages
+    assert "local_admission_guard_direct_fallback" not in messages
+
+
+@pytest.mark.asyncio
+async def test_dead_remote_chain_makes_the_eta_verdict_irrelevant(caplog):
+    """AC4 (LP-0MW0KZR7A003UFQK): the 08:49:40 / 08:50:41 pairing is deterministic.
+
+    Same prompt, same estimator, one run over the budget (which used to be
+    refused and routed remote) and one within it (which was admitted). With a
+    dead remote chain BOTH runs are served locally: flipping the enforcement
+    must not flip the routing outcome.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_calibration(tokens=100_000, ms_per_token=3.9)
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    async def _run(tokens: int):
+        with (
+            patch("proxy.router.proxy_to_local", _local),
+            patch("proxy.server.proxy_to_remote", _remote),
+            patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+            patch("proxy.provider.request_priority", return_value="low"),
+            _guard_patches(tokens=tokens),
+        ):
+            return await provider.proxy_with_fallback(
+                _DummyRequest(), "v1/chat/completions", _dead_remote_chain(),
+                _free_slot_cfg(),
+            )
+
+    over_budget = await _run(100_000)   # enforced: guard would have refused
+    within_budget = await _run(10_000)  # occupancy cleared: guard admits
+
+    assert over_budget.status_code == within_budget.status_code == 200
+    assert calls == ["local", "local"], (
+        f"the same prompt must get a single routing decision, got {calls}"
+    )

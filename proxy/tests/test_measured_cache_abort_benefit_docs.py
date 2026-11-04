@@ -12,8 +12,9 @@ the contract turns it into a retryable ``429``, and the abort also arms
 ``local_prefill_thrash_cooldown_seconds``. The gate's behaviour is therefore
 governed by two numbers an operator reads out of the documentation — the
 **comparator** (``budget_safety_fraction x local_prefill_deadline_seconds``,
-114 s shipped) and the fact that the admission **wait** budget is *not* that
-comparator — and by one new piece of vocabulary (``within_eta_budget``).
+derived from the shipped config) and the fact that the admission **wait** budget
+is *not* that comparator — and by one new piece of vocabulary
+(``within_eta_budget``).
 
 Documentation that drifts from the shipped config is how a future maintainer
 re-tunes the abort back into refusing a client that could have been served, so
@@ -22,7 +23,7 @@ that enforces it:
 
 * the documented comparator is the number
   :func:`proxy.prefill_eta.prefill_deadline_budget_seconds` resolves from the
-  shipped ``proxy/config.yaml`` (114.0 s), and it really is derived from
+  shipped ``proxy/config.yaml``, and it really is derived from
   ``local_prefill_deadline_seconds`` (shortening the deadline moves it);
 * the documented "the admission wait budget is **not** the comparator" claim is
   enforced: changing ``contention_queue_max_wait_seconds`` leaves the resolved
@@ -38,8 +39,9 @@ that enforces it:
 
 The assertions describe the *shipped* documentation, so they stay valid after
 any deliberate retuning: they compare the prose against the config and the
-readers, never against a frozen literal (the 114 s figure is asserted as a
-*derived* value, with the shipped inputs named).
+readers, never against a frozen literal — the comparator is asserted as a
+*derived* value, and the failure message names the file, the expected figure
+and the exact substitution to make (LP-0MW1V0LPM000QLUC).
 """
 
 from __future__ import annotations
@@ -187,10 +189,65 @@ def _routing_section() -> str:
     return text.split(marker, 1)[1].split("\n#### ", 1)[0]
 
 
+def _config_safety_budget_block() -> str:
+    """The canonical ``safety budget`` derivation block in ``proxy/config.yaml``.
+
+    One block per document: this is where ``config.yaml`` states
+    ``fraction x deadline`` with the concrete shipped figure; every other
+    mention names "the safety budget" instead of repeating a number.
+    """
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    marker = 'CANONICAL DERIVATION for the "safety budget"'
+    assert marker in text, (
+        "config.yaml must carry the canonical safety-budget derivation block"
+    )
+    start = text.index(marker)
+    end = text.index(f"  {SAFETY_FRACTION_KEY}:", start)
+    return text[start:end]
+
+
+#: A concrete figure stated in the prose (``= 171 s``, ``= 114 s``, ...).
+#: Used only to name the *stale* value in a drift failure message.
+_COMPARATOR_CLAIM_RE = re.compile(r"=\s*(\d+(?:\.\d+)?)\s*s\b")
+
+
+def _assert_states_comparator(name: str, text: str, expected: str) -> None:
+    """Fail with the file, the expected figure and the exact substitution.
+
+    Self-correcting by design (LP-0MW1V0LPM000QLUC): a future retune of
+    ``local_prefill_deadline_seconds`` makes this test red with a message an
+    operator can act on mechanically, rather than a bare ``assert False``
+    that needs a grep hunt.
+    """
+    if expected in text:
+        return
+    stale = sorted(
+        {match.group(1) for match in _COMPARATOR_CLAIM_RE.finditer(text)},
+        key=float,
+    )
+    stale = [f"{value} s" for value in stale if f"{value} s" != expected]
+    if stale:
+        substitution = "; ".join(
+            f"replace '{value}' with '{expected}'" for value in stale
+        )
+    else:
+        substitution = (
+            f"state the comparator as '{expected}' in the canonical "
+            "derivation block"
+        )
+    raise AssertionError(
+        f"{name} is missing the shipped comparator '{expected}'.\n"
+        f"  file: {name}\n"
+        f"  expected figure: {expected}\n"
+        f"  exact substitution: {substitution}"
+    )
+
+
 def test_both_documents_are_reachable_and_non_empty():
     """Guard the extractors themselves (a moved heading must fail loudly)."""
     assert len(_config_abort_block().splitlines()) > 40
     assert len(_routing_section().splitlines()) > 40
+    assert len(_config_safety_budget_block().splitlines()) > 5
 
 
 # ---------------------------------------------------------------------------
@@ -198,21 +255,63 @@ def test_both_documents_are_reachable_and_non_empty():
 # ---------------------------------------------------------------------------
 
 def test_documented_comparator_is_the_shipped_derived_budget():
-    """AC2/AC3: 114 s is ``fraction x deadline`` from the shipped config."""
+    """AC2/AC3: the comparator is ``fraction x deadline`` from the shipped config."""
     server = _shipped_server()
     budget = prefill_deadline_budget_seconds({"server": server})
     expected = float(server[SAFETY_FRACTION_KEY]) * float(server[DEADLINE_KEY])
 
-    assert budget == pytest.approx(expected) == pytest.approx(114.0)
+    assert budget == pytest.approx(expected)
 
     rendered = f"{budget:g} s"
     for name, text in (
-        ("config.yaml", _config_abort_block()),
-        ("routing.md", _routing_section()),
+        ("proxy/config.yaml", _config_safety_budget_block()),
+        ("proxy/docs/routing.md", _routing_section()),
     ):
-        assert rendered in text, f"{name} must state the shipped comparator ({rendered})"
-        for key in (SAFETY_FRACTION_KEY, DEADLINE_KEY):
-            assert key in text, f"{name} must name the comparator input {key}"
+        _assert_states_comparator(name, text, rendered)
+
+    # One canonical derivation block per document; the abort block refers to
+    # it by name instead of repeating the figure.
+    for name, text in (
+        ("proxy/config.yaml", _config_abort_block()),
+        ("proxy/docs/routing.md", _routing_section()),
+    ):
+        assert SAFETY_FRACTION_KEY in text, f"{name} must name the derivation input"
+        assert DEADLINE_KEY in text, f"{name} must name the derivation input"
+
+
+def test_derivation_is_stated_in_exactly_one_block_per_document():
+    """No second copy of the worked derivation figure in either document."""
+    rendered = f"{prefill_deadline_budget_seconds(_shipped_config()):g} s"
+    config_text = CONFIG_PATH.read_text(encoding="utf-8")
+    routing_text = ROUTING_DOC.read_text(encoding="utf-8")
+
+    assert config_text.count(rendered) == 1, (
+        f"config.yaml must state the comparator figure ({rendered}) exactly once; "
+        f"found {config_text.count(rendered)}"
+    )
+    # routing.md additionally carries recorded measurements quoted against the
+    # *comparator then shipped*, which are labelled historical — the shipped
+    # figure itself must appear only in the canonical block.
+    assert routing_text.count(rendered) == 1, (
+        f"routing.md must state the comparator figure ({rendered}) exactly once; "
+        f"found {routing_text.count(rendered)}"
+    )
+
+
+def test_drift_failure_names_the_file_the_figure_and_the_substitution():
+    """The failure is self-correcting: recorded deliberately-wrong-value run."""
+    stale_prose = (
+        "budget_s = fraction x deadline\n"
+        "         = 0.95 x 120 s = 114 s   (shipped)\n"
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_states_comparator("proxy/docs/routing.md", stale_prose, "171 s")
+
+    message = str(excinfo.value)
+    assert "file: proxy/docs/routing.md" in message
+    assert "expected figure: 171 s" in message
+    assert "exact substitution: replace '114 s' with '171 s'" in message
 
 
 def test_documented_comparator_inputs_are_the_ones_the_gate_reads():
@@ -255,7 +354,9 @@ def test_documented_abort_verdict_stays_reachable_for_the_huge_prompt():
     assert decision.abort is True
     assert decision.reason == MEASURED_CACHE_DEFICIT_REASON
     assert decision.detail == DETAIL_ABORT
-    assert decision.budget_s == pytest.approx(114.0)
+    assert decision.budget_s == pytest.approx(
+        prefill_deadline_budget_seconds(_shipped_config())
+    )
     assert decision.measured_eta_s > decision.budget_s
 
 

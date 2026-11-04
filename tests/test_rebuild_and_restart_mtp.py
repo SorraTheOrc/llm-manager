@@ -8,8 +8,58 @@ exists, the deploy is re-attempted --deploy-only AFTER the restart.
 import json
 import os
 import subprocess
+import time
 
 WRAPPER = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'scripts', 'rebuild-and-restart-mtp.sh'))
+
+# The wrapper launches every restart in the background (`nohup ... &`) so a
+# one-shot rebuild never blocks on a full proxy restart. The stub start-proxy
+# writes its marker from that detached child, so the marker can land shortly
+# AFTER the wrapper exits — bound the wait instead of racing the child
+# (LP-0MW1UKHHR000JD7D: an immediate read flaked inside the full suite).
+MARKER_WAIT_SECONDS = 30.0
+_MARKER_POLL_SECONDS = 0.02
+
+
+def _wait_for_marker_lines(path, minimum, timeout=MARKER_WAIT_SECONDS):
+    """Return the marker's lines once it holds at least ``minimum`` of them.
+
+    Returns whatever is present when the deadline passes (an empty list when
+    the marker never appeared) so the caller's assertion reports the real
+    count instead of hiding the race behind a fixed boolean.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if path.exists():
+            lines = [
+                line
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if len(lines) >= minimum:
+                return lines
+        else:
+            lines = []
+        if time.monotonic() >= deadline:
+            return lines
+        time.sleep(_MARKER_POLL_SECONDS)
+
+
+def _restart_failure_context(proc, log):
+    """Diagnostics for a restart that never reached the marker.
+
+    A bare boolean hides *why* the restart is missing, so include the wrapper's
+    exit code, its log and the detached child's log path in the message.
+    """
+    try:
+        log_text = log.read_text(encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - diagnostics only
+        log_text = f"<unreadable: {exc}>"
+    return (
+        f"wrapper rc={proc.returncode}\n"
+        f"--- {log} ---\n{log_text}\n"
+        "--- detached child log: /tmp/mtp-proxy-restart.log ---"
+    )
 
 
 def _fake_tree(tmp_path):
@@ -108,13 +158,18 @@ def test_rebuild_failure_does_not_abort_restart(tmp_path):
     artifact = tmp_path / "nonexistent" / "llama-server"
     proc, log = _run(tmp_path, repo, tools, rebuild_script, new_bin, artifact)
 
-    assert start_marker.exists(), "stack was NOT restarted despite rebuild failure"
-    assert (start_marker.read_text().strip().splitlines()[0]
-            .startswith("start-proxy --restart"))
+    restarts = _wait_for_marker_lines(start_marker, 1)
+    assert restarts, (
+        "stack was NOT restarted despite rebuild failure\n"
+        + _restart_failure_context(proc, log)
+    )
+    assert restarts[0].startswith("start-proxy --restart")
     assert "NOT aborting" in log.read_text(encoding="utf-8")
     assert proc.returncode == 1  # stack healthy, deploy failed
     # rebuild invoked exactly once (no deploy-only re-attempt without artifact)
     assert len(rebuild_marker.read_text(encoding="utf-8").strip().splitlines()) == 1
+    # ... and the stack was restarted exactly once
+    assert len(restarts) == 1
 
 
 def test_rebuild_failure_retries_deploy_after_restart(tmp_path):
@@ -140,7 +195,7 @@ def test_rebuild_failure_retries_deploy_after_restart(tmp_path):
     assert len(calls) == 2
     assert "--deploy-only" in calls[1]
     # stack restarted twice (initial + post-re-deploy)
-    assert len(start_marker.read_text(encoding="utf-8").strip().splitlines()) == 2
+    assert len(_wait_for_marker_lines(start_marker, 2)) == 2
 
 
 def test_rebuild_success_restarts_and_completes(tmp_path):
@@ -161,4 +216,4 @@ def test_rebuild_success_restarts_and_completes(tmp_path):
     assert "VERIFIED: binary supports --spec-type draft-mtp" in log_text
     assert proc.returncode == 0
     assert len(rebuild_marker.read_text(encoding="utf-8").strip().splitlines()) == 1
-    assert len(start_marker.read_text(encoding="utf-8").strip().splitlines()) == 1
+    assert len(_wait_for_marker_lines(start_marker, 1)) == 1

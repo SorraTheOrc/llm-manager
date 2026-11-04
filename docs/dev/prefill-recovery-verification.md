@@ -10,6 +10,13 @@ cancelled by the prefill deadline (or stalls with no observable progress), does
 the local gate recover in minutes and does local serving resume — instead of
 re-dispatching the same giant prompt for hours?
 
+> **Concurrent 24 h windows are coordinated in
+> [`measurement-windows.md`](measurement-windows.md).** That file is the shared
+> restart-free calendar: the open measurement items, the current proxy anchor,
+> the batching convention (deploy before a window opens, never inside one) and
+> the manual-restart investigation convention. Use it together with the
+> deployed-anchor rule below (*a pushed commit is not a deployed fix*).
+
 > **Later measurements live in their own sections.** The 2026-10-30
 > post-deadline **re-dispatch** fix (LP-0MVSAMN14001DMTY) is verified by
 > **LP-0MVSAMS5O006OAIS** — see
@@ -556,7 +563,7 @@ in [the gate below](#the-ac1-measurement-gate--met-over-the-24-h-post-deploy-win
 |---|---|---|---|
 | [`prefill-recovery-verification-post-deadline-baseline-2026-10-30.json`](prefill-recovery-verification-post-deadline-baseline-2026-10-30.json) | 2026-10-29 21:50 → 2026-10-30 21:50 | **pre-fix baseline** (window ends at the fix push; the running build had no fix) | the pre-fix build was not wedging in this particular 24 h (`wedge_denials: 0`, longest unproductive hold 195 s, `verdict_met: true`) — it does **not** demonstrate the fix, because the fix was not running |
 | [`prefill-recovery-verification-post-deadline-partial-2026-10-30.json`](prefill-recovery-verification-post-deadline-partial-2026-10-30.json) | 2026-10-30 21:47:02 → 22:35:00 (48 min) | **post-push, pre-deploy** partial window — the same, still pre-fix build | the transition itself: 3 deadline→release pairs all at 0.0 s, `unreleased: []`, 12 denials examined with 0 wedge denials (max unproductive hold 153 s), 24 local finishes after the last release. Useful as continuity evidence, **not** as fix verification |
-| [`prefill-recovery-verification-post-deadline-24h-2026-10-31.json`](prefill-recovery-verification-post-deadline-24h-2026-10-31.json) | 2026-10-30 23:10:47 → 2026-10-31 23:10:47 (24 h) | **post-deploy** window — the build that loaded `5b35dd80`, anchored on the 23:10:47 restart | the AC1 gate (below): **MET** — 0 wedge denials, longest unproductive hold 116 s, all 6 deadline→release pairs at 0.0 s, `unreleased: []`, 45 local finishes after the last release, coverage met |
+| [`prefill-recovery-verification-post-deadline-24h-2026-10-31.json`](prefill-recovery-verification-post-deadline-24h-2026-10-31.json) | 2026-10-30 23:10:47 → 2026-10-31 23:10:47 (24 h) | **post-deploy** window — the build that loaded `5b35dd80`, anchored on the 23:10:47 restart | the AC1 gate (below): **MET** — 0 wedge denials, longest unproductive hold 116 s, all 6 deadline→release pairs at 0.0 s, `unreleased: []`, 15 local finishes after the last release (tally clipped at the window's `until`), coverage met |
 
 ### The AC1 measurement gate — MET over the 24 h post-deploy window (2026-10-30 23:10:47 → 2026-10-31 23:10:47)
 
@@ -572,8 +579,10 @@ AC1 of LP-0MVSAMS5O006OAIS requires a **>=24 h post-fix** window satisfying:
 | `ac1.verdict_met` | `true` | the reported AC1 verdict itself |
 
 **Status: MET** — the window closed at 2026-10-31 23:10:47 and was measured
-later the same evening (23:31, once the AC3 resume window had elapsed;
-LP-0MVVJYJQ9001I8QK). The artefact is
+later the same evening (23:31; LP-0MVVJYJQ9001I8QK). The AC3 tally is
+window-bounded (LP-0MVX157ZF007QJSU) — clipped at `until` — so no wait for
+the 1 h resume window to run out is needed: the committed count is the
+settled value for the closed window. The artefact is
 [`prefill-recovery-verification-post-deadline-24h-2026-10-31.json`](prefill-recovery-verification-post-deadline-24h-2026-10-31.json).
 
 | Field | Required | Measured | Verdict |
@@ -582,7 +591,7 @@ LP-0MVVJYJQ9001I8QK). The artefact is
 | `ac1.max_unproductive_hold_seconds` | `< 300` | `116.0` | **MET** |
 | `ac2.max_release_seconds` | `<= 300` | `0.0` (all 6 deadline→release pairs at 0.0 s) | **MET** |
 | `ac2.unreleased_sessions` | `[]` | `[]` | **MET** |
-| `ac3.local_finishes_after_last_release` | `> 0` | `45` | **MET** |
+| `ac3.local_finishes_after_last_release` | `> 0` | `15` | **MET** |
 | `coverage.verdict_met` | `true` | `true` (10 log files, `gaps: []`, 1 s window-start gap) | **MET** |
 | `ac1.verdict_met` | `true` | `true` | **MET** |
 
@@ -610,21 +619,25 @@ judges. The confirmation above comes from live traffic only.
 **How the window was captured.** A self-removing one-shot cron
 (`# begin-post-deadline-24h`) parsed the closed window at 2026-10-31 23:20
 local with the command below; the follow-up `implement` session
-(LP-0MVVJYJQ9001I8QK) re-ran it once the AC3 resume window had elapsed, linked
-the result here and from LP-0MVSAMS5O006OAIS, and committed it. The runner is
-read-only with respect to the proxy — it reads `/var/log/llama-proxy` and
-never signals or restarts a process. The window is closed and the log files
-are retained, so re-running the same command reproduces the committed
-artefact.
+(LP-0MVVJYJQ9001I8QK) linked the result here and from LP-0MVSAMS5O006OAIS,
+and committed it. The runner is read-only with respect to the proxy — it
+reads `/var/log/llama-proxy` and never signals or restarts a process. The
+window is closed and the log files are retained, so re-running the same
+command reproduces the committed artefact.
 
 One caveat is worth knowing when reproducing it:
-`ac3.local_finishes_after_last_release` tallies local finishes over the fixed
-1 h resume window that opens at the **last** deadline→release pair
-(`resume_window_seconds: 3600`) — here 2026-10-31 22:30:16 → 23:30:16, i.e. it
-extends 20 min **past** `until`. A measurement taken before that hour has
-fully elapsed under-counts (the 23:21 cron run recorded 28; the committed
-artefact records the settled tally). The bound is `> 0`, so the drift can only
-make AC3 look worse than it is, never better.
+`ac3.local_finishes_after_last_release` tallies local stream finishes over
+`[last release, until)` — the tally is **window-bounded**
+(LP-0MVX157ZF007QJSU), i.e. clipped at the window's `until` even when the
+fixed 1 h resume window (`resume_window_seconds: 3600`, which opens at the
+**last** deadline→release pair) would extend past it. Here the last pair is
+at 2026-10-31 22:30:16 and `until` is 23:10:47, so the tally covers
+22:30:16 → 23:10:47 and is stable from the moment the window closes: live
+traffic arriving after `until` can no longer keep inflating it (the pre-fix
+run drifted 28 at 23:21 → 37 at 23:25 → 45 once the hour after the last
+release had elapsed; the committed value is the settled clipped count). The
+bound is `> 0`, so the drift could only ever have made AC3 look worse than
+it is, never better — and it is now gone.
 
 ```bash
 python3 scripts/prefill_recovery_verification.py --measure \

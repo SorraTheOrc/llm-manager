@@ -325,8 +325,11 @@ async def test_watchdog_detects_worker_failure_and_triggers_router_recovery(monk
 
     calls = {"recover": 0}
 
-    async def fake_recover():
+    async def fake_recover(reason=None):
+        # LP-0MVZVZLCS000LQNB: the watchdog now passes ``reason=`` naming the
+        # death that triggered the restart (recorded here for the assertion).
         calls["recover"] += 1
+        calls.setdefault("reasons", []).append(reason)
         return False
 
     sleep_calls = {"n": 0}
@@ -350,6 +353,10 @@ async def test_watchdog_detects_worker_failure_and_triggers_router_recovery(monk
     await server._backend_watchdog_loop()
 
     assert calls["recover"] == 1
+    assert calls["reasons"] == ["worker_unhealthy"], (
+        "the restart must carry the reason that triggered it "
+        "(LP-0MVZVZLCS000LQNB AC2)"
+    )
     assert server.backend_signal_counts["other_failures"] == 1
 
 
@@ -374,8 +381,17 @@ async def test_router_self_heal_uses_exponential_backoff_and_attempt_cap(monkeyp
     async def fake_sleep(delay):
         sleep_calls.append(delay)
 
+    async def fake_probe_unreachable(_port):
+        return False
+
     monkeypatch.setattr(server, "start_llama_server", fake_start)
     monkeypatch.setattr(server, "wait_for_llama_server", fake_wait)
+    # LP-0MVZT9L3N001XABB: a failed readiness wait now probes the port and
+    # adopts a reachable spawn instead of counting the attempt as failed. The
+    # probe must be stubbed here — otherwise the test depends on whether a real
+    # backend happens to be listening on 8080 and the attempt-cap path is
+    # never exercised.
+    monkeypatch.setattr(server, "_probe_backend_reachable", fake_probe_unreachable)
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(server, "config", {"server": {
         "llama_self_heal_max_attempts": 3,

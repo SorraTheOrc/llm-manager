@@ -1,0 +1,98 @@
+# Committed performance-metric defaults (LP-0MW0FU5Z6006A4P3).
+#
+# READ-ONLY AT RUNTIME. The daily analysis run never writes this file: it seeds
+# the metric history from the `measurements` blocks below and records the
+# current window in the live state file
+# (`<output-dir>/performance_metrics_state.yaml`).
+#
+# Per-metric detail copy is the single source of truth for the report's
+# "Performance metric details" section; the renderer hard-codes no prose. Each
+# `calculation` text names the metric's data source exactly as registered in
+# `scripts/performance_metrics.py`.
+#
+# Measurement schema (one entry per measured window):
+#   window:      window id, e.g. "2026-11-03"
+#   value:       the measured value in the metric's unit
+#   date:        the measurement date
+#   fingerprint: configuration era, "slots=<n>,ctx=<per-slot context>"
+
+metrics:
+  gpu_busy:
+    measurements: []
+    why: "GPU utilisation is the clearest single measure of whether the local model earns its keep: a busy GPU absorbs demand locally instead of paying for remote tokens."
+    calculation: "Power-based busy time from GPU telemetry sampler power samples, corroborated by log-derived local busy time for the same window."
+    levers: "Slot pool size and context geometry, the local admission policy, prompt-cache retention and the routing thresholds that decide when a request is served locally."
+    trade_offs: "Pushing utilisation higher by admitting more work per slot raises queueing delay and time to first token; widening context per slot reduces the number of concurrent slots."
+    data_section_anchor: "## Local model utilization"
+
+  fallback_rate:
+    measurements: []
+    why: "The fallback rate states how often a request that could have run locally was sent to a remote provider, so it is the direct cost signal of local capacity shortfalls."
+    calculation: "Share of window requests that produced Fallback triggered log events, as a percentage of all requests; the dominant reason is reported alongside it."
+    levers: "Local context thresholds, slot pool size, lease and queue policy, and provider routing budgets."
+    trade_offs: "Reducing fallbacks by admitting more work locally increases contention and stream latency; raising local thresholds serves larger prompts locally at the cost of prefill time."
+    data_section_anchor: "## Fallback reasons"
+
+  decode_speed:
+    measurements: []
+    why: "Decode speed is the throughput a caller actually feels for long answers, so a falling median is the earliest sign of GPU throttling, contention or an oversized model."
+    calculation: "Median decode throughput in tokens per second from Stream finished token counts for local streams in the window."
+    levers: "Model and quantisation choice, GPU offload and power limits, context geometry, and the number of concurrent local slots."
+    trade_offs: "Larger models and longer contexts lower decode speed; raising concurrency improves utilisation while shortening the per-stream share of the GPU."
+    data_section_anchor: "## Decode speed"
+
+  prompt_eval_speed:
+    measurements: []
+    why: "Prompt-evaluation speed sets how quickly a local request starts answering, and prefill dominates first-byte latency for large prompts."
+    calculation: "Median prompt-evaluation throughput in tokens per second from llama-server prompt eval timing for local requests in the window."
+    levers: "Context and batch geometry, prompt-cache reuse, GPU offload, and the routing thresholds that decide whether a large prompt is served locally at all."
+    trade_offs: "Serving larger prompts locally improves coverage but spends GPU time on prefill that could have served several shorter requests."
+    data_section_anchor: "## Prompt eval speed"
+
+  time_to_first_token:
+    measurements: []
+    why: "Time to first token is the first thing a caller experiences; a long local first byte reads as a hang even when total response time is acceptable."
+    calculation: "Local p90 of dispatch to first byte for the window, from dispatch_first_byte_ms and ttft_seconds log lines."
+    levers: "Prompt-cache warmth, prefill concurrency, queue and lease policy, and the prefill deadline that declines work whose ETA is too long."
+    trade_offs: "Lowering the p90 by refusing slow prefills protects interactivity but increases fallbacks and remote spend; admitting them keeps more work local."
+    data_section_anchor: "## Time to first token"
+
+  stream_error_rate:
+    measurements: []
+    why: "Stream errors are failed user requests; the rate separates genuine reliability problems from ordinary slow responses."
+    calculation: "Share of streams ending in error for the window, from Stream error and Stream finished reason=error lines divided by all streams."
+    levers: "Upstream provider health and fallback ordering, remote timeouts, local memory and slot-save reliability, and request-size limits."
+    trade_offs: "Tighter timeouts surface failures faster but abort slow-but-progressing streams; retaining more local state reduces slot-save errors at a memory cost."
+    data_section_anchor: "## Error analysis"
+
+  context_pressure:
+    measurements: []
+    why: "Context pressure shows how much local demand is pushed away by prompt size. The per-slot context is fixed by the model and the hardware available, so this metric measures pressure against a ceiling no setting can raise."
+    calculation: "Share of local requests whose estimated prompt size is at or above the per-slot context threshold, from routing_skip_local estimated_tokens lines against the configured slot geometry."
+    levers: "Prompt compaction in clients, slot-count versus per-slot-context rebalancing within the fixed model context, and the cache-cold and cache-warm routing thresholds."
+    trade_offs: "Rebalancing toward fewer, larger slots relieves per-slot pressure but lowers concurrency and raises queueing; more slots shrink per-slot context and raise bypass volume. The total context is capped by the model and the hardware, so it cannot be raised to buy headroom."
+    data_section_anchor: "## Context sizes approaching per-slot limits"
+
+  prompt_cache_hit_ratio:
+    measurements: []
+    why: "Prompt-cache reuse is what makes long, repeated conversations cheap locally; a falling hit ratio turns the same prompts into full prefill work."
+    calculation: "Median cached_ratio across local dispatches plus the warm share, from the cached_ratio and cache_state log fields on dispatch lines."
+    levers: "Prompt-cache slots and cache RAM, tenancy hold policy, slot-save and restore reliability, and the cache-warm routing threshold."
+    trade_offs: "Holding cached prefixes resident improves reuse but consumes GPU memory that could serve another slot; aggressive eviction frees memory at the cost of cold prefill."
+    data_section_anchor: "## Time to first token"
+
+  contention_denials_per_hour:
+    measurements: []
+    why: "Contention denials count requests refused local service because the pool was busy, so the hourly rate is the direct measure of unmet local capacity."
+    calculation: "Dispatch denials per hour for the window, counted from local_dispatch_denied log events and divided by the window length."
+    levers: "Slot pool size, lease and queue policy, admission-guard thresholds, and client retry and concurrency behaviour."
+    trade_offs: "Admitting work that would have been denied raises utilisation and lowers denials but pushes first-byte latency and queueing time up."
+    data_section_anchor: "## Local contention prediction vs reality"
+
+  prefill_eta_accuracy:
+    measurements: []
+    why: "The prefill ETA drives admission refusals, so its accuracy decides whether servable work is rejected or overload is admitted silently."
+    calculation: "Median absolute relative error between the priced ETA and the observed first byte, from local_admission_guard prefill ETA and dispatch first-byte pairs, reported as an accuracy percentage."
+    levers: "ETA calibration and cache-cold reference costs in the admission guard, the prefill deadline budget, and cache-warm dispatch behaviour."
+    trade_offs: "A conservative ETA protects first-byte latency but refuses more servable work; a tighter ETA admits more load at the risk of long prefills and queue growth."
+    data_section_anchor: "## Local contention prediction vs reality"

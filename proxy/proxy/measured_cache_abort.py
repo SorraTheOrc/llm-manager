@@ -66,7 +66,9 @@ because a deficit is by definition uncached — never the admission-priced
 prefill-deadline budget::
 
     budget_s = budget_safety_fraction × local_prefill_deadline_seconds
-               (0.95 × 120 s = 114 s shipped)
+
+(the derivation is stated once, in ``proxy/config.yaml`` at
+``local_admission_guard_budget_safety_fraction``)
 
 falling back to the bare ``local_prefill_deadline_seconds`` when the fraction
 is explicitly ``0`` (the documented "no safety margin" rollback) or omitted.
@@ -220,8 +222,9 @@ class AbortSettings:
         with the same calibrated/percentile knobs the admission guard uses.
         Excluded from equality (runtime wiring, not a knob).
     ``budget_seconds``
-        The comparator, ``prefill_deadline_budget_seconds(config)`` (114 s
-        shipped). ``None`` = the benefit gate is not configured (pre-gate
+        The comparator, ``prefill_deadline_budget_seconds(config)`` (the
+        safety budget, derived from the two admission-guard keys). ``None`` =
+        the benefit gate is not configured (pre-gate
         verdict, byte-for-byte); ``<= 0`` = configured but unusable (fail open).
         Excluded from equality so a fully-resolved settings object still
         compares equal to the hand-built rows whose verdicts it preserves.

@@ -27,9 +27,19 @@ ExecStart=/home/rgardler/projects/llm/proxy/.venv/bin/python -m uvicorn proxy.se
 Environment=LLAMA_PROXY_CONFIG=/home/rgardler/projects/llm/proxy/config.yaml
 Environment=LLAMA_START_SCRIPT=/home/rgardler/projects/llm/start-llama.sh
 
-# Restart policy
+# Restart policy (LP-0MVZ810NG008A3EW AC2): `always` + a short RestartSec, so an
+# involuntary SIGKILL/OOM is recovered automatically instead of the ~10.5 min
+# outage of 2026-11-02. StartLimit* bounds a crash loop.
 Restart=always
-RestartSec=5
+RestartSec=2
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# OOM protection (LP-0MVZ810NG008A3EW AC1): 0 for the front door, and the model
+# backend is raised instead (docs/systemd/llama-server.service sets 800). A
+# negative value needs CAP_SYS_RESOURCE, which the user manager does not have —
+# use the system service below for OOMScoreAdjust=-900.
+OOMScoreAdjust=0
 
 # Logging
 StandardOutput=append:/home/rgardler/.local/state/llama-proxy/logs/proxy.log
@@ -83,8 +93,17 @@ ExecStart=/home/rgardler/projects/llm/proxy/.venv/bin/python -m uvicorn proxy.se
 Environment=LLAMA_PROXY_CONFIG=/home/rgardler/projects/llm/proxy/config.yaml
 Environment=LLAMA_START_SCRIPT=/home/rgardler/projects/llm/start-llama.sh
 
+# Restart policy (LP-0MVZ810NG008A3EW AC2): recover an OOM SIGKILL automatically.
 Restart=always
-RestartSec=5
+RestartSec=2
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# OOM protection (LP-0MVZ810NG008A3EW AC1): as root the system manager CAN lower
+# the score, so the front door outranks every model backend (which the
+# llama-server unit raises to 800). The proxy also applies
+# server.oom_score_adj at startup and logs a WARNING when it is refused.
+OOMScoreAdjust=-900
 
 StandardOutput=append:/var/log/llama-proxy/proxy.log
 StandardError=append:/var/log/llama-proxy/proxy.log

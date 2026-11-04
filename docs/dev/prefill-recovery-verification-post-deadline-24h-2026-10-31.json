@@ -140,7 +140,7 @@
   },
   "ac3": {
     "resume_window_seconds": 3600,
-    "local_finishes_after_last_release": 45,
+    "local_finishes_after_last_release": 15,
     "verdict_met": true
   },
   "all_verdicts_met": true

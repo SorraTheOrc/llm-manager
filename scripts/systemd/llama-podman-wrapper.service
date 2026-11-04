@@ -18,9 +18,16 @@ ExecStart=/home/rgardler/projects/llm/scripts/podman_start_llama.sh router
 Environment=LLAMA_HOST_REPO=/home/rgardler/projects/llm
 Environment=PODMAN_LC_CONTAINER=llama
 
-# Restart policy
-Restart=on-failure
-RestartSec=5
+# Restart policy (LP-0MVZ810NG008A3EW AC2): always restart the model backend,
+# so a model child killed by the OOM killer comes back with the proxy.
+Restart=always
+RestartSec=2
+
+# OOM ranking (LP-0MVZ810NG008A3EW AC1): raising a score is always permitted, so
+# a global OOM prefers this backend over the proxy front door. Keep the proxy's
+# value (llama-proxy.service) lower than this one; 0 < 800 on this host. The
+# proxy also applies the same value at spawn time (server.llama_server_oom_score_adj).
+OOMScoreAdjust=800
 
 
 # Logging

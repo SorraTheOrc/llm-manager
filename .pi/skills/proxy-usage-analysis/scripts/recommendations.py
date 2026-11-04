@@ -8,23 +8,34 @@ operator's domain knowledge:
 - ``local_concurrency_limit`` / ``local_lease_active`` / ``slot_exhaustion``
   fallbacks indicate slot pool contention → raise the slot pool / schedule.
 - ``large_context_bypass`` (or any reason containing ``large_context``)
-  indicates prompts that cannot fit or would contend the KV cache → raise
-  local ctx-size / routing thresholds.
+  indicates prompts that cannot fit or would contend the KV cache → reduce
+  prompt size or rebalance slots against per-slot context; the context ceiling
+  itself is fixed by the model and the hardware (see
+  ``FORBIDDEN_CTX_ADVICE``).
 - ``context_too_large`` (legacy ``warm_cache_bypass`` in rotated logs)
-  indicates the prompt context exceeded the per-slot hard cap → raise
-  local ctx-size / routing thresholds.
+  indicates the prompt context exceeded the per-slot hard cap → the same
+  fixed-ceiling levers; oversized prompts stay remote by design.
 - Provider context-ceiling skips (``routing_skip_provider_context``,
   ``provider_context_exceeded``) indicate a remote entry's
   ``max_context_tokens`` was exceeded → raise that entry's limit, reorder the
   chain, or reduce prompt size.
 - Context pressure: sessions whose max context approaches the per-slot
-  context limit (``local_model_ctx_size / slots``) → raise ctx-size.
+  context limit (``local_model_ctx_size / slots``) → prompt compaction, or
+  slot-count rebalancing within the fixed model context.
 - Fast vs cheap fallback-rate imbalance → adjust ``slot_schedule`` entries.
 - Remote-side errors (HTTP 4xx/5xx, empty responses, timeouts) are
   informational: check the remote provider configuration.
 - The proxy's own request-budget skip (``provider_budget_exhausted``) is
   pacing on a healthy provider, not an upstream 429, and gets its own
   informational recommendation so the two can never be conflated.
+
+**Never advise raising the local context size (LP-0MW2BD6G8001E960).** The
+local context is bounded by the model (Qwen3, 262144 native) and by the Strix
+Halo unified-memory budget, so "raise the ctx-size" is advice the operator
+cannot act on. Every large-context rule names the levers that do exist —
+client-side prompt compaction, slot-count versus per-slot-context rebalancing
+*within* the fixed total, and accepting the remote bypass — and
+``FORBIDDEN_CTX_ADVICE`` is the single list a test pins that rule to.
 """
 
 from __future__ import annotations
@@ -88,6 +99,45 @@ CONTEXT_PRESSURE_RATIO = 0.80
 CONTEXT_CRITICAL_RATIO = 0.95
 IMBALANCE_RATIO = 1.5
 IMBALANCE_MIN_SESSIONS = 3
+
+#: Advice that must never reach a report: the local context size is fixed by
+#: the model (Qwen3, 262144 native) and the Strix Halo unified-memory budget, so
+#: telling the operator to raise it is unactionable noise that used to be
+#: repeated nightly (LP-0MW2BD6G8001E960). Each entry is a phrase an operator
+#: could act on wrongly; ``models.ini`` is included because every "raise the
+#: ctx-size" sentence used to point at it. Pinned by
+#: ``tests/test_no_ctx_size_advice.py``, which scans every generated
+#: recommendation, so a future rule cannot reintroduce the advice silently.
+FORBIDDEN_CTX_ADVICE = (
+    "models.ini",
+    "raise the local ctx-size",
+    "raise local ctx-size",
+    "raise the local model ctx-size",
+    "raise the local model's ctx-size",
+    "raising the local ctx-size",
+    "raising local ctx-size",
+    "raising the local model ctx-size",
+    "increase the local ctx-size",
+    "increase local ctx-size",
+    "increase the local model ctx-size",
+    "increasing the local ctx-size",
+    "increasing the local model ctx-size",
+    "larger per-slot context reduces pressure",
+    "raise ctx-size",
+    "raising ctx-size",
+)
+
+
+def ctx_advice_in(text: str) -> str | None:
+    """Return the first forbidden context-size phrase in *text*, if any.
+
+    Case-insensitive so capitalisation cannot smuggle the advice back in.
+    """
+    lowered = (text or "").lower()
+    for phrase in FORBIDDEN_CTX_ADVICE:
+        if phrase in lowered:
+            return phrase
+    return None
 
 
 @dataclass
@@ -295,13 +345,15 @@ def generate_recommendations(
         recs.append(
             Recommendation(
                 severity="high",
-                title="Raise local ctx-size / large-context routing thresholds",
+                title="Large-context bypass: prompts exceed the fixed per-slot context",
                 detail=(
                     "Requests are being bypassed to remote providers because their contexts exceed the "
-                    "large-context routing thresholds. Consider raising the local model's ctx-size "
-                    "(models.ini), `local_large_context_cold_cache_threshold`, "
-                    "`local_large_context_warm_cache_threshold`, or `session_slot_max_prompt_tokens`. "
-                    "See also work item LP-0MSAOQTJS000FFVM (evaluating an increase of the local ctx-size)."
+                    "large-context routing thresholds, which are clamped to the per-slot context. The "
+                    "context ceiling is fixed by the model and the hardware available (a native model "
+                    "context shared across the slot pool), so it cannot simply be raised. The levers "
+                    "that exist are reducing prompt size (client-side compaction), rebalancing slot "
+                    "count against per-slot context within that fixed total, and accepting the remote "
+                    "bypass for genuinely oversized prompts."
                 ),
                 evidence=(
                     f"{large_ctx} of {total_fallbacks} fallback events ({_pct(large_ctx, total_fallbacks):.1f}%) "
@@ -326,8 +378,10 @@ def generate_recommendations(
                     "The router skipped local because the estimated prompt context exceeded the "
                     "hard per-slot capacity (`local_large_context_warm_cache_threshold`, clamped to "
                     "local_model_ctx_size / slots). This is a context-size signal, not a cache-warmth "
-                    "problem. If it is frequent, consider raising the local ctx-size (models.ini) or "
-                    "the large-context routing thresholds."
+                    "problem. The per-slot ceiling is fixed by the model and the hardware available, "
+                    "so it cannot simply be raised: reduce prompt size (client-side compaction) or "
+                    "rebalance slot count against per-slot context within the fixed total. Prompts "
+                    "that stay above the ceiling are served remotely by design."
                 ),
                 evidence=(
                     f"{warm} of {total_fallbacks} fallback events ({_pct(warm, total_fallbacks):.1f}%) "
@@ -422,8 +476,10 @@ def generate_recommendations(
                     detail=(
                         "Some sessions reach contexts near the effective per-slot context "
                         "(local_model_ctx_size / active slots), which can force `large_context_bypass` "
-                        "or degrade local performance. Raising the local model ctx-size "
-                        "(models.ini) and/or the large-context thresholds reduces remote fallback."
+                        "or degrade local performance. The model context is fixed by the model and the "
+                        "hardware available, so the levers are prompt compaction on the client side "
+                        "and rebalancing slot count against per-slot context within that fixed total — "
+                        "not a larger context."
                     ),
                     evidence=(
                         f"{len(pressured)} session(s) peaked at >= {int(CONTEXT_PRESSURE_RATIO * 100)}% of "
@@ -747,9 +803,9 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
                 detail=(
                     f"{slot_save} `slot_save failed` event(s) (typically ReadTimeout/ReadTimeout) indicate "
                     "the local llama-server slot persistence is struggling, often under large-context "
-                    "pressure. Consider raising the local model ctx-size (models.ini) or the routing "
-                    "thresholds so fewer oversized prompts hit local slots. See LP-0MSAOQTJS000FFVM "
-                    "(evaluate increasing local ctx-size)."
+                    "pressure. Reduce prompt size with client-side prompt compaction so fewer "
+                    "oversized prompts hit local slots; the local context itself is fixed by the model "
+                    "and the hardware available."
                 ),
                 evidence=f"{slot_save} of {total} error events ({_pct(slot_save, total):.1f}%) were `slot_save_error`.",
             )

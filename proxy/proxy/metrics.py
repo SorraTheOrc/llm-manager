@@ -16,6 +16,14 @@ Extended by LP-0MVP7525P008RXMF (child-port discovery observability):
   be discovered (the previously silent regression that made the rank-1
   direct-polling fix inert).
 
+Extended by LP-0MVWBXEAI008YZ7B (unloaded-model /slots skip, slice 3 of
+LP-0MVVCY3HQ0009F0K):
+- llama_slots_child_port_skipped_total{reason="..."} (counter) — proxy-initiated
+  /slots polls that were deliberately **skipped** because the router
+  definitively reports the model as not loaded (a skipped poll is thereby
+  distinguishable in /metrics from a poll that was never attempted, so the
+  unloaded-model noise origin is verifiable post-deploy).
+
 Extended by LP-0MVT1O0VG00905EL (slot occupancy, parent LP-0MVNWUEY8008XM6W):
 - llama_slots_total (gauge) — slots reported by the last successful sample
 - llama_slots_busy (gauge) — slots with ``is_processing`` true
@@ -38,6 +46,14 @@ Extended by LP-0MVF7KQED005TG9Z (quota observability surface):
 - quota_exhausted{account,entry} (gauge, 1 = exhausted)
 - quota_last_poll_timestamp_seconds{account,entry} (gauge)
 - quota_poll_failures_total{account,reason} (counter)
+
+Extended by LP-0MVZ810NG008A3EW AC3 (pre-OOM host pressure):
+- llama_host_mem_available_ratio (gauge) — ``MemAvailable / MemTotal``
+- llama_host_gtt_used_ratio_of_ram (gauge) — GPU-backed GTT as a fraction of
+  *physical RAM* (not of the GTT pool, which is larger than RAM on this APU)
+- llama_host_memory_sample_timestamp_seconds (gauge) — heartbeat; a host that
+  cannot be measured must not read as an exhausted one
+- llama_oom_score_adj (gauge) — this process's OOM killer ranking knob
 
 The implementation is best-effort: when router-mode exposes multiple models in a
 single process we estimate per-model RSS by dividing the process RSS equally
@@ -93,6 +109,13 @@ llama_slots_query_failures_total = None
 # hidden by `except Exception: pass` (weeks of silent router 500s) now surfaces
 # as an alert/trend instead.
 llama_slots_child_port_fallbacks_total = None
+# Unloaded-model skip (LP-0MVWBXEAI008YZ7B AC6): a proxy-initiated /slots poll
+# for a model the router's /models snapshot definitively reports as not loaded
+# is skipped before any request and signal. Counted by reason so "skipped" is
+# observable (llama_slots_child_port_skipped_total) without polluting the
+# genuine child-port-discovery regression signal
+# (llama_slots_child_port_fallbacks_total).
+llama_slots_child_port_skipped_total = None
 # Slot occupancy (LP-0MVT1O0VG00905EL). Power/VRAM/GTT already reach Prometheus
 # through node_exporter, but nothing published llama-server *workload*, so "the
 # GPU drew 115 W" could not be attributed to llama-server. These gauges carry
@@ -127,6 +150,19 @@ quota_last_poll_timestamp_seconds = None
 #: Counts failed quota polls by reason, so a dead /v1/usage endpoint surfaces as
 #: an alert instead of only a rate-limited WARN.
 quota_poll_failures_total = None
+
+# Host memory pressure (LP-0MVZ810NG008A3EW AC3). The 2026-11-02 global OOM left
+# no in-process record: ``ps`` RSS cannot see GPU-backed (GTT) memory and the
+# only surviving evidence was a kernel log line. These gauges publish the two
+# numbers that would have warned first — ``MemAvailable`` and GTT-as-a-fraction-
+# of-physical-RAM — plus a heartbeat so a stale sample is distinguishable from a
+# genuinely idle host (a missing sample must never read as "0 available").
+llama_host_mem_available_ratio = None
+llama_host_gtt_used_ratio_of_ram = None
+llama_host_memory_sample_timestamp_seconds = None
+#: The proxy process's own OOM killer ranking knob (``/proc/self/oom_score_adj``),
+#: so the protection is verifiable from a scrape instead of from ps.
+llama_oom_score_adj = None
 
 # Post-acceptance local evictions (LP-0MVN4LCED00661MX, parent AC7): an accepted
 # local dispatch released before producing a first byte is a defect signal, so
@@ -185,6 +221,12 @@ if _enabled:
             'llama_slots_child_port_fallbacks_total',
             'Proxy /slots queries falling back to the router port because no '
             'model child port could be discovered, by reason',
+            ['reason'],
+        )
+        llama_slots_child_port_skipped_total = Counter(
+            'llama_slots_child_port_skipped_total',
+            'Proxy /slots polls skipped without a request because the router '
+            'definitively reports the model as not loaded, by reason',
             ['reason'],
         )
         # Slot occupancy (LP-0MVT1O0VG00905EL). Deliberately no ``slot=`` label
@@ -276,6 +318,31 @@ if _enabled:
             'quota_poll_failures_total',
             'Total /v1/usage poll failures by account and reason',
             ['account', 'reason'],
+        )
+        # Host memory pressure (LP-0MVZ810NG008A3EW AC3). Ratios, not bytes: the
+        # alert threshold is a fraction of physical RAM, and GTT must be compared
+        # with RAM (its pool is *larger* than RAM on this APU, so a
+        # pool-relative series lags the danger by tens of GiB).
+        llama_host_mem_available_ratio = Gauge(
+            'llama_host_mem_available_ratio',
+            'MemAvailable as a fraction of MemTotal on the proxy host '
+            '(0-1; published only when measurable)',
+        )
+        llama_host_gtt_used_ratio_of_ram = Gauge(
+            'llama_host_gtt_used_ratio_of_ram',
+            'GPU GTT (system RAM mapped for the GPU) in use as a fraction of '
+            'physical RAM (0-1; published only when the amdgpu sysfs attributes '
+            'are readable)',
+        )
+        llama_host_memory_sample_timestamp_seconds = Gauge(
+            'llama_host_memory_sample_timestamp_seconds',
+            'Unix timestamp of the last successful host memory sample (its age '
+            'keeps an unmeasurable host from looking like an exhausted one)',
+        )
+        llama_oom_score_adj = Gauge(
+            'llama_oom_score_adj',
+            'The proxy process oom_score_adj (negative means the OOM killer '
+            'prefers the model backend)',
         )
     except Exception:  # pragma: no cover - defensive
         _enabled = False
@@ -430,6 +497,32 @@ def record_slots_child_port_fallback(reason: str):
         return
     try:
         llama_slots_child_port_fallbacks_total.labels(reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_slots_child_port_skipped(reason: str):
+    """Increment ``llama_slots_child_port_skipped_total`` for a skipped poll.
+
+    Args:
+        reason: Why the poll was skipped without issuing a ``/slots`` request
+            — ``model_not_loaded`` (the router's cached ``/models`` snapshot
+            definitively reports the model as not loaded, so the poll would
+            only reproduce the definitive-400 noise).
+
+    LP-0MVWBXEAI008YZ7B AC1/AC6: before this counter, a skipped unloaded-model
+    poll was indistinguishable from a poll that was never attempted, so the
+    unloaded-model fallback noise (parent AC1/AC2) could not be verified
+    post-deploy. This counter makes the deliberate skip observable in
+    ``/metrics`` without touching ``llama_slots_child_port_fallbacks_total``
+    (which stays reserved for the genuine loaded-model discovery regression).
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or llama_slots_child_port_skipped_total is None:
+        return
+    try:
+        llama_slots_child_port_skipped_total.labels(reason=reason).inc()
     except Exception:
         pass
 
@@ -730,6 +823,40 @@ def record_quota_state(observation: dict):
         )
     except Exception:
         # Best-effort: never propagate metric errors into the poller.
+        return
+
+
+def record_host_pressure(snapshot, sampled_at: float, *, oom_score_adj: int | None = None):
+    """Publish one host memory-pressure sample (LP-0MVZ810NG008A3EW AC3).
+
+    Args:
+        snapshot: A ``proxy.host_pressure.MemorySnapshot``.
+        sampled_at: Unix timestamp of the sample.
+        oom_score_adj: The proxy's current ``oom_score_adj``, when known.
+
+    Only series that could actually be measured are written, and the heartbeat
+    advances only when at least one of them was — a host without ``amdgpu``
+    sysfs must not look like a host with zero free memory. Best-effort: metric
+    errors never propagate.
+    """
+    if not _enabled:
+        return
+    try:
+        published = False
+        available_ratio = getattr(snapshot, "available_fraction", None)
+        if available_ratio is not None and llama_host_mem_available_ratio is not None:
+            llama_host_mem_available_ratio.set(available_ratio)
+            published = True
+        gtt_ratio = getattr(snapshot, "gtt_host_fraction", None)
+        if gtt_ratio is not None and llama_host_gtt_used_ratio_of_ram is not None:
+            llama_host_gtt_used_ratio_of_ram.set(gtt_ratio)
+            published = True
+        if published and llama_host_memory_sample_timestamp_seconds is not None:
+            llama_host_memory_sample_timestamp_seconds.set(float(sampled_at))
+        if oom_score_adj is not None and llama_oom_score_adj is not None:
+            llama_oom_score_adj.set(int(oom_score_adj))
+    except Exception:
+        # Best-effort: never propagate metric errors into a sampler loop.
         return
 
 

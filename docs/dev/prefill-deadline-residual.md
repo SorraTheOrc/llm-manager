@@ -216,29 +216,59 @@ measured, the priced compute was wrong by two orders of magnitude (e.g. priced
 
 ### Contributing mechanism: the abandoned-prefill backlog
 
-58 of the 60 events' dispatches started **inside an abandoned-prefill window**:
-an earlier dispatch from the same burst had been released (49 of the 58 by
-`measured_cache_deficit`, 9 by `prefill_deadline`) and the backend kept
-evaluating its prompt, so the retry was queued behind it and reported no
-progress for its whole lease. The evidence is the release ledger joined on
-`measured_new_tokens / 43.1 tok/s` (F5's replay rate); median remaining backlog
-at the retry's start is 667 s (min 8.5 s, max 1 932 s).
+> **Superseded model, retained.** The figures in the first half of this
+> section were computed with the **legacy** estimator, under which an
+> abandoned window lasts `tokens / 43.1 tok/s`. Per-release measurement
+> ([abandoned-prefill-release-cancel.md](abandoned-prefill-release-cancel.md),
+> child `LP-0MVW8S7QY002S7DV` of `LP-0MVVEQW5Y00962T2`) shows the backend
+> stops the abandoned prefill in p90 **6.6 s**, so the legacy basis overstates
+> the backlog by two to three orders of magnitude. Both bases are stated
+> below; neither replaces the other.
 
-The backlog is visible directly at the backend. For the exactly-aligned
-calendar day `2026-10-29 00:00 → 2026-10-30 00:00`:
+**Legacy basis (as originally measured).** 58 of the 60 events' dispatches
+started inside an abandoned-prefill window: an earlier dispatch from the same
+burst had been released (49 of the 58 by `measured_cache_deficit`, 9 by
+`prefill_deadline`) and, on this estimator, the backend was still evaluating
+its prompt, so the retry was queued behind it and reported no progress for its
+whole lease. The evidence is the release ledger joined on
+`measured_new_tokens / 43.1 tok/s` (F5's replay rate); the median remaining
+backlog at the retry's start is **667 s** (min 8.5 s, max 1 932 s).
 
-| Backend vs proxy | Count |
+The same window at the backend, exactly-aligned calendar day
+`2026-10-29 00:00 → 2026-10-30 00:00`:
+
+| Backend vs proxy (legacy basis) | Count |
 |---|---|
 | `llama-server` completed prompt evaluations (`prompt eval time` lines) | 1 092 |
 | local streams the proxy actually consumed (`Stream finished … provider=local`) | 807 |
 | post-acceptance releases the proxy made in the same day | 389 |
 | **prefills computed and thrown away** | **285 (26 %)** |
 
-So the early abort detours the *client* in under a second, but the abandoned
-prefill is still computed. That is filed as
-`discovered-from:LP-0MVRMOT0N005136O` (see the work item) because cancelling or
-queuing against abandoned backend work is an admission/dispatch change, which
-this evidence item explicitly out-scopes.
+**Measured basis (correction).** Re-measured per release over a day-aligned
+48 h window (`2026-10-29 00:00 → 2026-10-31 00:00`):
+
+| Metric | Legacy basis | Measured basis |
+|---|---|---|
+| `prefill_deadline` events starting inside an abandoned-prefill window | **58 / 60 (96.7 %)** | **2 / 60 (3.3 %)** over 24 h; **1 / 105 (1.0 %)** over 48 h |
+| Backend completions not consumed by a proxy stream | 285 / 1 092 = 26 % (single day) | **215 / 1 833 = 11.7 %** (48 h); a further 277 of 2 581 launches (10.7 %) are not attributable to any proxy dispatch |
+| Waste per release | the whole remaining prompt at 43.1 tok/s (667 s median backlog) | **≤ 1 ubatch** — p90 cancel→stop **6.6 s**, ≤ 1 746 tokens evaluated after the cancel |
+
+So the early abort detours the *client* in under a second **and** the abandoned
+prefill is cancelled within one `ubatch` of the release; what it costs is that
+bounded tail plus the prefix the retry re-prefills. The residual starvation
+shape is real but rare — 2 of 375 releases over 24 h — not systematic.
+The mechanism's verdicts (H1 refuted, H2 confirmed, H3 partly confirmed, H4
+refuted, H5 supported) and the chosen fix are recorded in
+[abandoned-prefill-release-cancel.md](abandoned-prefill-release-cancel.md).
+Related items these measured statements depend on: the upstream cancel
+(`LP-0MVRMI5HK00558TB`, `LP-0MVT2KSN3007QYFK`), the Option D early release
+(`LP-0MVR7IN0O000DPXN`), the draining-slot annotation (`LP-0MVUTYHG7001S6BM`)
+and the per-path identity/stream plumbing that made the Option D path
+attributable (`LP-0MVUVHAQP001IRKK`).
+The original observation was filed as
+`discovered-from:LP-0MVRMOT0N005136O` because cancelling or queuing against
+abandoned backend work is an admission/dispatch change, which that evidence
+item explicitly out-scoped.
 
 ## 7. What the AC3 verdict can conclude (AC6)
 
@@ -262,19 +292,30 @@ evidence supporting a re-scope:
 3. The dominant class is *already* being converted (248 early releases), so a
    bare `prefill_deadline` threshold can be gamed by the conversion — any
    re-scoped criterion must count both reasons together (AC5).
-4. The abandoned-prefill backlog (285 thrown-away prefills/day) is the
-   mechanism that turns an early release into the *next* event, so a fix owned
-   by the dispatch path can plausibly move this residual — it is not a
-   GPU-capacity floor.
+4. The abandoned-prefill backlog — **285 thrown-away prefills/day on the
+   legacy 26 % basis; 215 / 1 833 (11.7 %) of backend completions over a
+   day-aligned 48 h window on the measured basis** — is the mechanism that
+   turns an early release into the *next* event. Per-release measurement puts
+   the overlap at **2 / 60 (3.3 %)** rather than 58 / 60 once the observed
+   cancel→stop (p90 6.6 s) replaces the `tokens / 43.1` estimate (see
+   [abandoned-prefill-release-cancel.md](abandoned-prefill-release-cancel.md)),
+   so a fix owned by the dispatch path can move this residual only at the
+   margin — it is neither a GPU-capacity floor nor the dominant term.
 
 ## 8. Limitations
 
 - `llama-server.log` carries no wall-clock timestamp, so per-event attribution
   is proxy-log-only; the backend accounting cross-check is window-level and
   valid only for the exactly-aligned day file.
-- The abandoned-prefill window is an *estimate* (tokens ÷ a conservative rate),
-  not an observation of the backend's queue. It is recorded as an evidence
-  column, never as a verdict class.
+- The abandoned-prefill window has two bases. The **legacy** basis is an
+  *estimate* (`tokens ÷ 43.1 tok/s`), not an observation of the backend's
+  queue. The **measured** basis (`basis="measured_stop"`) uses the observed
+  `cancel → stop processing` latency and the tokens actually evaluated after
+  the cancel, joined per release; the overlap share is reported on both. On
+  the analysed corpus the measured basis yields 2 / 60 (24 h) and 1 / 105
+  (48 h) against the legacy 58 / 60 and 99 / 105 — see
+  [abandoned-prefill-release-cancel.md](abandoned-prefill-release-cancel.md).
+  The window is recorded as an evidence column, never as a verdict class.
 - In the two comparison windows no `prefill_progress_measured` line exists (the
   capture shipped with F4), so their `predicted-warmth` share rests on the
   admission price plus the `progress=0` signature, not on measured deficits.

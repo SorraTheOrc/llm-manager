@@ -44,6 +44,7 @@ import engine_cross_check
 import gpu_busy
 import llama_log_parser
 import log_parser
+import performance_metrics
 import recommendations
 import reporting
 
@@ -2244,6 +2245,86 @@ def _session(
     }
 
 
+class TestNoContextSizeAdvice:
+    """The context ceiling is fixed by the model and the hardware
+    (LP-0MW2BD6G8001E960), so no generated recommendation may advise raising it."""
+
+    def _comprehensive_recs(self):
+        """Recommendations from a result that fires every large-context rule."""
+        sessions = [
+            _session("bypass", remote_move=True, reason="large_context_bypass", max_context=200000),
+            _session("too-large", remote_move=True, reason="context_too_large", max_context=200000),
+            # 40000 of 262144/6 = 43690 per-slot tokens is 91% of the ceiling.
+            _session("pressure", max_context=40000),
+            _session("denied", remote_move=True, reason="local_concurrency_limit"),
+        ]
+        fallback_events = [
+            log_parser.LogEvent("fallback", WINDOW_START, reason="large_context_bypass"),
+            log_parser.LogEvent("fallback", WINDOW_START, reason="context_too_large"),
+            log_parser.LogEvent("fallback", WINDOW_START, reason="local_concurrency_limit"),
+        ]
+        res = _result_with_sessions(sessions, fallback_events=fallback_events)
+        res.error_events = [
+            log_parser.LogEvent("slot_save_error", WINDOW_START, error="ReadTimeout/ReadTimeout"),
+            log_parser.LogEvent("stream_error", WINDOW_START, error="stream_exception"),
+        ]
+        return recommendations.generate_recommendations(
+            res, config={"local_model_ctx_size": 262144, "session_slot_pool_size": 6}
+        )
+
+    def test_all_four_large_context_rules_fire(self):
+        """The scan below is only meaningful if the rules actually produced advice."""
+        titles = " | ".join(r.title.lower() for r in self._comprehensive_recs())
+
+        assert "large-context bypass" in titles
+        assert "context-too-large" in titles
+        assert "context sizes approaching" in titles
+        assert "slot_save" in titles
+
+    def test_no_recommendation_advises_raising_the_context(self):
+        for rec in self._comprehensive_recs():
+            for field in (rec.title, rec.detail, rec.evidence):
+                offending = recommendations.ctx_advice_in(field)
+                assert offending is None, f"{offending!r} in recommendation {rec.title!r}"
+
+    def test_large_context_rules_name_the_fixed_ceiling_and_real_levers(self):
+        recs = {r.title: r for r in self._comprehensive_recs()}
+        bypass = next(r for t, r in recs.items() if "large-context bypass" in t.lower())
+        too_large = next(r for t, r in recs.items() if "context-too-large" in t.lower())
+        pressure = next(r for t, r in recs.items() if "context sizes approaching" in t.lower())
+
+        for rec in (bypass, too_large, pressure):
+            detail = rec.detail.lower()
+            assert "fixed by the model and the hardware" in detail
+            assert "compaction" in detail or "rebalancing" in detail
+
+    def test_the_completed_ctx_size_work_item_is_never_cited(self):
+        for rec in self._comprehensive_recs():
+            assert "LP-0MSAOQTJS000FFVM" not in f"{rec.title} {rec.detail} {rec.evidence}"
+
+    def test_a_rendered_report_carries_no_context_size_advice(self, tmp_path):
+        """The guard covers the artefact, not just the recommendation objects.
+
+        Reporting prose (the notes block, the error-analysis pointer) is part of
+        the report an operator reads, so it is scanned here too.
+        """
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n", encoding="utf-8")
+
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out",
+            config=None,
+        )
+
+        text = (tmp_path / "out" / "report.md").read_text(encoding="utf-8")
+        assert recommendations.ctx_advice_in(text) is None
+        assert "LP-0MSAOQTJS000FFVM" not in text
+
+
 class TestRecommendations:
     def test_concurrency_limit_dominant_suggests_slot_pool(self):
         res = _result_with_sessions(
@@ -2257,13 +2338,13 @@ class TestRecommendations:
         titles = " | ".join(r.title for r in recs)
         assert "session_slot_pool_size" in titles.lower()
 
-    def test_large_context_bypass_suggests_ctx(self):
+    def test_large_context_bypass_recommends_fixed_ceiling_levers(self):
         res = _result_with_sessions(
             [_session("a", remote_move=True, reason="large_context_bypass")],
         )
         recs = recommendations.generate_recommendations(res, config=None)
         titles = " | ".join(r.title for r in recs)
-        assert "ctx" in titles.lower() or "context" in titles.lower()
+        assert "context" in titles.lower()
 
     def test_context_too_large_suggests_context(self):
         res = _result_with_sessions(
@@ -2503,7 +2584,13 @@ class TestErrorRecommendations:
         recs = recommendations.generate_recommendations(res, config=None)
         titles = " | ".join(r.title.lower() for r in recs)
         assert "slot_save" in titles, f"expected slot_save recommendation, got: {titles}"
-        assert "LP-0MSAOQTJS000FFVM" in " | ".join(r.detail for r in recs)
+        detail = " | ".join(r.detail for r in recs)
+        # The context ceiling is fixed by the model and the hardware, so the
+        # remedy is prompt compaction — never a larger context, and never the
+        # (completed) work item the old copy cited (LP-0MW2BD6G8001E960).
+        assert "prompt compaction" in detail.lower()
+        assert recommendations.ctx_advice_in(detail) is None
+        assert "LP-0MSAOQTJS000FFVM" not in detail
 
     def test_upstream_429_triggers_cooldown_recommendation(self):
         errors = [
@@ -3158,7 +3245,8 @@ class TestBusyStats:
     def test_report_summary_by_hour_table_window_bounded_with_pct_and_totals(self):
         # Regression (LP-0MSVMLM7G009N74N) extended by LP-0MTFO210Q0044TTF and
         # reworked by LP-0MTYAZFGN003BYQS: the hourly profile is the
-        # top-of-report ``## Summary by hour`` table — it spans exactly the
+        # ``## Summary by hour`` table (after the performance scorecard,
+        # LP-0MW1BUA2M0005QRV) — it spans exactly the
         # report window (partial first/last rows truncated to the window
         # edges), lists every hour including idle ones, carries a % column
         # (busy / window-bounded bucket duration, clamped to 100%), and its
@@ -3180,7 +3268,8 @@ class TestBusyStats:
         assert summary.busy is not None
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        # AC1: renamed, moved to the top of the report (before Session summary).
+        # AC1: renamed, moved above the Session summary; it now follows the
+        # performance scorecard (LP-0MW1BUA2M0005QRV).
         assert "Busy time by hour:" not in md
         assert md.index("## Summary by hour") < md.index("## Session summary")
         # AC2/AC1: window-bounded rows with a % column; idle middle hour
@@ -3968,9 +4057,24 @@ class TestDispatchToFinishBusy:
         assert "Prefill vs decode" in section
         assert "Samples" in section
 
-    def test_report_note_is_deterministic_across_runs(self):
+    def test_report_note_is_deterministic_across_runs(self, monkeypatch):
         """AC3 (LP-0MVKN85WO007O00H): re-analysing the same logs renders a
-        byte-identical report, so the corrected note never drifts."""
+        byte-identical report, so the corrected note never drifts.
+
+        The clock is frozen for the comparison: the header records
+        ``Generated: <wall clock>``, so two builds that straddle a second
+        boundary differ by that line alone (observed as a full-suite flake once
+        the report body grew long enough for a second ``build_report`` call to
+        cross the boundary). Determinism is about the rendered content, not
+        about how long the build took.
+        """
+
+        class _FrozenClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 8, 2, 15, 0, 0)
+
+        monkeypatch.setattr(reporting, "datetime", _FrozenClock)
         lines = [
             "2026-08-02 10:00:00,000 - INFO - Stream started: provider=local "
             "model=Qwen3 session=old request=[]",
@@ -4278,8 +4382,9 @@ class TestPrefillVsDecodeSection:
 
 
 class TestSummaryByHourActivity:
-    """Per-hour activity columns in the top-of-report ``## Summary by hour``
-    table (LP-0MTYAZFGN003BYQS).
+    """Per-hour activity columns in the ``## Summary by hour``
+    table (LP-0MTYAZFGN003BYQS); the table follows the performance scorecard
+    (LP-0MW1BUA2M0005QRV) rather than opening the report.
 
     Activity is counted by each event's own timestamp inside its absolute-hour
     bucket: ``Requests started`` (all Stream started), ``Local attempts``
@@ -8940,3 +9045,426 @@ class TestEngineCrossCheck:
         data = reporting.summary_to_json(summary, None, config)
         assert headings >= 1
         assert data["recommendations"] == headings
+
+
+class TestPerformanceMetricInputs:
+    """Aggregation inputs for the ten scorecard metrics (LP-0MW1BU9R5006C23N).
+
+    Each helper must return a real measurement from data the pipeline already
+    produces, and must degrade to ``None`` ("n/a") — never ``0`` — when the
+    window holds no usable samples. A *measured* zero (no fallbacks in a window
+    that served requests) stays ``0.0``: the two facts are different.
+    """
+
+    @staticmethod
+    def _summary(
+        sessions: list[dict] | None = None,
+        fallback_events: list[log_parser.LogEvent] | None = None,
+    ) -> aggregation.AnalysisResult:
+        res = _result_with_sessions(sessions or [], fallback_events)
+        return res
+
+    # -- prompt cache ------------------------------------------------------
+
+    def test_prompt_cache_stats_median_ratio_and_state_shares(self):
+        events = [
+            _ttft_event(WINDOW_START, cached_ratio=0.9, cache_state="warm"),
+            _ttft_event(WINDOW_START, cached_ratio=0.5, cache_state="warm"),
+            _ttft_event(WINDOW_START, cached_ratio=0.1, cache_state="cold"),
+            _ttft_event(WINDOW_START, cached_ratio=0.7, cache_state="restored"),
+        ]
+        stats = aggregation.prompt_cache_stats(events)
+        assert stats is not None
+        assert stats.metric_id == "prompt_cache_hit_ratio"
+        assert stats.samples == 4
+        assert stats.median_cached_ratio == 0.6
+        # ``restored`` counts in neither share, so the shares need not sum to 100.
+        assert stats.stated_samples == 4
+        assert stats.warm_share_pct == 50.0
+        assert stats.cold_share_pct == 25.0
+        assert dict(stats.state_counts) == {"cold": 1, "restored": 1, "warm": 2}
+
+    def test_prompt_cache_stats_none_without_cache_evidence(self):
+        events = [_ttft_event(WINDOW_START, session="s1")]
+        assert aggregation.prompt_cache_stats(events) is None
+        assert aggregation.prompt_cache_stats([]) is None
+
+    def test_prompt_cache_stats_reports_shares_when_no_ratio_is_logged(self):
+        """A state without a ratio is still evidence: shares stand, median is n/a."""
+        events = [_ttft_event(WINDOW_START, cache_state="cold")]
+        stats = aggregation.prompt_cache_stats(events)
+        assert stats is not None
+        assert stats.samples == 0
+        assert stats.median_cached_ratio is None
+        assert stats.cold_share_pct == 100.0
+
+    def test_prompt_cache_median_keeps_the_logged_two_decimal_precision(self):
+        """``cached_ratio`` is logged to two decimals; a one-decimal median
+        would collapse 0.935 onto 0.9 and hide a real improvement."""
+        events = [
+            _ttft_event(WINDOW_START, cached_ratio=0.95, cache_state="warm"),
+            _ttft_event(WINDOW_START, cached_ratio=0.92, cache_state="warm"),
+        ]
+        stats = aggregation.prompt_cache_stats(events)
+        assert stats is not None
+        assert stats.median_cached_ratio == 0.935
+
+    # -- busy percentages --------------------------------------------------
+
+    def test_local_busy_pct_reports_the_measured_union(self):
+        busy = aggregation.BusyStats(
+            window_seconds=100.0,
+            busy_seconds=25.0,
+            total_compute_seconds=30.0,
+            streams=2,
+            peak_concurrency=1,
+            avg_concurrency=1.2,
+            avg_stream_duration=15.0,
+            unfinished_streams=0,
+            pre_window_unfinished=0,
+            fast_busy_seconds=25.0,
+            cheap_busy_seconds=0.0,
+            fast_window_seconds=100.0,
+            cheap_window_seconds=0.0,
+            hourly_busy=[],
+        )
+        assert aggregation.local_busy_pct(busy) == 25.0
+        assert aggregation.local_busy_pct(None) is None
+
+    def test_gpu_busy_pct_from_prometheus_result(self):
+        result = gpu_busy.GpuBusyResult(
+            computing_fraction=0.5,
+            total_seconds=100.0,
+            busy_seconds=50.0,
+            idle_seconds=50.0,
+            smoothed_power_values=[],
+        )
+        assert aggregation.gpu_busy_pct(result) == 50.0
+        assert aggregation.gpu_busy_pct(None) is None
+
+    # -- time to first token ----------------------------------------------
+
+    def test_ttft_p90_is_local_only_by_default(self):
+        events = [
+            _ttft_event(WINDOW_START, ttft_ms=100.0),
+            _ttft_event(WINDOW_START, ttft_ms=300.0),
+            log_parser.LogEvent(
+                "ttft",
+                WINDOW_START,
+                session="remote-1",
+                ttft_ms=9000.0,
+                ttft_source="remote",
+            ),
+        ]
+        assert aggregation.ttft_p90_ms(events) == 280.0
+        assert aggregation.ttft_p90_ms(events, include_remote=True) == 7260.0
+
+    def test_ttft_p90_none_without_samples(self):
+        assert aggregation.ttft_p90_ms([]) is None
+
+    # -- llama-server speeds ----------------------------------------------
+
+    def test_decode_and_prompt_eval_medians(self):
+        speed = llama_log_parser.SpeedStats(
+            decode={
+                "total": llama_log_parser.SpeedBucket(
+                    count=3, median=41.5, p90=50.0, p10=30.0
+                )
+            },
+            prompt_eval={
+                "total": llama_log_parser.SpeedBucket(
+                    count=2, median=812.0, p90=900.0, p10=700.0
+                )
+            },
+            files_parsed=1,
+            files_skipped=0,
+        )
+        assert aggregation.decode_median_tok_s(speed) == 41.5
+        assert aggregation.prompt_eval_median_tok_s(speed) == 812.0
+        assert aggregation.decode_median_tok_s(None) is None
+        assert aggregation.prompt_eval_median_tok_s(None) is None
+
+    def test_speeds_are_none_without_a_total_bucket_sample(self):
+        speed = llama_log_parser.SpeedStats(
+            decode={
+                "total": llama_log_parser.SpeedBucket(
+                    count=0, median=None, p90=None, p10=None
+                )
+            },
+            prompt_eval={},
+            files_parsed=0,
+            files_skipped=0,
+        )
+        assert aggregation.decode_median_tok_s(speed) is None
+        assert aggregation.prompt_eval_median_tok_s(speed) is None
+
+    # -- stream error rate -------------------------------------------------
+
+    def test_stream_error_rate_counts_terminal_error_streams(self):
+        res = self._summary([_session("s1")])
+        res.streams_finished = 7
+        res.streams_without_usage = 1
+        res.error_events = [
+            log_parser.LogEvent("stream_finish_error", WINDOW_START, session="s1"),
+            log_parser.LogEvent("stream_error", WINDOW_START, session="s1"),
+            # Not a stream outcome: a retry attempt is not a terminal line.
+            log_parser.LogEvent("backend_retry", WINDOW_START),
+        ]
+        rate = aggregation.stream_error_rate(res)
+        assert rate is not None
+        assert rate.metric_id == "stream_error_rate"
+        assert rate.errored == 2
+        assert rate.completed == 8
+        assert rate.share_pct == 20.0
+        assert dict(rate.by_kind) == {"stream_error": 1, "stream_finish_error": 1}
+
+    def test_stream_error_rate_is_zero_when_every_stream_completed(self):
+        res = self._summary([_session("s1")])
+        res.streams_finished = 4
+        rate = aggregation.stream_error_rate(res)
+        assert rate is not None
+        assert rate.share_pct == 0.0
+
+    def test_stream_error_rate_none_without_stream_outcomes(self):
+        assert aggregation.stream_error_rate(self._summary([_session("s1")])) is None
+
+    # -- fallback rate -----------------------------------------------------
+
+    def test_fallback_rate_and_dominant_reason(self):
+        res = self._summary(
+            [_session("s1", messages=4)],
+            [
+                log_parser.LogEvent(
+                    "fallback", WINDOW_START, reason="local_lease_active"
+                ),
+                log_parser.LogEvent(
+                    "fallback", WINDOW_START, reason="local_lease_active"
+                ),
+                log_parser.LogEvent(
+                    "fallback", WINDOW_START, reason="context_too_large"
+                ),
+            ],
+        )
+        rate = aggregation.fallback_rate(res)
+        assert rate is not None
+        assert rate.metric_id == "fallback_rate"
+        assert rate.fallbacks == 3
+        assert rate.requests == 4
+        assert rate.share_pct == 75.0
+        assert rate.dominant_reason == "local_lease_active"
+        assert dict(rate.reason_counts) == {
+            "context_too_large": 1,
+            "local_lease_active": 2,
+        }
+
+    def test_fallback_rate_is_zero_without_fallbacks(self):
+        rate = aggregation.fallback_rate(self._summary([_session("s1")]))
+        assert rate is not None
+        assert rate.share_pct == 0.0
+        assert rate.dominant_reason is None
+
+    def test_fallback_rate_none_without_requests(self):
+        assert aggregation.fallback_rate(self._summary([])) is None
+
+    # -- contention denials ------------------------------------------------
+
+    def test_contention_denials_per_hour(self):
+        res = self._summary([_session("s1")])
+        res.window_end = WINDOW_START + timedelta(hours=2)
+        res.dispatch_denied_count = 5
+        assert aggregation.contention_denials_per_hour(res) == 2.5
+
+    def test_contention_denials_per_hour_none_for_zero_length_window(self):
+        res = self._summary([_session("s1")])
+        res.window_end = WINDOW_START
+        assert aggregation.contention_denials_per_hour(res) is None
+
+    # -- prefill ETA accuracy ---------------------------------------------
+
+    def test_prefill_eta_accuracy_is_the_median_absolute_relative_error(self):
+        res = self._summary([_session("s1")])
+        res.local_admission_events = [
+            log_parser.LogEvent(
+                "local_admission_guard",
+                WINDOW_START - timedelta(seconds=2),
+                session="s1",
+                decision="admit",
+                enforced="false",
+                eta_prefill_s="10.0",
+            ),
+            log_parser.LogEvent(
+                "local_admission_guard",
+                WINDOW_START + timedelta(minutes=1),
+                session="s1",
+                decision="admit",
+                enforced="false",
+                eta_prefill_s="5.0",
+            ),
+        ]
+        res.ttft_events = [
+            log_parser.LogEvent(
+                "ttft",
+                WINDOW_START,
+                session="s1",
+                ttft_source="local",
+                dispatch_to_first_byte_ms=8000.0,
+            ),
+            log_parser.LogEvent(
+                "ttft",
+                WINDOW_START + timedelta(minutes=2),
+                session="s1",
+                ttft_source="local",
+                dispatch_to_first_byte_ms=10000.0,
+            ),
+        ]
+        # |10 - 8| / 8 = 25 %, |5 - 10| / 10 = 50 % -> median 37.5 %.
+        assert aggregation.prefill_eta_accuracy(res) == 37.5
+        assert aggregation.prefill_eta_pairs(res) == [(10.0, 8.0), (5.0, 10.0)]
+
+    def test_prefill_eta_accuracy_none_without_matched_pairs(self):
+        res = self._summary([_session("s1")])
+        res.local_admission_events = [
+            log_parser.LogEvent(
+                "local_admission_guard",
+                WINDOW_START,
+                session="other-session",
+                decision="admit",
+                enforced="false",
+                eta_prefill_s="10.0",
+            )
+        ]
+        res.ttft_events = [
+            log_parser.LogEvent(
+                "ttft",
+                WINDOW_START,
+                session="s1",
+                ttft_source="local",
+                dispatch_to_first_byte_ms=8000.0,
+            )
+        ]
+        assert aggregation.prefill_eta_accuracy(res) is None
+        assert aggregation.prefill_eta_pairs(res) == []
+
+    def test_prefill_eta_pairs_exclude_enforced_refusals(self):
+        """An applied refusal means that request never dispatched, so a later
+        first byte in the session belongs to a different request."""
+        res = self._summary([_session("s1")])
+        res.local_admission_events = [
+            log_parser.LogEvent(
+                "local_admission_guard",
+                WINDOW_START,
+                session="s1",
+                decision="reject",
+                enforced="true",
+                eta_prefill_s="10.0",
+            )
+        ]
+        res.ttft_events = [
+            log_parser.LogEvent(
+                "ttft",
+                WINDOW_START,
+                session="s1",
+                ttft_source="local",
+                dispatch_to_first_byte_ms=8000.0,
+            )
+        ]
+        assert aggregation.prefill_eta_pairs(res) == []
+
+    # -- context-size pressure --------------------------------------------
+
+    def test_context_pressure_share_at_or_above_the_per_slot_context(self):
+        res = self._summary([_session("s1", slots=2)])
+        res.local_prompt_samples = [("s1", 600), ("s1", 500), ("s1", 400)]
+        stats = aggregation.context_pressure(
+            res, {"local_model_ctx_size": 1000}
+        )
+        assert stats is not None
+        assert stats.metric_id == "context_pressure"
+        # per-slot context = 1000 / 2 = 500 tokens.
+        assert stats.samples == 3
+        assert stats.at_or_above == 2
+        assert stats.share_pct == 66.7
+        assert stats.thresholds == (500,)
+        assert stats.unknown_threshold_samples == 0
+
+    def test_context_pressure_uses_the_sessions_own_profile_context(self):
+        sessions = [_session("s1", slots=2)]
+        sessions[0]["ctx_size"] = 2000
+        res = self._summary(sessions)
+        res.local_prompt_samples = [("s1", 999), ("s1", 1000)]
+        stats = aggregation.context_pressure(res)
+        assert stats is not None
+        assert stats.thresholds == (1000,)
+        assert stats.at_or_above == 1
+
+    def test_context_pressure_falls_back_to_the_mode_profile_context(self):
+        schedule = _schedule()
+        mode_map = bucketing.ModeScheduleMap(
+            schedules={"fast": schedule},
+            ctx_sizes={"fast": 4096, "cheap": 8192},
+            default_mode="fast",
+        )
+        res = self._summary([_session("s1", slots=2, bucket="fast")])
+        res.local_prompt_samples = [("s1", 2048), ("s1", 1024)]
+        stats = aggregation.context_pressure(res, None, mode_map)
+        assert stats is not None
+        assert stats.thresholds == (2048,)
+        assert stats.at_or_above == 1
+
+    def test_context_pressure_excludes_samples_without_a_resolvable_limit(self):
+        res = self._summary([_session("s1", slots=2)])
+        res.local_prompt_samples = [("ghost", 9000), ("s1", 400)]
+        stats = aggregation.context_pressure(
+            res, {"local_model_ctx_size": 1000}
+        )
+        assert stats is not None
+        assert stats.samples == 1
+        assert stats.unknown_threshold_samples == 1
+        assert stats.share_pct == 0.0
+
+    def test_context_pressure_none_without_local_requests(self):
+        res = self._summary([_session("s1", slots=2)])
+        assert aggregation.context_pressure(res, {"local_model_ctx_size": 1000}) is None
+
+    # -- roll-up -----------------------------------------------------------
+
+    def test_performance_metric_inputs_keys_match_the_registry(self):
+        inputs = aggregation.performance_metric_inputs(
+            self._summary([_session("s1", slots=2)])
+        )
+        assert set(inputs) == {
+            metric.id for metric in performance_metrics.METRIC_REGISTRY
+        }
+        # Measured zeros stay zero; absent measurements are n/a, never 0.
+        assert inputs["fallback_rate"] == 0.0
+        assert inputs["contention_denials_per_hour"] == 0.0
+        assert inputs["prompt_cache_hit_ratio"] is None
+        assert inputs["gpu_busy"] is None
+        assert inputs["decode_speed"] is None
+        assert inputs["prompt_eval_speed"] is None
+        assert inputs["time_to_first_token"] is None
+        assert inputs["stream_error_rate"] is None
+        assert inputs["context_pressure"] is None
+        assert inputs["prefill_eta_accuracy"] is None
+
+    def test_aggregate_retains_local_prompt_samples_only(self):
+        """Only local, in-window terminal lines with measured usage are kept,
+        and they keep their session so the per-slot limit can be resolved."""
+        lines = [
+            "2026-08-02 14:01:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s-local",
+            "2026-08-02 14:01:05,000 - INFO - Stream finished: reason=stop "
+            "tokens=600/10/610 session=s-local provider=local model=Qwen3",
+            "2026-08-02 14:02:00,000 - INFO - Stream started: provider=opencode-go "
+            "model=deepseek-v4-flash session=s-remote",
+            "2026-08-02 14:02:05,000 - INFO - Stream finished: reason=stop "
+            "tokens=400/10/410 session=s-remote provider=opencode-go "
+            "model=deepseek-v4-flash",
+            # Local terminal line without usage: no prompt figure to record.
+            "2026-08-02 14:03:05,000 - INFO - Stream finished: reason=error "
+            "session=s-local provider=local model=Qwen3",
+        ]
+        summary = aggregation.aggregate(
+            _events(lines), WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert summary.local_prompt_samples == [("s-local", 600)]

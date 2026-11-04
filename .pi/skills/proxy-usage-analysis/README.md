@@ -4,6 +4,61 @@ The proxy-usage-analysis skill generates usage reports from llama-proxy logs,
 converting 24 hours of session and fallback activity into per-session CSV
 records and an operator-facing Markdown report.
 
+## Pipeline overview
+
+One deterministic pipeline turns the logs into the daily artifacts — no LLM is
+in the loop:
+
+```text
+proxy.log + llama-server.log
+        │  streaming parse (log_parser.py / llama_log_parser.py, window-filtered)
+        ▼
+   aggregation.py      sessions, fallbacks, busy time, TTFT, cache, denials, ETA
+        │              accuracy — the ten scorecard inputs
+        ▼
+  performance_metrics.py   metric registry, best-3 history, targets, verdicts
+        │
+        ▼
+   reporting.py ──► report.md        scorecard first, then the per-metric
+        │                            details, then the data sections
+        ├─────────► standard_sessions.csv, low_priority_sessions.csv,
+        │           errors.csv, errors.json and the --json summary
+        ▼
+  <output-dir>/performance_metrics_state.yaml    live best-3 history,
+                                                 rewritten once per run
+
+  report.md ──► discord_notify.py ──► Discord webhook (report as an
+                                      attachment; a failed run posts a
+                                      failure notice instead)
+```
+
+- **Scorecard.** `report.md` opens with `## Performance metrics summary`: the
+  ten metrics the proxy is held to, each with its best recorded baseline, an
+  evidence-based target (the mean of the three best measurements) and this
+  window's `Met` / `Unmet` / `Insufficient history` result — followed by a
+  `## Performance metric details` block with one subsection per metric
+  (importance, calculation, levers, trade-offs).
+- **State file.** The committed `metrics/performance_metrics.yaml` holds the
+  metric definitions and detail copy and is **never** written at runtime; the
+  mutable history lives in `<output-dir>/performance_metrics_state.yaml`, so
+  the nightly run never dirties the repository.
+- **Backfill.** A one-off `--seed-metrics-history [DIR]` seeds the best-3
+  history from the archived `report.md` files (idempotent per window), so the
+  scorecard is useful on its first run instead of reporting `Insufficient
+  history` for three days.
+- **Delivery.** A successful run posts `report.md` to the Discord webhook in
+  `.worklog/config.yaml` as an attachment and records the outcome in the
+  report's own `- Discord delivery:` bullet; a failed run posts a failure
+  notice to the same webhook. `--no-discord` keeps a run local. The webhook
+  URL is a credential and is never written to any artefact.
+- **No ctx-size advice.** The local context is fixed by the model and the
+  hardware, so no recommendation advises raising it — the large-context rules
+  name prompt compaction, slot rebalancing and the by-design remote bypass
+  instead.
+
+Metric definitions, both file schemas and the backfill command:
+[REFERENCE.md](REFERENCE.md#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3).
+
 ## Attribution Markers
 
 Since **LP-0MVAPNC2900145RH** the proxy logs restart and mode-switch lines

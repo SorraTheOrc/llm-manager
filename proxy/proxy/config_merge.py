@@ -27,6 +27,14 @@ effective (merged) config as canonical JSON — deterministic, key-sorted,
 formatting-agnostic — so both the shell read path and the Python write path
 produce byte-identical hashes for the same config inputs (LP-0MUJRVYQH002IEHW).
 
+The hash also covers ``models.ini`` (LP-0MVZ810NG008A3EW D1): the preset file is
+part of the effective local-backend config, so removing or retuning a preset
+must force a llama-server restart. Previously the signature hashed only the
+merged YAML, an unchanged ``models.ini`` edit went unnoticed, and the launcher
+printed "Preserving running llama-server" for a backend whose preset list had
+changed — the removed model stayed advertised until the signature file was
+deleted by hand.
+
 Typical use::
 
     from proxy.config_merge import deep_merge
@@ -107,7 +115,18 @@ def load_merged(base_path, overlay_path) -> dict:
     )
 
 
-def merged_config_sha256(base_path, overlay_path) -> str:
+def _models_ini_path(base_path) -> Path:
+    """Discover the ``models.ini`` preset file that belongs to *base_path*.
+
+    ``base_path`` is the proxy's authoritative ``config.yaml`` (``<repo>/proxy/
+    config.yaml``), so the preset file is its grandparent directory's
+    ``models.ini`` (``<repo>/models.ini``) — the path the launcher exports as
+    ``LLAMA_MODELS_PRESET`` and the one a container deployment may not ship.
+    """
+    return Path(base_path).resolve().parent.parent / "models.ini"
+
+
+def merged_config_sha256(base_path, overlay_path, models_ini_path=None) -> str:
     """Canonical sha256 of the merged (base + overlay) config.
 
     The restart signature (LP-0MUJRVYQH002IEHW) must reflect the *effective*
@@ -132,9 +151,15 @@ def merged_config_sha256(base_path, overlay_path) -> str:
         overlay_path: Path of the mode overlay (``config-<mode>.yaml``). When
             the overlay file is absent, the base is merged with itself
             (equivalent to an empty overlay).
+        models_ini_path: Path of the local-backend preset file (``models.ini``)
+            whose contents are part of the effective local-backend config
+            (LP-0MVZ810NG008A3EW D1). When ``None`` it is discovered from
+            *base_path* (:func:`_models_ini_path`); an absent file contributes
+            nothing, so a deployment without presets keeps its old hash.
 
     Returns:
-        Hex sha256 of the canonical JSON serialisation of the merged dict.
+        Hex sha256 of the canonical JSON serialisation of the merged dict, plus
+        the ``models.ini`` contents when that file exists.
     """
     base_path = Path(base_path)
     overlay_path = Path(overlay_path)
@@ -144,4 +169,17 @@ def merged_config_sha256(base_path, overlay_path) -> str:
         # Missing overlay -> the effective config is the base alone.
         merged = load_yaml_config(base_path)
     canonical = json.dumps(merged, sort_keys=True, separators=(",", ":"))
+    # LP-0MVZ810NG008A3EW D1: models.ini is part of the effective local-backend
+    # config. Hash its raw contents (comments included: any edit to the preset
+    # list is a config change) after a separator that cannot occur in YAML or
+    # ini text, so the two surfaces cannot be confused with one another.
+    models_ini = (
+        Path(models_ini_path) if models_ini_path is not None else _models_ini_path(base_path)
+    )
+    try:
+        presets = models_ini.read_text(encoding="utf-8") if models_ini.is_file() else ""
+    except (OSError, UnicodeDecodeError):
+        presets = ""
+    if presets:
+        canonical = f"{canonical}\x00models.ini\x00{presets}"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

@@ -67,6 +67,7 @@ module is owned by the repo-level ``scripts/lib/`` package (mirroring
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -109,6 +110,29 @@ FIELD_SLOTS_STALE = "slots_stale"
 #: beyond.
 LATENCY_BANDS = ("lt_1s", "1s_to_2s", "2s_to_5s", "gte_5s", "unknown")
 
+#: The six additive per-phase fields the proxy publishes on every
+#: ``status_request`` line (LP-0MVVXGHT1001I5YX, F1 of LP-0MVVCO1N7004TNGY):
+#: per-phase wall-clock timings for the status/counts/detail phases (ms, or
+#: ``None`` when a phase was never attempted), the upstream ``/slots``
+#: fan-out that poll caused, and the provenance of the served snapshot. They
+#: are read through their own regex on purpose: ``status_fields`` keeps its
+#: byte-for-byte fixed field set so pre-F1 windows stay measurable through
+#: the unchanged surface (F1 AC4 + the regression pin in
+#: ``proxy/tests/test_status_logging.py``), while the per-phase block below is
+#: strictly additive for windows that carry the instrumentation.
+PER_PHASE_FIELDS = (
+    "status_query_ms",
+    "slots_counts_ms",
+    "slots_detail_ms",
+    "slots_upstream_calls",
+    "slots_snapshot_source",
+)
+
+PER_PHASE_FIELD_RE = re.compile(
+    r"\b(?P<key>status_query_ms|slots_counts_ms|slots_detail_ms|"
+    r"slots_upstream_calls|slots_snapshot_source)=(?P<value>[^\s]+)"
+)
+
 
 def is_status_poll(line: str) -> bool:
     """True for a structured ``status_request`` line (the poll surface)."""
@@ -120,6 +144,74 @@ def status_fields(line: str) -> dict[str, str]:
     return {
         match.group("key"): match.group("value")
         for match in STATUS_FIELD_RE.finditer(line)
+    }
+
+
+def per_phase_fields(line: str) -> dict[str, str]:
+    """Return the per-phase read-path fields present on a status line.
+
+    Additive surface (F1 AC1): every field is present on an instrumented line
+    with the literal ``None`` for a phase that was never attempted, and absent
+    entirely from a pre-F1 line. The caller decides how to tell "not
+    instrumented" from "not attempted"; this function only extracts what is
+    there.
+    """
+    return {
+        match.group("key"): match.group("value")
+        for match in PER_PHASE_FIELD_RE.finditer(line)
+    }
+
+
+def parse_phase_ms(value: str | None) -> int | None:
+    """Parse a per-phase millisecond field (``None`` when absent/bogus).
+
+    A phase that was never attempted renders as the literal ``None`` on the
+    log line (the formatter stringifies ``None``); that is distinct from the
+    field being absent on a pre-F1 line, which the caller sees as ``value is
+    None`` before ``parse_phase_ms`` is ever called.
+    """
+    if value is None or value == "None":
+        return None
+    return parse_int(value)
+
+
+def parse_upstream_calls(value: str | None) -> int | None:
+    """Parse the per-poll upstream fan-out (``slots_upstream_calls``)."""
+    return parse_phase_ms(value)
+
+
+def percentile(sorted_values: list[int | float], q: float) -> int | float | None:
+    """Nearest-rank percentile ``q`` of an already-sorted sample.
+
+    ``None`` when the sample is empty — never a fabricated 0. Nearest-rank is
+    the definition used for the per-phase latency distributions, so p50/p90/p99
+    are reproducible from the raw sample without an external statistics
+    library.
+    """
+    if not sorted_values:
+        return None
+    # Nearest-rank rounds the ordinal up, then indexes (1-based ordinal ->
+    # 0-based index).
+    ordinal = math.ceil((q / 100.0) * len(sorted_values))
+    return sorted_values[ordinal - 1]
+
+
+def per_phase_distribution(
+    values: list[int | None],
+) -> dict:
+    """p50/p90/p99 over the attempted (non-``None``) phase samples.
+
+    ``count`` is the number of attempted phases; ``not_attempted`` the ones
+    rendered ``None``. Empty sample -> all percentiles ``None`` (no fabricated
+    numbers).
+    """
+    attempted = sorted(v for v in values if v is not None)
+    return {
+        "count": len(attempted),
+        "not_attempted": len(values) - len(attempted),
+        "p50": percentile(attempted, 50),
+        "p90": percentile(attempted, 90),
+        "p99": percentile(attempted, 99),
     }
 
 

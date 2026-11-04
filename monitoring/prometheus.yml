@@ -26,9 +26,15 @@ global:
 # in a podman container (no host process handle) — the proxy now resolves the
 # real RSS from the container's process tree / cgroup memory.current and
 # refreshes it on every /metrics scrape.
+#
+# host_memory_alerts.yaml (LP-0MVZ810NG008A3EW AC3) is the pre-OOM layer: it
+# thresholds MemAvailable against MemTotal and GTT against *physical RAM*, so it
+# warns while a model can still be shed, unlike gpu_memory_alerts.yaml whose
+# pool-relative thresholds (GTT pool = 128 GiB > 124 GiB of RAM) lag the danger.
 rule_files:
   - "gpu_compute_rules.yaml"
   - "gpu_memory_alerts.yaml"
+  - "host_memory_alerts.yaml"
   - "llama_memory_alerts.yaml"
   - "proxy_5xx_alerts.yaml"
   - "slots_query_alerts.yaml"

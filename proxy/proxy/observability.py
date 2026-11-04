@@ -55,6 +55,7 @@ import asyncio
 import contextlib
 import json
 import re
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -223,6 +224,361 @@ def last_known_slot_counts() -> tuple[int, int] | None:
 
 
 # ===================================================================
+# Enumerated slot-staleness reason (LP-0MW1VVIPG008896N)
+#
+# ``slots_stale`` was a bare boolean, so the 2026-11-04 freeze (a per-slot
+# snapshot served unchanged for 8 h 17 m) could only be diagnosed by decoding
+# Prometheus counter labels. ``/llama/local/status`` now also publishes
+# ``slots_stale_reason`` from this single canonical vocabulary: one constant
+# so no call site spells a reason inline, and a test can assert every member
+# is produced by a covered path.
+#
+# Deliberately *additive*: the existing ``llama_slots_query_failures_total``
+# label vocabulary (``timeout``, ``http_<code>``, ``connection_error``,
+# ``invalid_payload``, ``unknown``) is unchanged, so
+# ``monitoring/slots_query_alerts.yaml`` keeps matching. The metric labels are
+# *mapped onto* this vocabulary rather than replaced by it.
+# ===================================================================
+
+SLOTS_STALE_REASON_ROUTER_MODEL_MISSING = "router_model_missing"
+"""No usable model id: resolution fell through to its last resort and the
+server rejected the query. Router mode requires ``?model=``."""
+
+SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED = "child_port_undiscovered"
+"""Router mode with no discoverable child port, so the poll went to the router
+port (``llama_slots_child_port_fallbacks_total{reason="no_child_port_router_mode"}``)."""
+
+SLOTS_STALE_REASON_QUERY_TIMEOUT = "query_timeout"
+"""The ``/slots`` fetch timed out."""
+
+SLOTS_STALE_REASON_QUERY_ERROR = "query_error"
+"""Any other ``/slots`` fetch failure: non-200 HTTP status, connection error or
+malformed payload."""
+
+SLOTS_STALE_REASON_SNAPSHOT_TOO_OLD = "snapshot_too_old"
+"""The served snapshot is older than the configured ceiling. Declared here so
+the vocabulary is complete; the ceiling that *produces* it end-to-end is
+supplied by LP-0MW1VVKPF001ZAV5."""
+
+SLOTS_STALE_REASONS: tuple[str, ...] = (
+    SLOTS_STALE_REASON_ROUTER_MODEL_MISSING,
+    SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED,
+    SLOTS_STALE_REASON_QUERY_TIMEOUT,
+    SLOTS_STALE_REASON_QUERY_ERROR,
+    SLOTS_STALE_REASON_SNAPSHOT_TOO_OLD,
+)
+"""The complete, ordered ``slots_stale_reason`` vocabulary.
+
+Precedence when several conditions hold at once (see
+:func:`select_slots_stale_reason`): ``snapshot_too_old`` dominates every
+transport reason, and the per-slot **detail** phase dominates the **counts**
+phase — a cached ``is_processing`` is a fossil of a past request, and detail is
+what ``capacity_hint`` consumes.
+
+Consumer rule: treat any unrecognised value as *stale* (fail closed); never as
+fresh. Additive values may appear in future schema versions.
+"""
+
+_STALE_REASON_LOCK = threading.Lock()
+_last_slots_stale_reason: str | None = None
+
+
+def classify_slots_failure_reason(label: str | None) -> str:
+    """Map a ``llama_slots_query_failures_total`` label onto the vocabulary.
+
+    ``timeout`` becomes ``query_timeout``; every other failure label (a
+    ``http_<code>`` status, ``connection_error``, ``invalid_payload``,
+    ``unknown``, or anything unrecognised) becomes ``query_error``. A reason is
+    never silently dropped: an unknown label still reports a failure.
+    """
+    if isinstance(label, str) and label.strip().lower() == "timeout":
+        return SLOTS_STALE_REASON_QUERY_TIMEOUT
+    return SLOTS_STALE_REASON_QUERY_ERROR
+
+
+def select_slots_stale_reason(
+    detail_reason: str | None,
+    counts_reason: str | None,
+    snapshot_too_old: bool = False,
+) -> str | None:
+    """Pick the single published reason under the documented precedence.
+
+    * ``snapshot_too_old`` wins over every transport reason — an over-age
+      snapshot is the condition a consumer must act on regardless of why the
+      last fetch failed.
+    * Otherwise the detail phase wins over the counts phase (detail is what
+      capacity consumes).
+    * A value outside the vocabulary is reported as ``query_error`` rather
+      than published verbatim, so the field can never carry an invented
+      spelling.
+    """
+    if snapshot_too_old:
+        return SLOTS_STALE_REASON_SNAPSHOT_TOO_OLD
+    for candidate in (detail_reason, counts_reason):
+        if candidate is None:
+            continue
+        if candidate in SLOTS_STALE_REASONS:
+            return candidate
+        return SLOTS_STALE_REASON_QUERY_ERROR
+    return None
+
+
+def record_slots_stale_reason(reason: str | None) -> None:
+    """Remember the staleness reason for the current poll (fail-open).
+
+    Best-effort by contract: a recorder fault must never break the status
+    endpoint, so any exception is swallowed. A value outside the vocabulary is
+    ignored (``None`` clears the record), keeping the published field free of
+    invented spellings.
+    """
+    global _last_slots_stale_reason
+    try:
+        with _STALE_REASON_LOCK:
+            if reason is None:
+                _last_slots_stale_reason = None
+            elif reason in SLOTS_STALE_REASONS:
+                _last_slots_stale_reason = reason
+    except Exception:
+        pass
+
+
+def last_slots_stale_reason() -> str | None:
+    """Current recorded reason, or ``None`` when the surface is fresh.
+
+    Fail-open: a recorder fault reports ``None`` ("no reason claimed") rather
+    than raising inside the status path.
+    """
+    try:
+        with _STALE_REASON_LOCK:
+            return _last_slots_stale_reason
+    except Exception:
+        return None
+
+
+def reset_slots_stale_reason() -> None:
+    """Clear the recorded reason (test isolation, and a fresh healthy poll)."""
+    record_slots_stale_reason(None)
+# Snapshot age ceiling (LP-0MW1VVKPF001ZAV5)
+#
+# The 2026-11-04 defect was not a missing *measurement* — the payload
+# published ``slots_snapshot_age_seconds=29825.67`` (8 h 17 m) — but a missing
+# *bound*: the per-slot detail cache was served, and availability claimed from
+# it, indefinitely. The counts cache was already bounded
+# (``SLOT_COUNTS_STALE_AFTER_SECONDS``, 1 h); the detail cache had no ceiling
+# at all.
+#
+# The bound is expressed as a small multiple of the status poll cadence
+# (``STATUS_POLL_CADENCE_SECONDS``) rather than an hour: the point is that a
+# consumer can never act on a snapshot older than roughly the next few polls.
+# ===================================================================
+
+STATUS_POLL_CADENCE_SECONDS: float = 30.0
+"""Assumed cadence (seconds) of the ``/llama/local/status`` consumers.
+
+A downtime dispatcher decides whether to schedule work on each poll; ~30 s is
+the observed decision cadence. Kept as a named constant so the default ceiling
+is *derived* from it in code (and asserted by a test) instead of hard-coding a
+magic number.
+"""
+
+_SLOTS_MAX_SNAPSHOT_AGE_FLOOR_SECONDS: float = 120.0
+"""Lower bound (seconds) for the derived ceiling.
+
+Even a fast poll cadence must not produce a ceiling so tight that ordinary
+jitter turns a healthy surface into ``snapshot_too_old``.
+"""
+
+_SLOTS_MAX_SNAPSHOT_AGE_CADENCE_MULTIPLE: float = 10.0
+"""How many poll intervals a snapshot may lag before it is too old to serve."""
+
+
+def _default_slots_max_snapshot_age_seconds() -> float:
+    """Cadence-derived default ceiling (seconds)."""
+    return max(
+        _SLOTS_MAX_SNAPSHOT_AGE_FLOOR_SECONDS,
+        _SLOTS_MAX_SNAPSHOT_AGE_CADENCE_MULTIPLE * STATUS_POLL_CADENCE_SECONDS,
+    )
+
+
+def _positive_float(value: object) -> float | None:
+    """Return *value* as a positive float, or ``None`` when unusable."""
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed <= 0.0:  # NaN or non-positive
+        return None
+    return parsed
+
+
+def local_slots_max_snapshot_age_seconds(config: dict | None = None) -> float:
+    """Resolve ``local_slots_max_snapshot_age_seconds`` (seconds).
+
+    Order: ``server.local_slots_max_snapshot_age_seconds`` in *config* → the
+    ``LOCAL_SLOTS_MAX_SNAPSHOT_AGE_SECONDS`` environment variable → the
+    cadence-derived default from
+    :func:`_default_slots_max_snapshot_age_seconds`.
+
+    An unparseable, non-positive or absent value falls through to the next
+    source, so a bad setting **never** disables the bound or raises inside the
+    status endpoint — the ceiling is a safety limit, not a preference.
+    """
+    server_cfg = {}
+    if isinstance(config, dict):
+        server_cfg = config.get("server") or {}
+        if not isinstance(server_cfg, dict):
+            server_cfg = {}
+    resolved = _positive_float(server_cfg.get("local_slots_max_snapshot_age_seconds"))
+    if resolved is not None:
+        return resolved
+    import os
+
+    resolved = _positive_float(os.environ.get("LOCAL_SLOTS_MAX_SNAPSHOT_AGE_SECONDS"))
+    if resolved is not None:
+        return resolved
+    return _default_slots_max_snapshot_age_seconds()
+
+
+def slots_snapshot_too_old(
+    age_seconds: float | None, ceiling_seconds: float
+) -> bool:
+    """True when a served snapshot is older than *ceiling_seconds*.
+
+    Total by construction: an unknown age (``None``, NaN) is **not** too old —
+    a missing measurement is not evidence of staleness, and the ceiling must
+    never turn a healthy poll into a degraded one. The ceiling itself is the
+    last acceptable age, so ``age == ceiling`` is still servable.
+    """
+    if age_seconds is None:
+        return False
+    try:
+        age = float(age_seconds)
+        ceiling = float(ceiling_seconds)
+    except (TypeError, ValueError):
+        return False
+    if age != age or ceiling != ceiling:  # NaN
+        return False
+    return age > ceiling
+
+
+SLOTS_SURFACE_OK = "ok"
+SLOTS_SURFACE_STALE = "stale"
+SLOTS_SURFACE_UNKNOWN = "unknown"
+
+SLOTS_SURFACE_STATES: tuple[str, ...] = (
+    SLOTS_SURFACE_OK,
+    SLOTS_SURFACE_STALE,
+    SLOTS_SURFACE_UNKNOWN,
+)
+"""The ``slots_surface_status`` vocabulary published on ``/health``."""
+
+
+def _age_of_stamp(stamp: float | None) -> float | None:
+    """Age (seconds) of a monotonic *stamp*, or ``None`` when unset.
+
+    A non-positive or NaN stamp means "never fetched", which is an *unknown*
+    age — never "infinitely old" (the same discipline as the status handler's
+    ``_snapshot_age_seconds``, LP-0MW1VVKPF001ZAV5).
+    """
+    if stamp is None:
+        return None
+    try:
+        value = float(stamp)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value <= 0.0:
+        return None
+    return max(0.0, time.monotonic() - value)
+
+
+def evaluate_slots_surface(
+    config: dict | None = None,
+    backend_available: bool = True,
+    served_age_seconds: float | None = None,
+    served_from_snapshot: bool = False,
+) -> dict:
+    """Single source of truth for slot-surface freshness.
+
+    Both ``/llama/local/status`` and ``/health`` consume this, so the ceiling
+    arithmetic and the reason precedence exist once (LP-0MW1VVMI1005XU0J AC3).
+
+    Args:
+        config: server configuration (for the ceiling).
+        backend_available: whether the backend is reachable at all. When it is
+            not, the surface is simply unobservable — reported ``unknown``,
+            never ``stale``, so an ordinary idle window is not a defect.
+        served_age_seconds: the age of the snapshot this poll actually served,
+            when the caller knows it (the status handler does, from its
+            provenance). ``None`` falls back to the cache stamps.
+        served_from_snapshot: whether the served data came from a cache.
+
+    Returns a dict with ``status`` (one of :data:`SLOTS_SURFACE_STATES`),
+    ``slots_stale`` (bool), ``slots_stale_reason`` (vocabulary member or
+    ``None``), ``snapshot_age_seconds`` and ``max_snapshot_age_seconds``.
+
+    Never raises: a fault yields an ``unknown`` surface rather than breaking a
+    health or status poll.
+    """
+    try:
+        ceiling = local_slots_max_snapshot_age_seconds(config)
+    except Exception:  # pragma: no cover - defensive
+        ceiling = _default_slots_max_snapshot_age_seconds()
+
+    try:
+        if served_age_seconds is not None:
+            age = served_age_seconds
+        elif _last_slot_details_cache:
+            age = _age_of_stamp(_last_slot_details_at)
+        else:
+            age = _age_of_stamp(
+                _last_slot_counts_cache[2] if _last_slot_counts_cache else None
+            )
+    except Exception:  # pragma: no cover - defensive
+        age = None
+
+    try:
+        too_old = slots_snapshot_too_old(age, ceiling)
+        recorded = last_slots_stale_reason()
+    except Exception:  # pragma: no cover - defensive
+        too_old, recorded = False, None
+
+    reason = select_slots_stale_reason(
+        detail_reason=recorded, counts_reason=None, snapshot_too_old=too_old
+    )
+
+    if reason is not None:
+        status = SLOTS_SURFACE_STALE
+    elif not backend_available:
+        status = SLOTS_SURFACE_UNKNOWN
+    else:
+        status = SLOTS_SURFACE_OK
+
+    return {
+        "status": status,
+        "slots_stale": reason is not None or (
+            served_from_snapshot and bool(too_old)
+        ),
+        "slots_stale_reason": reason,
+        "snapshot_age_seconds": age,
+        "max_snapshot_age_seconds": ceiling,
+    }
+
+
+def last_known_slot_counts_stamp() -> float | None:
+    """Monotonic stamp of the last successful counts fetch, or ``None``.
+
+    Published so the status handler can report the age of a graceful-
+    degradation snapshot exactly (LP-0MVVXGHT1001I5YX AC1 ``slots_"
+    "snapshot_age_seconds``) rather than guessing from the read time — the
+    age is the distance from when the data was fetched, not from when it was
+    served (LP-0MVECWYWK000U3E1 discipline).
+    """
+    if _last_slot_counts_cache is None:
+        return None
+    return _last_slot_counts_cache[2]
+
+
+# ===================================================================
 # /slots poll coalescing (LP-0MUCEFD5B003TURT)
 #
 # Every herdr client polls /llama/local/status, and each poll queries
@@ -332,8 +688,14 @@ def reset_slots_poll_cache() -> None:
     _slots_poll_cache.clear()
 
 
-def _cached_slots_payload(url: str) -> tuple[int, object] | None:
-    """Return the cached (status, data) for *url* when still fresh."""
+def _cached_slots_payload_entry(url: str) -> tuple[float, int, object] | None:
+    """Return the cached ``(fetched_at, status, data)`` for *url* when fresh.
+
+    ``fetched_at`` is the ``time.monotonic()`` stamp of the upstream fetch that
+    produced the entry, so callers can publish the age of the snapshot they
+    were served (LP-0MVVXGHT1001I5YX). Never re-stamped on a cache read: a
+    cache hit must not make stale data look fresh (LP-0MVECWYWK000U3E1).
+    """
     cached = _slots_poll_cache.get(url)
     if cached is None:
         return None
@@ -342,8 +704,40 @@ def _cached_slots_payload(url: str) -> tuple[int, object] | None:
     if status != 200:
         ttl = max(ttl, _slots_poll_failure_backoff_seconds())
     if time.monotonic() - ts < ttl:
-        return status, data
+        return ts, status, data
     return None
+
+
+def _cached_slots_payload(url: str) -> tuple[int, object] | None:
+    """Return the cached (status, data) for *url* when still fresh."""
+    entry = _cached_slots_payload_entry(url)
+    if entry is None:
+        return None
+    return entry[1], entry[2]
+
+
+def _note_slots_provenance(
+    provenance_out: dict | None,
+    *,
+    source: str,
+    fetched_at: float | None,
+    upstream_calls: int,
+) -> None:
+    """Record how a ``/slots`` read was served (LP-0MVVXGHT1001I5YX).
+
+    Fills the caller's optional dict with the provenance of one read path so
+    the status handler can publish per-poll attribution (which phase asked
+    upstream, which was served from cache, and how old the served snapshot
+    is). Best-effort: a provenance failure must never break a status poll.
+    """
+    if provenance_out is None:
+        return
+    try:
+        provenance_out["source"] = source
+        provenance_out["fetched_at"] = fetched_at
+        provenance_out["upstream_calls"] = int(upstream_calls)
+    except Exception:
+        pass
 
 
 async def _do_slots_fetch(
@@ -438,16 +832,32 @@ async def _await_slots_inflight(fut: "asyncio.Future", wait_seconds: float) -> b
 
 
 async def _run_slots_fetch_as_leader(
-    url: str, timeout: float, client, fut: "asyncio.Future"
+    url: str,
+    timeout: float,
+    client,
+    fut: "asyncio.Future",
+    provenance_out: dict | None = None,
 ) -> tuple[int, object]:
     """Fetch /slots and settle the shared future for every follower."""
     try:
         status, data = await _do_slots_fetch(url, timeout, client)
-        _slots_poll_cache[url] = (time.monotonic(), status, data)
+        fetched_at = time.monotonic()
+        _slots_poll_cache[url] = (fetched_at, status, data)
+        _note_slots_provenance(
+            provenance_out,
+            source="upstream",
+            fetched_at=fetched_at,
+            upstream_calls=1,
+        )
         if not fut.done():
             fut.set_result((status, data))
         return status, data
     except BaseException as exc:
+        # The attempt still reached upstream: record the cost even when it
+        # failed, so an error poll is not mislabelled as a cache hit.
+        _note_slots_provenance(
+            provenance_out, source="upstream", fetched_at=None, upstream_calls=1
+        )
         # ``CancelledError`` derives from ``BaseException``, so a leader
         # cancelled by a client disconnect used to skip this path entirely and
         # leave the future pending with no owner (LP-0MVJML600003CQ6Y, AC1).
@@ -465,7 +875,7 @@ async def _run_slots_fetch_as_leader(
 
 
 async def _fetch_slots_payload(
-    url: str, timeout: float, client=None
+    url: str, timeout: float, client=None, provenance_out: dict | None = None
 ) -> tuple[int, object]:
     """Fetch /slots with TTL caching and single-flight coalescing.
 
@@ -475,20 +885,39 @@ async def _fetch_slots_payload(
     ``SLOTS_POLL_FAILURE_BACKOFF_SECONDS`` so a failing backend is not
     hammered. Returns ``(status_code, parsed_data)``.
 
+    ``provenance_out`` (optional, additive) is filled with how the read was
+    served — ``source`` (``upstream`` | ``ttl_cache`` | ``failure_backoff``),
+    the monotonic ``fetched_at`` of the served payload and the number of
+    upstream calls this read caused — so the status path can attribute a poll
+    to a phase and a cache path instead of inferring it from an aggregate
+    latency (LP-0MVVXGHT1001I5YX AC1/AC2).
+
     Cancellation safety (LP-0MVJML600003CQ6Y): the shared future is always
     settled by its owner, and a follower waits for it only for a bounded time
     before promoting itself to leader — see the invariant block above.
     """
-    cached = _cached_slots_payload(url)
-    if cached is not None:
-        return cached
+    entry = _cached_slots_payload_entry(url)
+    if entry is not None:
+        _note_slots_provenance(
+            provenance_out,
+            source="failure_backoff" if entry[1] != 200 else "ttl_cache",
+            fetched_at=entry[0],
+            upstream_calls=0,
+        )
+        return entry[1], entry[2]
 
     lock = _get_slots_poll_lock()
     leader = False
     async with lock:
-        cached = _cached_slots_payload(url)
-        if cached is not None:
-            return cached
+        entry = _cached_slots_payload_entry(url)
+        if entry is not None:
+            _note_slots_provenance(
+                provenance_out,
+                source="failure_backoff" if entry[1] != 200 else "ttl_cache",
+                fetched_at=entry[0],
+                upstream_calls=0,
+            )
+            return entry[1], entry[2]
         inflight = _slots_poll_inflight.get(url)
         if inflight is not None:
             fut = inflight
@@ -498,12 +927,18 @@ async def _fetch_slots_payload(
             leader = True
 
     if leader:
-        return await _run_slots_fetch_as_leader(url, timeout, client, fut)
+        return await _run_slots_fetch_as_leader(
+            url, timeout, client, fut, provenance_out=provenance_out
+        )
 
     # Follower: bounded wait, then take over leadership (AC1/AC2).
     wait_seconds = _slots_poll_follower_timeout_seconds(timeout)
     for attempt in range(_SLOTS_POLL_FOLLOWER_ATTEMPTS):
         if await _await_slots_inflight(fut, wait_seconds) and not fut.cancelled():
+            # Followed a leader this poll caused no upstream call of its own.
+            _note_slots_provenance(
+                provenance_out, source="upstream", fetched_at=None, upstream_calls=0
+            )
             # Re-raises the leader's exception, preserving the old shared-await
             # semantics for genuine upstream failures.
             return fut.result()
@@ -511,16 +946,24 @@ async def _fetch_slots_payload(
         # progress rather than waiting forever.
         fut, leader = await _promote_slots_follower(url, fut)
         if leader:
-            return await _run_slots_fetch_as_leader(url, timeout, client, fut)
+            return await _run_slots_fetch_as_leader(
+                url, timeout, client, fut, provenance_out=provenance_out
+            )
         if attempt + 1 >= _SLOTS_POLL_FOLLOWER_ATTEMPTS:
             break
 
     # Every shared future this caller followed was abandoned: degrade to a
     # still-fresh cached payload, else report the timeout to the caller (which
     # records a /slots failure and falls back to last-known counts).
-    cached = _cached_slots_payload(url)
-    if cached is not None:
-        return cached
+    entry = _cached_slots_payload_entry(url)
+    if entry is not None:
+        _note_slots_provenance(
+            provenance_out,
+            source="failure_backoff" if entry[1] != 200 else "ttl_cache",
+            fetched_at=entry[0],
+            upstream_calls=0,
+        )
+        return entry[1], entry[2]
     raise TimeoutError(
         f"/slots single-flight follower waited {_SLOTS_POLL_FOLLOWER_ATTEMPTS} "
         f"bounded attempts for {url} without a payload"
@@ -558,6 +1001,7 @@ async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None,
     base_url: str | None = None,
     status_out: dict | None = None,
+    provenance_out: dict | None = None,
 ) -> tuple:
     """Query the llama-server ``/slots`` endpoint.
 
@@ -597,7 +1041,9 @@ async def _query_slots(
         # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls behind a
         # short TTL so N status pollers produce a bounded number of upstream
         # requests (not N per interval).
-        status, slots_data = await _fetch_slots_payload(url, timeout, client)
+        status, slots_data = await _fetch_slots_payload(
+            url, timeout, client, provenance_out=provenance_out
+        )
         if status == 200:
             if isinstance(slots_data, list):
                 total_slots = len(slots_data)
@@ -606,6 +1052,11 @@ async def _query_slots(
                 )
                 if total_slots > 0:
                     _record_last_slot_counts(available_slots, total_slots)
+                    # A successful counts read is fresh evidence: clear any
+                    # recorded staleness reason so the published field never
+                    # lingers from an earlier failed poll
+                    # (LP-0MW1VVIPG008896N).
+                    reset_slots_stale_reason()
                 _set_slots_status_out(status_out, status=status)
                 return available_slots, total_slots
             _record_slots_query_failure("invalid_payload")
@@ -664,13 +1115,21 @@ def _record_last_slot_counts(available_slots: int, total_slots: int) -> None:
 
 
 def _record_slots_query_failure(reason: str) -> None:
-    """Increment the /slots query failure metric (best-effort)."""
+    """Increment the /slots query failure metric and record the stale reason.
+
+    Best-effort on both counts (LP-0MW1VVIPG008896N): the metric increment is
+    wrapped exactly as before, and the reason is mapped onto the enumerated
+    ``slots_stale_reason`` vocabulary and recorded for the status payload. The
+    metric *label* is passed through unchanged, so
+    ``monitoring/slots_query_alerts.yaml`` keeps matching.
+    """
     try:
         from proxy.metrics import record_slots_query_failure
 
         record_slots_query_failure(reason)
     except Exception:
         pass
+    record_slots_stale_reason(classify_slots_failure_reason(reason))
 
 
 def _slot_context_tokens(slot: dict) -> int | None:
@@ -698,6 +1157,7 @@ async def _query_slots_detail(
     model: str | None = None,
     endpoint: str | None = None,
     _client: httpx.AsyncClient | None = None,
+    provenance_out: dict | None = None,
 ) -> list[dict]:
     """Query the llama-server ``/slots`` endpoint and return per-slot details.
 
@@ -734,6 +1194,9 @@ async def _query_slots_detail(
         url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
         url = f"{url}?model={resolved_model}"
         if _client is not None:
+            _note_slots_provenance(
+                provenance_out, source="upstream", fetched_at=None, upstream_calls=1
+            )
             slots_resp = await _client.get(url)
             if slots_resp.status_code == 200:
                 slots_data = await _safe_parse_json_response(slots_resp)
@@ -741,7 +1204,9 @@ async def _query_slots_detail(
                 slots_data = None
         else:
             # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls.
-            status, slots_data = await _fetch_slots_payload(url, timeout, None)
+            status, slots_data = await _fetch_slots_payload(
+                url, timeout, None, provenance_out=provenance_out
+            )
             if status != 200:
                 slots_data = None
         if isinstance(slots_data, list):
@@ -903,6 +1368,13 @@ async def _sample_slot_occupancy(srv) -> dict | None:
         # fetch below report the outcome (a failure still publishes nothing).
         pass
 
+    if llama_port is None:
+        # LP-0MVWBXEAI008YZ7B AC6: the resolver's (None, None) skip sentinel —
+        # the model is definitively not loaded. The sampler publishes nothing
+        # (no gauges, no failure counter: the poll was deliberately skipped,
+        # not a failed sample) exactly like its failure path.
+        return None
+
     url = _build_llama_url(llama_port, "/slots")
     # Never model-less: the router answers a bare /slots with HTTP 400, so a
     # missing current_model is filled from the cached /models resolution
@@ -979,6 +1451,19 @@ async def _slot_metrics_loop(
             from proxy.metrics import record_slot_occupancy
 
             record_slot_occupancy(snapshot)
+        except Exception:
+            pass
+        # LP-0MVZ810NG008A3EW AC3: the same cadence refreshes the host-memory
+        # pressure gauges. Cheap (one /proc read and two sysfs reads) and
+        # independent of the /slots result — pressure is what warns before the
+        # kernel watermark, so it must not stop when a slot query fails.
+        try:
+            from proxy import host_pressure as _host_pressure
+            from proxy.metrics import record_host_pressure
+
+            record_host_pressure(
+                _host_pressure.read_memory_snapshot(), time.time()
+            )
         except Exception:
             pass
         await asyncio.sleep(interval_seconds)
@@ -1398,18 +1883,31 @@ async def query_llama_status() -> dict:
     # allow updating/reading endpoint cache/failures
     srv = _srv()
 
+    server_config = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+    llama_port = server_config.get("llama_server_port", 8080)
+
+    running = srv.llama_process is not None and srv.llama_process.poll() is None
+    if not running and bool(server_config.get("llama_router_mode", False)):
+        # LP-0MVZT9L3N001XABB AC2/AC3: a reachable router-mode backend is
+        # running even when this proxy holds no process handle for it (an
+        # unadopted self-heal spawn, or a host-first server started outside
+        # the proxy). Without this, /health and /llama/local/status reported
+        # ``llama_server_running: false`` and ``total_slots: 0`` while the
+        # local route was fully functional.
+        try:
+            running = bool(await srv._probe_backend_reachable(llama_port))
+        except Exception:
+            running = False
+
     result = {
         "n_ctx": None,
         "kv_cache_tokens": None,
-        "llama_server_running": srv.llama_process is not None and srv.llama_process.poll() is None,
+        "llama_server_running": running,
         "router_mode": False
     }
 
-    if not result["llama_server_running"]:
+    if not running:
         return result
-
-    server_config = srv.config.get("server", {})
-    llama_port = server_config.get("llama_server_port", 8080)
 
     # One-time discovery: probe metadata endpoints once per llama-server process
     client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
@@ -1844,6 +2342,20 @@ Consumer rule: any hint value a consumer does not recognise — including this
 one, and any future one — must be treated as **busy**, never as idle.
 """
 
+CAPACITY_UNKNOWN = "unknown"
+"""Capacity cannot be asserted from the served evidence (LP-0MW1VDZIX0011D8M).
+
+Published when the only evidence is a stale ``/slots`` snapshot and the proxy
+has no live in-flight local work of its own: the fossil cannot prove the pool
+is available, and it cannot prove it is busy either. Reporting ``idle`` there
+was the defect the item fixes — it asserted availability from a stale list
+(``available_slots: 2`` while ``slots[]`` showed both slots
+``is_processing: true``). ``unknown`` asserts neither direction; per the
+consumer rule above it is treated as **busy** by any consumer that does not
+recognise it, so the failure mode is fail-closed (a refused newcomer) rather
+than over-dispatch behind a ghost.
+"""
+
 STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS = 15.0
 """Maximum proxy-observed idle age that still counts as fresh decode evidence.
 
@@ -1968,6 +2480,25 @@ def compute_capacity_hint(slots: list[dict]) -> str:
     return CAPACITY_IDLE
 
 
+def count_available_slots(slots: list[dict]) -> int:
+    """Number of slots the served detail reports as *not* processing.
+
+    This is the single derivation behind ``available_slots``
+    (LP-0MW1VDZIX0011D8M AC1): the summary is computed from ``slots[]`` by
+    construction, never from a separate counter, so the two can never
+    contradict each other. A slot the proxy abandoned but llama-server still
+    reports processing counts as **not available** — abandonment reduces
+    availability rather than sitting beside it (AC4).
+    """
+    count = 0
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        if not bool(slot.get("is_processing", False)):
+            count += 1
+    return count
+
+
 def downgrade_stale_capacity_hint(
     hint: str,
     *,
@@ -1989,10 +2520,15 @@ def downgrade_stale_capacity_hint(
 
     1. Fresh detail → return ``hint`` unchanged (the decision table is
        authoritative).
-    2. Stale detail and **no** live in-flight local requests → ``idle``. The
-       cached occupancy is contradicted by the proxy's own dispatch state
+    2. Stale detail and **no** live in-flight local requests → ``unknown``.
+       The cached occupancy is contradicted by the proxy's own dispatch state
        (retained leases and a leaked ``local_active_queries`` counter are not
-       work, and an unloaded model reports no slots at all).
+       work), so neither availability nor saturation can be asserted from it
+       (LP-0MW1VDZIX0011D8M AC3). This was ``idle`` before that item: folding
+       a fossil into ``idle`` asserted availability from a stale list, which
+       is exactly the contradiction (``available_slots: 2`` beside two
+       ``is_processing: true`` slots) the item removes. ``unknown`` is
+       fail-closed for consumers that treat unrecognised hints as busy.
     3. Stale detail with live in-flight work and fresh decode evidence
        (``activity_source == "chunk"`` within
        ``STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS``) → ``saturated``.
@@ -2011,7 +2547,7 @@ def downgrade_stale_capacity_hint(
     if not stale:
         return hint
     if live_local_requests <= 0:
-        return CAPACITY_IDLE
+        return CAPACITY_UNKNOWN
     recent_decode = (
         activity_source == "chunk"
         and idle_seconds is not None
@@ -2505,6 +3041,10 @@ def _resolve_slot_details_for_enrichment(slot_details: list[dict] | None) -> lis
         global _last_slot_details_at
         _last_slot_details_cache[:] = [dict(s) for s in slot_details]
         _last_slot_details_at = time.monotonic()
+        # Fresh per-slot detail clears any previously recorded staleness
+        # reason (LP-0MW1VVIPG008896N): the surface is live again, so the
+        # published reason must not linger from an earlier failed poll.
+        reset_slots_stale_reason()
     return [dict(s) for s in _last_slot_details_cache]
 
 
@@ -2705,14 +3245,21 @@ async def _periodic_broadcast_loop():
                             )
                         except Exception:
                             pass
-                        # 5s timeout: llama-server may be slow to respond
+                        # LP-0MVWBXEAI008YZ7B AC: the resolver's (None, None)
+                        # skip sentinel — the model is definitively not loaded,
+                        # so this broadcast issues **no** /slots request and
+                        # the payload degrades to the empty slot list. A 5s
+                        # timeout: llama-server may be slow to respond
                         # to /slots when busy generating tokens. The single-flight
                         # helper bounds a follower's wait too, so a cancelled leader
                         # can no longer stall this loop for every SSE client
                         # (LP-0MVJML600003CQ6Y, AC5).
-                        slot_details = await _query_slots_detail(
-                            llama_port, timeout=5.0, model=model_name,
-                        )
+                        if llama_port is None:
+                            slot_details = []
+                        else:
+                            slot_details = await _query_slots_detail(
+                                llama_port, timeout=5.0, model=model_name,
+                            )
                     except Exception:
                         pass
 

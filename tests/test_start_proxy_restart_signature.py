@@ -124,6 +124,18 @@ printf '%s %s\\n' "@NAME@" "$*" >> "$FAKE_KILL_LOG"
 exit 0
 """
 
+# LP-0MVZ810NG008A3EW D2: the launcher no longer calls `pkill -f`; it selects
+# victims with `pgrep -f` (which never matches itself) and signals them with
+# `kill`. The stub always reports one fake matching pid and records the pattern,
+# so a "preserve" case can prove that no llama-server kill was even attempted
+# while a "restart" case proves it was. The fake pid does not exist, and the
+# `kill` stub below records instead of signalling.
+FAKE_PGREP = """#!/usr/bin/env bash
+printf 'pgrep %s\\n' "$*" >> "$FAKE_KILL_LOG"
+echo 424242
+exit 0
+"""
+
 
 def _free_port() -> int:
     sock = socket.socket()
@@ -189,6 +201,12 @@ def _sandbox(tmp_path: Path, *, with_config_merge: bool = True) -> _Sandbox:
     for name in ("pkill", "fuser"):
         (tools / name).write_text(FAKE_KILLER.replace("@NAME@", name), encoding="utf-8")
         (tools / name).chmod(0o755)
+    # LP-0MVZ810NG008A3EW D2: kill selection is pgrep+kill, so both are stubbed —
+    # a real `pgrep -f 'uvicorn proxy\.server'` would match the live proxy.
+    (tools / "pgrep").write_text(FAKE_PGREP, encoding="utf-8")
+    (tools / "pgrep").chmod(0o755)
+    (tools / "kill").write_text(FAKE_KILLER.replace("@NAME@", "kill"), encoding="utf-8")
+    (tools / "kill").chmod(0o755)
 
     kill_log = tmp_path / "kill.log"
     argv_log = tmp_path / "uvicorn-argv.log"
@@ -286,8 +304,8 @@ def _uvicorn_argv(sandbox: _Sandbox) -> list[str]:
 def _llama_server_kills(sandbox: _Sandbox) -> list[str]:
     """Kill-log lines that would have killed llama-server.
 
-    Covers both ``pkill`` phases (graceful and ``-9``) and the ``fuser -k``
-    port fallback on the llama-server port.
+    Covers the `pgrep` selection phases (graceful and forced) and the
+    `fuser -k` port fallback on the llama-server port.
     """
     if not sandbox.kill_log.exists():
         return []
@@ -295,11 +313,9 @@ def _llama_server_kills(sandbox: _Sandbox) -> list[str]:
     return [line for line in lines if "llama-server" in line or f"{LLAMA_PORT}/tcp" in line]
 
 
-def _killed_llama_server_via_pkill(sandbox: _Sandbox) -> bool:
-    return any(
-        line.startswith("pkill") and "llama-server" in line
-        for line in _llama_server_kills(sandbox)
-    )
+def _killed_llama_server(sandbox: _Sandbox) -> bool:
+    """True when the restart phases would have killed llama-server."""
+    return bool(_llama_server_kills(sandbox))
 
 
 def test_restart_preserves_llama_server_when_signature_matches(tmp_path):
@@ -344,8 +360,41 @@ def test_restart_restarts_llama_server_when_config_changed(tmp_path):
     assert proc.returncode == 0, _output(proc)
     assert len(_uvicorn_argv(sandbox)) == 1, "the restart phase never reached the launch"
     assert "Preserving running llama-server" not in _output(proc), _output(proc)
-    assert _killed_llama_server_via_pkill(sandbox), (
+    assert _killed_llama_server(sandbox), (
         f"no llama-server kill observed, kill log: {_llama_server_kills(sandbox)}"
+    )
+
+
+def test_models_ini_change_forces_a_llama_server_restart(tmp_path):
+    """D1: a ``models.ini`` edit is a local-backend change and must restart.
+
+    LP-0MVZ810NG008A3EW D1: the signature covered only the merged YAML, so
+    removing the ``[gpt120]`` preset left it matching and the launcher printed
+    "Preserving running llama-server" for a backend whose preset list had
+    changed — the removed model was still advertised on :8080 until the
+    signature file was deleted by hand.
+    """
+    sandbox = _sandbox(tmp_path)
+    models_ini = tmp_path / "models.ini"  # discovered from <proxy>/config.yaml
+    models_ini.write_text("[global]\nngl=99\n\n[qwen3]\nhf-repo=X/Qwen3-GGUF:Q4_K_M\n", encoding="utf-8")
+    _write_signature(sandbox, _config_sha(sandbox))
+
+    # Proxy-only restart with an unchanged preset list: preserved.
+    proc = _run(sandbox, "--foreground", "--restart", "--port", str(_free_port()))
+    assert proc.returncode == 0, _output(proc)
+    assert "Preserving running llama-server" in _output(proc), _output(proc)
+    assert _llama_server_kills(sandbox) == [], _llama_server_kills(sandbox)
+
+    # Now drop a preset exactly as the operator mitigation did.
+    models_ini.write_text("[global]\nngl=99\n", encoding="utf-8")
+    assert _config_sha(sandbox) != json.loads(sandbox.signature.read_text())["config_sha256"]
+
+    sandbox.kill_log.unlink(missing_ok=True)
+    proc = _run(sandbox, "--foreground", "--restart", "--port", str(_free_port()))
+    assert proc.returncode == 0, _output(proc)
+    assert "Preserving running llama-server" not in _output(proc), _output(proc)
+    assert _killed_llama_server(sandbox), (
+        f"a models.ini preset removal did not restart llama-server: {_output(proc)}"
     )
 
 
@@ -412,6 +461,6 @@ def test_fail_safe_signatures_restart_llama_server(tmp_path, case):
     assert "Preserving running llama-server" not in _output(proc), (
         f"{case}: an unusable signature earned a preserve: {_output(proc)}"
     )
-    assert _killed_llama_server_via_pkill(sandbox), (
+    assert _killed_llama_server(sandbox), (
         f"{case}: no llama-server kill observed, kill log: {_llama_server_kills(sandbox)}"
     )

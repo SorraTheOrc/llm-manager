@@ -6,8 +6,9 @@ surface of the *benefit* gate before the implementation lands
 
 * the abort fires only when the **measured** cold prefill genuinely cannot
   finish inside the request's own prefill-deadline budget
-  (``budget_safety_fraction x local_prefill_deadline_seconds`` = 114 s with the
-  shipped ``proxy/config.yaml``) — the admission wait budget
+  (``budget_safety_fraction x local_prefill_deadline_seconds``, derived from the
+  shipped ``proxy/config.yaml`` — never a frozen literal in this file) — the
+  admission wait budget
   (``contention_queue_max_wait_seconds``, 60 s) is **not** the comparator and
   the recorded admission evidence (``budget_s=60.0`` / ``deadline_s=120.0`` /
   ``new_tokens=49``) is never an input to the decision;
@@ -29,11 +30,18 @@ Measured on the host on 2026-10-31 from 224 paired
 * 14 380 cold tokens therefore cost **38.8 s** at the median rate and
   **84.6 s** at the p25 rate;
 * 56 000 cold tokens cost **150.9 s** at the median rate;
-* comparator budget: ``0.95 x 120 s = 114 s``.
+* comparator budget: ``0.95 x local_prefill_deadline_seconds``, **derived**
+  from the shipped config (``SHIPPED_BUDGET_S`` below) — never a literal.
 
 Both incident and huge-prompt rows assert those numbers, so the incident prompt
-keeps continuing even at the p25 rate (84.6 s < 114 s) and the huge prompt keeps
-aborting at every measured rate (150.9 s and 218.4 s > 114 s).
+keeps continuing even at the p25 rate (84.6 s) while the huge prompt's
+*uncalibrated* fit (218.4 s) keeps aborting. The deadline was widened to 180 s
+(LP-0MW1V0LPM000QLUC), so the comparator is now 171 s: the huge prompt's
+**calibrated** prices (135 s p75, 130 s point fit, 150.9 s at the host median
+rate) now FIT the budget and correctly continue — aborting a prefill that can
+finish inside the deadline was over-refusal. The rows below therefore pin the
+abort direction at a deliberately tight deadline instead of relying on the
+shipped one to be small.
 
 API contract pinned here
 ------------------------
@@ -59,7 +67,7 @@ yields no usable budget (fail open — a default must never manufacture an abort
 an explicitly present safety fraction of ``0`` yields the bare
 ``local_prefill_deadline_seconds``, and a fraction in ``(0, 1]`` yields
 ``fraction x deadline``. ``proxy/config.yaml`` declares both keys, so the
-shipped 114 s comparator is unaffected by that distinction.
+shipped comparator is unaffected by that distinction.
 
 Why every row used to be ``xfail(strict=True)``
 ---------------------------------------------
@@ -110,11 +118,6 @@ INCIDENT_PRICED = 48
 HUGE_TOTAL = 56_000
 HUGE_PRICED = 100
 
-#: Shipped comparator inputs (``proxy/config.yaml``) and their product.
-SHIPPED_DEADLINE_S = 120.0
-SHIPPED_SAFETY_FRACTION = 0.95
-SHIPPED_BUDGET_S = 114.0
-
 #: The incident's recorded admission evidence (``local_admission_guard`` line):
 #: ``eta_prefill_s=8.2 budget_s=60.0 deadline_s=120.0 new_tokens=49``. Recorded
 #: here so the wait-budget row can name exactly the evidence a naive wiring
@@ -133,11 +136,23 @@ DEFAULT_PREFILL_MS_PER_TOKEN = 3.9
 
 #: A spread calibration window for the 56 000-token bucket: the fitted p75 is
 #: 135 000 ms, so the conservative uplift prices the prompt above the point
-#: estimate (``1.2 x mean(108 333 ms) = 130 000 ms``) and well above 114 s.
+#: estimate (``1.2 x mean(108 333 ms) = 130 000 ms``).
 SEED_WINDOW_MS = (60_000.0, 70_000.0, 80_000.0, 90_000.0, 150_000.0, 200_000.0)
 
 _DROP = object()
 _SHIPPED_SERVER = (yaml.safe_load(CONFIG_PATH.read_text()) or {})["server"]
+
+#: Shipped comparator inputs — read from ``proxy/config.yaml`` and DERIVED
+#: through the production helper, never frozen as literals, so retuning the
+#: deadline does not put this file back in the edit set
+#: (LP-0MW1V0LPM000QLUC).
+SHIPPED_DEADLINE_S = float(_SHIPPED_SERVER["local_prefill_deadline_seconds"])
+SHIPPED_SAFETY_FRACTION = float(
+    _SHIPPED_SERVER["local_admission_guard_budget_safety_fraction"]
+)
+SHIPPED_BUDGET_S = prefill_eta.prefill_deadline_budget_seconds(
+    {"server": _SHIPPED_SERVER}
+)
 
 
 @pytest.fixture(autouse=True)
@@ -164,11 +179,16 @@ def _shipped_config(**overrides) -> dict:
 
 
 def _settings(config: dict | None = None, **overrides) -> AbortSettings:
-    """Settings resolved from *config* (shipped by default) for the incident model."""
+    """Settings resolved from *config* (shipped by default) for the incident model.
+
+    ``model=None`` is an explicit override, so it must not collide with the
+    default the helper installs.
+    """
     resolved = measured_cache_abort.AbortSettings.from_config(
         _shipped_config() if config is None else config
     )
-    return dataclasses.replace(resolved, model=MODELLED_MODEL, **overrides)
+    fields = {"model": MODELLED_MODEL, **overrides}
+    return dataclasses.replace(resolved, **fields)
 
 
 def _progress(total: int, cache: int) -> PromptProgress:
@@ -204,8 +224,9 @@ def test_incident_prompt_continues_within_the_eta_budget() -> None:
 
     Rate basis (see module docstring): the shipped default fit prices the
     measured deficit at 14 380 x 3.9 ms = 56.08 s — 38.8 s at the host median
-    371 tok/s and 84.6 s at the p25 170 tok/s — against the 114 s comparator
-    (0.95 x 120 s). Every measured rate therefore fits, with >= 29 s of margin.
+    371 tok/s and 84.6 s at the p25 170 tok/s — against the derived comparator
+    (``0.95 x local_prefill_deadline_seconds``). Every measured rate therefore
+    fits, with a wide margin.
     """
     decision = decide_measured_cache_abort(
         _progress(INCIDENT_TOTAL, 0), INCIDENT_PRICED, _settings()
@@ -238,11 +259,14 @@ def test_incident_prompt_continues_within_the_eta_budget() -> None:
 
 
 def test_huge_prompt_aborts_on_the_shipped_default_fit() -> None:
-    """56 000 cold tokens priced at 100 still abort (218.4 s > 114 s).
+    """56 000 cold tokens priced at 100 still abort (218.4 s > the comparator).
 
     Rate basis: uncalibrated default fit, 56 000 x 3.9 ms = 218.4 s; the
-    measured median rate gives 150.9 s. Both exceed the 114 s comparator, so
-    the abort keeps today's behaviour for the population it exists for.
+    measured median rate gives 150.9 s. Only the default fit still exceeds the
+    comparator, so the abort keeps today's behaviour for the population it
+    exists for on an uncalibrated (freshly restarted) proxy. At the calibrated
+    median rate the prefill genuinely fits inside the widened deadline, so the
+    gate declines — see the module docstring.
     """
     decision = decide_measured_cache_abort(
         _progress(HUGE_TOTAL, 0), HUGE_PRICED, _settings()
@@ -260,15 +284,40 @@ def test_huge_prompt_aborts_on_the_shipped_default_fit() -> None:
     median_eta = _eta_at_host_rate(HUGE_TOTAL, HOST_MEDIAN_TOKENS_PER_S)
     assert default_fit_eta == pytest.approx(218.4)
     assert median_eta == pytest.approx(150.9, abs=0.1)
-    assert median_eta > decision.budget_s
+    # The widened comparator (LP-0MW1V0LPM000QLUC) is what moved this row: at
+    # the calibrated median rate the deficit now fits and the gate declines.
+    assert median_eta < decision.budget_s
+
+
+def test_huge_prompt_aborts_under_a_tight_deadline() -> None:
+    """The abort direction is reachable at any comparator, incl. calibrated.
+
+    ``local_prefill_deadline_seconds: 120`` restores the pre-widening comparator
+    (114 s), so the calibrated p75 price (135 s) exceeds it. This keeps the
+    abort path pinned without asserting a frozen shipped deadline.
+    """
+    _seed_huge_prompt_window()
+    settings = _settings(_shipped_config(local_prefill_deadline_seconds=120))
+
+    decision = decide_measured_cache_abort(
+        _progress(HUGE_TOTAL, 0), HUGE_PRICED, settings
+    )
+
+    assert decision.abort is True
+    assert decision.detail == DETAIL_ABORT
+    assert decision.measured_eta_s == pytest.approx(135.0, abs=0.5)
+    assert decision.budget_s == pytest.approx(114.0)
+    assert decision.measured_eta_s > decision.budget_s
 
 
 def test_huge_prompt_aborts_with_the_conservative_p75_uplift() -> None:
-    """With a calibrated window the p75 price (135 s) still exceeds 114 s.
+    """With a calibrated window the p75 price (135 s) exceeds a tight budget.
 
     Determinism: a synthetic spread window for the 56 000-token bucket
     (``_seed_huge_prompt_window``); the uplift is what makes the row exercise
-    the conservative path rather than the default fit.
+    the conservative path rather than the default fit. The deadline override
+    keeps the *abort* direction under test — against the widened shipped
+    comparator (171 s) this calibrated price now correctly continues.
     """
     _seed_huge_prompt_window()
     measured_eta_s, coefficients = prefill_eta.estimate_prefill_seconds(
@@ -279,15 +328,15 @@ def test_huge_prompt_aborts_with_the_conservative_p75_uplift() -> None:
     assert measured_eta_s == pytest.approx(135.0, abs=0.5)
 
     decision = decide_measured_cache_abort(
-        _progress(HUGE_TOTAL, 0), HUGE_PRICED, _settings()
+        _progress(HUGE_TOTAL, 0),
+        HUGE_PRICED,
+        _settings(_shipped_config(local_prefill_deadline_seconds=120)),
     )
 
     assert decision.abort is True
     assert decision.detail == DETAIL_ABORT
     assert decision.measured_eta_s == pytest.approx(measured_eta_s)
-    assert decision.measured_eta_s > decision.budget_s == pytest.approx(
-        SHIPPED_BUDGET_S
-    )
+    assert decision.measured_eta_s > decision.budget_s == pytest.approx(114.0)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +345,7 @@ def test_huge_prompt_aborts_with_the_conservative_p75_uplift() -> None:
 
 
 def test_a_zero_safety_fraction_falls_back_to_the_deadline() -> None:
-    """``budget_safety_fraction: 0`` => the comparator is the 120 s deadline."""
+    """``budget_safety_fraction: 0`` => the comparator is the bare deadline."""
     config = _shipped_config(local_admission_guard_budget_safety_fraction=0)
     settings = _settings(config)
 
@@ -435,22 +484,37 @@ def test_the_gate_prices_with_the_calibrated_model_and_config() -> None:
     Seeded 56 000-token window: the shipped config prices at the p75 (135 s),
     ``local_admission_guard_eta_percentile: 0`` rolls back to the point fit
     (130 s), and a missing model would ignore the window entirely (218.4 s).
-    All three exceed the 114 s comparator, so the abort stands either way — the
-    ETA is what must move.
+    Against a tight deadline (``local_prefill_deadline_seconds: 120`` => 114 s)
+    all three exceed the comparator, so the abort stands either way — the ETA is
+    what must move. (Against the widened shipped comparator the calibrated two
+    would fit and correctly continue; the override keeps the abort direction
+    under test without freezing the shipped deadline.)
     """
     _seed_huge_prompt_window()
+    tight = _shipped_config(local_prefill_deadline_seconds=120)
     shipped = decide_measured_cache_abort(
-        _progress(HUGE_TOTAL, 0), HUGE_PRICED, _settings()
+        _progress(HUGE_TOTAL, 0), HUGE_PRICED, _settings(tight)
     )
     rolled_back = decide_measured_cache_abort(
         _progress(HUGE_TOTAL, 0),
         HUGE_PRICED,
-        _settings(_shipped_config(local_admission_guard_eta_percentile=0)),
+        _settings(
+            _shipped_config(
+                local_prefill_deadline_seconds=120,
+                local_admission_guard_eta_percentile=0,
+            )
+        ),
+    )
+    uncalibrated = decide_measured_cache_abort(
+        _progress(HUGE_TOTAL, 0),
+        HUGE_PRICED,
+        _settings(_shipped_config(local_prefill_deadline_seconds=120), model=None),
     )
 
     assert shipped.measured_eta_s == pytest.approx(135.0, abs=0.5)
     assert rolled_back.measured_eta_s == pytest.approx(130.0, abs=0.5)
     assert shipped.abort is rolled_back.abort is True
+    assert uncalibrated.measured_eta_s == pytest.approx(218.4, abs=0.5)
 
 
 def test_resolved_settings_price_with_the_dispatch_model() -> None:
@@ -459,9 +523,10 @@ def test_resolved_settings_price_with_the_dispatch_model() -> None:
     The router resolves the abort settings once, so the calibration key the
     dispatch targets is resolved there too: with the seeded 56 000-token window
     the resolved ETA is the calibrated p75 (135 s), while omitting the model
-    prices the same deficit from the uncalibrated default fit (218.4 s). Both
-    exceed the 114 s comparator, so the *ETA* is what moves — this row pins the
-    wiring's input provenance, not the verdict.
+    prices the same deficit from the uncalibrated default fit (218.4 s). The
+    calibrated price fits the widened comparator and continues; the uncalibrated
+    one exceeds it and aborts — so the *input provenance* is what this row pins,
+    and at the shipped settings it now also decides the verdict.
     """
     _seed_huge_prompt_window()
 
@@ -481,7 +546,8 @@ def test_resolved_settings_price_with_the_dispatch_model() -> None:
 
     assert with_model.measured_eta_s == pytest.approx(135.0, abs=0.5)
     assert model_less.measured_eta_s == pytest.approx(218.4, abs=0.5)
-    assert with_model.abort is model_less.abort is True
+    assert with_model.abort is False
+    assert model_less.abort is True
     assert with_model.measured_eta_s < model_less.measured_eta_s
 
 

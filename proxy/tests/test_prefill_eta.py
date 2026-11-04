@@ -169,9 +169,15 @@ def test_eta_within_budget_admits():
     assert decision.eta_prefill_seconds <= decision.budget_seconds
 
 
-def test_high_priority_never_queues_and_so_is_never_refused():
-    """AC3 regression guard: ``high`` priority never queues, so it has no
-    budget and the guard cannot refuse it."""
+def test_high_priority_still_admits_and_never_queues():
+    """``high`` still never queues — but that no longer makes it unbounded.
+
+    This fixture disables the deadline (``local_prefill_deadline_seconds: 0``)
+    to isolate the budget bound, so with no queue budget and no time bound the
+    guard stays inert — the documented rollback. The deadline/safety bound a
+    high-priority dispatch now honours is pinned in
+    ``tests/test_prefill_eta_deadline.py`` (LP-0MVZF3JZ9009LTN2).
+    """
     _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     decision = prefill_eta.evaluate_admission(_cfg(), "Qwen3", 100_000, 0.0, "high")
 

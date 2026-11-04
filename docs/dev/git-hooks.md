@@ -23,7 +23,10 @@ push:
 3. **Full-suite test gate on `dev`/`main` pushes** — a push whose target ref
    is `refs/heads/dev` or `refs/heads/main` runs the **full test suite**
    (`run_tests.py --scope full --strict-git-env`) and is **refused** while
-   the suite is red. The gate first verifies that it is measuring the
+   the suite is red. The *full suite* covers the repo's own tests **and** the
+   project-local skill tests under `.pi/skills/*/tests` — see
+   [What the full suite covers](#what-the-full-suite-covers). The gate first
+   verifies that it is measuring the
    **pushed commit** — the pushed `local_sha` must be the checkout's `HEAD`
    and the tree must be clean, otherwise the push is refused before the suite
    runs (see [The gate verifies the pushed
@@ -36,6 +39,131 @@ push:
 Without activation **none** of this runs: this is what
 [LP-0MVFFJWPW007ZEPK](worklog) fixed — before it, `git config core.hooksPath`
 was unset and `.git/hooks/pre-push` absent, so a red tree could reach `dev`.
+
+## What the full suite covers
+
+A gated `dev`/`main` push runs the **entire** full-suite set resolved by
+`run_tests.py`'s `full_suite_commands()`: the repo's own tests **and** the
+project-local skill tests under `.pi/skills/*/tests` (SA-0MVQJSGLY0098DVB).
+The gate command set is:
+
+```text
+pytest -q -r a --disable-warnings
+pytest -q -r a --disable-warnings .pi/skills/proxy-usage-analysis/tests
+```
+
+The two surfaces and their measured split (2026-11-02, uncached green gate
+run at `origin/dev` `53e99612` — LP-0MVT26S4J0021ST3):
+
+| Surface | Command | Count |
+|---|---|---|
+| Repo tests | `pytest -q -r a --disable-warnings` | **7 599** passed (18 skipped, 5 xfailed) |
+| Project-local skill tests | `pytest -q -r a --disable-warnings .pi/skills/proxy-usage-analysis/tests` | **790** passed (2 skipped) |
+| **Combined** | both commands (chained with `&&`) | **8 389** passed |
+
+The repo surface has grown from the intake brief's 5 264 (2026-10-25) to
+7 599, so the counts are re-measured — never inherited from the pre-change
+figure.
+
+**Why `.pi/` needs its own command.** pytest's default `norecursedirs`
+includes `.*`, so a plain recursive `pytest` run from the repository root
+never traverses `.pi/` — before SA-0MVQJSGLY0098DVB the skill tests were
+silently absent from the "full" suite (the parent LP-0MVOBJGB4001TQ8X found
+529 unenforced tests). The upstream rule fixes this at the tool level:
+`run_tests.py` `full_suite_commands()` now emits one **extra explicit-path**
+quiet pytest command naming every `.pi/skills/<name>/tests` directory that
+exists and contains `*.py`. An explicit initial path on the command line
+bypasses `norecursedirs` (explicit paths are always collected), so the
+recursive run is unchanged and the skill tests finally run. The skill-test
+command is **additive** — the canonical repo pytest command stays in the set
+unchanged (the repo suite's full-suite cache key and the audit's F3 lookup
+rely on it), exactly as the drift guard
+[`tests/test_skill_suite_gate.py`](../tests/test_skill_suite_gate.py)
+asserts.
+
+**No-pin rule: `.pi/test-config.json` must never gain `suiteCommands`.**
+A pinned list **wins by design** — `full_suite_commands()` returns it
+verbatim and skips convention detection — so a pin would silently drop the
+auto `.pi/skills/*/tests` command until the skill dirs are listed explicitly
+in the pin, taking the 790 skill tests out of the gate (and out of the
+full-suite verification consumed by the audit) with no visible error. The
+runner only surfaces the gap as a machine-readable notice
+(`hidden_skill_tests_uncovered`); it never appends to a pinned list. This
+repo therefore keeps `.pi/test-config.json` at `{"timeoutPerCommand": 1800}`
+— deliberately **no** `suiteCommands` — and the drift guard's
+`test_no_suite_commands_pin_in_test_config` turns red the day a pin appears.
+
+**Finish loop.** Changed-scope selection is untouched by the resolution
+rule: `implement.py finish` still runs only the tests affected by the
+worktree's changes vs `origin/dev`, and the hidden skill tests are enforced
+**at full scope only** (SA-0MVQJSGLY0098DVB D5 — `changed_scope_commands`
+never emits the extra skill command). The plan (2026-10-29) expected a pin
+also to disable changed-scope selection, but SA-0MVL7YOMJ006UMDO (2026-10-31)
+removed that: a pinned list "no longer disables selection — it defines the
+*full* suite only", so today the pin's residual harm is exactly the silent
+full-suite drop above, which is why the no-pin rule stands regardless.
+
+### Decision record (AC5)
+
+The producer's enforcement decision (parent LP-0MVOBJGB4001TQ8X round,
+2026-10-27) was **option 3 + all `.pi/skills/*/tests` directories**: the fix
+lands upstream in the test skill (`run_tests.py` `full_suite_commands()`,
+SA-0MVQJSGLY0098DVB), and **every** skill's test directory is enforced (glob
+form), not only `proxy-usage-analysis`. The rejected alternatives and their
+runtime-cost rationale:
+
+1. **`.pi/test-config.json` `suiteCommands` pin** — full coverage, but the
+   pin makes `implement.py finish`'s changed-scope gate fall back to the
+   FULL suite on every finish (~302 s then; ~432–460 s measured now),
+   regressing the fast changed-scope loop — rejected.
+2. **Root `pytest.ini` with `testpaths = . .pi/skills/*/tests`** — same
+   coverage (~+17 s cold gate measured for the skill command; +6 s was the
+   2026-10-25 estimate for 529 tests), leaves the finish changed-scope loop
+   and the gate's command strings (cache keys / audit F3) untouched, and was
+   the intake's recommendation — but it stays repository-local, so it was
+   set aside once the producer chose the upstream fix that benefits every
+   project.
+3. **Upstream fix in the test skill (chosen)** — the `full_suite_commands()`
+   resolution rule; this repo only verifies enforcement (F2), drift-guards it
+   (F1) and documents it (F3).
+4. **Document the gap as intentional non-enforcement** — leaves the skill
+   tests unenforced; the gap this sub-tree exists to close.
+
+The upstream acceptance record mirrors this decision — see
+[SA-0MVQJSGLY0098DVB](worklog).
+
+## One pytest configuration, at the repository root (LP-0MVZ43UR8004IL8Y)
+
+`pytest.ini` at the repository root is the **only** pytest configuration file
+in the tree; `proxy/pytest.ini` was folded into it (same marker registry, no
+new options, no `testpaths`). The move is a correctness fix, not a coverage
+change: the full suite still resolves exactly the same test set, and
+`.pi/test-config.json` still carries **no** `suiteCommands` pin (the no-pin
+rule above).
+
+**Why it is load-bearing.** pytest's rootdir algorithm looks upward from the
+initial paths' common ancestor for a configuration file and, failing that,
+adopts a configuration file found deeper in the tree. While `proxy/pytest.ini`
+was the only configuration file, any invocation that named a `proxy/` path
+resolved `rootdir` to `<repo>/proxy` — including
+`implement.py finish`'s changed-scope selection, which mixes
+`.pi/skills/proxy-usage-analysis/tests` with `proxy/tests` in one process.
+Test modules outside that rootdir then lost the file component of their node
+ids (`::Class::test`), so unrelated modules shared a node-id prefix and
+module-level autouse fixtures leaked across them: `_no_prometheus` from
+`test_capacity_signals.py` replaced `gpu_busy.compute_gpu_busy` inside
+`test_gpu_busy.py`, and three GPU-busy tests failed with `None` because their
+`patch("gpu_busy.query_prometheus")` had nothing left to intercept. The same
+tests passed in every other invocation (the skill suite alone, the
+pair-of-modules run, the full suite), which is what made the failure look
+like a flake.
+
+**The contract is pinned** by
+[`proxy/tests/test_pytest_rootdir_contract.py`](../proxy/tests/test_pytest_rootdir_contract.py):
+a mixed `.pi`/`proxy` collection must report the repository root as `rootdir`,
+keep file-qualified node ids, and execute the three previously-failing tests
+successfully in one process. Add new pytest markers to the root `pytest.ini`,
+never to a nested configuration file.
 
 ## Install (one-time, per clone)
 
@@ -81,11 +209,17 @@ and the audit skill, a worktree gate run mirrors its new cache entries into
 the main checkout's `.worklog/cache`.
 
 **Timeout:** the cold full suite measured **~302 s** on this host
-(2026-10-22, 4.3k tests), which is close enough to the 600 s default
-`implement.py finish` push timeout that host load could tip a cold push over
-it. This repo therefore provisions headroom in `.pi/test-config.json`
-(`timeoutPerCommand: 1800`, read both by `run_tests.py`'s per-command timeout
-and by `implement.py finish`'s push step). After the suite is cached (2 h
+(2026-10-22, 4.3k tests) — that figure covers the **repo surface only**: it
+was taken before the skill-test command existed and before the repo grew to
+7 599 tests, so it must not be read as covering the skill tests. The
+re-measured cold gate (2026-11-02, uncached) is **≈ 432–460 s**: the repo
+command ≈ 415–440 s plus the skill command ≈ 17–18 s ([What the full suite
+covers](#what-the-full-suite-covers)), measured under concurrent agent load.
+That is close enough to the 600 s default `implement.py finish` push timeout
+that host load could tip a cold push over it. This repo therefore provisions
+headroom in `.pi/test-config.json` (`timeoutPerCommand: 1800`, read both by
+`run_tests.py`'s per-command timeout and by `implement.py finish`'s push
+step) — roughly **4×** the measured runtime. After the suite is cached (2 h
 TTL, git-state fingerprint) repeat pushes at the same commit are cheap.
 
 ### The gate verifies the pushed commit

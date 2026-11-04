@@ -61,12 +61,18 @@ EVICTION_NO_PROGRESS_WATCHDOG = "no_progress_watchdog"
 #: An inactive dispatch record expired past ``expires_at``.
 EVICTION_IDLE_TIMEOUT = "idle_timeout"
 
+#: A deliberate backend restart (crash recovery, self-heal, model switch) threw
+#: away the prefills that were in flight (LP-0MVZVZLCS000LQNB AC3). Without
+#: this reason a restart looks like a capacity problem: the abandoned
+#: dispatches simply vanish from the accounting while the cache is cold.
+EVICTION_BACKEND_RESTART = "backend_restart"
+
 #: The orphan-cleanup sweep released a dispatch with no live backend slot.
 EVICTION_ORPHAN_CLEANUP = "orphan_cleanup"
 
-#: The six reasons an ACCEPTED-and-unserved dispatch can be released for
-#: (LP-0MVN4LCED00661MX AC1). Every one of these is an ERROR when it happens
-#: before the first byte.
+#: The reasons an ACCEPTED-and-unserved dispatch can be released for
+#: (LP-0MVN4LCED00661MX AC1, extended by LP-0MVZVZLCS000LQNB AC3). Every one of
+#: these is an ERROR when it happens before the first byte.
 EVICTION_REASONS_AFTER_ACCEPTANCE: tuple[str, ...] = (
     EVICTION_PREFILL_DEADLINE,
     EVICTION_MEASURED_CACHE_DEFICIT,
@@ -75,6 +81,7 @@ EVICTION_REASONS_AFTER_ACCEPTANCE: tuple[str, ...] = (
     EVICTION_ORPHAN_CLEANUP,
     EVICTION_LEASE_EVICTED,
     EVICTION_SLOT_ASSIGNMENT_FREED,
+    EVICTION_BACKEND_RESTART,
 )
 
 #: The closed vocabulary of eviction reasons (AC6/AC7).
@@ -88,6 +95,7 @@ EVICTION_REASONS: tuple[str, ...] = (
     EVICTION_NO_PROGRESS_WATCHDOG,
     EVICTION_IDLE_TIMEOUT,
     EVICTION_ORPHAN_CLEANUP,
+    EVICTION_BACKEND_RESTART,
 )
 
 
@@ -235,6 +243,56 @@ def _format_extra_fields(extra_fields: Mapping[str, object] | None) -> str:
     except Exception:
         return ""
     return " " + " ".join(parts)
+
+
+def record_backend_restart_evictions(srv, *, restart_reason: str) -> int:
+    """Record the dispatches a backend restart abandons (LP-0MVZVZLCS000LQNB AC3).
+
+    A restart discards the in-flight prefills: the GPU work is gone and the
+    prompt cache is cold again. Left unrecorded, that churn is indistinguishable
+    from a capacity problem (the 2026-11-02 window measured 61 post-acceptance
+    evictions across six backend restarts without a single one attributed to
+    the restarts themselves). Every active dispatch that has not yet served its
+    first byte is therefore recorded as an
+    :data:`EVICTION_BACKEND_RESTART` eviction, carrying the reason the backend
+    was restarted.
+
+    Idempotent per dispatch record (the shared sink de-duplicates through the
+    record's ``eviction_logged`` flag), so a restart path that races another
+    release path cannot double-count. Never raises: a restart is already an
+    exceptional path.
+
+    Returns the number of evictions emitted.
+    """
+    records = getattr(srv, "local_dispatch_records", None)
+    if not isinstance(records, dict):
+        return 0
+    try:
+        snapshot = list(records.items())
+    except Exception:
+        return 0
+
+    emitted = 0
+    for session_id, record in snapshot:
+        if not isinstance(record, dict):
+            continue
+        if not record.get("active"):
+            continue
+        if record.get("first_byte_seen"):
+            continue
+        try:
+            recorded = record_eviction_after_acceptance(
+                srv,
+                session_id,
+                EVICTION_BACKEND_RESTART,
+                record,
+                extra_fields={"restart_reason": restart_reason},
+            )
+        except Exception:
+            continue
+        if recorded:
+            emitted += 1
+    return emitted
 
 
 def eviction_after_acceptance_counters() -> dict:

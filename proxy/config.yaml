@@ -564,9 +564,8 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
-      # after the opencode-go chain. It declares no available_times window,
-      # so it is eligible around the clock. The API key is resolved from
-      # ~/.pi/agent/auth.json (key ``munitoai``).
+      # after the opencode-go chain. Restricted to 10:00-23:00 UTC so
+      # paid dispatches fall within business hours.
       - name: munitoai
         priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
@@ -589,6 +588,7 @@ models:
         # x-ratelimit-limit-input-tokens=400000 per rolling 60s
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
+        available_times: ["10:00-23:00"]
       - name: deepseek-flash
         priorities: [low, medium, high]
         type: remote
@@ -726,9 +726,8 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
-      # after the opencode-go chain. It declares no available_times window,
-      # so it is eligible around the clock. The API key is resolved from
-      # ~/.pi/agent/auth.json (key ``munitoai``).
+      # after the opencode-go chain. Restricted to 10:00-23:00 UTC so
+      # paid dispatches fall within business hours.
       - name: munitoai
         priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
@@ -751,6 +750,7 @@ models:
         # x-ratelimit-limit-input-tokens=400000 per rolling 60s
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
+        available_times: ["10:00-23:00"]
       - name: deepseek-flash
         priorities: [low, medium, high]
         type: remote
@@ -895,9 +895,8 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
-      # after the opencode-go chain. It declares no available_times window,
-      # so it is eligible around the clock. The API key is resolved from
-      # ~/.pi/agent/auth.json (key ``munitoai``).
+      # after the opencode-go chain. Restricted to 10:00-23:00 UTC so
+      # paid dispatches fall within business hours.
       - name: munitoai
         priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
@@ -920,6 +919,7 @@ models:
         # x-ratelimit-limit-input-tokens=400000 per rolling 60s
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
+        available_times: ["10:00-23:00"]
       - name: deepseek-flash
         priorities: [low, medium, high]
         type: remote
@@ -990,6 +990,20 @@ server:
   # podman-backed container via the host start script wrapper.
   llama_allow_host_fallback: true
   llama_embed_load_timeout: 30
+  # --- OOM protection + pre-OOM host pressure (LP-0MVZ810NG008A3EW) ---
+  # 2026-11-02T12:03:08Z: a global OOM killed the proxy and its llama-server
+  # backend in one event (both at oom_score_adj 0) after GPU-backed memory
+  # (amdgpu GTT) reached ~96.7 GiB on this 124 GiB host.
+  #
+  # oom_score_adj applied to the proxy process. Negative values require
+  # CAP_SYS_RESOURCE: the systemd unit sets OOMScoreAdjust=-900 for privileged
+  # deployments; when the write is refused the current score is kept and a
+  # WARNING explains the remedy at startup.
+  oom_score_adj: -900
+  # oom_score_adj applied to the llama-server backend after it is spawned (and
+  # to an adopted backend). Raising a child's score is always permitted, so the
+  # kernel prefers the model backend over the proxy in every deployment mode.
+  llama_server_oom_score_adj: 800
   # Router model-health monitoring cadence (seconds).
   # Preferred key (used by backend health loop):
   llama_model_health_interval_seconds: 10
@@ -1247,6 +1261,22 @@ server:
   #   - Non-streaming requests are held silently (deferred response).
   #   - A client disconnect aborts the hold promptly.
   #   - 0 disables the wait (retries immediately).
+  #   - NO hold is taken when the residual chain is PROVABLY DEAD
+  #     (LP-0MW0KZR7A003UFQK): if every remaining provider is either
+  #     deterministically skipped (usage_limit_reset_pending /
+  #     quota_exhausted / quota_hard_stop / outside_available_window) or
+  #     terminally refused for this request (a non-retryable 4xx), no wait can
+  #     change the outcome, so the error is returned immediately with the
+  #     earliest known reset as its Retry-After and no chain_hold_cycle is
+  #     consumed. This is what stops an unattended caller burning its per-call
+  #     budget on 300 s x 3 holds for a call that can never succeed (measured
+  #     2026-11-03 08:41, every remote provider deterministically skipped).
+  #     Cooldowns, stall circuit breakers, budget-window rollovers, imminent
+  #     window edges and unknown reasons keep today's bounded hold — an
+  #     unknown skip reason is transient by contract. The fail-fast is logged
+  #     as ``chain_planned_unavailable ... hold=skipped
+  #     reason=deterministic_residual_chain``, beside which the hold's
+  #     ``Chain exhausted ... holding <N>s`` line remains distinguishable.
   chain_hold_seconds: 300
   # Maximum number of hold-retry cycles before returning the exhaustion error
   # response unchanged. 0 = infinite (keep holding/retrying until the client
@@ -1272,7 +1302,9 @@ server:
   # ``diagnostics``/``unavailable_providers`` and provider schedules,
   # cooldowns and quarantine durations are untouched. A missing, malformed or
   # non-positive value falls back to the default 3600 so the cap is never
-  # accidentally disabled.
+  # accidentally disabled. The cap also bounds the fail-fast Retry-After
+  # (LP-0MW0KZR7A003UFQK), which advertises the EARLIEST known reset of a
+  # provably dead chain rather than the slowest one.
   max_retry_after_seconds: 3600
   # Local slot-exhaustion grace retries before remote fallback.
   # Helps right-after-restart races where slot probes briefly report 0 available.
@@ -1838,7 +1870,9 @@ server:
   # With both fixed the gate is safe but still not productive: the band it
   # governs starts at `local_large_context_cold_cache_threshold` (38 000 new
   # tokens), and at the guard's conservative ~3.9 ms/token that is >= 148 s —
-  # beyond the 114 s safety budget. So it admits NOTHING until the per-bucket
+  # beyond the safety budget (derived at
+  # `local_admission_guard_budget_safety_fraction` above). So it admits NOTHING
+  # until the per-bucket
   # calibration (a measured, faster rate) makes a band prompt fit, which is
   # exactly the documented precondition. Leave it off; flip it on when
   # `routing_capacity_admit` would fire on a real band prompt.
@@ -1982,8 +2016,15 @@ server:
   # Before dispatching a local request the proxy costs the projected local
   # prefill from OBSERVED dispatches (dispatch_first_byte_ms, per model and
   # context bucket, rolling window) and compares it with the caller's wait
-  # budget (``contention_queue_max_wait_seconds`` above; ``high`` priority
-  # never queues, so it has no budget). When the prefill cannot finish inside
+  # budget (``contention_queue_max_wait_seconds`` above). ``high`` priority
+  # never queues, so it has no *queue-wait* budget — but it is bounded in the
+  # same way as every other priority by the prefill deadline
+  # (``local_prefill_deadline_seconds``) and its deadline-relative safety
+  # budget (``local_admission_guard_budget_safety_fraction``), which are what
+  # actually cancel an accepted dispatch; refusing at admission is strictly
+  # cheaper than accepting and detouring at the deadline
+  # (LP-0MVZF3JZ9009LTN2, measured: 43 of 126 ``prefill_deadline`` evictions
+  # in 24 h were high-priority dispatches the inert guard never priced). When the prefill cannot finish inside
   # the budget the wait is a guaranteed loss — the request would park for up
   # to the full budget and then fall back remote anyway (measured 2026-10-19
   # → 10-20: 4,947 of 5,805 queued waits = 85 % abandoned) — so local
@@ -2018,7 +2059,8 @@ server:
   # budget instead of by the queue budget. Measured 2026-11-01 13:12-14:00
   # (1 788 requests, local share 2.6 %): 20 of the 76 refusals that had a free
   # prefill gate had a measured own ETA of 36-102 s — inside the 114 s safety
-  # budget — and were refused only against the 30 s queue budget, i.e. a paid
+  # budget then shipped — and were refused only against the 30 s queue budget,
+  # i.e. a paid
   # remote call for work the GPU could have started immediately. Counter-
   # evidence: replaying the 2026-10-23 thrash window with the rung enabled
   # admits those prompts but 6 of the 20 are then cancelled at the deadline
@@ -2034,6 +2076,22 @@ server:
   # as a residual non-quarantine cause, so the trade (admitted-and-doomed risk)
   # is accepted for the re-measurement window; the trade and its result are
   # recorded on that item. Flip back to false to restore the queue-budget bound.
+  #
+  # KEEP ENABLED — POST-ENABLEMENT MEASUREMENT (LP-0MVZ5WV6W008UO5F, 2026-11-02):
+  # the operator decided to keep the rung on (the +132 % relative local-share
+  # gain from the LP-0MVXZWF7A002TUO1 re-measurement stands). Attribution of
+  # the 24 h window 2026-11-01 11:09 -> 2026-11-02 11:09 (`attribute_
+  # prefill_deadline.py`, SKILL.md triage rule) split its 126
+  # ``prefill_deadline`` evictions as: ``rung_accepted`` 26 (79,740 priced new
+  # tokens) — THE rung's own trade — plus 43 ``high_priority_inert`` (the guard
+  # never prices high priority, LP-0MVZF3JZ9009LTN2), 47 ``inert_unlogged``
+  # (inert admits log nothing, LP-0MVZF4SU10032OZH), 8
+  # ``priced_within_queue_budget`` (occupancy priced 0, LP-0MVZF50MJ00654O1)
+  # and 2 ``idle_override``. None of the 7 evictions with a stamped ETA above
+  # the then-shipped 120 s deadline is an ETA-per-token under-prediction: each
+  # was priced over the deadline and admitted by a path that never enforced the
+  # bound.
+  # The rung's accepted rate is therefore 26 / 24 h, not 126 / 24 h.
   local_admission_guard_free_gate_deadline_budget: true
   #
   # The comparison is OCCUPANCY-AWARE (LP-0MVICD2YW004DJPV): the quantity
@@ -2118,8 +2176,8 @@ server:
   # ``contended_samples=<n>`` so the residual optimism is visible. Warm prompts
   # (``cached_ratio >= 0.9``) stay on the solitary path byte-for-byte. Scope
   # guardrails (UNCHANGED by this feature): ``contention_queue_max_wait_seconds``
-  # = 30 and ``local_prefill_deadline_seconds`` = 120; the ordering
-  # ``30 < 120 < local_dispatch_first_byte_timeout_seconds (840) <
+  # = 30 and ``local_prefill_deadline_seconds`` = 180; the ordering
+  # ``30 < 180 < local_dispatch_first_byte_timeout_seconds (840) <
   # local_dispatch_max_prefill_seconds (900)`` must keep holding.
   #
   #   reject  — refuse admission when the projected wait exceeds the budget
@@ -2257,24 +2315,37 @@ server:
   local_cold_prefill_budget_tokens: 25000
   # Fraction of local_prefill_deadline_seconds a budgeted prompt's conservative
   # p75 ETA must fit inside before it is admitted (default 0.0 = DISABLED =
-  # documented rollback). 0.95 x 120 s = 114 s: a 25k cold prompt prices ~93 s
-  # at the measured 20-30k band p75 rate (~270 t/s) and is admitted, while a
-  # band-slow 25k (~132 s at ~190 t/s) is refused
+  # documented rollback). CANONICAL DERIVATION for the "safety budget" — the
+  # figure every other mention in this file and in proxy/docs/routing.md
+  # refers to by name rather than by number:
+  #
+  #     safety budget = local_admission_guard_budget_safety_fraction
+  #                     x local_prefill_deadline_seconds
+  #
+  # With the shipped values below that is 0.95 x 180 s = 171 s. A 25k cold
+  # prompt prices ~93 s at the measured 20-30k band p75 rate (~270 t/s) and is
+  # admitted, while a band-slow 25k (~132 s at ~190 t/s) is refused
   # (LP-0MVN4LBEQ005QRVL). This makes the budget deadline-relative instead of a
   # bare token count, so a future deadline change stays consistent.
   local_admission_guard_budget_safety_fraction: 0.95
   # Deadline-aware admission bound (LP-0MVKUKEU80022C3U): the guard ALSO
   # refuses local when the projected first-byte ETA exceeds this hard
   # backstop (seconds; 0 disables the bound). Widened 90 -> 120 s
-  # (LP-0MVN4LBEQ005QRVL): at the measured 20-30k band rate (249 t/s) a 25 000
-  # new-token prefill costs ~100 s (~93 s at the band's p75 of ~270 t/s), so a
-  # 90 s deadline cancels a genuinely feasible prompt while 120 s admits it
-  # with ~16 % margin (~23 % at p75).
+  # (LP-0MVN4LBEQ005QRVL) and then 120 -> 180 s (LP-0MW1V0LPM000QLUC): at the
+  # measured 20-30k band rate (249 t/s) a 25 000 new-token prefill costs
+  # ~100 s (~93 s at the band's p75 of ~270 t/s), so a 90 s deadline cancelled
+  # a genuinely feasible prompt while 120 s admitted it with ~16 % margin
+  # (~23 % at p75). Moving to 180 s widens the safety budget (derived above)
+  # from the 120 s deadline's figure to this one, which newly admits the
+  # mid-size cold prompts priced 117-169 s that the 2026-11-04 overnight window
+  # refused 61 times while the GPU sat idle with both slots free; the derived
+  # figure moves with this value automatically — no other number in the code is
+  # keyed to it.
   #
   # ORDERING (asserted at startup, FATAL on violation by
   # _startup_validate_prefill_timeout_config):
   #   contention_queue_max_wait_seconds (30)
-  #     < local_prefill_deadline_seconds (120)
+  #     < local_prefill_deadline_seconds (180)
   #     < local_dispatch_first_byte_timeout_seconds (840)
   #     < local_dispatch_max_prefill_seconds (900)
   #     < the client's 900 s queue deadline.
@@ -2286,8 +2357,10 @@ server:
   # local_admission_guard_budget_safety_fraction to 0.0 (bound disabled) and
   # local_admission_guard_reference_tokens to 32000. Each is a pure value
   # change — no code change and no restart ordering constraint beyond the
-  # usual process restart.
-  local_prefill_deadline_seconds: 120
+  # usual process restart. Setting this key back to 120 restores the previous
+  # admission behaviour (the comparator derived from that deadline); no code
+  # change is needed.
+  local_prefill_deadline_seconds: 180
   # Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL): when a
   # local dispatch is cancelled by the prefill deadline
   # (``prefill_deadline_exceeded``) or by the measured-cache early abort
@@ -2377,7 +2450,8 @@ server:
   # decisions carry ``n_past_actual=none``, so a slot owner is admitted at
   # ``reuse_ratio=1.0`` even when llama-server is about to re-prefill the prompt
   # from scratch (measured 2026-10-26: 29 of 116 deadline evictions were ~56k
-  # prompts priced at 17-182 new tokens, cancelled at 120 s).
+  # prompts priced at 17-182 new tokens, cancelled at the then-shipped 120 s
+  # deadline).
   #
   # With these keys enabled the proxy asks llama-server (b8782) for
   # ``prompt_progress`` inside the SSE stream (``return_progress: true`` on a
@@ -2385,7 +2459,7 @@ server:
   # the first progress event, compares the MEASURED compute (``total - cache``)
   # with the admission-priced ``new_tokens``. When the measurement proves the
   # dispatch is re-prefilling far more than priced, the proxy releases the
-  # accepted dispatch in SECONDS (not at the 120 s deadline), logs
+  # accepted dispatch in SECONDS (not at the prefill deadline), logs
   # ``local_eviction_after_acceptance reason=measured_cache_deficit`` with the
   # measured evidence (``total``, ``measured_cache``, ``priced_new_tokens``,
   # ``elapsed_s``) and returns the same retryable 503 the deadline returns, so
@@ -2424,7 +2498,7 @@ server:
   # less likely). Nothing in the path can raise: a missing/partial/malformed
   # measurement, a capture or decision error, an unpriceable deficit, an
   # unusable budget, or a stream that never emits ``prompt_progress`` all
-  # degrade to today's behaviour, including the full 120 s deadline path (fail
+  # degrade to today's behaviour, including the full prefill-deadline path (fail
   # open — never a hard local outage).
   #
   # THE BENEFIT GATE (condition 3, LP-0MVWBD91Z004U135). Conditions 1-2 alone
@@ -2438,14 +2512,11 @@ server:
   # exactly the optimism the abort exists to correct) with the admission
   # guard's OWN calibrated model (``proxy.prefill_eta.estimate_prefill_seconds``
   # at ``cached_ratio=0.0``, since a deficit is by definition uncached) and
-  # aborts only when that ETA EXCEEDS:
-  #
-  #   budget_s = local_admission_guard_budget_safety_fraction
-  #              x local_prefill_deadline_seconds
-  #            = 0.95 x 120 s = 114 s (shipped)
-  #
-  # falling back to the bare ``local_prefill_deadline_seconds`` (120 s) when
-  # the fraction is explicitly 0 — the documented "no safety margin" rollback,
+  # aborts only when that ETA EXCEEDS the request's "safety budget" — the
+  # single derivation stated above at
+  # ``local_admission_guard_budget_safety_fraction`` (fraction x deadline) —
+  # falling back to the bare ``local_prefill_deadline_seconds`` when the
+  # fraction is explicitly 0 — the documented "no safety margin" rollback,
   # not a disabled budget. The comparator is resolved by
   # ``proxy.prefill_eta.prefill_deadline_budget_seconds``, the SAME helper the
   # admission guard enforces, so the advertised threshold can never drift from
@@ -2460,8 +2531,9 @@ server:
   # dispatch is accepted and prefilling — ``local_prefill_deadline_seconds`` is
   # what actually cancels an accepted prefill. The distinction is not
   # cosmetic: against a 60 s comparator the incident prompt (84.6 s at the
-  # host p25 rate) still aborts, i.e. the defect survives; against 114 s it
-  # continues at every measured rate with >= 29 s of margin.
+  # host p25 rate) still aborts, i.e. the defect survives; against the
+  # then-shipped 114 s comparator it continued at every measured rate with
+  # >= 29 s of margin.
   #
   # WHY IT MATTERS FOR A PINNED CLIENT: the early abort returns the same
   # retryable 503 the deadline returns so the request detours to the next

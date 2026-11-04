@@ -308,9 +308,19 @@ def test_parser_extracts_local_post_without_fabricating_session():
     assert ev.ts == datetime(2026, 10, 23, 2, 0, 44, 564000)
 
 
-def test_report_deterministic_across_runs_and_json_state():
+def test_report_deterministic_across_runs_and_json_state(monkeypatch):
     """AC3: identical inputs produce byte-identical reports, and the JSON
     summary carries the state + its raw evidence."""
+    # The report stamps its generation time, so the clock is frozen: without
+    # this the byte-identical assertion flakes whenever the two renders land
+    # on opposite sides of a second boundary (observed ~1 in 400 runs).
+    class _FrozenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 23, 3, 0, 0)
+
+    monkeypatch.setattr(reporting, "datetime", _FrozenClock)
+
     first = reporting.build_report(_summary(), None)
     second = reporting.build_report(_summary(), None)
     assert first == second

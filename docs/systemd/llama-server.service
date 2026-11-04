@@ -54,9 +54,16 @@ Environment=HSA_OVERRIDE_GFX_VERSION=11.5.1
 Environment=ROCM_LLVM_PRE_VEGA=1
 Environment=PORT=8080
 
-# Restart policy
+# Restart policy (LP-0MVZ810NG008A3EW AC2): a backend killed by the OOM killer
+# comes back without an operator.
 Restart=always
-RestartSec=5
+RestartSec=2
+
+# OOM ranking (LP-0MVZ810NG008A3EW AC1): raising a score is always permitted, so
+# a global OOM sacrifices the model backend before the proxy front door. Keep
+# this strictly above the proxy's OOMScoreAdjust. The proxy applies the same
+# value at spawn time (server.llama_server_oom_score_adj).
+OOMScoreAdjust=800
 
 # Logging
 StandardOutput=append:/home/rgardler/.local/state/llama-server/logs/llama-server.log
@@ -119,8 +126,14 @@ Environment=HSA_OVERRIDE_GFX_VERSION=11.5.1
 Environment=ROCM_LLVM_PRE_VEGA=1
 Environment=PORT=8080
 
+# Restart policy (LP-0MVZ810NG008A3EW AC2).
 Restart=always
-RestartSec=5
+RestartSec=2
+
+# OOM ranking (LP-0MVZ810NG008A3EW AC1): the backend is the preferred victim, so
+# an OOM takes a model down instead of the proxy front door (which the
+# llama-proxy unit pins at -900).
+OOMScoreAdjust=800
 
 StandardOutput=append:/var/log/llama-server/llama-server.log
 StandardError=append:/var/log/llama-server/llama-server.log

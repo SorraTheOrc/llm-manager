@@ -60,6 +60,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy import prefill_eta
 
+
+#: The shipped ``server:`` section, loaded from the repository config so the
+#: comparator below is DERIVED rather than frozen (LP-0MW1V0LPM000QLUC).
+def _shipped_server_section() -> dict:
+    import yaml
+
+    config_path = Path(__file__).resolve().parents[2] / "proxy" / "config.yaml"
+    return (yaml.safe_load(config_path.read_text(encoding="utf-8")) or {})["server"]
+
 MODEL = "Qwen3"
 SESSION = "sess-measured-cache-abort-1"
 PRICED_NEW_TOKENS = 150
@@ -78,8 +87,12 @@ SERVER_CONFIG = {
         "local_dispatch_lease_prefill_buffer_seconds": 0.5,
         "local_dispatch_no_progress_timeout_seconds": 180,
         "local_dispatch_max_prefill_seconds": 900,
-        # The feature must beat this by a wide margin (AC1).
-        "local_prefill_deadline_seconds": 120,
+        # The feature must beat this by a wide margin (AC1). Read from the
+        # shipped config so the harness runs the *shipped* comparator rather
+        # than a frozen literal (LP-0MW1V0LPM000QLUC).
+        "local_prefill_deadline_seconds": _shipped_server_section()[
+            "local_prefill_deadline_seconds"
+        ],
         # The benefit gate's comparator is the *prefill-deadline* budget
         # (``budget_safety_fraction x local_prefill_deadline_seconds``), which
         # is what the shipped ``proxy/config.yaml`` sets. Declared here so the
@@ -1052,8 +1065,8 @@ async def test_prefill_deadline_503_has_no_deficit_marker(monkeypatch):
 
 #: The benefit-gate **wiring** landed in LP-0MVWDZ22I005A26B: the
 #: ``measured_cache_abort`` decision log line now carries ``detail`` /
-#: ``measured_eta_s`` / ``budget_s`` (the comparator actually enforced, 114 s
-#: under the shipped config). The red-first ``xfail(strict=True)`` marker that
+#: ``measured_eta_s`` / ``budget_s`` (the comparator actually enforced, derived
+#: from the shipped config). The red-first ``xfail(strict=True)`` marker that
 #: pinned these rows has therefore been removed — a regression must fail the
 #: gate loudly rather than hide behind an xfail.
 
@@ -1070,10 +1083,24 @@ INCIDENT_DEADLINE_S = 120.0
 HUGE_TOTAL = 56_000
 HUGE_PRICED = 100
 
-#: Shipped comparator (``0.95 x 120 s``) and the incident row's measured
-#: numbers, recorded so a future tuning change that re-breaks the case fails
-#: loudly instead of silently.
-SHIPPED_BUDGET_S = 114.0
+#: Shipped comparator (``0.95 x local_prefill_deadline_seconds``), DERIVED from
+#: ``proxy/config.yaml`` through the production helper, and the incident row's
+#: measured numbers, recorded so a future tuning change that re-breaks the case
+#: fails loudly instead of silently.
+SHIPPED_BUDGET_S = prefill_eta.prefill_deadline_budget_seconds(
+    {"server": _shipped_server_section()}
+)
+#: The comparator the incident-shape config below enforces, DERIVED through the
+#: production helper so the two cannot disagree (LP-0MW1V0LPM000QLUC).
+INCIDENT_BUDGET_S = prefill_eta.prefill_deadline_budget_seconds(
+    {
+        "server": {
+            "local_admission_guard_budget_safety_fraction": 0.95,
+            "local_prefill_deadline_seconds": 120.0,
+        }
+    }
+)
+
 INCIDENT_ETA_SHIPPED_FIT_S = 56.08  # 14 380 x 3.9 ms/token
 INCIDENT_ETA_RANGE = (
     "38.8-84.6 s across the measured host rate (371 tok/s median .. "
@@ -1124,9 +1151,9 @@ def test_incident_replay_never_aborts_and_arms_no_cooldown():
     Pre-gate every row aborts (measured deficit 14 380 tokens priced at 48) and
     arms a 600 s thrash cooldown; with the gate the measured cold ETA fits the
     prefill-deadline budget. The numbers are pinned explicitly — measured ETA
-    ~56 s (shipped fit) against ``budget_s = 114``, with the measured rate range
-    (38.8-84.6 s) named in the failure message — so a future recalibration or
-    comparator change that re-breaks the incident fails loudly.
+    ~56 s (shipped fit) against the derived ``budget_s``, with the measured rate
+    range (38.8-84.6 s) named in the failure message — so a future
+    recalibration or comparator change that re-breaks the incident fails loudly.
     """
     # The incident's 14 380-token bucket was uncalibrated, so the shipped
     # default fit (3.9 ms/token) is the honest rate basis for this row.
@@ -1221,7 +1248,7 @@ async def test_incident_pin_local_turn_is_served_locally(monkeypatch):
     decision_lines = [line for line in warnings if "measured_cache_abort" in line]
     for line in decision_lines:
         assert "detail=within_eta_budget" in line, line
-        assert "budget_s=114" in line, line
+        assert f"budget_s={INCIDENT_BUDGET_S}" in line, line
 
 
 @pytest.mark.asyncio
@@ -1260,7 +1287,7 @@ async def test_declined_abort_line_reports_the_gate_evidence(monkeypatch):
     line = decision_lines[0]
     assert f"session={SESSION}" in line, line
     assert "detail=within_eta_budget" in line, line
-    assert f"budget_s={SHIPPED_BUDGET_S}" in line, line
+    assert f"budget_s={INCIDENT_BUDGET_S}" in line, line
     # The admission *wait* budget is not the comparator (parent D1(a)).
     assert f"budget_s={INCIDENT_WAIT_BUDGET_S}" not in line, line
     assert f"total={INCIDENT_TOTAL}" in line, line

@@ -300,11 +300,15 @@ class TestHandlerGracefulDegradation:
 
     @pytest.mark.asyncio
     async def test_slots_failure_serves_last_known_counts(self):
-        """Fresh /slots failure (0,0) with a fresh last-known cache → cached counts + slots_stale."""
+        """Fresh /slots failure (0,0) with a fresh last-known cache → cached
+        total + slots_stale. Since LP-0MW1VDZIX0011D8M a stale list asserts no
+        availability: ``available_slots`` is 0 with ``availability_unknown``
+        true, while the cached pool size is still published as ``total_slots``."""
         cache = (2, 3, time.monotonic())
         j = await self._get(slots_counts=(0, 0), cache_value=cache)
         assert j["total_slots"] == 3
-        assert j["available_slots"] == 2
+        assert j["available_slots"] == 0
+        assert j["availability_unknown"] is True
         assert j["slots_stale"] is True
 
     @pytest.mark.asyncio

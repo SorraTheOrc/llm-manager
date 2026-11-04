@@ -141,7 +141,11 @@ class TestLastKnownFallbackBehaviour:
 
     @pytest.mark.asyncio
     async def test_status_uses_last_known_when_direct_fails(self):
-        """get_llama_local_status serves the cached counts with slots_stale=true when direct _query_slots fails."""
+        """get_llama_local_status serves the cached total with
+        slots_stale=true when direct _query_slots fails. Since
+        LP-0MW1VDZIX0011D8M a stale list asserts no availability: the summary
+        publishes ``available_slots: 0`` with ``availability_unknown: true``
+        instead of the cached ``2`` (which over-dispatched behind a fossil)."""
         import proxy.observability as obs
         import proxy.server as server
         from proxy.handlers import get_llama_local_status
@@ -161,7 +165,8 @@ class TestLastKnownFallbackBehaviour:
                 server._http_client = None
                 server.config = {"server": {"llama_server_port": 8080, "session_slot_pool_size": 3}}
                 async def fake_query_slots(
-                    client, port, timeout=2.0, model=None, status_out=None
+                    client, port, timeout=2.0, model=None, status_out=None,
+                    provenance_out=None,
                 ):
                     # Handlers path resolves child port before calling _query_slots.
                     # The handler asks for the fresh query's outcome so a
@@ -171,7 +176,9 @@ class TestLastKnownFallbackBehaviour:
                     if isinstance(status_out, dict):
                         status_out.update({"status": 500, "reason": "http_500"})
                     return (0, 0)
-                async def fake_query_detail(port, timeout=2.0, model=None, _client=None):
+                async def fake_query_detail(
+                    port, timeout=2.0, model=None, _client=None, provenance_out=None,
+                ):
                     return []
                 with patch("proxy.observability._query_slots", side_effect=fake_query_slots):
                     with patch("proxy.observability._query_slots_detail", side_effect=fake_query_detail):
@@ -180,7 +187,8 @@ class TestLastKnownFallbackBehaviour:
                         req.client = MagicMock(host="127.0.0.1", port=54321)
                         j = await get_llama_local_status(req)
                         assert j["total_slots"] == 3
-                        assert j["available_slots"] == 2
+                        assert j["available_slots"] == 0
+                        assert j["availability_unknown"] is True
                         assert j["slots_stale"] is True
 
     @pytest.mark.asyncio
@@ -196,12 +204,15 @@ class TestLastKnownFallbackBehaviour:
                 server._http_client = None
                 server.config = {"server": {"llama_server_port": 8080, "session_slot_pool_size": 3}}
                 async def fake_query_slots(
-                    client, port, timeout=2.0, model=None, status_out=None
+                    client, port, timeout=2.0, model=None, status_out=None,
+                    provenance_out=None,
                 ):
                     if isinstance(status_out, dict):
                         status_out.update({"status": 200, "reason": None})
                     return (1, 3)
-                async def fake_query_detail(port, timeout=2.0, model=None, _client=None):
+                async def fake_query_detail(
+                    port, timeout=2.0, model=None, _client=None, provenance_out=None,
+                ):
                     return [{"slot_id": 0, "is_processing": False, "n_decoded": 10}]
                 with patch("proxy.observability._query_slots", side_effect=fake_query_slots):
                     with patch("proxy.observability._query_slots_detail", side_effect=fake_query_detail):

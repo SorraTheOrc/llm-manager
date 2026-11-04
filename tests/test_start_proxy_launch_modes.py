@@ -94,11 +94,21 @@ def _sandbox(tmp_path: Path) -> dict[str, str]:
     (tools / "python3").chmod(0o755)
     # Port probes report "free"; kill helpers are stubs so a --restart run can
     # never reach a live pkill/fuser (project rule: never blanket-kill python).
-    for name in ("ss", "netstat", "pkill", "fuser"):
+    # LP-0MVZ810NG008A3EW D2: the launcher now selects victims with `pgrep` and
+    # signals them with `kill`, so both are stubbed too — a real `pgrep -f
+    # 'uvicorn proxy\.server'` would match the live proxy on this host.
+    for name in ("ss", "netstat", "pkill", "fuser", "kill"):
         (tools / name).write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         (tools / name).chmod(0o755)
+    (tools / "pgrep").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    (tools / "pgrep").chmod(0o755)
 
     argv_log = tmp_path / "uvicorn-argv.log"
+    # LP-0MVZ810NG008A3EW D3: the default startup log is per-invocation and lives
+    # in $LLAMA_PROXY_STARTUP_LOG_DIR. Point it at the sandbox so no test ever
+    # writes to the production /tmp/proxy-startup*.log paths.
+    startup_logs = tmp_path / "startup-logs"
+    startup_logs.mkdir()
     env = {
         key: value
         for key, value in os.environ.items()
@@ -117,9 +127,15 @@ def _sandbox(tmp_path: Path) -> dict[str, str]:
             "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": f"{proxy_dir}{os.pathsep}{proxy_dir / 'proxy'}",
             "FAKE_UVICORN_ARGV": str(argv_log),
+            "LLAMA_PROXY_STARTUP_LOG_DIR": str(startup_logs),
         }
     )
-    return {"proxy_dir": str(proxy_dir), "env": env, "argv_log": argv_log}
+    return {
+        "proxy_dir": str(proxy_dir),
+        "env": env,
+        "argv_log": argv_log,
+        "startup_logs": startup_logs,
+    }
 
 
 def _run(sandbox: dict, *args: str, extra_env: dict[str, str] | None = None):
@@ -288,3 +304,64 @@ def test_usage_header_documents_foreground_and_log_file():
     assert "--foreground" in joined
     assert "--log-file" in joined
     assert "START_PROXY_FOREGROUND" in joined
+
+
+def _wait_for_startup_logs(directory: Path, expected: int, timeout: float = 15.0) -> list[Path]:
+    deadline = time.monotonic() + timeout
+    while True:
+        found = sorted(p for p in directory.glob("proxy-startup-*.log") if p.is_file())
+        if len(found) >= expected or time.monotonic() > deadline:
+            return found
+        time.sleep(0.05)
+
+
+def _wait_for_log_content(path: Path, timeout: float = 15.0) -> str:
+    """The detached child writes asynchronously; wait until it has said something."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if text or time.monotonic() > deadline:
+            return text
+        time.sleep(0.05)
+
+
+def test_default_startup_log_is_per_invocation_and_never_overwritten(tmp_path):
+    """D3: each default launch writes its own log; an older log survives.
+
+    LP-0MVZ810NG008A3EW D3: a fixed ``/tmp/proxy-startup.log`` was shared by the
+    launcher and the test suite, so a pytest run at 12:03 on 2026-11-02
+    overwrote the real startup log of the OOM incident with ``FAKE_UVICORN``
+    output and destroyed the forensic record.
+    """
+    sandbox = _sandbox(tmp_path)
+    logs = sandbox["startup_logs"]
+    port = _free_port()
+
+    # No --log-file: exercises the default per-invocation behaviour.
+    first = _run(sandbox, "--port", str(port))
+    assert first.returncode == 0, first.stderr
+    first_logs = _wait_for_startup_logs(logs, 1)
+    assert len(first_logs) == 1, f"expected one per-invocation log, got {first_logs}"
+    first_log = first_logs[0]
+    assert first_log.name.startswith("proxy-startup-"), first_log.name
+    assert first_log.name != "proxy-startup.log"
+
+    # The stable path stays usable for operators (and for `tail -f`).
+    link = logs / "proxy-startup.log"
+    assert link.is_symlink(), "proxy-startup.log must point at the newest run"
+    assert link.resolve() == first_log.resolve()
+
+    original = _wait_for_log_content(first_log)
+    assert "FAKE_UVICORN" in original, f"per-invocation log stayed empty: {first_log}"
+
+    second = _run(sandbox, "--port", str(_free_port()))
+    assert second.returncode == 0, second.stderr
+    second_logs = _wait_for_startup_logs(logs, 2)
+    assert len(second_logs) == 2, f"the second run reused the first run's log: {second_logs}"
+
+    # Forensics preserved: the first run's content is still on disk, untouched.
+    assert first_log.read_text(encoding="utf-8") == original
+    assert link.resolve() != first_log.resolve()

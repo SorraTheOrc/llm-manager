@@ -1,0 +1,33 @@
+# Hermetic proxy-log slice for the measured abandoned-prefill window model
+# (LP-0MVW8S74G004MFAQ). Covers the same fake window as
+# abandoned_prefill_windows_measured_llama.log (2026-02-01 00:00:00 -> 00:10:00).
+#
+# Real line shape (field order) copied from /var/log/llama-proxy/proxy.log:
+#   local_eviction_after_acceptance session=... reason=... estimated_tokens=N
+#       new_tokens=N eta_prefill_s=F elapsed_s=F slot_id=unknown llama_task_id=unknown endpoint=...
+#
+# Four prefill_deadline releases / dispatches and the ground truth the window
+# model must produce (the llama segments follow release order):
+#   W1 user-one   00:00:00 release   task 51: cancel observed, 10000 tokens after
+#       cancel (40000 -> 50000), stop at the fixture's 625 tok/s => 16.0 s window.
+#       Legacy token/rate estimate would be 5120 / 43.1 = 118.79 s. dispatch_start
+#       = 00:00:00 - 120.1 s = 23:57:59.9 (before its own window: no overlap).
+#   W4 user-one   00:02:05 release (elapsed_s=120.0 => dispatch_start 00:00:05,
+#       a retry that starts BEFORE W1's observed stop): task 52 still processing,
+#       unbounded. Measured overlap TRUE (inside [00:00:00, 00:00:16]);
+#       legacy overlap TRUE.
+#   W3 user-one   00:02:30 release (elapsed_s=120.0 => dispatch_start 00:00:30,
+#       a retry that starts AFTER W1's observed stop): task 53 still processing,
+#       unbounded. Measured overlap FALSE (stop at 00:00:16); legacy overlap TRUE
+#       (legacy window runs to 00:01:58.79) - the two bases must disagree here.
+#   W2 user-two   00:05:00 release (elapsed_s=120.0 => dispatch_start 00:03:00,
+#       inside W4/W3's expensive LEGACY windows): task 54 still processing,
+#       unbounded. Measured overlap FALSE; legacy overlap TRUE.
+#
+# There are no measured-prefill capture lines at all in this fixture, so
+# every release is a zero-progress lease expiry. Only W4 (dispatch start
+# inside W1's MEASURED window) counts in zero_progress_while_draining.
+2026-02-01 00:00:00,000 - ERROR - local_eviction_after_acceptance session=user-one reason=prefill_deadline estimated_tokens=56000 new_tokens=5120 eta_prefill_s=13.8 elapsed_s=120.1 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
+2026-02-01 00:02:05,000 - ERROR - local_eviction_after_acceptance session=user-one reason=prefill_deadline estimated_tokens=30000 new_tokens=30000 eta_prefill_s=24.2 elapsed_s=120.0 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
+2026-02-01 00:02:30,000 - ERROR - local_eviction_after_acceptance session=user-one reason=prefill_deadline estimated_tokens=30000 new_tokens=30000 eta_prefill_s=24.2 elapsed_s=120.0 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080
+2026-02-01 00:05:00,000 - ERROR - local_eviction_after_acceptance session=user-two reason=prefill_deadline estimated_tokens=42000 new_tokens=5600 eta_prefill_s=11.3 elapsed_s=120.0 slot_id=unknown llama_task_id=unknown endpoint=http://localhost:8080

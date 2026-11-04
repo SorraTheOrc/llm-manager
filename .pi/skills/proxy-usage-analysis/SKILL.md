@@ -14,6 +14,13 @@ Markdown report with highlighted, data-backed recommendations — including an
 errors observed in the window, and a **provider context-skips** breakdown for
 the per-provider context-ceiling skips (`routing_skip_provider_context`).
 
+The report also opens with a **performance metrics scorecard**: the ten
+metrics the proxy is held to, each with its best recorded baseline, an
+evidence-based target, this window's actual value and a direction-aware
+result, followed by a per-metric detail block (importance, calculation,
+levers, trade-offs). See [Performance metrics
+scorecard](#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3).
+
 The pipeline is fully deterministic: every report section is produced by
 rule-based Python, not an LLM. The skill is a thin, CLI-focused wrapper
 around the pipeline. The daily report is produced unattended by the 05:00
@@ -53,8 +60,15 @@ Options:
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
 | `--stale-rate-target` | `0.05` | Target share of status polls allowed to report `slots_stale=true`; drives the **Local capacity signals** section's met/unmet outcome and `--json`'s `capacity_signals.slots_stale.passed`. Mirrors `scripts/capacity_signal_verification.py --stale-rate-target` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings) |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings — plus `performance_metrics` — the scorecard block keyed by metric id and its `performance_metrics_counts` totals) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
+| `--metrics-config` | `metrics/performance_metrics.yaml` | Path to the committed performance-metric defaults (metric detail copy and any seeded history); read-only at runtime, never written |
+| `--metrics-state` | `<output-dir>/performance_metrics_state.yaml` | Path to the live performance-metric history file this run records its window in |
+| `--no-metrics-update` | off | Render the performance metrics section but do not record this window (no state write) |
+| `--seed-metrics-history [DIR]` | `~/proxy-usage-reports` | One-off backfill: seed the best-3 history from archived `report.md` files and exit without analysing logs |
+| `--no-discord` | off | Do not post the report (or a failure notice) to the Discord webhook; the report notes `disabled (--no-discord)` |
+| `--discord-webhook-url` | — | Discord webhook URL, overriding `discord.webhook_url` in the worklog config. A credential: never written to the report, `--json` or the logs |
+| `--discord-config` | auto-discovered `.worklog/config.yaml` | Path to the worklog config holding `discord.webhook_url` |
 
 ## Daily cadence (05:00 cron)
 
@@ -67,25 +81,141 @@ loop:
 0 5 * * * cd /home/rgardler/projects/llm && python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py >> ~/proxy-usage-reports/cron.log 2>&1
 ```
 
+That line is unchanged by delivery (LP-0MW2BD6G8001E960): the report is
+posted to Discord by default, so no new flag is needed and a failure is
+announced on the same channel.
+
 Each run archives the previous day's outputs into a dated subdirectory (see
 [Archival](REFERENCE.md#archival)), so a historical daily report accumulates
 under `~/proxy-usage-reports/YYYY-MM-DD/`. `cron.log` is not an analysis
 artifact and stays at the root, untouched by archival.
 
+## Discord delivery (LP-0MW2BD6G8001E960)
+
+The report is pushed to the operator instead of being parked on disk. Three
+outcomes, all recorded in the report's own `- Discord delivery:` header
+bullet so the artefact says how it travelled:
+
+| Situation | What happens | The report says |
+|---|---|---|
+| Webhook configured | `report.md` is posted as a multipart **file attachment** (`proxy-usage-report-YYYY-MM-DD.md`) with a short body — window, headline figures and the top three recommendations by severity | `report sent as an attachment (…)` |
+| No webhook configured | Nothing is sent | `not configured — no \`discord.webhook_url\` in <path searched>; report not sent to Discord` |
+| Send failed | Nothing further is attempted (delivery is fail-soft; the analysis result is never lost) | `failed — <reason>` |
+| `--no-discord` | Nothing is sent | `disabled (--no-discord)` |
+
+**Where the credential comes from.** `--discord-webhook-url`, else
+`discord.webhook_url` in `.worklog/config.yaml` — auto-discovered by walking
+up from the working directory and then from the repository root derived from
+the script path, so a run from any directory finds the project config. The
+URL is a credential and is never written to the report, the `--json` summary,
+`cron.log` or an error message; only its *source* (the config path) is named.
+
+**A failed run announces itself.** Any failure in `main()` — an unexpected
+exception, an invalid window, an unreadable log directory — posts
+`⚠️ proxy-usage-analysis failed on <host>: <reason>` (with the window and the
+cron log path) before the original error text and exit code are preserved.
+The notifier is fail-soft: a dead webhook never masks the real failure. So
+silence on the channel means "ran and was fine", never "crashed at 05:00".
+
+**Tests never post.** The skill's `tests/conftest.py` replaces the network
+seam for the whole suite, so a test can only reach Discord by injecting its
+own `poster`; delivery behaviour is covered in
+`tests/test_discord_notify.py`.
+
 ## Outputs
 
 Written to `--output-dir` (default `~/proxy-usage-reports`): `report.md`
 (primary deliverable), `fast_sessions.csv`, `cheap_sessions.csv`,
-`errors.csv`, and `errors.json`. On every non-`--quiet` run the CLI summary
+`errors.csv`, `errors.json`, and the live performance-metric history
+`performance_metrics_state.yaml`. On every non-`--quiet` run the CLI summary
 prints the complete absolute path to each artifact, starting with the
 report. `report.md` also carries the **Provider context skips** section
 (count, share of all skip events, standard/low split, provider breakdown and
 the `limit` ceiling each provider hit) whenever the window contains
 `routing_skip_provider_context` lines; the `--json` summary exposes the same
-figures as `provider_context_skips`.
+figures as `provider_context_skips`. The report's header carries one
+`- Discord delivery:` bullet describing how it was delivered, and `--json`
+exposes the same outcome as `discord_delivery` (`configured`, `sent`, `note`,
+`error`, `report_path`, `attachment_name`, `webhook_source`).
 
 See [REFERENCE.md](REFERENCE.md#outputs) for the full schema of each
 artifact and the archival behaviour.
+
+## Performance metrics scorecard (LP-0MW0FU5Z6006A4P3)
+
+The report opens with `## Performance metrics summary`: the ten metrics the
+proxy is held to, one row each, with the columns **Metric | Baseline |
+Target | Actual | Result**. It is the report's first section after the header
+bullets — before `## Performance metric details`, `## Summary by hour` and
+every data section — so a stakeholder who reads only this table still learns
+whether the proxy improved in this window.
+
+| Column | Meaning |
+|---|---|
+| Metric | The registry label; row order is the registry order, which never changes between runs |
+| Baseline | The single best recorded value and the date it was measured |
+| Target | The mean of the three best recorded measurements (direction-aware) |
+| Actual | This window's measurement, `n/a` when it cannot be measured |
+| Result | `Met` / `Unmet` against the target, or `Insufficient history` below three measurements |
+
+The rules behind those numbers:
+
+- **Direction.** Each metric is registered as higher-is-better or
+  lower-is-better, and every comparison respects it — a decoding speed of
+  33.1 tok/s against a 32.4 tok/s target is `Met`, a 9.7 denials/h against
+  9.1 denials/h is `Unmet`.
+- **Retention.** The three best *windows* are retained behind each target,
+  one measurement per window, so a re-run of the same day replaces that day's
+  value instead of appending a duplicate.
+- **Target.** The mean of those three retained measurements; below three the
+  target is `n/a`.
+- **Verdict.** The actual is compared with the target (equality counts as
+  met). Fewer than three measurements reports **Insufficient history** —
+  never a false Met/Unmet — and a window with no measurable actual reports
+  `n/a` with `Insufficient history`, never `0`.
+- **Configuration era.** Every measurement records the slot geometry it was
+  taken under (`slots=<n>,ctx=<per-slot context>`). When a metric's retained
+  best three span more than one era the section prints a **cross-era note**
+  naming the metric and the eras, because such a target averages unlike
+  configurations.
+
+`## Performance metric details` follows the table immediately: one `###`
+subsection per metric, headed by the metric id and label (for example
+`### decode_speed — Decode speed`), stating why the metric matters, how it is
+calculated and from which data, the levers available to change it and the
+trade-offs of trying to improve it. The prose comes from the committed
+defaults file rather than the renderer, so a wording change is a defaults-file
+change; each subsection links to the data section reporting its figures
+instead of repeating those tables.
+
+Where the numbers live:
+
+- `.pi/skills/proxy-usage-analysis/metrics/performance_metrics.yaml` — the
+  **committed defaults**: empty history plus each metric's detail copy.
+  **Read-only at runtime**; no run ever writes it.
+- `<output-dir>/performance_metrics_state.yaml` — the **live state**: every
+  recorded measurement, written once per run while the report is built.
+
+Four flags relocate those files, suppress the write, or seed the history from
+the archive:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--metrics-config PATH` | `metrics/performance_metrics.yaml` | Committed defaults to read (detail copy and any seeded history); never written |
+| `--metrics-state PATH` | `<output-dir>/performance_metrics_state.yaml` | Live history file this run records its window in |
+| `--no-metrics-update` | off | Render the scorecard without recording this window (no state write) |
+| `--seed-metrics-history [DIR]` | `~/proxy-usage-reports` | One-off backfill: seed the best-3 history from the archived `report.md` files and exit without analysing logs |
+
+**The existing 05:00 cron invocation is unchanged.** No metrics flag is
+needed: a default run reads the committed defaults, writes
+`<output-dir>/performance_metrics_state.yaml` and renders the scorecard, so
+the cron line under [Daily cadence](#daily-cadence-0500-cron) stays exactly
+as it is. `--json` carries the same figures as a `performance_metrics` block
+keyed by metric id (plus `performance_metrics_counts`), so an audit reads
+`baseline` / `target` / `actual` / `verdict` without parsing Markdown.
+
+Metric definitions, the two file schemas and a worked backfill run:
+[REFERENCE.md § Performance metrics scorecard](REFERENCE.md#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3).
 
 ## GPU busy time from power (Prometheus)
 
@@ -180,7 +310,8 @@ budget, *any* such event is an alert — not a trend to watch. It means the
 budget/pricing model admitted a dispatch the GPU could not serve, which is
 exactly the failure the budget exists to prevent (baseline: 125 deadline
 cancellations and ~779k discarded prefill tokens in the 2026-10-24 18:38–23:47
-window).
+window). The rung trade-off that deliberately accepts some of these is
+quantified below — the threshold itself does not change.
 
 **Triage rule.** Any `local_eviction_after_acceptance` for a within-budget
 prompt is treated as a **defect** and filed as a **critical `test-failure`-class
@@ -198,6 +329,60 @@ is normal and is not reported (classification is by the dispatch record's
 `first_byte_seen` flag), so everything that does appear here is unserved work.
 If the events cluster in one prompt band, the band's calibrated rate is wrong —
 re-measure before changing the budget.
+
+**Attributing a `prefill_deadline` spike (LP-0MVZ5WV6W008UO5F).** The count
+alone cannot answer triage's question — *which admission path let this
+dispatch start?* — because the free-gate rung is only one of several answers.
+Run the attribution CLI over the alert window before filing, and record its
+class split on the work item:
+
+```bash
+python3 .pi/skills/proxy-usage-analysis/scripts/attribute_prefill_deadline.py \
+  --start '<window start YYYY-MM-DD HH:MM:SS>' \
+  --until '<window end YYYY-MM-DD HH:MM:SS>' [--json]
+```
+
+Each eviction is joined to its admission evidence at the measured dispatch
+start (`eviction_ts - elapsed_s`) and classified (`--json` carries the same
+summary plus per-event rows):
+
+| Class | Meaning | Action |
+|---|---|---|
+| `rung_accepted` | `local_admission_guard decision=admit` priced inside the deadline-relative bound but above the queue budget — the free-gate rung's documented admitted-and-doomed trade | compare the rate against the documented accepted level (26 / 24 h, ~80k priced tokens, measured 2026-11-01→02); no fix unless the rate grows |
+| `priced_within_queue_budget` | admitted inside the 30 s queue budget yet no first byte — the slot was held by another session's prefill (occupancy priced ~0) | occupancy-observability defect — file a `discovered-from` bug (measured 8 / 24 h) |
+| `high_priority_inert` | `priority=high` was *genuinely* inert: a logged `no_budget` decision with every time bound disabled, so nothing was priced | **fixed** (LP-0MVZF3JZ9009LTN2; attribution corrected under LP-0MVZQUT3A0039MLY): `high` is now bounded by the deadline and safety budget like every other priority. An **unlogged** high-priority eviction is `inert_unlogged`; only a genuine logged `no_budget` line keeps this class, which must otherwise read 0 |
+| `inert_unlogged` | no guard line at the dispatch instant and no override — an inert decision that logged nothing (uncalibrated bucket, or `high` priority with no logged `no_budget` line) | observability defect — file a `discovered-from` bug (measured 47 / 24 h) |
+| `idle_override` / `economic_override` / `capacity_override` | a routing override admitted the dispatch without the guard | assess the override's own trade |
+| `priced_above_bound` | admitted although the priced wait exceeded the bound it was compared against | impossible by construction — treat as a guard bug |
+
+**Measured accepted level (rung enabled).** For the window
+2026-11-01 11:09:07 → 2026-11-02 11:09:07 (the rung
+`local_admission_guard_free_gate_deadline_budget: true` was enabled at
+2026-11-01 21:27:04Z, LP-0MVXZWF7A002TUO1) the split of 126
+`prefill_deadline` evictions was: `rung_accepted` 26 (79,740 priced new
+tokens), `high_priority_inert` 43, `inert_unlogged` 47,
+`priced_within_queue_budget` 8, `idle_override` 2 — all inside the 25k
+cold-prefill budget, 796,993 priced new tokens discarded in total, 7 with a
+stamped ETA above the 120 s deadline (6 high priority + 1 inert; none is an
+ETA-per-token under-prediction — in each case the pricing, where it ran,
+already said "over the deadline"). **The rung's own trade is therefore 26 /
+24 h, not 126 / 24 h**: the other 100 belong to admission paths the rung does
+not govern, tracked in LP-0MVZF3JZ9009LTN2 (high priority),
+LP-0MVZF4SU10032OZH (inert unlogged) and LP-0MVZF50MJ00654O1 (occupancy
+priced at 0). A post-rung window returning toward ~26/24 h with the rung on
+is the documented accepted behaviour.
+
+**Fix status of those classes.** LP-0MVZF3JZ9009LTN2 landed first (producer
+decision: "high-priority are bound in the same way as anything else"), so a
+window measured after it should show `high_priority_inert` at **0** — a
+non-zero count is a regression, not an expected class. Its attribution was
+corrected under LP-0MVZQUT3A0039MLY: an unlogged `priority=high` eviction is
+now `inert_unlogged` (it was previously mislabelled `high_priority_inert`),
+and `high_priority_inert` survives only for a genuine logged `no_budget`
+decision, so the "must read 0" rule is no longer diluted by uncalibrated high
+dispatches. LP-0MVZF4SU10032OZH (inert unlogged) and LP-0MVZF50MJ00654O1
+(occupancy priced at 0) remain open: those classes still appear until they
+land.
 
 **Reading the numbers.** `estimated_tokens` / `new_tokens` / `eta_prefill_s` are
 the **admission-time** values the routing decision priced and the dispatch
@@ -284,6 +469,17 @@ hand and cross-checking two surfaces:
   disagree. Status polls are aggregated with the reference tool's half-open
   `[window_start, window_end)` window, so a poll exactly at the window end
   belongs to the next night.
+- **Same-process import safety.** The derivation tool imports the live
+  `MEASURED_CACHE_DEFICIT_REASON` constant from the proxy package
+  (`proxy.measured_cache_abort`) so its wording cannot drift from the proxy's
+  own reason string. The repo's `proxy/` directory is a PEP 420 namespace dir
+  without an `__init__.py`, so `aggregation.compaction_impact`'s best-effort
+  `from proxy.provider import ...` can leave a half-imported `proxy` entry in
+  `sys.modules` when it (expectedly) fails; a later same-process import of the
+  real package would then resolve against that stale cache. The aggregation
+  drops the broken entry on failure and the tool refreshes the cache before
+  importing, so the two never collide under the full test suite's single
+  process (LP-0MVYNLWWL009R49W).
 - **Standalone equivalent.** For an ad-hoc window — or to cross-check a night
   — run the same derivation without the rest of the report:
   `python3 scripts/capacity_signal_verification.py --since '<start>' --until
@@ -433,3 +629,16 @@ recommendation rules, llama-server eval-timing parsing
 (decode + prompt eval, Qwen3 port filtering, fast/cheap speed stats), and an
 end-to-end run, using fixtures copied from real `/var/log/llama-proxy`
 lines (`proxy.log` and `llama-server.log`).
+
+Two invariants have their own dedicated suites:
+
+- `tests/test_no_ctx_size_advice.py` — no generated recommendation and no
+document advises raising the local context size (the ceiling is fixed by the
+model and the hardware), and the completed ctx-size work item is never cited
+as an open action.
+- `tests/test_discord_notify.py` — webhook discovery (flag → worklog config →
+`--discord-config`), the multipart attachment payload, message truncation, the
+report's `- Discord delivery:` bullet in all four states, and the CLI wiring
+for both a delivered report and an announced failure. No test performs network
+I/O: `tests/conftest.py` replaces `discord_notify._post_multipart` for the
+whole suite, and delivery tests inject their own `poster`.

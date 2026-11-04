@@ -220,6 +220,64 @@ class TestMergedConfigSha256:
         base = str(proxy_dir() / "config.yaml")
         assert merged_config_sha256(base, base) == merged_config_sha256(base, base)
 
+    def test_models_ini_is_part_of_the_signature(self, tmp_path):
+        """D1: editing a preset must change the signature (LP-0MVZ810NG008A3EW).
+
+        The preset file sits next to the proxy directory (``<repo>/models.ini``)
+        and is discovered from ``base_path``, so both the shell read path and
+        the Python write path hash the same file without one side having to
+        pass it explicitly.
+        """
+        from proxy.config_merge import merged_config_sha256
+
+        proxy_dir = tmp_path / "proxy"
+        proxy_dir.mkdir()
+        base = proxy_dir / "config.yaml"
+        base.write_text("server:\n  x: 1\n", encoding="utf-8")
+        models_ini = tmp_path / "models.ini"
+        models_ini.write_text(
+            "[global]\nngl=99\n\n[gpt120]\nhf-repo=Unsloth/gpt-oss-120b-GGUF:Q5_K_M\n",
+            encoding="utf-8",
+        )
+
+        with_big_model = merged_config_sha256(base, base)
+
+        # The operator mitigation of 2026-11-02: remove the 120B preset.
+        models_ini.write_text("[global]\nngl=99\n", encoding="utf-8")
+        without_big_model = merged_config_sha256(base, base)
+
+        assert with_big_model != without_big_model, (
+            "a models.ini preset change left the restart signature unchanged, so "
+            "the launcher would preserve a llama-server with a stale preset list"
+        )
+
+    def test_absent_models_ini_changes_nothing(self, tmp_path):
+        """A deployment without presets keeps the historical hash."""
+        from proxy.config_merge import merged_config_sha256
+
+        proxy_dir = tmp_path / "proxy"
+        proxy_dir.mkdir()
+        base = proxy_dir / "config.yaml"
+        base.write_text("server:\n  x: 1\n", encoding="utf-8")
+
+        assert merged_config_sha256(base, base) == merged_config_sha256(
+            base, base, models_ini_path=tmp_path / "absent.ini"
+        )
+
+    def test_explicit_models_ini_path_is_hashed(self, tmp_path):
+        from proxy.config_merge import merged_config_sha256
+
+        proxy_dir = tmp_path / "proxy"
+        proxy_dir.mkdir()
+        base = proxy_dir / "config.yaml"
+        base.write_text("server:\n  x: 1\n", encoding="utf-8")
+        presets = tmp_path / "elsewhere.ini"
+        presets.write_text("[qwen3]\nctx-size=65536\n", encoding="utf-8")
+
+        assert merged_config_sha256(
+            base, base, models_ini_path=presets
+        ) != merged_config_sha256(base, base)
+
 
 # ---------------------------------------------------------------------------
 # Shipped sibling-fallback tuning invariants (LP-0MUYQ6CYZ0083X38)

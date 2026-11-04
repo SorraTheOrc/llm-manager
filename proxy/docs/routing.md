@@ -326,8 +326,10 @@ Capacity vs resilience — the three entries are **not** interchangeable:
 | 5xx / stall / terminal error | `_failure_domain_key` = `endpoint:model` | Shared domain: one failure skips all three for the rest of the request → **no** 3× outage resilience (LP-0MSG45I8Q0020N1F). |
 
 The fully paid `munitoai` and `deepseek-flash` entries declare exactly
-`priorities: [medium, high]`, so they never join a `low` chain: they carry no
-window discipline that would confine spend to off-peak hours.
+`priorities: [medium, high]`, so they never join a `low` chain. `munitoai`
+carries a 10:00-23:00 UTC `available_times` window (paid dispatches confined
+to business hours); `deepseek-flash` keeps its off-peak windows and carries
+no spend discipline of its own.
 
 ### Priority-chain membership (`priorities`, LP-0MVGPZWY0001JD1D)
 
@@ -871,8 +873,9 @@ server:
   same conservative estimator the guard uses, so the admission rate is
   whatever the *measured* prefill rate supports. The band starts at
   `local_large_context_cold_cache_threshold` (38 000 new tokens); at the
-  guard's conservative ~3.9 ms/token that is ≥ 148 s, beyond the 114 s safety
-  budget, so with today's pricing the gate admits **nothing** and the key
+  guard's conservative ~3.9 ms/token that is ≥ 148 s, beyond the safety
+  budget (derived from `local_admission_guard_budget_safety_fraction`, see
+  [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135)), so with today's pricing the gate admits **nothing** and the key
   ships **off**. It becomes productive once the per-bucket calibration (a
   measured, faster rate) makes a band prompt fit — that is the documented
   enablement precondition, and `routing_capacity_admit` firing on a real band
@@ -894,7 +897,113 @@ server:
   above are what make enabling it safe and effective once calibration
   supports it.
 
-## Prefill serialisation (LP-0MVGDUUV3001XFRJ)
+## Routing occupancy counts other sessions, not your own lease (LP-0MW0VH2LB008JSKQ)
+
+Two gates decide local admission, and they must agree about the **requesting
+session's own** dispatch record:
+
+| Gate | Where | Own record |
+| --- | --- | --- |
+| routing concurrency (`cur_local >= max_local` → `local_concurrency_limit`) | `_proxy_with_fallback_cycle` → `_local_concurrency_info` | **idle lease excluded** |
+| dispatch lease (`_try_acquire_local_dispatch`) | lease choke point | same-session re-acquisition permitted (`own_has_lease`) |
+
+Before this, the routing gate counted *every* active-or-unexpired record —
+including the requester's own — so it fired first and the lease gate's
+own-lease exemption was unreachable. The 30 s no-preemption retention
+(`local_dispatch_lease_timeout_seconds`) exists so a returning session keeps its
+slot; the routing gate then denied it that slot, and because `remote-ok` (the
+default preference) never queues, the request stepped straight to a remote
+provider.
+
+Measured 2026-11-03 (14:25–15:10 UTC, `session_slot_pool_size: 2`): of 82
+`local_concurrency_limit` fall-throughs, **15 (18 %)** had the session's own
+local turn finish within the 30 s lease timeout — `cur_local = 2` with
+`generating = 0`, i.e. both "occupied" slots were finished turns inside their
+idle lease, one of them the returning session's own. Three sessions oscillated
+local→remote for no capacity reason, one of them pushed remote on four
+consecutive turns 4.5–26.2 s after its own local turn.
+
+**The rule.** `_get_local_concurrency_info(..., session_id=…)` excludes the
+requesting session's own record **only while it is an idle lease**
+(`active: false`). A record that is still `active` is genuine in-flight work, so
+a second concurrent request from the same session is gated exactly as before.
+`session_id=None` (anonymous callers, and the pool-description readers behind
+`/llama/local/status` and `/llama/local/reserve`) excludes nothing, so the
+engine-capacity view and the pure-legacy global-counter path are unchanged.
+
+## Dispatch-lease occupancy and the denial line (LP-0MW0KZTWC004HXQ5)
+
+`_try_acquire_local_dispatch` (`proxy/router_helpers.py`) is the single
+admission choke point for local work. Its occupancy view and the capacity
+view published to clients are **different questions with different sources**,
+and conflating them is what made the 2026-11-03 incident undiagnosable.
+
+| Question | Source | Where |
+| --- | --- | --- |
+| May this session dispatch **now**? | in-process dispatch-lease records + the generating-only and prefill-in-flight counters | `_try_acquire_local_dispatch` |
+| Does the **engine** have a free slot? | llama-server's `/slots` (fresh, else the bounded last-known counts) | `_query_slots` → `/llama/local/status` |
+
+`available_slots` / `total_slots` are **never lease-derived**. They come from
+llama-server's `/slots`, with the documented fallbacks in
+`proxy/handlers.py` (last-known counts when the query fails, the configured
+`session_slot_pool_size` when the model is definitively unloaded) and the
+documented upward reconciliation with live in-flight work when the served
+*detail* is stale. A second derivation from lease records would let the two
+views drift apart silently again; there is exactly one.
+
+### Stale records never block (AC1)
+
+Before counting, the admission path runs `_prune_stale_dispatch_records`: a
+record is stale only when it is **inactive and past `expires_at`** (the request
+finished and its post-request cooldown elapsed). A record that is still
+`active` past its expiry is live work whose lease lapsed — the 180 s
+no-progress watchdog's concern, never the admission gate's — so it is left for
+the watchdog. Pruning also releases the freed session-slot assignment, so the
+slot registry cannot describe a slot the gate has already forgotten.
+
+### The denial line carries its evidence (AC2)
+
+Every `local_dispatch_denied` line is followed on the SAME line by an
+occupancy snapshot, so a refusal is diagnosable from the log alone:
+
+```
+local_dispatch_denied session=… owner=… active=… cold_start=… <turn>
+  records_total=… records_active=… records_unexpired=… records_stale=…
+  active_counter=… max_local=… generating=… prefill_in_flight=… prefill_cap=…
+  llama_available_slots=… llama_total_slots=…
+  records=<key>:<active|idle>:<expires_in=Ns|expired>,…
+```
+
+`records=` is `none` for an empty registry; the aggregate fields always appear
+(`None` when unavailable) so "no data" is never confused with "zero".
+`prefill_cap` is the *effective* cap (`local_max_concurrent_prefills`, clamped
+to the slot pool), which is what the prefill branch actually compares against.
+The field vocabulary is published as `OCCUPANCY_EVIDENCE_FIELDS` so the log
+contract cannot drift from the code.
+
+### Divergence is logged, not shipped silently (AC3)
+
+When a refusal contradicts the occupancy evidence, a
+`local_occupancy_divergence reason=… session=… owner=… <evidence>` warning is
+emitted beside the denial (reading the last known llama counts costs no extra
+poll). Two shapes are recognised:
+
+| `reason=` | Meaning |
+| --- | --- |
+| `llama_reports_free_slots` | llama-server's last known counts report a free slot while the lease gate refused — the 2026-11-03 08:49:31 shape (`available_slots=2` on a two-slot pool) |
+| `occupancy_unexplained` | the refusal cannot be reproduced from any gate input in the snapshot (generating, prefill and unexpired-record counts are all below their caps) |
+
+Nothing is inferred from missing data: an absent llama count is not a
+disagreement, and a genuinely full pool that llama agrees with logs no
+warning at all. The divergence is a *diagnostic*: it never changes the routing
+decision, so a divergence is observable without being a behaviour change.
+
+Log level follows blame: `occupancy_unexplained` (our numbers cannot reproduce
+the refusal) is a `WARNING`, while `llama_reports_free_slots` is an `INFO` line
+beside the denial — an idle-leased slot counts as free to llama while the
+prefill cap legitimately refuses, so treating it as a warning would flood the
+WARNING stream (2,633 denial lines were observed in one window).
+
 
 Prefill (dispatch → first byte) does not scale with concurrency on this
 backend. Measured 2026-10-19 → 10-20 over 460 paired local dispatches:
@@ -1300,11 +1409,13 @@ projected_wait = own_prefill_seconds + occupied_seconds
   busy_slots       = min(slot_pool, max(generating_concurrency, prefills_in_flight))
   gate_occupancy   = min(busy_slots, prefills_in_flight)   # in-flight PREFILLS only
 
-bound  = wait_budget
+bound  = wait_budget                                  # 0 when the caller never queues
        if free_gate_deadline_budget and gate_occupancy == 0 and safety_budget > 0:
            max(wait_budget, safety_budget)   # free gate ⇒ no queue, bound = deadline
-admit  if projected_wait <= bound
+within = True if wait_budget == 0 else projected_wait <= bound   # no queue ⇒ no queue comparison
+admit  if within
        and projected_wait <  local_prefill_deadline_seconds
+       and own_prefill   <= safety_budget            # both bound EVERY priority, `high` included
 else   refuse local admission immediately -> next provider in the chain
 ```
 
@@ -1323,8 +1434,9 @@ calibrated for *queue* losses; a request that starts its prefill immediately
 never queues, so its only wait is its own prefill. Measured 2026-11-01
 13:12-14:00 (1 788 requests, 58 sessions, local share 2.6 %): 20 of the 76
 refusals with a free prefill gate had a measured own ETA of 36-102 s, inside
-the 114 s safety budget, and were refused **only** against the 30 s queue
-budget — a paid remote call for a prefill the GPU could have started at once.
+the safety budget then shipped (114 s), and were refused **only** against the
+30 s queue budget — a paid remote call for a prefill the GPU could have
+started at once.
 Counter-evidence: replaying the 2026-10-23 thrash window with the rung enabled
 admits them, but 6 of the 20 are then cancelled at the deadline
 (`admitted_and_doomed` 0 → 6) — the very invariant the flat cold-prefill
@@ -1334,11 +1446,95 @@ accepts the trade. **Status 2026-11-01:** enabled by operator decision
 (LP-0MVXZWF7A002TUO1 — the post-fix 13:17:50-15:34:42 UTC window measured
 1.56 % local share with free-gate refusals as a residual non-quarantine
 cause; the trade was accepted for a live re-measurement with the rung on,
-recorded in a comment on that item). Flip the config value back to `false` to
+recorded in a comment on that item). **Status 2026-11-02 (kept enabled, see
+"Measured attribution" below):** after the re-measurement the operator
+decided to keep the rung enabled; the measured attribution of its first 24 h
+window is LP-0MVZ5WV6W008UO5F.  Flip the config value back to `false` to
 restore the queue-bound behaviour. Contended admissions keep the queue bound in
 either case, and the deadline + safety bounds still refuse anything that could
 not finish. The log line carries `budget_s` (the resolved queue budget) and
 `bound_s` (the bound actually enforced), so the two can never be confused.
+
+### The ETA refusal is only taken when a remote can serve (LP-0MW0KZR7A003UFQK)
+
+The guard's refusal is a **capacity** judgement about the local engine, so it
+only justifies moving the request remote when a remote provider can actually
+take it. On 2026-11-03 08:49:40 the guard refused a `remote-ok` request on an
+enforced ETA bound (`eta_prefill_s=45.2 enforced=true`) and routed it to a
+chain whose every entry was deterministically skipped; the request ended
+`outcome=exhausted`. At 08:50:41 the identical prompt with the identical ETA
+was admitted (`enforced=false`, `eta_occupancy_s=0.0`) and produced a first
+byte in 6 s.
+
+`_remote_chain_has_capacity` therefore gates the direct (free-slot) rejection
+with the resolution predicate's own vocabulary, read-only and in the same
+order: not deterministically skipped for this request, not in cooldown, no
+pending usage-limit reset, not quota-hard-stopped, inside its
+`available_times` window. When no remote can serve, the request is **admitted
+locally** and waits for its prefill — the same outcome the client got once the
+occupancy cleared — logged as:
+
+```
+local_admission_guard_local_wait provider=… model=… session=… preference=…
+  reason=eta_exceeds_budget_direct free_slot=true → remote chain has no
+  capacity; admitting locally and waiting for the prefill
+```
+
+and recorded as a `status=local_admission_override` attempt (so the
+diagnostics show why local was used despite the ETA bound). The
+`local_admission_guard_direct_fallback` line keeps its meaning — a real
+fall-through — and is never emitted on the admit-locally path.
+
+Deliberately narrow, because "admit locally" must not become a way to blow
+through the request's own bounds:
+
+| Case | Behaviour |
+|---|---|
+| `reason=eta_exceeds_budget_direct`, hybrid chain, no remote capacity | **admit locally** and wait for the prefill |
+| `reason=eta_exceeds_budget_direct`, hybrid chain, a remote has capacity | unchanged — refuse and route remote |
+| request-property reasons (`prefill_budget_exceeded`, `context_too_large`, deadline / safety budget) | unchanged refusal — the prompt cannot be served locally at all |
+| local-only chain (no remote provider) | unchanged refusal — there is nothing to bounce to, and the ETA bound is the honest answer to a caller whose budget cannot cover the prefill |
+| pin-local / `local-only` intent | unchanged (the pin branch runs first, including bounded deferral escalation) |
+
+### Measured attribution of the first rung-enabled 24 h window (LP-0MVZ5WV6W008UO5F)
+
+Window 2026-11-01 11:09:07 → 2026-11-02 11:09:07 (the rung was enabled at
+2026-11-01 21:27:04Z): **126** `local_eviction_after_acceptance
+reason=prefill_deadline` events, all inside the 25,000-token cold-prefill
+budget (max `new_tokens` 23,027), 796,993 priced new tokens discarded —
+matching the usage report's `wasted prefill tokens` figure exactly. Joining
+each eviction to its admission evidence at the measured dispatch start
+(`eviction_ts - elapsed_s`) splits them by admission path
+(`attribute_prefill_deadline.py`, see the proxy-usage-analysis
+[SKILL.md triage rule](../../.pi/skills/proxy-usage-analysis/SKILL.md)):
+
+| Admission path | Evictions | Priced new tokens discarded |
+|---|---|---|
+| `rung_accepted` — free-gate rung priced the wait inside the comparator then shipped (114 s; measured band 43.0–112.9 s) but above the 30 s queue budget | 26 | 79,740 |
+| `high_priority_inert` — `priority=high` never queues, so the guard was inert (`no_budget`); **no** deadline/safety bound ran (fixed by LP-0MVZF3JZ9009LTN2 — this class must now read 0) | 43 | 257,778 |
+| `inert_unlogged` — guard inert (uncalibrated bucket) and silent at the dispatch instant | 47 | 439,307 |
+| `priced_within_queue_budget` — admitted inside the 30 s queue budget (5.3–28.0 s) yet stalled the full deadline behind another session's prefill (occupancy priced 0) | 8 | 12,954 |
+| `idle_override` — admitted by the idle-capacity override, guard not consulted | 2 | 7,214 |
+
+**Conclusions.** (1) The rung's own accepted trade is **26 / 24 h** — not
+126 / 24 h: the other 100 events came from admission paths the rung does not
+govern and are tracked separately (LP-0MVZF3JZ9009LTN2 high priority,
+LP-0MVZF4SU10032OZH inert-unlogged, LP-0MVZF50MJ00654O1 occupancy-priced-0).
+(2) None of the 7 events with a stamped (admission-time) ETA above the then-
+shipped 120 s deadline is an ETA-per-token **under-prediction** — AC1's
+hypothesis. In all 7
+the pricing, where it ran, already priced the prompt *over* the deadline (6
+high priority: 278.8–325.9 s; 1 inert medium priority: 170.3 s); each was
+admitted because the admission path never enforced the bound. (3) The
+attribution is reproducible with:
+
+```bash
+python3 .pi/skills/proxy-usage-analysis/scripts/attribute_prefill_deadline.py \
+  --start '2026-11-01 11:09:07' --until '2026-11-02 11:09:07'
+```
+
+A post-rung window returning toward ~26 `rung_accepted` / 24 h is the
+documented accepted behaviour.
 
 The occupancy term matters because prefills are serialised
 (`local_max_concurrent_prefills: 1`): the in-flight prefill holds the gate
@@ -1402,7 +1598,7 @@ line carries `rate_bucket=contended|solitary|solitary_fallback` and
 `contended_samples=<n>`.
 
 Ordering to keep (the guard does not change these values):
-`contention_queue_max_wait_seconds (30) < local_prefill_deadline_seconds (120)
+`contention_queue_max_wait_seconds (30) < local_prefill_deadline_seconds (180)
 < local_dispatch_first_byte_timeout_seconds (840) <
 local_dispatch_max_prefill_seconds (900)` — an admitted request must never be
 cut off by the deadline, and the deadline must fire before the first-byte
@@ -1436,9 +1632,17 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   ≈ 390 s and is refused. Behind an occupied gate the occupancy term applies
   to both, so a wait only stays admissible when the whole projected wait fits
   the budget. Locality is kept where it actually pays.
-- **Priority semantics are unchanged**: `high` never queues, so it has no
-  wait budget and the guard never applies to it; `low`/`medium` use
-  `contention_queue_max_wait_seconds`.
+- **Priority semantics**: `high` never queues, so it has no *queue-wait*
+  budget, and `low`/`medium` use `contention_queue_max_wait_seconds`. Every
+  priority — `high` included — is bounded by the prefill deadline and its
+  deadline-relative safety budget, because those are what actually cancel an
+  accepted dispatch; only the queue-wait comparison is skipped for `high`
+  (LP-0MVZF3JZ9009LTN2). Before that fix the guard returned inert
+  `no_budget` for `high` and never priced it at all, which is why 43 of the
+  126 `prefill_deadline` evictions in the 2026-11-01→02 window were
+  high-priority dispatches (6 of them already priced above the deadline when
+  they were admitted). A `high` prompt that fits both time bounds admits
+  exactly as before.
 - **Refusal is immediate and visible**: the request falls through to the next
   provider without waiting. If the whole chain is exhausted, the client
   receives a `429` with `X-Local-Admission: reject` /
@@ -1483,7 +1687,7 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   **Deadline refusal** (LP-0MVKUKEU80022C3U): when the projected **time to
   first byte** — own ETA plus the occupied gate, i.e. the same
   `projected_wait` above — reaches ``local_prefill_deadline_seconds``
-  (default 120 s) the guard also refuses with
+  (default `DEFAULT_PREFILL_DEADLINE_SECONDS`) the guard also refuses with
   ``reason=prefill_eta_exceeds_deadline`` (both paths). The deadline reason
   dominates the budget reason whenever it fires — it names the hard physical
   constraint that would cancel the dispatch; when the projected first byte is
@@ -2291,7 +2495,7 @@ expired` is the reserved-but-unused signal for ticket hoarding.
 ### Prefill deadline (LP-0MVIQ0G2M0006QF6)
 
 Before the first byte, a local dispatch is bounded by
-`server.local_prefill_deadline_seconds` (default **120 s**, 0 disables). The
+`server.local_prefill_deadline_seconds` (0 disables). The
 effective first-byte ceiling is the tighter of this and
 `local_dispatch_first_byte_timeout_seconds` (840 s), so by default the deadline
 is the bound that fires. On expiry the pending upstream request is cancelled
@@ -2357,13 +2561,22 @@ The abort needs **all three** conditions, in this enforced order:
    `cached_ratio=0.0`) **exceeds the request's own prefill-deadline budget**:
 
    ```text
-   budget_s = local_admission_guard_budget_safety_fraction
-              × local_prefill_deadline_seconds
-            = 0.95 × 120 s = 114 s   (shipped)
+   safety budget (the comparator) = local_admission_guard_budget_safety_fraction
+                                    × local_prefill_deadline_seconds
    ```
 
-   falling back to the bare `local_prefill_deadline_seconds` (**120 s**) when
-   the safety fraction is `0` (the "no safety margin" rollback). The
+   This is the **one canonical derivation** for the comparator in this
+   document (the matching canonical block in `proxy/config.yaml` sits at
+   `local_admission_guard_budget_safety_fraction`); every other mention here
+   says "the safety budget" or "the comparator" instead of repeating a number.
+   With the shipped keys it is **171 s**. `proxy/config.yaml` carries the same
+   two keys, so a retune of either moves the figure — and the
+   documentation-drift test in
+   `proxy/tests/test_measured_cache_abort_benefit_docs.py` fails naming the
+   file, the expected figure and the exact string to substitute.
+
+   Falling back to the bare `local_prefill_deadline_seconds` when the safety
+   fraction is `0` (the "no safety margin" rollback). The
    comparator comes from `proxy.prefill_eta.prefill_deadline_budget_seconds` —
    the same helper the admission guard enforces — so the advertised and the
    enforced threshold cannot drift.
@@ -2384,8 +2597,8 @@ the time a dispatch is accepted and prefilling, so
 `local_prefill_deadline_seconds` is what actually cancels it. The choice is
 load-bearing: against a 60 s
 comparator the incident prompt (84.6 s at the host p25 rate) still aborts, i.e.
-the defect survives; against 114 s it continues at every measured rate with
-at least 29 s of margin.
+the defect survives; against the 114 s comparator then shipped it continued at
+every measured rate with at least 29 s of margin.
 
 **A pinned dispatch whose measured ETA fits the budget is never aborted.**
 This is the point of the gate. A `local-preferred` (pin-local) request may not
@@ -2450,8 +2663,9 @@ measured_cache_abort session=<id> model=<model> reason=measured_cache_deficit de
   bound_tokens=<n> measured_eta_s=<s> budget_s=<s> elapsed_s=<s> → cancelling local dispatch early and detouring to the next provider
 ```
 
-`budget_s` is the comparator **actually enforced** (114.0 under the shipped
-config), never the admission wait budget; `measured_eta_s` / `budget_s` render
+`budget_s` is the comparator **actually enforced** (the safety budget, derived
+the same way the guard derives it), never the admission wait budget;
+`measured_eta_s` / `budget_s` render
 `unknown` when the gate did not price the deficit.
 
 **Rollback.** Two independent, value-only rollbacks: set
@@ -2488,8 +2702,10 @@ deadline-relative knobs:
   a startup WARNING says the band guard is silently dead.
 - `local_admission_guard_budget_safety_fraction` (shipped **0.95**, default
   **0.0** = disabled) — a budgeted prompt is admitted only when its
-  conservative p75 ETA fits inside `0.95 × local_prefill_deadline_seconds`
-  (= 114 s at 120 s). A 25k cold prompt prices ~93 s at the band's p75 rate
+  conservative p75 ETA fits inside the safety budget
+  (`fraction × local_prefill_deadline_seconds`; the canonical derivation is in
+  [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135) → *benefit gate*).
+  A 25k cold prompt prices ~93 s at the band's p75 rate
   (~270 t/s) and is admitted; a band-slow 25k (~132 s at ~190 t/s) is refused.
 
 `local_admission_guard_reference_tokens` (shipped **25 000**, previously
@@ -2669,20 +2885,55 @@ Two mechanisms, applied per reason:
 
 A `measured_cache_deficit` abandonment only exists because the benefit gate
 **allowed** the abort: all three conditions held, so the measured cold ETA
-exceeds the request's prefill-deadline budget (`0.95 ×
-local_prefill_deadline_seconds` = 114 s shipped, falling back to the bare
+exceeds the request's safety budget (the comparator, derived from
+`local_admission_guard_budget_safety_fraction`; falling back to the bare
 deadline when the safety fraction is `0`) and waiting could not have succeeded.
 A deficit the gate declines continues the dispatch and abandons nothing (see
 [Measured cache-deficit early abort](#measured-cache-deficit-early-abort-lp-0mvr7in0o000dpxn-benefit-gate-lp-0mvwbd91z004u135)).
 
-The cancel is real on this build, not decoration. llama-server aborts at its
-next write to the socket, and `return_progress` guarantees such writes
-throughout prefill. Evidence (2026-10-28 `llama-server.log`, 82
-`Connection handling canceled` events): **42** of them cancelled a task that
-never reached `prompt processing done`, i.e. mid-prefill cancellation is
-achievable and observable here. The sequence is always
+The cancel is real on **every** release path, not decoration. llama-server
+aborts at its next write to the socket, and `return_progress` guarantees such
+writes throughout prefill. The sequence is always
 `Connection handling canceled` → `stop: cancel task, id_task = N` →
 `slot release: … stop processing`.
+
+Per-path status — what each abandonment does to the backend:
+
+| Release path | Cancels the upstream stream? | Records slot identity? |
+|---|---|---|
+| `prefill_deadline` | **yes** — the handler passes `upstream_stream_cm=cm` and `abandoned_slot_id` | yes |
+| `session_evicted` | **yes** — the pinned `stream_cm` of each released record | yes |
+| `no_progress_watchdog` | **yes** — the record's `stream_cm` (`LP-0MVIQ0FJC000YLX0`) | yes |
+| `client_disconnect` | **yes** — the record's `stream_cm` (`LP-0MVLFVY6K003VYEL`) | yes |
+| `orphan_cleanup` | **yes** — same shared cancel/annotate core | yes |
+| `measured_cache_deficit` (Option D) | **yes since `LP-0MVUVHAQP001IRKK`** — the `MeasuredCacheAbortDetourError` arm in `proxy/proxy/router.py` now passes both `upstream_stream_cm=cm` and `abandoned_slot_id=slot_id`; before that change it closed `cm` itself and recorded no slot identity | yes |
+
+The per-path behaviour above is measured, not inferred. The evidence lives in
+[abandoned-prefill-release-cancel.md](../../docs/dev/abandoned-prefill-release-cancel.md)
+(child `LP-0MVW8S7QY002S7DV`, parent `LP-0MVVEQW5Y00962T2`) and is taken on
+the paths that actually produce the releases, not on the deadline path alone:
+
+- **Per-release cancel rate** (canonical 24 h window, 2026-10-29 14:08 →
+  2026-10-30 14:08 UTC): **300 of 375 post-acceptance releases (80.0 %)** had
+  an observed backend cancel. **66 % of that window's releases are Option D**
+  (`measured_cache_deficit`, 248 of 375), so the rate is dominated by the path
+  that produces most releases rather than by the deadline.
+- **H1 refuted — an abandoned prefill does not run to completion.** Over a
+  day-aligned 48 h window **748 of 2 581** backend launches stopped before
+  emitting `prompt eval time`, and post-cancel progress is at most 4 batches
+  and ≤ 1 746 tokens (one to two `ubatch`es).
+- **The stop is bounded.** `cancel → stop processing` p90 **6.585 s**, exactly
+  one `--ubatch-size 1024` at the window's measured **155.51 tok/s**. The
+  recorded bound is **6.6 s**.
+
+The 2026-10-28 sampler (**42 of 82** `Connection handling canceled` events,
+never reaching `prompt processing done`) is retained here as history: it was
+taken on the **deadline** path and must not be quoted as a generic
+per-release rate. What the logs cannot always supply is *attribution*, not
+cancellation: 227 of the 375 releases pair with a bare
+`operator(): http client error: Connection handling canceled` line that
+carries no task id (`unjoined_reason=cancel_without_task_id`), so the cancel is
+observed but the task cannot be named.
 
 Because the backend can lag the close, the abandonment is also **recorded**
 (`_record_abandoned_slot`, `proxy/proxy/router_helpers.py`) with a bounded TTL

@@ -1098,3 +1098,192 @@ LOCAL_ERROR_NO_MARKER_2026_09_25 = _stream_finish_error_line(
     "2026-09-25 08:30:00,000", "herdr-1790300000-000000-00000",
     "local", "Qwen3", "stream_exception", _LOCAL_MESSAGE, _LOCAL_ACTION,
 )
+
+
+# --- Archived daily reports (backfill fixtures) -----------------------------
+#
+# ``performance_metrics.parse_archived_report()`` reads the values already
+# rendered in archived ``report.md`` files (LP-0MW1BUB1Z004AK21). Two report
+# eras exist under ``~/proxy-usage-reports/``:
+#
+# * **era A** — per-bucket columns named ``Day`` / ``Night``, and neither the
+#   ``## Time to first token`` nor the ``## Local contention prediction vs
+#   reality`` section (shape of ``2026-08-07/report.md``);
+# * **era B** — the same columns renamed ``Standard`` / ``Low``, with both extra
+#   sections present (shape of ``2026-10-31/report.md``).
+#
+# Each fixture below is a trimmed but format-faithful excerpt of the real file:
+# the header bullet block, then only the tables the backfill parser reads. The
+# numbers are the values from those two archived reports, so the expected
+# extraction for every asserted metric is unambiguous.
+
+ARCHIVED_REPORT_ERA_A = """\
+# Proxy Usage Analysis Report
+
+- Generated: 2026-08-07 02:10:21
+- Window: 2026-08-06 02:10:19 → 2026-08-07 02:10:19 (24.0h)
+- Sessions in window: **569** | Requests: **20339** (local 3956 / remote 16383)
+- Fallback events: **16216** (79.7% of requests) | dispatch denied: 637
+- Unattributed stream events (no session UUID): 106
+- Lines parsed: 56960 | lines skipped: 0
+
+## Session summary
+
+| Metric | Total | Day | Night |
+|---|---|---|---|
+| Sessions | 569 | 569 (100.0%) | 0 (0.0%) |
+| Requests | 20339 | 20339 (100.0%) | 0 (0.0%) |
+| Local requests | 3956 (19.5%) | 3956 (19.5%) | 0 (0.0%) |
+| Remote requests | 16383 (80.5%) | 16383 (80.5%) | 0 (0.0%) |
+| Fallback events | 16216 (79.7%) | 16216 (100.0%) | 0 (0.0%) |
+| Dispatch denied | 637 | 637 (100.0%) | 0 (0.0%) |
+
+## Fallback reasons
+
+| Reason | Total | % of fallbacks | Day | Night |
+|---|---|---|---|---|
+| warm_cache_bypass | 12273 | 75.7% | 12273 (100.0%) | 0 (0.0%) |
+| local_concurrency_limit | 3177 | 19.6% | 3177 (100.0%) | 0 (0.0%) |
+| local_lease_active | 617 | 3.8% | 617 (100.0%) | 0 (0.0%) |
+| stall_after_reasoning | 78 | 0.5% | 78 (100.0%) | 0 (0.0%) |
+
+## Error analysis
+
+| Error type | Count | Affected providers/models | Evidence excerpt |
+|---|---|---|---|
+| upstream HTTP error | 90 | - | `2026-08-06 16:55:06,297 - WARNING - [remote] upstream error status=429` |
+| Stream finished: reason=error | 51 | opencode-go/deepseek-v4-flash, local/Qwen3 | `2026-08-06 22:23:59,908 - INFO - Stream finished: reason=error` |
+| Stream error | 1 | local/Qwen3 | `2026-08-06 22:23:59,908 - WARNING - Stream error` |
+
+- 142 error event(s) in window — see `errors.csv` / `errors.json`.
+
+## Decode speed
+
+| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |
+|---|---|---|---|---|---|
+| Qwen3 | Total | 5484 | 25.8 | 39.6 | 8.6 |
+| Qwen3 | Day | 5484 | 25.8 | 39.6 | 8.6 |
+
+## Prompt eval speed
+
+| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |
+|---|---|---|---|---|---|
+| Qwen3 | Total | 5484 | 137.2 | 223.3 | 66.5 |
+| Qwen3 | Day | 5484 | 137.2 | 223.3 | 66.5 |
+
+## Local model utilization
+
+Busy = at least one local slot actively generating (local streams paired per session, clipped to the window, overlapping streams merged).
+
+| Metric | Total | Day | Night |
+|---|---|---|---|
+| Busy time | 7h 59m (33.3%) | 7h 59m (33.3%) | 0s |
+| Idle time | 16h 00m (66.7%) | 16h 00m (66.7%) | 0s |
+| Streams served | 3938 | - | - |
+| Avg stream duration | 10.2s | - | - |
+| Total compute (slot-time) | 11h 06m | - | - |
+| Avg concurrency (while busy) | 1.39 | - | - |
+| Peak concurrency | 4 | - | - |
+"""
+
+ARCHIVED_REPORT_ERA_B = """\
+# Proxy Usage Analysis Report
+
+- Generated: 2026-10-31 23:33:36
+- Window: 2026-10-30 23:10:47 → 2026-10-31 23:10:47 (24.0h)
+- Sessions in window: **492** | Requests: **30606** (local 533 / remote 30073)
+- Fallback events: **14717** (48.1% of requests) | dispatch denied: 362
+- Local-skip events: **14714** | hold-cycle re-emissions (excluded from demand): **1**
+- Provider context-ceiling skips: **23** (per-provider skip counted, not a provider failure)
+- Unattributed stream events (no session UUID): 0
+- Lines parsed: 174614 | lines skipped: 0
+
+## Summary by hour
+
+| Hour | State | Busy | % | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 23:10-00:00 | serving+lease-blocked | 13m 53s | 28.2% | 1791 | 31 | 30 | 80 | 16 | 1013 | 692 |
+| 00:00-01:00 | serving+lease-blocked | 14m 51s | 24.7% | 2248 | 46 | 45 | 71 | 4 | 1449 | 1109 |
+
+## Session summary
+
+| Metric | Total | Standard | Low |
+|---|---|---|---|
+| Sessions | 492 | 312 (63.4%) | 180 (36.6%) |
+| Requests | 30606 | 22162 (72.4%) | 8444 (27.6%) |
+| Local requests | 533 (1.7%) | 397 (1.8%) | 136 (1.6%) |
+| Remote requests | 30073 (98.3%) | 21765 (98.2%) | 8308 (98.4%) |
+| Fallback events | 14717 (48.1%) | 10532 (47.5%) | 4185 (49.6%) |
+| Dispatch denied | 362 | 274 (75.7%) | 88 (24.3%) |
+
+## Fallback reasons
+
+| Reason | Total | % of fallbacks | Standard | Low |
+|---|---|---|---|---|
+| warm_cache_bypass | 9062 | 61.6% | 6421 (70.8%) | 2641 (29.2%) |
+| local_concurrency_limit | 3311 | 22.5% | 2405 (72.6%) | 906 (27.4%) |
+| local_lease_active | 1904 | 12.9% | 1341 (70.4%) | 563 (29.6%) |
+
+## Error analysis
+
+| Error type | Status | Count | Evidence excerpt |
+|---|---|---|---|
+| slot_save failed | - | 58 | `2026-10-30 23:34:16,846 - WARNING - slot_save failed slot=0 error=ReadTimeout/ReadTimeout` |
+| Stream finished: reason=error | - | 25 | `2026-10-30 23:40:36,220 - INFO - Stream finished: reason=error tokens=missing` |
+| upstream HTTP error | 429 | 8 | `2026-10-30 00:11:06,468 - WARNING - [remote] upstream error status=429` |
+
+## Time to first token
+
+Percentiles of time from dispatch to first token (ms), from local
+``dispatch_first_byte_ms=`` and remote ``ttft_seconds=`` log lines.
+
+| Bucket | Samples | p10 | Median | p90 |
+|---|---|---|---|---|
+| Total | 22636 | 1ms | 14ms | 670ms |
+| Fast | 19885 | 1ms | 14ms | 629ms |
+| Cheap | 2751 | 1ms | 15ms | 942ms |
+
+## Decode speed
+
+| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |
+|---|---|---|---|---|---|
+| Qwen3 | Total | 1933 | 37.8 | 43.7 | 13.1 |
+| Qwen3 | Fast | 1933 | 37.8 | 43.7 | 13.1 |
+
+## Prompt eval speed
+
+| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |
+|---|---|---|---|---|---|
+| Qwen3 | Total | 1933 | 193.3 | 641.9 | 67.1 |
+| Qwen3 | Fast | 1933 | 193.3 | 641.9 | 67.1 |
+
+## Local model utilization
+
+Busy = at least one local slot active **from dispatch to finish** (prefill + decode).
+
+| Metric | Total | Standard | Low |
+|---|---|---|---|
+| Busy time — upper bound (dispatch → finish) | 4h 02m (16.8%) | 3h 10m (21.2%) | 51m 18s (9.5%) |
+| Decode-only busy — lower bound (`Stream started` → finish) | 2h 21m (9.8%) | 1h 58m (13.1%) | 23m 05s (4.3%) |
+| Idle time | 19h 57m (83.2%) | 11h 49m (78.8%) | 8h 08m (90.5%) |
+| Streams served | 790 | - | - |
+| Avg stream duration | 18.8s | - | - |
+| Total compute (slot-time) | 4h 07m | - | - |
+| Avg concurrency (while busy) | 1.02 | - | - |
+| Peak concurrency | 2 | - | - |
+| GPU busy — power-based (hardware) | 6h 45m (28.1%) | - | - |
+
+## Local contention prediction vs reality
+
+Measures whether the payload's `lease_state` / `prefill_eta_seconds` signals predict **real** local contention (LP-0MVGR2OXT0096OGK).
+
+### M2 — local busy fraction vs denials
+
+| Metric | This window | Baseline (pre-change) |
+|---|---|---|
+| Window | 2026-10-29 23:43:30 → 2026-10-30 23:43:30 (24.0h) | 2026-10-19 07:23 → 2026-10-20 07:23 (24h) |
+| Dispatch denials | 307 | **2641** |
+| Denials per hour | 12.8 | 110.0 |
+| Local busy (dispatch → finish) | 16.8% | 29.3% |
+| Worst hour | 2026-10-30 19:00:00 (55 denials at 29.5% busy) | 2026-10-20 04:00–05:00 (187 denials at 2.5% busy) |
+"""
