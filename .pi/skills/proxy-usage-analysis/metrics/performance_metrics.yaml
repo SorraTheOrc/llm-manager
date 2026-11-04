@@ -28,7 +28,7 @@ metrics:
   fallback_rate:
     measurements: []
     why: "The fallback rate states how often a request that could have run locally was sent to a remote provider, so it is the direct cost signal of local capacity shortfalls."
-    calculation: "Share of window requests carrying a Fallback triggered log events record, as a percentage of all requests; the dominant reason is reported alongside it."
+    calculation: "Share of window requests that produced Fallback triggered log events, as a percentage of all requests; the dominant reason is reported alongside it."
     levers: "Local context thresholds, slot pool size, lease and queue policy, and provider routing budgets."
     trade_offs: "Reducing fallbacks by admitting more work locally increases contention and stream latency; raising local thresholds serves larger prompts locally at the cost of prefill time."
     data_section_anchor: "## Fallback reasons"

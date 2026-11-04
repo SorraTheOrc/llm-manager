@@ -1089,6 +1089,111 @@ def _append_performance_metrics_section(
     _append_cross_era_note(ap, state)
 
 
+# ---------------------------------------------------------------------------
+# Performance metric details (LP-0MW1BUAEG006FMHX)
+# ---------------------------------------------------------------------------
+#
+# One detail subsection per registry metric, immediately after the scorecard, so
+# an operator reads why a metric matters, how it is calculated, which levers
+# change it and what improving it costs before touching configuration (parent
+# LP-0MW0FU5Z6006A4P3 AC4). Every word of metric prose comes from the committed
+# defaults through ``performance_metrics.detail_copy``: this module hard-codes
+# no metric prose, and the figures stay in the linked data sections rather than
+# being restated here.
+
+#: Rendered in place of a field a custom defaults file omits.
+_MISSING_DETAIL_COPY = "not documented in the committed metrics defaults."
+
+#: Label that opens a metric's cross-configuration (era) caveat.
+_ERA_FLAG = "**Configuration eras:**"
+
+
+def _section_anchor(heading: str) -> str:
+    """In-page anchor for a rendered ``## Title`` heading (GitHub slug rules)."""
+    title = heading.lstrip("#").strip().lower()
+    kept = "".join(char for char in title if char.isalnum() or char in " -")
+    return "#" + kept.replace(" ", "-")
+
+
+def _append_metric_era_flag(ap, metric: performance_metrics.Metric, state: dict) -> None:
+    """Flag a metric whose retained best three span configuration eras.
+
+    A target averaging across slot/context geometries compares unlike things,
+    so the caveat sits in the metric's own subsection — the place an operator
+    reads before acting on that metric — and names every era involved.
+    """
+    measurements = state["metrics"][metric.id]["measurements"]
+    fingerprints = _cross_era_fingerprints(measurements, metric.direction)
+    if not fingerprints:
+        return
+    named = ", ".join(f"`{fingerprint}`" for fingerprint in fingerprints)
+    ap("")
+    ap(
+        f"{_ERA_FLAG} the retained best three measurements behind this target "
+        f"span more than one configuration era ({named}), so the target "
+        "averages unlike configurations and the comparison is indicative "
+        "rather than like-for-like."
+    )
+
+
+def _append_performance_metric_details(
+    ap,
+    *,
+    metrics_config: str | Path | None = None,
+    metrics_state: str | Path | None = None,
+) -> None:
+    """Render the per-metric detail block after the scorecard.
+
+    One ``###`` subsection per registry metric, in registry order, each stating
+    why the metric matters, how it is calculated (naming its data source), the
+    levers available and the trade-offs of improving it. The copy is read from
+    the committed defaults, so a wording change is a defaults-file change and
+    the renderer stays prose-free; a field a custom file omits is reported as
+    undocumented rather than invented. The subsection links to the data section
+    that reports the figures instead of duplicating its tables.
+    """
+    defaults_path = (
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
+    defaults = performance_metrics.load_defaults(defaults_path)
+    state = _load_metrics_state(metrics_config, metrics_state)
+
+    ap("")
+    ap("## Performance metric details")
+    ap("")
+    ap(
+        "One subsection per scorecard metric, in the summary table's order: why "
+        "the metric matters, how it is calculated and from which data, the "
+        "levers that change it, and the trade-offs of trying to improve it. "
+        "Each subsection links to the data section reporting its figures "
+        "rather than repeating those tables."
+    )
+    for metric in performance_metrics.METRIC_REGISTRY:
+        copy = performance_metrics.detail_copy(metric.id, defaults)
+        ap("")
+        ap(f"### {metric.id} — {metric.label}")
+        ap("")
+        ap(f"**Importance:** {copy.get('why', _MISSING_DETAIL_COPY)}")
+        ap("")
+        ap(f"**Calculation:** {copy.get('calculation', _MISSING_DETAIL_COPY)}")
+        anchor = copy.get("data_section_anchor")
+        if anchor:
+            # The link text is deliberately generic: repeating the section title
+            # verbatim would leak the title into reports where that section is
+            # not rendered at all (tests assert a section's absence by its
+            # title), so only the anchor carries the target's identity.
+            ap("")
+            ap(
+                "**Data:** the figures behind this metric are reported in the "
+                f"[corresponding data section]({_section_anchor(anchor)})."
+            )
+        ap("")
+        ap(f"**Levers:** {copy.get('levers', _MISSING_DETAIL_COPY)}")
+        ap("")
+        ap(f"**Trade-offs:** {copy.get('trade_offs', _MISSING_DETAIL_COPY)}")
+        _append_metric_era_flag(ap, metric, state)
+
+
 def _verdict_counts(block: dict[str, dict]) -> dict[str, int]:
     """How many metrics landed on each verdict token (all three always present)."""
     counts = {
@@ -1206,6 +1311,12 @@ def build_report(
         metrics_config=metrics_config,
         metrics_state=metrics_state,
         update_metrics=update_metrics,
+    )
+
+    # The per-metric detail block follows the scorecard immediately
+    # (LP-0MW1BUAEG006FMHX), before the data sections it links to.
+    _append_performance_metric_details(
+        ap, metrics_config=metrics_config, metrics_state=metrics_state
     )
 
     _append_summary_by_hour(ap, summary)
