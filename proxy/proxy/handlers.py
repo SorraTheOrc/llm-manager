@@ -38,10 +38,21 @@ def _snapshot_age_seconds(fetched_at: float | None) -> float | None:
     stamp, so its age cannot be reported truthfully. Never negative — a
     clock that appears to move backwards yields ``0.0`` rather than a
     negative age (LP-0MVVXGHT1001I5YX AC1).
+
+    A **non-positive** stamp is also ``None``, not "infinitely old": the
+    module-level caches initialise their stamp to ``0.0``/"never fetched", and
+    reading that as an enormous age would make the snapshot-age ceiling
+    (LP-0MW1VVKPF001ZAV5) withhold a list whose age is simply unknown.
     """
     if fetched_at is None:
         return None
-    return max(0.0, time.monotonic() - fetched_at)
+    try:
+        stamp = float(fetched_at)
+    except (TypeError, ValueError):
+        return None
+    if stamp <= 0.0 or stamp != stamp:  # unset or NaN
+        return None
+    return max(0.0, time.monotonic() - stamp)
 
 
 def _provenance_fetched_at(*provenance: dict) -> float | None:
@@ -994,6 +1005,8 @@ async def get_llama_local_status(request: Request):
     try:
         from proxy.observability import (
             local_slots_max_snapshot_age_seconds,
+        )
+        from proxy.observability import (
             slots_snapshot_too_old as _snapshot_too_old,
         )
 
@@ -1194,6 +1207,13 @@ async def get_llama_local_status(request: Request):
     except Exception:
         capacity_hint = "idle"
 
+    if slots_snapshot_too_old:
+        # An over-age snapshot proves nothing in either direction, so the hint
+        # must not claim availability (LP-0MW1VVKPF001ZAV5 AC3). ``unknown``
+        # is the documented "cannot assert" value; consumers treat an
+        # unrecognised hint as busy, so the failure mode stays fail-closed.
+        capacity_hint = "unknown"
+
     # AC1 (LP-0MVRMI5HK00558TB): count the slots annotated as abandoned so a
     # poll can see the ghost occupancy without re-deriving it from the array.
     abandoned_slots = 0
@@ -1282,7 +1302,10 @@ async def get_llama_local_status(request: Request):
         slots_stale_reason = select_slots_stale_reason(
             detail_reason=last_slots_stale_reason(),
             counts_reason=None,
-            snapshot_too_old=False,
+            # An over-age snapshot dominates every transport reason: it is the
+            # condition a consumer must act on regardless of why the last
+            # fetch failed (LP-0MW1VVKPF001ZAV5).
+            snapshot_too_old=slots_snapshot_too_old,
         )
     except Exception:
         # Fail-open: a recorder/evaluator fault publishes ``None`` rather than
@@ -1308,6 +1331,7 @@ async def get_llama_local_status(request: Request):
         "total_slots": total_slots,
         "slots_stale": slots_stale,
         "slots_stale_reason": slots_stale_reason,
+        "slots_max_snapshot_age_seconds": slots_max_snapshot_age_seconds,
         # Per-phase read-path timing + provenance (LP-0MVVXGHT1001I5YX
         # AC1/AC2): additive fields that let a stale (> budget) poll be
         # attributed to the status query, the counts query, the detail query
@@ -1394,6 +1418,11 @@ async def get_llama_local_status(request: Request):
         # when the surface is fresh. Additive field; consumers that ignore it
         # behave exactly as before. Treat an unrecognised value as stale.
         "slots_stale_reason": slots_stale_reason,
+        # The applied snapshot-age ceiling (LP-0MW1VVKPF001ZAV5): published so
+        # a consumer can judge ``slots_snapshot_age_seconds`` against it
+        # without knowing the config, and so ``snapshot_too_old`` is
+        # self-explanatory.
+        "slots_max_snapshot_age_seconds": slots_max_snapshot_age_seconds,
         # Truthful in-flight local request count, derived from live dispatch
         # records (``None`` in legacy mode with no record registry).
         # ``local_active_query`` mirrors ``> 0``; ``Null`` is never emitted.

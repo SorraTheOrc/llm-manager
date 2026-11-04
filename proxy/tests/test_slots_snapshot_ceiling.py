@@ -25,6 +25,7 @@ The counts cache was already bounded (``SLOT_COUNTS_STALE_AFTER_SECONDS``,
 
 from __future__ import annotations
 
+import logging
 import time
 from unittest.mock import patch
 
@@ -111,6 +112,9 @@ class _Resp:
         self.status_code = status_code
         self._payload = payload
 
+    async def json(self):
+        return self._payload
+
 
 class _NoopLock:
     def locked(self):
@@ -160,8 +164,9 @@ async def _get_status(client, server_config=None, fossil=None, age_seconds=None)
     ``age_seconds`` back-dates the seeded fossil cache's stamp so the served
     snapshot has a known, deterministic age without patching ``time``.
     """
-    from proxy import server
     from proxy.server import app
+
+    from proxy import server
 
     config = {
         "server": {
@@ -210,11 +215,36 @@ async def _get_status(client, server_config=None, fossil=None, age_seconds=None)
                                                         "/llama/local/status"
                                                     )
     assert resp.status_code == 200
-    return resp.json()
+    return resp.json(), _last_status_request_record()
+
+
+_STATUS_REQUEST_RECORDS: list = []
+
+
+class _CaptureStatusRequest(logging.Handler):
+    """Collect ``status_request`` records so their ``extra`` fields are visible.
+
+    ``slots_snapshot_source`` / ``slots_snapshot_age_seconds`` are published on
+    the ``status_request`` log line (LP-0MVVXGHT1001I5YX), not in the JSON body.
+    """
+
+    def emit(self, record):
+        if record.getMessage() == "status_request":
+            _STATUS_REQUEST_RECORDS.append(record)
+
+
+def _last_status_request_record():
+    return _STATUS_REQUEST_RECORDS[-1] if _STATUS_REQUEST_RECORDS else None
 
 
 @pytest.fixture(autouse=True)
 def _clean_caches():
+    logger = logging.getLogger("llama-proxy")
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    handler = _CaptureStatusRequest()
+    logger.addHandler(handler)
+    _STATUS_REQUEST_RECORDS.clear()
     obs.reset_slots_poll_cache()
     obs.reset_slots_stale_reason()
     obs._last_slot_counts_cache = None
@@ -226,6 +256,8 @@ def _clean_caches():
     obs._last_slot_counts_cache = None
     obs._last_slot_details_cache[:] = []
     obs._last_slot_details_at = 0.0
+    logger.removeHandler(handler)
+    logger.setLevel(previous_level)
 
 
 class TestClockAdvancePastCeiling:
@@ -234,7 +266,7 @@ class TestClockAdvancePastCeiling:
     @pytest.mark.asyncio
     async def test_payload_stops_claiming_availability_past_the_ceiling(self):
         """The incident's own numbers: a 29825 s-old two-slot fossil."""
-        payload = await _get_status(
+        payload, record = await _get_status(
             _ScriptedClient(ok=False),
             server_config={"local_slots_max_snapshot_age_seconds": 300},
             fossil=FOSSIL,
@@ -255,19 +287,20 @@ class TestClockAdvancePastCeiling:
     @pytest.mark.asyncio
     async def test_age_is_still_published_truthfully(self):
         """The true age is reported even when the list is withheld."""
-        payload = await _get_status(
+        payload, record = await _get_status(
             _ScriptedClient(ok=False),
             server_config={"local_slots_max_snapshot_age_seconds": 300},
             fossil=FOSSIL,
             age_seconds=1000,
         )
-        assert payload["slots_snapshot_age_seconds"] >= 1000
-        assert payload["slots_snapshot_source"] == "snapshot"
+        assert record is not None, "no status_request line was logged"
+        assert record.slots_snapshot_age_seconds >= 1000
+        assert record.slots_snapshot_source == "snapshot"
 
     @pytest.mark.asyncio
     async def test_default_ceiling_bounds_the_incident_age(self):
         """With no knob configured, the derived default still rejects 8 h."""
-        payload = await _get_status(
+        payload, record = await _get_status(
             _ScriptedClient(ok=False),
             fossil=FOSSIL,
             age_seconds=29_825.67,
@@ -281,7 +314,7 @@ class TestBelowTheCeiling:
 
     @pytest.mark.asyncio
     async def test_stale_snapshot_still_served_below_the_ceiling(self):
-        payload = await _get_status(
+        payload, record = await _get_status(
             _ScriptedClient(ok=False),
             server_config={"local_slots_max_snapshot_age_seconds": 300},
             fossil=FOSSIL,
@@ -289,14 +322,15 @@ class TestBelowTheCeiling:
         )
         # Slot identity survives a transient failure, as before.
         assert [s["slot_id"] for s in payload["slots"]] == [0, 1]
-        assert payload["slots_snapshot_source"] == "snapshot"
+        assert record is not None, "no status_request line was logged"
+        assert record.slots_snapshot_source == "snapshot"
         assert payload["slots_detail_stale"] is True
         assert payload["slots_stale_reason"] in ("query_error", "query_timeout")
 
     @pytest.mark.asyncio
     async def test_ceiling_midpoint_is_inclusive(self):
         """An age just under the ceiling is still served."""
-        payload = await _get_status(
+        payload, record = await _get_status(
             _ScriptedClient(ok=False),
             server_config={"local_slots_max_snapshot_age_seconds": 300},
             fossil=FOSSIL,
@@ -312,7 +346,7 @@ class TestAutomaticRecovery:
     @pytest.mark.asyncio
     async def test_successful_poll_after_the_ceiling_recovers(self):
         client = _ScriptedClient(ok=False)
-        stale = await _get_status(
+        stale, _ = await _get_status(
             client,
             server_config={"local_slots_max_snapshot_age_seconds": 300},
             fossil=FOSSIL,
@@ -323,7 +357,7 @@ class TestAutomaticRecovery:
         # The very next successful /slots?model=... poll restores the surface.
         client.ok = True
         obs.reset_slots_poll_cache()
-        fresh = await _get_status(
+        fresh, _ = await _get_status(
             client, server_config={"local_slots_max_snapshot_age_seconds": 300}
         )
 
@@ -338,7 +372,7 @@ class TestEffectiveCeilingIsPublished:
 
     @pytest.mark.asyncio
     async def test_payload_carries_the_applied_ceiling(self):
-        payload = await _get_status(
+        payload, record = await _get_status(
             _ScriptedClient(ok=True),
             server_config={"local_slots_max_snapshot_age_seconds": 123},
         )
@@ -346,7 +380,7 @@ class TestEffectiveCeilingIsPublished:
 
     @pytest.mark.asyncio
     async def test_payload_carries_the_default_when_unset(self):
-        payload = await _get_status(_ScriptedClient(ok=True))
+        payload, record = await _get_status(_ScriptedClient(ok=True))
         assert payload["slots_max_snapshot_age_seconds"] == (
             obs.local_slots_max_snapshot_age_seconds(config={})
         )
