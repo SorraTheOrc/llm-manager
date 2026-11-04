@@ -462,6 +462,7 @@ def detail_copy(metric_id: str, defaults: Mapping | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_GENERATED_DATE_RE = re.compile(r"(?m)^-\s*Generated:\s*(\d{4}-\d{2}-\d{2})")
 _FALLBACK_RATE_RE = re.compile(
     r"Fallback events:\s*\*\*[\d,]+\*\*\s*\(([\d.]+)% of requests\)"
 )
@@ -587,6 +588,23 @@ _ARCHIVE_PARSERS = (
     ("gpu_busy", _parse_gpu_busy),
     ("contention_denials_per_hour", _parse_denials_per_hour),
 )
+
+
+def archived_window_id(report_text: str, fallback: str) -> str:
+    """Window id for an archived report: its ``Generated`` date, else *fallback*.
+
+    The archived daily report's header records when it was generated; its date
+    names the window the report covers, so run-to-run directory suffixes
+    (``2026-08-07_2``) collapse onto one window and a re-run can never record
+    the same day twice. A report whose ``Generated`` line is missing or
+    unparseable falls back to *fallback* (the archive directory name) rather
+    than guessing a date.
+    """
+    if isinstance(report_text, str):
+        match = _GENERATED_DATE_RE.search(report_text)
+        if match:
+            return match.group(1)
+    return str(fallback)
 
 
 def parse_archived_report(report_text: str) -> dict[str, float]:

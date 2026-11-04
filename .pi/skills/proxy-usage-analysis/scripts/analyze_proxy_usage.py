@@ -148,23 +148,27 @@ def _seed_metrics_history(
     """Seed the best-3 history from archived report directories (idempotent).
 
     Each immediate subdirectory of *archive_dir* holding a ``report.md`` is one
-    archived window, identified by the directory name (the daily run names its
-    archive directory after the window it covers). Only the live state file is
-    written; the committed defaults file is read, never modified, and
-    re-running the seed never duplicates a window's measurement
+    archived report; its window id is the report's ``Generated`` date, falling
+    back to the directory name when that header is missing (so run-to-run
+    directory suffixes such as ``2026-08-07_2`` collapse onto one window). Only
+    the live state file is written; the committed defaults file is read, never
+    modified, and re-running the seed never duplicates a window's measurement
     (LP-0MW1BUB1Z004AK21).
     """
     reports: list[tuple[str, str]] = []
     for report_path in sorted(archive_dir.glob("*/report.md")):
         try:
-            reports.append(
-                (
-                    report_path.parent.name,
-                    report_path.read_text(encoding="utf-8", errors="replace"),
-                )
-            )
+            report_text = report_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        reports.append(
+            (
+                performance_metrics.archived_window_id(
+                    report_text, report_path.parent.name
+                ),
+                report_text,
+            )
+        )
     state = performance_metrics.load_state(metrics_state, defaults_path=metrics_config)
     result = performance_metrics.seed_history(state, reports)
     performance_metrics.save_state(state, metrics_state)

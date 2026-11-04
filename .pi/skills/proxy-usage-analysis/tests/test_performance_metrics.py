@@ -38,6 +38,8 @@ Functions::
     configuration_fingerprint(slot_count, per_slot_context) -> str
     is_cross_era(measurements) -> bool
     parse_archived_report(report_text) -> dict[str, float]    # omit unparseable
+    archived_window_id(report_text, fallback) -> str          # Generated date,
+        # else the archive directory name
     seed_history(state, reports) -> dict                      # reports:
         # iterable of (window_id, report_text); returns at least
         # {"seeded": int, "already_present": int, "skipped_metrics": dict}
@@ -472,3 +474,21 @@ def test_backfill_reports_the_metrics_it_could_not_parse():
     assert "contention_denials_per_hour" in skipped
     assert _measurement_count(state, "time_to_first_token") == 0
     assert _measurement_count(state, "decode_speed") == 1
+
+
+def test_archived_window_id_uses_the_generated_date():
+    # Era A's header renders "Generated: 2026-08-07 02:10:21", so the report's
+    # own date names the window even when the archive directory carries a
+    # run-to-run suffix.
+    assert pm.archived_window_id(ARCHIVED_REPORT_ERA_A, "2026-08-07_2") == "2026-08-07"
+
+
+def test_archived_window_id_falls_back_to_the_directory_name_when_generated_is_missing():
+    without_header = ARCHIVED_REPORT_ERA_A.replace(
+        "- Generated: 2026-08-07 02:10:21\n", ""
+    )
+
+    assert pm.archived_window_id(without_header, "2026-08-07") == "2026-08-07"
+    assert (
+        pm.archived_window_id(without_header, "2026-08-07_2") == "2026-08-07_2"
+    )

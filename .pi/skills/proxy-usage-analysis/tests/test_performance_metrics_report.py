@@ -792,3 +792,55 @@ class TestBackfillCli:
             windows = [m["window"] for m in _measurements(replayed, metric_id)]
             assert len(windows) == len(set(windows)), f"{metric_id}: duplicate window after replay"
         assert DEFAULTS_PATH.read_bytes() == defaults_before
+
+    def test_seed_metrics_history_windows_reports_by_generated_date(self, tmp_path):
+        # Two archived directories on the same ``Generated`` day (the live
+        # archive has 2026-08-07 and 2026-08-07_2/3/4) are one window, so the
+        # second contributes no duplicate measurement and the directory suffix
+        # never becomes a window id of its own.
+        log_dir = _write_log_dir(tmp_path)
+        archive = tmp_path / "archive"
+        (archive / "2026-08-07").mkdir(parents=True)
+        (archive / "2026-08-07" / "report.md").write_text(fixtures.ARCHIVED_REPORT_ERA_A)
+        (archive / "2026-08-07_2").mkdir()
+        (archive / "2026-08-07_2" / "report.md").write_text(fixtures.ARCHIVED_REPORT_ERA_A)
+        state_path = tmp_path / "generated_window_state.yaml"
+
+        assert _run_cli(
+            log_dir,
+            tmp_path / "usage",
+            "--seed-metrics-history",
+            str(archive),
+            "--metrics-state",
+            str(state_path),
+            "--quiet",
+        ) == 0
+
+        state = pm.load_state(state_path)
+        windows = {m["window"] for m in _measurements(state, "decode_speed")}
+        assert windows == {"2026-08-07"}
+        assert len(_measurements(state, "decode_speed")) == 1
+
+    def test_seed_metrics_history_without_generated_uses_directory_name(self, tmp_path):
+        log_dir = _write_log_dir(tmp_path)
+        archive = tmp_path / "archive"
+        (archive / "2026-08-07").mkdir(parents=True)
+        (archive / "2026-08-07" / "report.md").write_text(
+            fixtures.ARCHIVED_REPORT_ERA_A.replace(
+                "- Generated: 2026-08-07 02:10:21\n", ""
+            )
+        )
+        state_path = tmp_path / "no_generated_state.yaml"
+
+        assert _run_cli(
+            log_dir,
+            tmp_path / "usage",
+            "--seed-metrics-history",
+            str(archive),
+            "--metrics-state",
+            str(state_path),
+            "--quiet",
+        ) == 0
+
+        state = pm.load_state(state_path)
+        assert {m["window"] for m in _measurements(state, "decode_speed")} == {"2026-08-07"}
