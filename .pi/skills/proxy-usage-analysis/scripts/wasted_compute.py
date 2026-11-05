@@ -239,7 +239,7 @@ def load_analyser(path: Path | None = None) -> ModuleType | None:
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
-    except Exception as exc:  # noqa: BLE001 - any failure degrades, never raises
+    except Exception as exc:
         LOGGER.warning("wasted_compute: analyser import failed: %s", exc)
         return None
     _ANALYSER_CACHE[key] = module
@@ -293,7 +293,7 @@ def analyse_window(
             log_dir=str(log_dir),
             llama_log=llama_spec,
         )
-    except Exception as exc:  # noqa: BLE001 - degrade, never break the report
+    except Exception as exc:
         LOGGER.warning("wasted_compute: analysis failed: %s", exc)
         return WastedCompute(status="unavailable", reason=f"analysis failed: {exc}")
     return normalise(dataset, rate_target_per_hour=rate_target_per_hour)
