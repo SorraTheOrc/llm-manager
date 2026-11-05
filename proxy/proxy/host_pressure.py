@@ -34,6 +34,20 @@ OOM victim protection (:func:`protect_proxy_process`,
     protection is verifiable without provoking a real global OOM (which would
     risk killing the very proxy under test).
 
+The score must land on the **llama-server process**, not on the wrapper the
+proxy spawned (LP-0MW3K7XJ30027RV6). ``start-llama.sh`` runs ``llama-server`` as
+a foreground child, so a write to the wrapper's pid after that fork is never
+inherited: measured live on 2026-11-05, the router and its model child both sat
+at ``oom_score_adj=0`` while the configuration asked for ``800``. The
+protection therefore resolves the process **tree** (:func:`process_tree`,
+:func:`backend_pids`), scores every ``llama-server`` process in it
+(:func:`apply_backend_oom_protection`) and can re-assert — and verify — the
+ranking later (:func:`reapply_backend_oom_protection`,
+:func:`inspect_backend_oom_protection`), which also covers the model children
+the router forks when it loads a model. ``oom_score_adj`` is copied by the
+kernel at fork time, so scoring the router first makes every later child inherit
+the raised value.
+
 Pre-OOM observability (:func:`read_memory_snapshot`, :func:`evaluate_pressure`)
     ``MemAvailable`` from ``/proc/meminfo`` plus GTT use/size from the
     ``amdgpu`` sysfs attributes, evaluated against thresholds that trip *before*
@@ -334,6 +348,148 @@ def apply_oom_score_adj(pid: int, value: int) -> tuple[int | None, str | None]:
     return read_oom_score_adj(pid), error
 
 
+# ---------------------------------------------------------------------------
+# Process-tree resolution: the score belongs on llama-server, not its wrapper
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROC_ROOT = Path("/proc")
+
+#: Kernel ``comm`` (and first ``cmdline`` field) of the backend binary. Truncated
+#: to 15 characters in ``comm``, which still contains this whole marker.
+LLAMA_SERVER_MARKER = "llama-server"
+
+
+@dataclass(frozen=True)
+class ProcessEntry:
+    """One ``/proc/<pid>`` row: parent, kernel ``comm`` and full command line."""
+
+    pid: int
+    ppid: int
+    comm: str
+    cmdline: str
+
+    @property
+    def is_llama_server(self) -> bool:
+        """True for a llama-server process, however it was launched.
+
+        ``comm`` is the executable name (``llama-server``). A stand-in started
+        with ``exec -a llama-server`` keeps its own ``comm`` but carries the
+        name in ``argv[0]``. Only ``argv[0]`` is matched — never the whole
+        command line — so a wrapper whose *script text* mentions llama-server
+        (``bash -c '… llama-server …'``, ``podman run … llama-server``) is not
+        mistaken for the backend. The container case is still covered: the tree
+        walk reaches the container's ``llama-server`` process whose ``comm``
+        matches.
+        """
+        if LLAMA_SERVER_MARKER in self.comm:
+            return True
+        return LLAMA_SERVER_MARKER in Path(self.argv0).name
+
+    @property
+    def argv0(self) -> str:
+        """First ``cmdline`` field (the program name), or ``""`` when unknown."""
+        return self.cmdline.split(" ", 1)[0] if self.cmdline else ""
+
+
+def _parse_stat(raw: str) -> tuple[str, int] | None:
+    """``(comm, ppid)`` from one ``/proc/<pid>/stat`` line.
+
+    ``comm`` is wrapped in parentheses and the kernel does **not** escape it,
+    so a process can legitimately be called ``foo) 1`` and a naive split on the
+    first ``)`` would read the wrong fields. The outermost pair is therefore
+    located with the first ``(`` and the last ``)``.
+    """
+    left = raw.find("(")
+    right = raw.rfind(")")
+    if left == -1 or right <= left:
+        return None
+    fields = raw[right + 1 :].split()
+    # fields[0] is the state, fields[1] the parent pid.
+    if len(fields) < 2:
+        return None
+    try:
+        return raw[left + 1 : right], int(fields[1])
+    except ValueError:
+        return None
+
+
+def read_process_table(proc_root=None) -> dict[int, ProcessEntry]:
+    """Read ``{pid: ProcessEntry}`` for every process this user can inspect.
+
+    Processes that exit mid-read are skipped: the table is a best-effort
+    snapshot and a vanished pid must never raise.
+    """
+    root = Path(proc_root) if proc_root is not None else DEFAULT_PROC_ROOT
+    table: dict[int, ProcessEntry] = {}
+    try:
+        candidates = list(root.iterdir())
+    except OSError:
+        return table
+    for candidate in candidates:
+        if not candidate.name.isdigit():
+            continue
+        pid = int(candidate.name)
+        try:
+            stat = (candidate / "stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        parsed = _parse_stat(stat)
+        if parsed is None:
+            continue
+        comm, ppid = parsed
+        try:
+            raw_cmdline = (candidate / "cmdline").read_bytes()
+        except OSError:
+            raw_cmdline = b""
+        table[pid] = ProcessEntry(
+            pid=pid,
+            ppid=ppid,
+            comm=comm,
+            cmdline=raw_cmdline.replace(b"\0", b" ").decode("utf-8", "replace").strip(),
+        )
+    return table
+
+
+def process_tree(root_pids, table=None, proc_root=None) -> list[int]:
+    """*root_pids* followed by every descendant, breadth-first.
+
+    ``start-llama.sh``/podman/proxy layers mean the process the proxy holds a
+    handle for is usually an ancestor of the real backend, so scoring only the
+    handle leaves the backend (and its router children) unprotected.
+    """
+    known = table if table is not None else read_process_table(proc_root)
+    roots: list[int] = []
+    for pid in root_pids:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0 and pid not in roots:
+            roots.append(pid)
+    children: dict[int, list[int]] = {}
+    for pid in sorted(known):
+        children.setdefault(known[pid].ppid, []).append(pid)
+    ordered: list[int] = []
+    queue = list(roots)
+    while queue:
+        pid = queue.pop(0)
+        if pid in ordered:
+            continue
+        ordered.append(pid)
+        queue.extend(children.get(pid, ()))
+    return ordered
+
+
+def backend_pids(root_pids, table=None, proc_root=None) -> list[int]:
+    """Pids of the ``llama-server`` processes among *root_pids* and their trees."""
+    known = table if table is not None else read_process_table(proc_root)
+    return [
+        pid
+        for pid in process_tree(root_pids, table=known)
+        if (entry := known.get(pid)) is not None and entry.is_llama_server
+    ]
+
+
 def _server_cfg(config) -> dict:
     if isinstance(config, dict):
         section = config.get("server", {})
@@ -393,43 +549,310 @@ def protect_proxy_process(config=None, logger=None) -> int | None:
     return applied
 
 
-def protect_backend_process(proc, config=None, logger=None) -> int | None:
-    """Raise the llama-server backend's ``oom_score_adj`` so it dies before the proxy.
-
-    Returns the applied score, or ``None`` when the process handle has no pid or
-    the score is unreadable. Never raises: a failed adjustment must not prevent
-    a model from loading.
-    """
-    pid = getattr(proc, "pid", None)
-    if not pid:
-        return None
+def _configured_backend_score(config) -> int:
+    """``server.llama_server_oom_score_adj``, or the module default."""
     configured = _server_cfg(config).get(
         "llama_server_oom_score_adj", LLAMA_SERVER_OOM_SCORE_ADJ
     )
     try:
-        configured = int(configured)
+        return int(configured)
     except (TypeError, ValueError):
-        configured = LLAMA_SERVER_OOM_SCORE_ADJ
-    applied, error = apply_oom_score_adj(int(pid), configured)
+        return LLAMA_SERVER_OOM_SCORE_ADJ
+
+
+def _coerce_pid(value) -> int | None:
+    """A positive pid from *value*, else ``None`` (``_AdoptedLlamaProcess`` is 0)."""
     try:
-        if logger is not None and error is not None:
-            logger.warning(
-                "Could not set oom_score_adj=%s on llama-server pid %s (%s); the "
-                "backend is not preferentially killable",
-                configured,
-                pid,
-                error,
-            )
-        elif logger is not None and applied is not None and applied != configured:
-            logger.warning(
-                "llama-server pid %s oom_score_adj applied as %s (requested %s)",
-                pid,
-                applied,
-                configured,
-            )
-    except Exception:  # pragma: no cover
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+@dataclass(frozen=True)
+class OomScoreWrite:
+    """What one ``/proc/<pid>/oom_score_adj`` write (or read) produced."""
+
+    pid: int
+    comm: str
+    requested: int
+    applied: int | None
+    error: str | None = None
+    #: True for the ``llama-server`` process itself (as opposed to a wrapper or
+    #: start-script ancestor scored so later forks inherit the raised value).
+    is_backend: bool = False
+
+    @property
+    def ok(self) -> bool:
+        """The kernel accepted the requested value (a read-back comparison)."""
+        return self.error is None and self.applied == self.requested
+
+
+@dataclass(frozen=True)
+class BackendOomReport:
+    """Verification result for one backend process tree.
+
+    ``gap`` is the documented explanation when the intended ranking is *not*
+    live (no backend in the tree, a refused write, or a process that vanished),
+    so an unverified backend is never reported as protected.
+    """
+
+    configured: int
+    rows: tuple[OomScoreWrite, ...] = ()
+    gap: str | None = None
+
+    @property
+    def backend_rows(self) -> tuple[OomScoreWrite, ...]:
+        return tuple(row for row in self.rows if row.is_backend)
+
+    @property
+    def protected(self) -> bool:
+        return self.gap is None and bool(self.backend_rows) and all(
+            row.ok for row in self.backend_rows
+        )
+
+    def as_dict(self) -> dict:
+        """JSON-friendly view (the runbook tool and the watchdog both use it)."""
+        return {
+            "configured": self.configured,
+            "protected": self.protected,
+            "gap": self.gap,
+            "rows": [
+                {
+                    "pid": row.pid,
+                    "comm": row.comm,
+                    "requested": row.requested,
+                    "applied": row.applied,
+                    "error": row.error,
+                    "is_backend": row.is_backend,
+                }
+                for row in self.rows
+            ],
+        }
+
+
+#: State keys already reported this process lifetime (log-once throttle).
+_REPORTED: set[str] = set()
+
+#: Bound on :data:`_REPORTED`; a long-lived proxy must not accumulate pid keys
+#: forever, and re-reporting after a reset is at most one line per 1024 changes.
+_REPORTED_MAX = 1024
+
+
+def _log_once(logger, key: str, level: str, message: str, *args) -> None:
+    """Log *message* at *level* once per *key*; never raises.
+
+    One reconcile pass emits one line per state, not one per 30 s pass: a
+    router child that appears later has a new pid and therefore a new key, so a
+    real change is still reported.
+    """
+    if key in _REPORTED:
+        return
+    _REPORTED.add(key)
+    if len(_REPORTED) > _REPORTED_MAX:
+        _REPORTED.clear()
+    try:
+        if logger is not None:
+            getattr(logger, level, logger.warning)(message, *args)
+    except Exception:  # pragma: no cover - logging must never break startup
         pass
-    return applied
+
+
+def _is_gone_error(error: str | None) -> bool:
+    """True when *error* means the process no longer exists (not a refusal)."""
+    if not error:
+        return False
+    return any(
+        marker in error
+        for marker in ("No such file or directory", "ProcessLookupError", "ESRCH")
+    )
+
+
+def _backend_rows(root_pids, configured: int, *, write: bool) -> list[OomScoreWrite]:
+    """Score (or read) every root and every ``llama-server`` in their trees."""
+    table = read_process_table()
+    roots = {
+        pid
+        for pid in (_coerce_pid(value) for value in root_pids)
+        if pid is not None
+    }
+    rows: list[OomScoreWrite] = []
+    for pid in process_tree(sorted(roots), table=table):
+        entry = table.get(pid)
+        is_backend = entry is not None and entry.is_llama_server
+        if pid not in roots and not is_backend:
+            # Scoring a transient helper (awk, mktemp) would be noise; only the
+            # roots (so later forks inherit) and the backend itself matter.
+            continue
+        if write:
+            applied, error = apply_oom_score_adj(pid, configured)
+        else:
+            applied, error = read_oom_score_adj(pid), None
+        rows.append(
+            OomScoreWrite(
+                pid=pid,
+                comm=entry.comm if entry is not None else "",
+                requested=configured,
+                applied=applied,
+                error=error,
+                is_backend=is_backend,
+            )
+        )
+    return rows
+
+
+def _build_report(
+    rows: list[OomScoreWrite],
+    configured: int,
+    roots,
+    *,
+    logger=None,
+    require_backend: bool = False,
+) -> BackendOomReport:
+    """Summarise *rows*, logging the gaps and the once-per-run verification."""
+    gap: str | None = None
+    backend_rows = [row for row in rows if row.is_backend]
+    refused = [row for row in rows if row.error is not None and not _is_gone_error(row.error)]
+    mismatched = [row for row in backend_rows if row.error is None and not row.ok]
+    if not backend_rows:
+        gap = (
+            "no llama-server process in the tree of pid(s) "
+            f"{', '.join(str(pid) for pid in sorted(roots)) or 'none'} — the backend "
+            "is not running, its start script has not forked it yet, or it could "
+            "not be discovered (an adopted backend whose port is unreadable); its "
+            "oom_score_adj is unverified"
+        )
+    elif refused:
+        gap = (
+            f"could not set oom_score_adj={configured} on "
+            + ", ".join(f"pid {row.pid} ({row.error})" for row in refused)
+        )
+    elif mismatched:
+        gap = (
+            "oom_score_adj on "
+            + ", ".join(f"pid {row.pid}" for row in mismatched)
+            + f" reads {', '.join(str(row.applied) for row in mismatched)}, expected "
+            f"{configured} (the kernel is not holding the intended ranking)"
+        )
+
+    report = BackendOomReport(configured=configured, rows=tuple(rows), gap=gap)
+    if gap is not None:
+        if require_backend:
+            _log_once(
+                logger,
+                f"backend-oom-gap:{gap}",
+                "warning",
+                "Backend OOM protection is not verified: %s. The model backend is "
+                "not preferentially killable; reapply and verify by hand with "
+                "`python3 scripts/verify_oom_protection.py --apply` (see "
+                "docs/dev/oom-recovery-runbook.md), or restart the backend so the "
+                "proxy scores it at spawn time.",
+                gap,
+            )
+        return report
+    for row in backend_rows:
+        if row.error is None:
+            _log_once(
+                logger,
+                f"backend-oom-ok:{row.pid}:{row.applied}",
+                "info",
+                "oom_score_adj=%s verified on llama-server pid %s (%s), above the "
+                "proxy for the OOM killer",
+                row.applied,
+                row.pid,
+                row.comm or "comm unreadable",
+            )
+    return report
+
+
+def apply_backend_oom_protection(root_pids, configured: int) -> list[OomScoreWrite]:
+    """Raise ``oom_score_adj`` on *root_pids* and every llama-server below them."""
+    return _backend_rows(root_pids, int(configured), write=True)
+
+
+def reapply_backend_oom_protection(
+    root_pids, config=None, logger=None, *, require_backend: bool = False
+) -> BackendOomReport:
+    """Re-assert the backend ranking on a running tree (router and children).
+
+    Idempotent and safe to call periodically: it walks the tree from the pids the
+    caller knows about (the tracked spawn handle plus any port discovery), writes
+    the configured score to every ``llama-server`` process it finds and verifies
+    the result from ``/proc``. A backend that cannot be found or scored is
+    reported as a :attr:`BackendOomReport.gap` — with *require_backend*, the gap
+    is logged once together with the operator action — never silently passed.
+    """
+    configured = _configured_backend_score(config)
+    rows = apply_backend_oom_protection(root_pids, configured)
+    return _build_report(
+        rows, configured, root_pids, logger=logger, require_backend=require_backend
+    )
+
+
+def inspect_backend_oom_protection(
+    root_pids, config=None, *, require_backend: bool = False
+) -> BackendOomReport:
+    """Read-only verification of the backend ranking from ``/proc``."""
+    configured = _configured_backend_score(config)
+    rows = _backend_rows(root_pids, configured, write=False)
+    return _build_report(rows, configured, root_pids, require_backend=require_backend)
+
+
+def protect_backend_process(proc, config=None, logger=None) -> int | None:
+    """Raise the llama-server backend's ``oom_score_adj`` so it dies before the proxy.
+
+    The write goes to the process the caller spawned **and** to every
+    ``llama-server`` process already below it, because ``start-llama.sh`` forks
+    the backend before the proxy can reach ``/proc`` (LP-0MW3K7XJ30027RV6).
+    Scoring the wrapper first is what makes a child forked *later* — a model
+    loaded after the write — inherit the raised value.
+
+    Returns the applied score of *proc*, or ``None`` when the process handle has
+    no pid or the score is unreadable. Never raises: a failed adjustment must not
+    prevent a model from loading.
+    """
+    pid = _coerce_pid(getattr(proc, "pid", None))
+    if pid is None:
+        return None
+    configured = _configured_backend_score(config)
+    rows = apply_backend_oom_protection([pid], configured)
+    for row in rows:
+        try:
+            if logger is None:
+                continue
+            if row.error is not None:
+                if not _is_gone_error(row.error):
+                    logger.warning(
+                        "Could not set oom_score_adj=%s on pid %s (%s); the backend "
+                        "is not preferentially killable",
+                        configured,
+                        row.pid,
+                        row.error,
+                    )
+                else:
+                    logger.debug(
+                        "pid %s exited before oom_score_adj=%s could be applied",
+                        row.pid,
+                        configured,
+                    )
+            elif row.applied is not None and row.applied != configured:
+                logger.warning(
+                    "pid %s oom_score_adj applied as %s (requested %s)",
+                    row.pid,
+                    row.applied,
+                    configured,
+                )
+            elif row.is_backend:
+                logger.info(
+                    "llama-server pid %s oom_score_adj=%s (backend ranked above the "
+                    "proxy for the OOM killer)",
+                    row.pid,
+                    row.applied,
+                )
+        except Exception:  # pragma: no cover - logging must never break startup
+            pass
+    root_row = next((row for row in rows if row.pid == pid), None)
+    return root_row.applied if root_row is not None else None
 
 
 # ---------------------------------------------------------------------------

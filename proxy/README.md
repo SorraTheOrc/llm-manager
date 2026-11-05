@@ -2058,10 +2058,18 @@ backend together (~96.7 GiB of GPU-backed amdgpu GTT memory on a 124 GiB host,
 - **OOM ranking.** The proxy applies `server.oom_score_adj` (default `-900`) to
   itself and `server.llama_server_oom_score_adj` (default `+800`) to the spawned
   or adopted llama-server, so the kernel's `oom_badness` ranking sacrifices the
-  model backend before the front door. Raising a score is always permitted;
+  model backend before the front door. The score is written to the whole
+  process **tree** — the start-script wrapper at spawn time (so later forks
+  inherit it) plus every `llama-server` process already running, including the
+  router and the per-model children it forks — and re-asserted every ~30 s by
+  the backend watchdog (LP-0MW3K7XJ30027RV6: writing only to the wrapper left
+  the live router and its child at `0`). Raising a score is always permitted;
   lowering one below 0 needs `CAP_SYS_RESOURCE` (the systemd **system** unit sets
   `OOMScoreAdjust=-900`), and a refused lowering is logged with the remedy at
   startup. Verify with
+  `for p in $(pgrep -x llama-server); do cat /proc/$p/oom_score_adj; done` or
+  `python3 scripts/verify_oom_protection.py` (`--apply` to reapply), and the
+  proxy's own score with
   `cat /proc/$(pgrep -f 'uvicorn proxy\.server' | head -1)/oom_score_adj`.
 - **Supervision.** `scripts/systemd/llama-proxy.service` and
   `scripts/systemd/llama-podman-wrapper.service` use `Restart=always` with

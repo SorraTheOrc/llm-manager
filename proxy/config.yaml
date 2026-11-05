@@ -1029,6 +1029,11 @@ server:
   # oom_score_adj applied to the llama-server backend after it is spawned (and
   # to an adopted backend). Raising a child's score is always permitted, so the
   # kernel prefers the model backend over the proxy in every deployment mode.
+  # The value is written to the process TREE, not only to the start-script
+  # wrapper: the router and the per-model children it forks are scored too, and
+  # the backend watchdog re-asserts it every ~30 s (LP-0MW3K7XJ30027RV6 — the
+  # wrapper-only write left the live router and child at 0). Verify with
+  # `python3 scripts/verify_oom_protection.py`.
   llama_server_oom_score_adj: 800
   # --- Death-signal decoding + death-window capture (LP-0MW3K7WD6003TJKZ) ---
   # The proxy used to report a blanket ``llama_server_exit_code_137`` for every

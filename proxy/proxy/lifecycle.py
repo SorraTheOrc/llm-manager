@@ -253,6 +253,14 @@ def _apply_backend_oom_protection(proc) -> None:
     below 0 needs privileges), so this half of the protection works in an
     unprivileged deployment. The score is inherited by the backend's children
     and, best-effort, never blocks a model load.
+
+    LP-0MW3K7XJ30027RV6: applied as the spawner's ``on_spawn`` hook, i.e. right
+    after ``Popen`` and *before* the 3 s quick-exit probe. That ordering is the
+    point: ``start-llama.sh`` forks ``llama-server`` within milliseconds and the
+    kernel copies ``oom_score_adj`` at fork time, so a write issued after the
+    probe never reaches the backend (the live symptom: the wrapper scored 800,
+    the router and its model child stayed at 0). ``protect_backend_process``
+    scores the whole tree, so an already-forked backend is covered too.
     """
     if proc is None:
         return
@@ -267,6 +275,72 @@ def _apply_backend_oom_protection(proc) -> None:
         )
     except Exception:
         pass
+
+
+#: How often the watchdog re-asserts the backend OOM ranking (seconds). A router
+#: child forked by a model load inherits the router's score, so this only has to
+#: catch a backend that was already running when the score was written.
+BACKEND_OOM_RECONCILE_SECONDS = 30.0
+
+#: Timestamp of the last reconcile (throttle for the watchdog).
+_backend_oom_reconcile_at = 0.0
+
+
+def _reapply_backend_oom_protection(force: bool = False) -> dict | None:
+    """Re-assert and verify the backend OOM ranking on the running tree.
+
+    LP-0MW3K7XJ30027RV6: the spawn-time write can miss a backend the start script
+    had already forked, and an adopted backend predates this proxy entirely.
+    This walks from the tracked spawn handle **and** from the port discovery of
+    the live ``llama-server`` (the router; its model children are found through
+    the tree) and re-applies ``server.llama_server_oom_score_adj`` to each,
+    returning the :meth:`proxy.host_pressure.BackendOomReport.as_dict` report.
+
+    Best-effort and throttled to :data:`BACKEND_OOM_RECONCILE_SECONDS`; a gap is
+    logged once with the operator action instead of failing a request. Never
+    raises.
+    """
+    global _backend_oom_reconcile_at
+    now = time.time()
+    if not force and now - _backend_oom_reconcile_at < BACKEND_OOM_RECONCILE_SECONDS:
+        return None
+    _backend_oom_reconcile_at = now
+    try:
+        srv = _srv()
+        roots: list[int] = []
+        pid = getattr(getattr(srv, "llama_process", None), "pid", None)
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            roots.append(pid)
+        config = getattr(srv, "config", None)
+        port = 8080
+        if isinstance(config, dict):
+            section = config.get("server", {})
+            if isinstance(section, dict):
+                try:
+                    port = int(section.get("llama_server_port", 8080) or 8080)
+                except (TypeError, ValueError):
+                    port = 8080
+        try:
+            from proxy.backend_rss import discover_llama_pids
+
+            roots.extend(discover_llama_pids(port))
+        except Exception:
+            pass
+        from proxy.host_pressure import reapply_backend_oom_protection
+
+        report = reapply_backend_oom_protection(
+            roots,
+            config,
+            getattr(srv, "logger", None),
+            require_backend=bool(getattr(srv, "backend_ready", False)),
+        )
+        return report.as_dict()
+    except Exception:
+        return None
 
 
 def _resolve_llama_log_path(srv) -> Path:
@@ -1409,6 +1483,7 @@ def spawn_and_capture(
     log_file,
     logger: logging.Logger,
     model_name: str = "unknown",
+    on_spawn=None,
 ) -> tuple:
     """Start a subprocess and capture immediate stderr/stdout if it exits quickly.
 
@@ -1431,6 +1506,12 @@ def spawn_and_capture(
             ``None`` falls back to the legacy pipe relay.
         logger: Logger instance.
         model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
+        on_spawn: Optional ``callable(proc)`` invoked immediately after
+            ``Popen`` succeeds, **before** the quick-exit probe below. A start
+            script forks the real backend within milliseconds and the kernel
+            copies ``oom_score_adj`` at fork time, so the OOM ranking has to be
+            written here rather than after the probe returns
+            (LP-0MW3K7XJ30027RV6). Best-effort: a failure is logged, never raised.
 
     Returns a tuple (Popen|None, captured_output_str|None).
     """
@@ -1451,6 +1532,23 @@ def spawn_and_capture(
         tb = traceback.format_exc()
         logger.error(f"Failed to spawn command {cmd}: {e}\n{tb}")
         return None, f"Spawn failed: {e}\n{tb}"
+
+    # LP-0MW3K7XJ30027RV6: run the spawn hook before the probe window. The child
+    # (the start script) forks llama-server almost immediately, and oom_score_adj
+    # is inherited at fork time only — a write after ``proc.wait(timeout=3)``
+    # reaches the wrapper, not the backend.
+    if on_spawn is not None:
+        try:
+            on_spawn(proc)
+        except Exception:
+            try:
+                logger.warning(
+                    "spawn hook failed for %s; continuing without it",
+                    cmd[0],
+                    exc_info=True,
+                )
+            except Exception:
+                pass
 
     try:
         if direct_to_file:
@@ -1912,7 +2010,14 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
             host_cmd.append("router")
 
         srv.logger.info(f"Attempting host-first startup with: {' '.join(host_cmd)}")
-        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger, model_name=_display)
+        host_proc, host_out = spawn_and_capture(
+            host_cmd,
+            env,
+            srv.llama_log_file,
+            srv.logger,
+            model_name=_display,
+            on_spawn=_apply_backend_oom_protection,
+        )
 
         if host_proc is not None:
             srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
@@ -1935,7 +2040,14 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
     tried_cmds = []
 
     for attempt in range(retries):
-       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger, model_name=_display)
+       proc, out = spawn_and_capture(
+           cmd,
+           env,
+           srv.llama_log_file,
+           srv.logger,
+           model_name=_display,
+           on_spawn=_apply_backend_oom_protection,
+       )
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")

@@ -615,6 +615,18 @@ async def _backend_watchdog_loop() -> None:
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
             llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
 
+            # LP-0MW3K7XJ30027RV6: keep the OOM ranking on the *backend* — the
+            # router and the model children it forks — not only on the
+            # start-script wrapper the proxy holds a handle for. Throttled
+            # internally, best-effort, and it records a documented gap when the
+            # backend cannot be found or scored.
+            try:
+                from ..lifecycle import _reapply_backend_oom_protection
+
+                _reapply_backend_oom_protection()
+            except Exception:
+                pass
+
             if proc is None:
                 if router_mode and not srv.backend_ready:
                     # Probe the backend before attempting restart
