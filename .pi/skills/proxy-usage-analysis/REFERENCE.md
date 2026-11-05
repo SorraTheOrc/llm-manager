@@ -1550,6 +1550,75 @@ window cannot. A missing series reads as no queue activity (the proxy publishes
 the gauge to zero on every dequeue). See
 [monitoring/README.md](../../../monitoring/README.md) for the PromQL examples.
 
+## Prefix-reuse and slot-steal Prometheus series (LP-0MVWPK2VH008YWBD)
+
+E7 of `docs/dev/single-slot-impact.md` predicts that at one slot every session
+maps to slot 0, so each session switch evicts the previous prefix (the recorded
+`95 %` steal rate that the same report's §5.8 requires be re-measured). Before
+this change no metric recorded the **cause** — prefix reuse vs steal — so the
+only evidence of thrash was a rising `prefill_slot_seconds` per served turn,
+which a decode-side or prompt-size change could mimic. The proxy now publishes
+the cause directly, from `proxy/proxy/metrics.py`:
+
+| Series | Type | Meaning |
+|---|---|---|
+| `llama_prefix_cache_reuse_total{outcome}` | counter | served local streams by measured prefix-cache reuse outcome (`reused` = at least one `prompt_tokens_details.cached_tokens`; `cold` = none) |
+| `llama_slot_steal_total{reason}` | counter | slot steals/evictions — a resident KV prefix discarded when the slot changes hands — by the eviction `reason` the save/restore path already uses (`proxy.admission_events.EVICTION_REASONS`) |
+
+**How a single-slot regime shows up.** Two things move together and only in the
+thrashing direction:
+
+- the `reused` share of `llama_prefix_cache_reuse_total` **collapses** — with
+  one slot and two interleaving sessions, almost every served stream is `cold`
+  because the previous session's prefix was evicted before it could be reused;
+- `llama_slot_steal_total` **rises per 100 local turns** — every session switch
+  at pool size one is a handover that discards a resident prefix, so the steal
+  rate approaches the switch rate rather than staying near zero (the two-slot
+  baseline, where each session owns its own slot and steals nothing).
+
+A missing series reads as no activity: the counters are only created when
+`prometheus_client` is available, and an unmeasured stream (no usable
+`prompt_tokens`) increments nothing — an absent measurement is never counted as
+`cold`, so a reporting gap cannot be mistaken for thrash.
+
+### Pre-registered steal threshold (committed with the counters)
+
+The decision rule below is committed in the **same** change that lands the
+counters, i.e. before any measurement window is read, so the eventual verdict
+cannot be retrofitted to the data. The rule may be tightened after the fact but
+**not loosened**. Steal is **real** when either condition holds in the window:
+
+- **(a)** `≥ 5` steal events per 100 local turns; or
+- **(b)** measured aggregate prefix reuse `≤ 50 %` for prompts `> 20,000` tokens.
+
+Condition (b) must be **sustained across at least two sessions sharing a pool of
+one** in the same window — a single session cannot demonstrate a steal, because
+it never evicts another session's prefix.
+
+The reproducible queries (Prometheus, 24 h window):
+
+```promql
+# Share of served local streams that reused any prefix (1 = all reused).
+sum(rate(llama_prefix_cache_reuse_total{outcome="reused"}[24h]))
+  / clamp_min(sum(rate(llama_prefix_cache_reuse_total[24h])), 1)
+
+# Steal/eviction events per 100 local turns (local turns = every counted stream).
+100 * sum(increase(llama_slot_steal_total[24h]))
+  / clamp_min(sum(increase(llama_prefix_cache_reuse_total[24h])), 1)
+```
+
+The size-filtered ratio for condition (b) (`prompts > 20,000` tokens) is not on
+the live counter — it carries no prompt-size label, to keep cardinality flat —
+so read it from the nightly report's per-dispatch `cached_ratio` for
+`prompt_tokens > 20000` (`## Prompt cache` / `prompt_cache_hit_ratio`); the
+report's `local_eviction` records are the log-side equivalent of
+`llama_slot_steal_total` (same reason vocabulary, same eviction chokepoint), so
+the two figures can always be cross-checked against the series.
+
+> **Verdict status.** The verdict itself is recorded on LP-0MVWPK2VH008YWBD once
+a pool-of-one window of at least 24 h exists. It cannot be produced from the
+shipped two-slot geometry, where a steal is structurally rare.
+
 ## Legacy reason normalisation
 
 The parser maps legacy reason spellings to their current names so historical and

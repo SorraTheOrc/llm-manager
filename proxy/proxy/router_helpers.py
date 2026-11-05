@@ -3871,6 +3871,11 @@ def _record_local_eviction(
     "save the evicted prefix so the client restores warm" step can never
     drift apart.
 
+    LP-0MVWPK2VH008YWBD AC1: this is also where ``llama_slot_steal_total{reason}``
+    is incremented. A reclaim discards the resident KV prefix, so the counter
+    and this event describe the same handover, and the label reuses the
+    ``reason`` the save/restore path already receives.
+
     Returns whether a snapshot save was planned (i.e. not gated off).
     """
     plan = None
@@ -3882,6 +3887,16 @@ def _record_local_eviction(
         )
     except Exception:
         plan = None
+
+    # LP-0MVWPK2VH008YWBD AC1: count the slot steal/eviction under the same
+    # reason label the save/restore path uses. Best-effort: a metrics failure
+    # must never change a reclaim decision.
+    try:
+        from proxy.metrics import record_slot_steal
+
+        record_slot_steal(reason)
+    except Exception:
+        pass
 
     slot_owner = slot_owner_session or session_key
     try:

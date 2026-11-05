@@ -33,6 +33,18 @@ class Counter:
             self._store[key] = _Label()
         return self._store[key]
 
+    def remove(self, *labelvalues):
+        """Drop one label-value combination, like the real client.
+
+        Needed by the slot-metrics lifecycle reset (LP-0MVWPK2VH008YWBD), which
+        retires the prefix-reuse/steal label values on a simulated restart so
+        "the label set is cleaned up" is testable under the stub too.
+        """
+        key = tuple(labelvalues)
+        if key not in self._store:
+            raise KeyError(labelvalues)
+        del self._store[key]
+
 class _GaugeChild:
     """A labelled gauge child — the stub's counterpart of a real client child.
 

@@ -35,6 +35,23 @@ Extended by LP-0MVT1O0VG00905EL (slot occupancy, parent LP-0MVNWUEY8008XM6W):
   last successful sample is queryable and a stalled sampler is not mistaken for
   idle slots
 
+Extended by LP-0MVWPK2VH008YWBD (prefix-reuse and slot-steal observability for
+slot thrash, E7 of ``docs/dev/single-slot-impact.md``):
+- llama_prefix_cache_reuse_total{outcome="reused|cold"} (counter) — one
+  increment per served local stream, classified from the measured
+  ``prompt_tokens_details.cached_tokens`` (``reused`` = at least one prompt
+  token served from the prefix cache, ``cold`` = none). This is the *cause*
+  half of E7 that used to be inferable only from a rising prefill-seconds
+  ratio.
+- llama_slot_steal_total{reason="..."} (counter) — slot steals/evictions, i.e.
+  a resident KV prefix discarded when the slot changes hands, labelled with the
+  same eviction reason the save/restore path already uses
+  (``proxy.admission_events.EVICTION_REASONS``). Both counters carry only a
+  closed-vocabulary label, so a restarted backend cannot leave a ghost series
+  (contrast ``llama_slot_busy{slot}``, whose label set is reconciled on every
+  publish). ``reset_slot_occupancy_gauges()`` also clears their label tracking
+  so the restart lifecycle is exercised by tests.
+
 Extended by LP-0MVF7KQED005TG9Z (quota observability surface):
 - quota_rolling_percent{account,entry} (gauge)
 - quota_weekly_percent{account,entry} (gauge)
@@ -136,6 +153,16 @@ llama_slots_busy = None
 llama_slot_busy = None
 llama_slots_in_flight_tasks = None
 llama_slots_sample_timestamp_seconds = None
+# Prefix-cache reuse outcomes (LP-0MVWPK2VH008YWBD). One increment per served
+# local stream, so a single-slot regime (every session on slot 0) shows up as a
+# collapse in the ``reused`` share instead of being inferred from a rising
+# prefill-seconds ratio.
+llama_prefix_cache_reuse_total = None
+# Slot steals/evictions (LP-0MVWPK2VH008YWBD): a resident KV prefix discarded
+# when a slot changes hands, labelled with the eviction reason the save/restore
+# path already uses. Together with the reuse counter this separates "more
+# re-prefill because of thrash" from "more re-prefill because prompts grew".
+llama_slot_steal_total = None
 # Remote-stream watchdog terminations (LP-0MSVP7ZML003XZTJ): a remote
 # stream terminated by the max-duration or activity-timeout watchdog (a
 # "connected but idle" upstream that never goes silent). Counts by reason
@@ -321,6 +348,24 @@ if _enabled:
             'Unix timestamp of the last *successful* /slots occupancy sample '
             '(its age makes a stalled sampler visible; a failed query does not '
             'advance it)',
+        )
+        # Prefix-cache reuse and slot steals (LP-0MVWPK2VH008YWBD). Defined next
+        # to the slot gauges on purpose: the same lifecycle owns them, and both
+        # carry only a closed-vocabulary label so a restarted backend cannot
+        # leave a ghost series.
+        llama_prefix_cache_reuse_total = Counter(
+            'llama_prefix_cache_reuse_total',
+            'Served local streams by measured prefix-cache reuse outcome '
+            '(reused = at least one prompt token served from the prefix cache, '
+            'cold = none)',
+            ['outcome'],
+        )
+        llama_slot_steal_total = Counter(
+            'llama_slot_steal_total',
+            'Slot steals/evictions: a resident KV prefix discarded when the '
+            'slot changes hands, by the eviction reason the save/restore path '
+            'uses',
+            ['reason'],
         )
         llama_remote_stream_terminated_total = Counter(
             'llama_remote_stream_terminated_total',
@@ -650,6 +695,113 @@ def record_slots_child_port_skipped(reason: str):
 #: values lets :func:`record_slot_occupancy` remove the ones that disappeared.
 _slot_busy_labelvalues: set[str] = set()
 
+# ---------------------------------------------------------------------------
+# Prefix-cache reuse outcomes and slot steals (LP-0MVWPK2VH008YWBD)
+# ---------------------------------------------------------------------------
+#
+# E7 of ``docs/dev/single-slot-impact.md``: at one slot every session maps to
+# slot 0, so each session switch evicts the previous prefix (the 95 % steal rate
+# the report demands be re-measured). Before these counters the *cause* of a
+# rising ``prefill_slot_seconds`` per served turn was invisible — a decode-side
+# or prompt-size change could mimic it. The counters carry only a closed
+# vocabulary so a restarted backend cannot leave a ghost series.
+
+PREFIX_CACHE_REUSE_REUSED = "reused"
+"""A served local stream used at least one prompt token from the prefix cache."""
+
+PREFIX_CACHE_REUSE_COLD = "cold"
+"""A served local stream reused no prompt tokens (a full re-prefill)."""
+
+PREFIX_CACHE_REUSE_OUTCOMES: tuple[str, ...] = (
+    PREFIX_CACHE_REUSE_REUSED,
+    PREFIX_CACHE_REUSE_COLD,
+)
+"""The closed ``outcome`` label vocabulary of ``llama_prefix_cache_reuse_total``."""
+
+#: ``outcome`` values already published on the reuse counter, so a restart/test
+#: lifecycle reset can retire them and the counter's label set is provably
+#: cleaned up (AC3).
+_prefix_reuse_labelvalues: set[str] = set()
+
+#: ``reason`` values already published on the steal counter, for the same
+#: restart-lifecycle cleanup.
+_slot_steal_labelvalues: set[str] = set()
+
+
+def classify_prefix_cache_reuse(
+    cached_tokens: int | float | None, prompt_tokens: int | float | None
+) -> str | None:
+    """Return the reuse outcome for a measured local stream, or ``None``.
+
+    ``outcome`` is ``"reused"`` when the served stream reported at least one
+    ``prompt_tokens_details.cached_tokens``, else ``"cold"``. ``None`` means the
+    stream carried no usable prompt measurement (missing/zero prompt tokens), so
+    the caller must not count it — an unmeasured stream is not evidence of a
+    cold prefix (that would bias the reuse ratio toward thrash).
+    """
+    try:
+        prompt = int(prompt_tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    if prompt <= 0:
+        return None
+    try:
+        cached = int(cached_tokens or 0)
+    except (TypeError, ValueError):
+        cached = 0
+    return PREFIX_CACHE_REUSE_REUSED if cached > 0 else PREFIX_CACHE_REUSE_COLD
+
+
+def record_prefix_cache_reuse(
+    cached_tokens: int | float | None, prompt_tokens: int | float | None
+) -> str | None:
+    """Count one served local stream's prefix-cache reuse outcome.
+
+    Args:
+        cached_tokens: ``prompt_tokens_details.cached_tokens`` from the local
+            response's measured ``usage`` block.
+        prompt_tokens: The response's ``prompt_tokens``.
+
+    Returns:
+        The recorded outcome (``"reused"``/``"cold"``), or ``None`` when the
+        stream was unmeasured (nothing counted). Best-effort no-op when
+        prometheus_client is unavailable, matching the other recorders here.
+    """
+    outcome = classify_prefix_cache_reuse(cached_tokens, prompt_tokens)
+    if outcome is None:
+        return None
+    _prefix_reuse_labelvalues.add(outcome)
+    if not _enabled or llama_prefix_cache_reuse_total is None:
+        return outcome
+    try:
+        llama_prefix_cache_reuse_total.labels(outcome=outcome).inc()
+    except Exception:
+        pass
+    return outcome
+
+
+def record_slot_steal(reason: str) -> None:
+    """Count one slot steal/eviction under its eviction ``reason``.
+
+    A steal is a resident KV prefix discarded when a slot changes hands. Every
+    tenancy/lease reclaim funnels through ``router_helpers._record_local_eviction``
+    (the same chokepoint that plans the KV snapshot save), and its ``reason`` is
+    already the vocabulary the save/restore path receives, so the live counter
+    and the ``local_eviction`` log records speak the same language.
+
+    Best-effort no-op when prometheus_client is unavailable. An empty reason is
+    recorded as ``"unknown"`` so a caller bug is visible rather than dropped.
+    """
+    label = str(reason or "unknown")
+    _slot_steal_labelvalues.add(label)
+    if not _enabled or llama_slot_steal_total is None:
+        return
+    try:
+        llama_slot_steal_total.labels(reason=label).inc()
+    except Exception:
+        pass
+
+
 
 def summarise_slot_occupancy(payload: list, *, sampled_at: float) -> dict:
     """Derive the slot-occupancy snapshot from one ``/slots`` payload.
@@ -792,16 +944,37 @@ def reset_slot_occupancy_gauges() -> None:
     0..3 would otherwise look like a slot disappearance to the next case.
     Mirrors ``observability.reset_slots_poll_cache()``; nothing in production
     calls it — the proxy only ever publishes forward for its lifetime.
+
+    LP-0MVWPK2VH008YWBD AC2/AC3: the prefix-reuse and slot-steal counters share
+    the slot-metrics lifecycle, so their tracked label sets are cleared here too
+    and every published series is removed. That makes "the label set is cleaned
+    up on restart" directly assertable instead of an unverified claim.
     """
-    global _slot_busy_labelvalues
+    global _slot_busy_labelvalues, _prefix_reuse_labelvalues, _slot_steal_labelvalues
     tracked = _slot_busy_labelvalues
+    tracked_reuse = _prefix_reuse_labelvalues
+    tracked_steal = _slot_steal_labelvalues
     _slot_busy_labelvalues = set()
+    _prefix_reuse_labelvalues = set()
+    _slot_steal_labelvalues = set()
     if not _enabled:
         return
     if llama_slot_busy is not None:
         for label in tracked:
             try:
                 llama_slot_busy.remove(label)
+            except Exception:
+                pass
+    if llama_prefix_cache_reuse_total is not None:
+        for label in tracked_reuse:
+            try:
+                llama_prefix_cache_reuse_total.remove(label)
+            except Exception:
+                pass
+    if llama_slot_steal_total is not None:
+        for label in tracked_steal:
+            try:
+                llama_slot_steal_total.remove(label)
             except Exception:
                 pass
     for gauge in (

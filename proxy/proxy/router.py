@@ -706,6 +706,17 @@ async def _update_session_and_slot(
                         pass
                     _real_usage_applied = True
                     _measured_prompt_tokens = _prompt
+                    # LP-0MVWPK2VH008YWBD AC1: count the served stream's reuse
+                    # outcome (reused vs cold) from the measured cached tokens.
+                    # This is the cause-side signal E7 used to infer only from
+                    # a rising prefill-seconds ratio. Best-effort: an
+                    # unmeasured stream (prompt <= 0) counts nothing.
+                    try:
+                        from proxy.metrics import record_prefix_cache_reuse
+
+                        record_prefix_cache_reuse(_cached, _prompt)
+                    except Exception:
+                        pass
         except Exception:
             srv.logger.debug(
                 "update_cached_ratio from usage failed", exc_info=True
