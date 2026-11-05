@@ -28,6 +28,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK = Path(".githooks/pre-push")
 INSTALLER = Path("scripts/install_git_hooks.sh")
@@ -194,14 +196,17 @@ def _hook(
         stdin += line + "\n"
     fake_home = home or (tmp_path / "home")
     fake_home.mkdir(exist_ok=True)
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": str(fake_home),
-        # Keep the worklog sync out of these tests: it is not what is under
-        # test and would need a worklog store.
-        "WORKLOG_SKIP_PRE_PUSH": "1",
-        "PRE_PUSH_TEST_MARKER": str(tmp_path / "runner-calls.log"),
-    }
+    env = _git_env()
+    env.update(
+        {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": str(fake_home),
+            # Keep the worklog sync out of these tests: it is not what is under
+            # test and would need a worklog store.
+            "WORKLOG_SKIP_PRE_PUSH": "1",
+            "PRE_PUSH_TEST_MARKER": str(tmp_path / "runner-calls.log"),
+        }
+    )
     env.update(extra_env or {})
     return subprocess.run(
         ["sh", str(cwd / HOOK), "origin", "git@example.invalid:repo.git"],
@@ -220,10 +225,13 @@ def _marker(tmp_path: Path) -> str:
 
 
 def _install(root: Path, *extra: str, env: dict[str, str] | None = None):
-    run_env = {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": str(root.parent / "home"),
-    }
+    run_env = _git_env()
+    run_env.update(
+        {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": str(root.parent / "home"),
+        }
+    )
     run_env.update(env or {})
     return subprocess.run(
         ["bash", str(root / INSTALLER), *extra],
@@ -232,6 +240,38 @@ def _install(root: Path, *extra: str, env: dict[str, str] | None = None):
         text=True,
         env=run_env,
         check=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hermetic fixtures — the sandbox never writes into an inherited index
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_git_commands_ignore_an_inherited_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sandbox must never stage into an inherited ``GIT_INDEX_FILE``.
+
+    ``implement.py finish`` exports a temporary ``GIT_INDEX_FILE`` while it
+    runs the suite it gates. If the sandbox's ``git init``/``git add``/
+    ``git commit`` inherited that value they would write into the gate's index,
+    so the verdict could not be attributed to the would-be-commit tree. The
+    fixture must drop the repository overrides instead.
+    """
+    probe = tmp_path / "inherited-index"
+    assert not probe.exists()
+    monkeypatch.setenv("GIT_INDEX_FILE", str(probe))
+
+    root = _sandbox(tmp_path)
+    _install(root)
+    _install_runner(root)
+    result = _hook(root, "refs/heads/dev", tmp_path=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert not probe.exists(), (
+        "a fixture wrote into the inherited GIT_INDEX_FILE instead of the "
+        "sandbox repository's own index"
     )
 
 
