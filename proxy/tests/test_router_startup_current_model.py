@@ -106,6 +106,12 @@ def _router_config(preload: list[str]) -> dict:
 async def _run_startup_loader(monkeypatch, preload: list[str]) -> None:
     """Run the real ``_startup_launch_default_model_loader`` task to completion."""
     monkeypatch.setattr(server, 'config', _router_config(preload))
+    # Restore the real alias→llama_model resolver: some tests replace
+    # ``server.get_local_model_name`` directly (not via monkeypatch) and leave
+    # it stubbed, which would otherwise make this test order-dependent.
+    from proxy.lifecycle import get_local_model_name as _real_resolver
+
+    monkeypatch.setattr(server, 'get_local_model_name', _real_resolver)
     loaded: set[str] = set()
     client = _install_router_mock(monkeypatch, loaded)
 
