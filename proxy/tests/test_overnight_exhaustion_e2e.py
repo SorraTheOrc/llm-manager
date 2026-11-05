@@ -556,3 +556,95 @@ async def test_known_until_fail_fast_returns_immediately_when_streaming(monkeypa
 
     assert result.status_code == 503
     assert json.loads(result.body)["code"] == "no_provider_available_in_window"
+
+
+# ======================================================================
+# AC9b (LP-0MVYVX38100841G6): the hold bounds itself by the untruncated
+# retry_at, not the capped client-facing retry_after.
+# ======================================================================
+
+
+def _planned_response_with(true_wait: int, cap: int):
+    """A planned-unavailable response whose true wait exceeds *cap*."""
+    verdict = {
+        "skips": {"opencode-go-2": "outside_available_window"},
+        "terminal": [],
+        "providers": 1,
+        "retry_after_seconds": true_wait,
+    }
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        return provider._build_planned_unavailable_response(
+            verdict,
+            {"server": {"max_retry_after_seconds": cap}},
+            {
+                "providers": [
+                    {
+                        "name": "opencode-go-2",
+                        "type": "remote",
+                        "endpoint": "https://opencode.ai/zen/go",
+                        "available_times": _OVERNIGHT_WINDOW,
+                    }
+                ]
+            },
+        )
+
+
+def test_truncated_planned_response_hold_uses_the_real_wait():
+    """AC9b: a capped advertisement must not shrink the hold to the cap."""
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        response = _planned_response_with(true_wait=7200, cap=60)
+        assert response is not None
+        body = json.loads(response.body)
+        # Client-facing: capped, flagged, with the untruncated instant.
+        assert body["retry_after"] == 60
+        assert body["retry_after_truncated"] is True
+        assert body["retry_at"] == "2026-01-05T15:00:00+00:00"  # 13:00 + 2 h
+
+        # Hold-side: the real 7200 s wait, not the 60 s cap.
+        assert provider._exhaustion_retry_after(response) == 7200
+        # 7200 s exceeds the 300 s x 3 = 900 s budget, so no hold is taken.
+        assert provider._bounded_hold_seconds(300.0, response, 3) is None
+
+
+def test_truncated_planned_response_within_budget_holds_the_real_wait():
+    """AC9b: within the budget the hold equals the real (untruncated) wait."""
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        response = _planned_response_with(true_wait=120, cap=60)
+        assert response is not None
+        body = json.loads(response.body)
+        assert body["retry_after"] == 60
+        assert body["retry_after_truncated"] is True
+
+        assert provider._exhaustion_retry_after(response) == 120
+        assert provider._bounded_hold_seconds(300.0, response, 3) == 120.0
+
+
+def test_streaming_hold_comment_surfaces_the_planned_fields():
+    """AC9: the streaming hold comment carries the new payload's story."""
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        planned = _planned_response_with(true_wait=120, cap=60)
+        assert planned is not None
+        diagnostics = provider._exhaustion_diagnostics(planned)
+    assert "code=no_provider_available_in_window" in diagnostics
+    assert "retry_at=2026-01-05T13:02:00+00:00" in diagnostics
+    assert "opencode-go-2" in diagnostics
+
+
+def test_streaming_hold_comment_is_unchanged_for_generic_exhaustion():
+    """AC9c: a generic payload's diagnostics string is byte-identical."""
+    generic = Response(
+        content=json.dumps(
+            {
+                "error": "All providers exhausted",
+                "code": "all_exhausted",
+                "retry_after": 7,
+                "unavailable_providers": {"a": 7},
+            }
+        ).encode(),
+        status_code=503,
+        media_type="application/json",
+        headers={"Retry-After": "7"},
+    )
+    assert provider._exhaustion_diagnostics(generic) == (
+        "error=All providers exhausted, unavailable={'a': 7}"
+    )

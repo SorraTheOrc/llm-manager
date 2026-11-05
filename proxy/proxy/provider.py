@@ -11812,6 +11812,12 @@ def _exhaustion_diagnostics(response: Response) -> str:
     of the exhausted 503 payload (built by ``_build_exhausted_response``) so
     the hold-feedback comment can tell the client which providers were
     unavailable and why. Returns "" when the body is not a JSON payload.
+
+    A planned-unavailable payload (LP-0MVWC9CZH004OZYN) additionally carries
+    the stable ``code``, the honest ``retry_at`` and the ``detail`` naming the
+    earliest reopening provider; those are surfaced on the streaming hold
+    comment too, so a held client sees the same story as the terminal body.
+    Other payloads keep the historical string exactly (AC9c).
     """
     try:
         body_text = _response_body_text(response)
@@ -11827,6 +11833,13 @@ def _exhaustion_diagnostics(response: Response) -> str:
             diag = payload.get("diagnostics")
             if isinstance(diag, list) and diag:
                 bits.append(f"attempts={len(diag)}")
+            if payload.get("code") == EXHAUSTION_CODE_TIME_WINDOW_BLOCKED:
+                bits.append(f"code={payload['code']}")
+                if payload.get("retry_at"):
+                    bits.append(f"retry_at={payload['retry_at']}")
+                detail = payload.get("detail")
+                if isinstance(detail, str) and detail:
+                    bits.append(detail)
             if bits:
                 return ", ".join(bits)[:512]
     except Exception:
@@ -12611,25 +12624,45 @@ def _log_chain_planned_unavailable(
 
 
 def _exhaustion_retry_after(response: Response) -> int | None:
-    """Return an exhaustion response's ``Retry-After`` in seconds.
+    """Return an exhaustion response's real wait in seconds (hold-side).
 
     Prefers the ``Retry-After`` header; falls back to the JSON
     ``retry_after`` field. Returns ``None`` when neither is present/parsable
     (unknown wait — the caller then preserves the legacy full hold).
+
+    When the payload carries ``retry_after_truncated: true`` the header is the
+    client-facing *capped* value while ``retry_at`` is the untruncated instant
+    (LP-0MVWC9CZH004OZYN AC3). The hold must bound itself by the **real** wait,
+    not the cap, or it would replay the chain before the window reopens
+    (AC9b); so a truncated payload's ``retry_at`` wins over the header. Every
+    other payload keeps the historical header-first behaviour byte-identically
+    (AC9c) — none of them set the flag.
     """
+    try:
+        body = _response_body_text(response)
+        payload = json.loads(body) if body else None
+    except Exception:
+        payload = None
+    if isinstance(payload, dict) and payload.get("retry_after_truncated") is True:
+        try:
+            retry_at = datetime.fromisoformat(str(payload["retry_at"]))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            return max(0, int((retry_at - datetime.now(UTC)).total_seconds()))
+        except Exception:
+            # Fall through to the header/field value rather than guessing.
+            pass
     try:
         header = response.headers.get("Retry-After")
         if header is not None:
             return max(0, int(float(header)))
     except Exception:
         pass
-    try:
-        body = _response_body_text(response)
-        payload = json.loads(body) if body else None
-        if isinstance(payload, dict) and "retry_after" in payload:
+    if isinstance(payload, dict) and "retry_after" in payload:
+        try:
             return max(0, int(float(payload["retry_after"])))
-    except Exception:
-        pass
+        except Exception:
+            pass
     return None
 
 
