@@ -638,6 +638,105 @@ async def _backend_watchdog_loop() -> None:
             except Exception:
                 pass
 
+            # LP-0MW3MOMD9007DC26 AC1/AC3: an adopted sentinel (pid=0, its
+            # poll() always returns None) can never trip the poll()-based death
+            # checks below — its only liveness signal is the port itself. Probe
+            # reachability every interval and, after ``llama_adopted_unreachable_probes``
+            # consecutive unreachable probes, declare the death: log a death
+            # line (the true signal when the handle carries a decodable pid,
+            # else the adopted-unreachable class), record it, clear the handle
+            # and run the normal router self-heal.
+            if bool(getattr(proc, "adopted", False)):
+                reachable = await srv._probe_backend_reachable(llama_port)
+                if reachable:
+                    # Still alive: make backend_ready reflect reality (a
+                    # previous failure may have left it False), and reset the
+                    # unreachable-probe streak so a later death needs the full
+                    # window again (a transient dip is not a partial death).
+                    srv.backend_recovery_state["adopted_unreachable_streak"] = 0
+                    if not srv.backend_ready:
+                        srv.backend_ready = True
+                        srv.backend_recovery_state["last_failure"] = None
+                        try:
+                            srv.logger.info(
+                                "watchdog: adopted llama-server reachable on port %d, "
+                                "resetting backend_ready to True",
+                                llama_port,
+                            )
+                        except Exception:
+                            pass
+                    continue
+
+                # Unreachable: accumulate a streak so a single transient probe
+                # failure does not restart a live backend.
+                streak = int(
+                    srv.backend_recovery_state.get("adopted_unreachable_streak", 0)
+                    or 0
+                ) + 1
+                srv.backend_recovery_state["adopted_unreachable_streak"] = streak
+                max_probes = max(
+                    1,
+                    int(
+                        server_cfg.get("llama_adopted_unreachable_probes", 3) or 3
+                    ),
+                )
+                if streak < max_probes:
+                    try:
+                        srv.logger.warning(
+                            "watchdog: adopted llama-server unreachable on port %d "
+                            "(probe %d/%d)",
+                            llama_port,
+                            streak,
+                            max_probes,
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                # Declared dead after N consecutive unreachable probes.
+                srv.backend_ready = False
+                srv._record_backend_signal("other_failures")
+                death = _death_capture.probe_death(proc)
+                if death is None:
+                    reason = "llama_server_adopted_unreachable"
+                    describe = f"unreachable on port {llama_port} (pid=0, no wait status)"
+                else:
+                    reason = death.restart_reason(_LLAMA_DEATH_LABEL)
+                    describe = death.describe()
+                try:
+                    srv.logger.error(
+                        "watchdog detected adopted llama-server death: %s "
+                        "(restart_reason=%s) model=%s",
+                        describe,
+                        reason,
+                        srv.current_model,
+                    )
+                except Exception:
+                    pass
+                _death_capture.record_death(
+                    srv,
+                    _LLAMA_DEATH_LABEL,
+                    death,
+                    extra={"restart_reason": reason, "adopted": True},
+                    state_attr="backend_recovery_state",
+                )
+                srv.backend_recovery_state["last_restart_reason"] = reason
+                srv.backend_recovery_state["last_failure"] = (
+                    f"adopted llama-server unreachable on port {llama_port}"
+                )
+                srv.llama_process = None
+                srv.current_model = None
+                if router_mode:
+                    recovered = await srv._attempt_router_self_heal(reason=reason)
+                    try:
+                        srv.logger.info(
+                            "watchdog adopted-backend self-heal recovered=%s",
+                            recovered,
+                        )
+                    except Exception:
+                        pass
+                continue
+
             if proc is None:
                 if router_mode and not srv.backend_ready:
                     # Probe the backend before attempting restart

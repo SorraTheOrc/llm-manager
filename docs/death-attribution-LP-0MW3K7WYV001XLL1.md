@@ -251,6 +251,16 @@ grep -cE "died|exit code=|self-heal|TTS watchdog" /var/log/llama-proxy/proxy.log
 Filed as a discovered work item (see §10) — it is a *detection* defect, not a
 killer, and it is on its own sufficient to void a measurement window.
 
+> **Resolved by LP-0MW3MOMD9007DC26 (2026-11-05).** The watchdog now probes
+> **reachability** for the adopted sentinel (pid-0, `poll()` always alive) every
+> interval and declares the death after `llama_adopted_unreachable_probes`
+> consecutive unreachable probes (default 3 ≈ 15 s), logs a death line with the
+> true signal when the handle carries a decodable pid, records it and runs the
+> normal router self-heal. `/health` and `/llama/local/status` no longer derive
+> `llama_server_running` from the sentinel alone — both require reachability for
+> an adopted handle. Regression coverage:
+> `proxy/tests/test_adopted_backend_death_detection.py`.
+
 ---
 
 ## 8. Fix direction for the fix children (AC5, AC4)

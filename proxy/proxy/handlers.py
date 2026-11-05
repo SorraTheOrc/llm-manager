@@ -1730,6 +1730,14 @@ async def health_check():
     llama_server_managed = (
         srv.llama_process is not None and srv.llama_process.poll() is None
     )
+    # LP-0MW3MOMD9007DC26 AC2: an adopted sentinel (pid=0, poll() always
+    # None) is owned by the proxy but is not a live process handle — the
+    # proxy never spawned it, so poll() can never observe its death.
+    # ``llama_server_running`` must follow reachability for such a handle,
+    # never the sentinel's perpetual ``poll() is None``: the 2026-11-05
+    # backends reported ``running: true`` while ``backend_reachable`` was
+    # false for 35 minutes / 6.5 h.
+    adopted_handle = bool(getattr(srv.llama_process, "adopted", False))
     # LP-0MVZT9L3N001XABB AC2: in router mode a backend can serve the local
     # route while this proxy holds no process handle for it (a self-heal spawn
     # that outlived its readiness wait, or a host-first server started outside
@@ -1768,9 +1776,13 @@ async def health_check():
                 )
         except Exception:
             pass
-    llama_running = bool(
-        llama_server_managed or (router_mode and backend_reachable)
-    )
+    if adopted_handle:
+        # The sentinel is never running on its own: reachability decides.
+        llama_running = bool(backend_reachable)
+    else:
+        llama_running = bool(
+            llama_server_managed or (router_mode and backend_reachable)
+        )
     self_healing = srv._is_self_healing_active()
     gpu_wedge_detected = bool(getattr(srv, "gpu_wedge_detected", False))
     gpu_wedge_detection_disabled = bool(

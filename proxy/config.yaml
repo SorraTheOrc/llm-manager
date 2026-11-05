@@ -3088,6 +3088,13 @@ server:
   local_backend_skip_seconds: 60
   llama_watchdog_interval_seconds: 5
   llama_backend_probe_timeout_seconds: 2
+  # LP-0MW3MOMD9007DC26: consecutive unreachable reachability probes before an
+  # *adopted* llama-server (pid=0 sentinel, poll() always alive) is declared
+  # dead — the sentinel alone can never trip the poll()-based watchdog, so the
+  # port probe is the only liveness signal. 3 probes ≈ 15 s at the default
+  # watchdog interval: a short window that still absorbs a transient probe
+  # failure without restarting a live backend.
+  llama_adopted_unreachable_probes: 3
   llama_self_heal_max_attempts: 3
   llama_self_heal_window_seconds: 300
   llama_self_heal_backoff_base_seconds: 1

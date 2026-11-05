@@ -108,13 +108,13 @@ async def test_watchdog_probes_before_restart_when_proc_none(monkeypatch):
     """AC 2: Watchdog should probe the backend for reachability before
     attempting a full restart when llama_process is None in router mode."""
     call_order = []
-    probe_results = [True]  # Backend is reachable
 
     async def fake_probe_backend_reachable(port):
+        # The backend stays reachable for the whole run: after adoption the
+        # watchdog keeps probing the sentinel (LP-0MW3MOMD9007DC26) and must
+        # never restart while the port answers.
         call_order.append("probe")
-        if probe_results:
-            return probe_results.pop(0)
-        return False
+        return True
 
     def fake_start(model=None):
         call_order.append("start")

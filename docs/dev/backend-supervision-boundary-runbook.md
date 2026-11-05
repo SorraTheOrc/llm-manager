@@ -182,6 +182,20 @@ curl -s localhost:8000/health | python3 -c 'import json,sys;print(json.load(sys.
 `proxy/proxy/backend_boundary.py` implements the check (cgroup + PGID/SID
 disjointness) and `proxy/tests/test_backend_boundary_isolation.py` covers it.
 
+### 4.3b Adopted-backend liveness (LP-0MW3MOMD9007DC26)
+
+An **adopted** backend — one the proxy found already running at startup and
+installs the pid-0 sentinel for — holds no `Popen`, so the proxy cannot
+`poll()` its death. It is **never** reported "running" from the sentinel
+alone: `/health`'s `llama_server_running` and `/llama/local/status` both
+require the port to answer (`backend_reachable`) for an adopted handle, and the
+watchdog probes reachability every interval, declaring the death after
+`llama_adopted_unreachable_probes` consecutive unreachable probes (default 3 ≈
+15 s) and triggering the normal router self-heal. Symptom of a dead adopted
+backend: `llama_server_running: false` / `backend_reachable: false` with a
+`watchdog detected adopted llama-server death` line (or the pre-3.0 picture of
+`running: true` + `backend_reachable: false` is the *pre-fix* bug signature).
+
 ## 5. Root/operator actions (system-service variant)
 
 Only needed when the backend must survive logout or run system-wide:

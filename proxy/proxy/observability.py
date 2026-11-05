@@ -2055,7 +2055,14 @@ async def query_llama_status() -> dict:
     llama_port = server_config.get("llama_server_port", 8080)
 
     running = srv.llama_process is not None and srv.llama_process.poll() is None
-    if not running and bool(server_config.get("llama_router_mode", False)):
+    # LP-0MW3MOMD9007DC26 AC2: an adopted sentinel (pid=0, poll() always
+    # None) is not a live process handle — its poll() can never observe
+    # death, so it must be probed for reachability instead of being trusted
+    # as "running", in router mode and in single-model mode alike.
+    adopted_handle = bool(getattr(srv.llama_process, "adopted", False))
+    if (not running or adopted_handle) and (
+        adopted_handle or bool(server_config.get("llama_router_mode", False))
+    ):
         # LP-0MVZT9L3N001XABB AC2/AC3: a reachable router-mode backend is
         # running even when this proxy holds no process handle for it (an
         # unadopted self-heal spawn, or a host-first server started outside
