@@ -1039,7 +1039,7 @@ server:
   #
   # Arm the per-second ring buffer. Off by default (it costs one /proc +
   # sysfs read per second); arm it while attributing a death.
-  death_capture_enabled: false
+  death_capture_enabled: true  # armed by LP-0MW3K7WYV001XLL1 — rationale: docs/death-attribution-LP-0MW3K7WYV001XLL1.md
   # Sampling interval, retained-window length and hard sample cap for the ring.
   death_capture_interval_seconds: 1
   death_capture_window_seconds: 120
