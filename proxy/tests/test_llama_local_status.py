@@ -1810,6 +1810,50 @@ async def test_stale_summary_never_asserts_availability(
 
 
 @pytest.mark.asyncio
+async def test_counts_stale_with_fresh_detail_never_serves_cached_availability():
+    """AC1/AC2 (LP-0MVXSX0TZ00798KA): the 2026-10-30 06:01:20 shape — the
+    counts query fails and the last-known counts (1 of 2 available) are served
+    while the per-slot detail is fresh and shows both slots decoding.
+
+    The cached count must not be published as positive availability beside a
+    fresh-detail ``saturated`` hint: ``available_slots`` is withheld (0) with
+    ``availability_unknown`` true, and the two cache paths stay distinguishable
+    (``slot_counts_stale`` true, ``slots_detail_stale`` false).
+    """
+    import time as _time
+    from unittest.mock import patch as _patch
+
+    fresh_saturated_detail = [
+        _slot(0, is_processing=True, n_decoded=872),
+        _slot(1, is_processing=True, n_decoded=41),
+    ]
+    # A fresh last-known counts cache is (available, total, monotonic_ts).
+    with _patch(
+        "proxy.observability._last_slot_counts_cache",
+        (1, 2, _time.monotonic()),
+    ):
+        j = await _CapacityStatusHarness().get(
+            slots_detail=fresh_saturated_detail,
+            counts_outcome={"status": 500, "reason": "http_500"},
+        )
+
+    # Cache paths are disclosed independently and keep their meaning.
+    assert j["slot_counts_stale"] is True
+    assert j["slots_detail_stale"] is False
+    assert j["slots_stale"] is True
+
+    # The cached ``available_slots=1`` is not served: a cache-served counts
+    # pair cannot assert free capacity, so availability is withheld.
+    assert j["available_slots"] == 0
+    assert j["availability_unknown"] is True
+    # The hint is still derived from the fresh detail, so the pair is
+    # consistent (0 + saturated) rather than (cached 1 + saturated).
+    assert j["capacity_hint"] == "saturated"
+    assert j["total_slots"] == 2
+    assert len(j["slots"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_local_idle_seconds_holds_while_a_slot_is_processing():
     """AC4: the published idle age must not climb while any slot reports
     ``is_processing: true`` (advance the clock and assert it holds)."""

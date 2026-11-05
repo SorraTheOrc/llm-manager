@@ -506,6 +506,16 @@ async def get_llama_local_status(request: Request):
     ``availability_unknown: true`` flag says why: availability is **not**
     asserted from a stale list (AC3). ``total_slots`` is never smaller than
     the served ``slots[]`` length, so ``0 <= available_slots <= total_slots``.
+    When only the *counts* pair came from the last-known cache while the
+    detail snapshot is fresh (``slot_counts_stale: true`` with
+    ``slots_detail_stale: false``), the cached counts are likewise never
+    published as a positive ``available_slots``: they are withheld (``0`` plus
+    ``availability_unknown: true``) so the payload cannot pair a fossil
+    ``available_slots>0`` with a fresh-detail ``saturated`` /
+    ``abandoned_busy`` hint (LP-0MVXSX0TZ00798KA; the 2026-10-30 06:01:20
+    shape, where the cached counts said 1 of 2 free while the fresh detail
+    showed both slots decoding). The fresh detail still drives
+    ``capacity_hint`` and the served ``slots[]``.
 
     When llama-server is running with a model loaded but the ``/slots``
     query fails (e.g. HTTP 500 while the model reloads after a cheap-mode
@@ -517,9 +527,11 @@ async def get_llama_local_status(request: Request):
     (worker alive but zero dispatches across an idle window) is observable.
     The two sources are also published separately:
     ``slot_counts_stale`` and ``slots_detail_stale``. Only the detail matters
-    for capacity: a cached ``is_processing``/``phase`` is a fossil of a past
-    request, so a hint derived from it is reconciled with live proxy state
-    (see ``capacity_hint`` below, LP-0MVKSXR4P001V0CM AC3).
+    for the capacity *hint*: a cached ``is_processing``/``phase`` is a fossil
+    of a past request, so a hint derived from it is reconciled with live proxy
+    state (see ``capacity_hint`` below, LP-0MVKSXR4P001V0CM AC3). The counts
+    pair feeds ``available_slots`` only when both reads are fresh; a
+    cache-served counts pair is withheld (see above).
 
     ``slots`` carries the per-slot details (``slot_id``, ``is_processing``,
     ``n_decoded``) from llama-server's ``/slots`` endpoint so consumers such
@@ -1057,12 +1069,22 @@ async def get_llama_local_status(request: Request):
     try:
         if slots and total_slots < len(slots):
             total_slots = len(slots)
-        if counts_stale or detail_stale:
+        if detail_stale:
             # ``slots_stale`` (the union) is client-visible; whenever it is
-            # true no summary field may assert availability (AC3). This covers
-            # the counts-only fallback too: cached counts are a stale list of
-            # slot states with no per-slot detail, and serving them as
-            # availability is the same over-dispatch hazard.
+            # true no summary field may assert availability (AC3). A cached
+            # detail list is a stale list of slot states and serving it as
+            # availability is the over-dispatch hazard.
+            available_slots = 0
+            availability_unknown = True
+        elif counts_stale:
+            # LP-0MVXSX0TZ00798KA: the counts pair is cache-served even when
+            # the detail snapshot is fresh. Never publish the cached
+            # ``available_slots`` as a positive count: the 2026-10-30
+            # 06:01:20 shape paired a cached ``available_slots=1`` with a
+            # fresh-detail ``saturated`` hint. Withhold it (``0`` +
+            # ``availability_unknown``) so the pair cannot read as free
+            # capacity; the fresh detail still drives ``capacity_hint`` and
+            # ``slot_counts_stale`` discloses the cache path.
             available_slots = 0
             availability_unknown = True
         elif slots:

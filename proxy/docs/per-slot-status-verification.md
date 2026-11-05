@@ -444,6 +444,29 @@ the last-known cache); the per-source flags `slot_counts_stale` and
 on a stale wait estimate. `prefill_budget_seconds` is a configuration constant
 (not poll-derived) and stays truthful.
 
+### Counts-stale never asserts availability (LP-0MVXSX0TZ00798KA)
+
+The two `/slots` reads degrade independently, so a poll can serve a
+cache-served counts pair (`slot_counts_stale: true`) beside a *fresh* detail
+snapshot (`slots_detail_stale: false`). The 2026-10-30 06:01:20 poll is the
+canonical shape: `available_slots=1` from the cached counts while the fresh
+detail showed both slots decoding and `capacity_hint=saturated`.
+
+The rule is: a cache-served counts pair is **never** published as a positive
+`available_slots`. The value is withheld as `0` with
+`availability_unknown: true`; the fresh detail still drives `capacity_hint`
+and the served `slots[]`, and `slot_counts_stale` / `slots_detail_stale`
+disclose which half (or both) came from the cache. So the payload can never
+pair a fossil `available_slots>0` with a fresh-detail `saturated` or
+`abandoned_busy` hint.
+
+Consumer contract rule: when `slot_counts_stale` is `true`, treat
+`available_slots` as **unknown** (`0` is a withholding sentinel, not "no free
+slot") and gate on `capacity_hint` + `slots[]` instead. Only when both
+`slot_counts_stale` and `slots_detail_stale` are `false` may `available_slots`
+be read as a live free-slot count. Pinned by
+`test_counts_stale_with_fresh_detail_never_serves_cached_availability`.
+
 ## Truthful in-flight accounting (LP-0MVKSXR4P001V0CM AC1/AC2)
 
 - `local_active_query` is driven by **active dispatch records**, not the
@@ -532,7 +555,10 @@ counts the slots llama-server reports as **not processing**; the hint classifies
 **admission capacity**, and a slot held by a post-stream lease is
 `idle_leased` — not capacity for a newcomer — while another slot decodes (626 of
 the 1,283 `saturated` polls in a direct scan of that window's status log; the
-tool's own filtered count is 1,307). A dispatcher that needs
+tool's own filtered count is 1,307). That pair is only possible while both
+reads are fresh: a cache-served counts pair withholds `available_slots` to `0`
+(see [Counts-stale never asserts availability](#counts-stale-never-asserts-availability-lp-0mvxsx0tz00798ka)).
+A dispatcher that needs
 the engine verdict reads `capacity_hint` (keyed on `lease_state`), not the raw
 slot count; `slot_counts_stale` additionally flags a count served from the
 last-known cache
