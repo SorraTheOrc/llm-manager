@@ -1737,7 +1737,7 @@ async def health_check():
     # never the sentinel's perpetual ``poll() is None``: the 2026-11-05
     # backends reported ``running: true`` while ``backend_reachable`` was
     # false for 35 minutes / 6.5 h.
-    adopted_handle = bool(getattr(srv.llama_process, "adopted", False))
+    adopted_handle = getattr(srv.llama_process, "adopted", False) is True
     # LP-0MVZT9L3N001XABB AC2: in router mode a backend can serve the local
     # route while this proxy holds no process handle for it (a self-heal spawn
     # that outlived its readiness wait, or a host-first server started outside

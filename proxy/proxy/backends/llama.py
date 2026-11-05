@@ -646,7 +646,7 @@ async def _backend_watchdog_loop() -> None:
             # line (the true signal when the handle carries a decodable pid,
             # else the adopted-unreachable class), record it, clear the handle
             # and run the normal router self-heal.
-            if bool(getattr(proc, "adopted", False)):
+            if getattr(proc, "adopted", False) is True:
                 reachable = await srv._probe_backend_reachable(llama_port)
                 if reachable:
                     # Still alive: make backend_ready reflect reality (a

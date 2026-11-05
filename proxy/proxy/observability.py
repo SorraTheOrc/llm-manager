@@ -2059,7 +2059,7 @@ async def query_llama_status() -> dict:
     # None) is not a live process handle — its poll() can never observe
     # death, so it must be probed for reachability instead of being trusted
     # as "running", in router mode and in single-model mode alike.
-    adopted_handle = bool(getattr(srv.llama_process, "adopted", False))
+    adopted_handle = getattr(srv.llama_process, "adopted", False) is True
     if (not running or adopted_handle) and (
         adopted_handle or bool(server_config.get("llama_router_mode", False))
     ):
