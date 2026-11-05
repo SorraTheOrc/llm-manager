@@ -384,8 +384,18 @@ print(merged_config_sha256('$REPO_ROOT/config.yaml', '$_restart_cfg'))
   _kill_matching KILL 'tts-server'
   sleep 2
 
-  # Phase 3: fuser fallback — kill any leftover processes holding our ports
-  if command -v fuser >/dev/null 2>&1; then
+  # Phase 3: fuser fallback — kill any leftover processes holding our ports.
+  #
+  # LP-0MW3PLEH8008O4I7: this is the only phase that kills by *port* instead of
+  # by a selected process identity, so it signals whatever happens to hold the
+  # port — including a live backend this process does not supervise. Phases 1-2
+  # match on the command line and can be sandboxed with a `pgrep` stub; this
+  # phase cannot, so a sandboxed/CI run sets START_PROXY_PORT_KILL_DISABLED=1
+  # and it is skipped with a notice. The default (unset) keeps the production
+  # behaviour unchanged.
+  if [ "${START_PROXY_PORT_KILL_DISABLED:-0}" = "1" ]; then
+    echo "Port-kill fallback disabled by START_PROXY_PORT_KILL_DISABLED=1."
+  elif command -v fuser >/dev/null 2>&1; then
     if [ "$KEEP_LLAMA" -eq 0 ]; then
       fuser -k "$LLAMA_PORT/tcp" 2>/dev/null || true
     fi

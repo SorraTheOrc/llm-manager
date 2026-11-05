@@ -25,7 +25,7 @@ reproduces it.
 | The proxy's own `killpg` escalation? | **Ruled out.** The escalation logs; it never fired in the retained logs. |
 | The launcher (`start-proxy.sh`)? | **Ruled out** for these deaths — a launcher restart also kills the *proxy* and leaves a rotated log; neither happened. |
 | GPU-driver reset? | **Ruled out as the killer** — a driver/ROCm fault surfaces as `SIGSEGV`/`GPF` (class B below), never as `SIGKILL`. |
-| So what kills them? | An **unprivileged userspace process** that `kill(2)`s the two GPU backends and not the proxy. It is **load-correlated** (see §6). The sending pid is not observable without root on this host (§5). |
+| So what kills them? | An **unprivileged userspace process** that `kill(2)`s the two GPU backends and not the proxy. It is **load-correlated** (see §6). The sending pid is not observable without root on this host (§5) — **but the sender has since been identified**: see [`death-attribution-class-a-LP-0MW3PLEH8008O4I7.md`](death-attribution-class-a-LP-0MW3PLEH8008O4I7.md). It is this repository's own `start-proxy.sh --restart`, executed against the live host by `tests/test_start_proxy_self_kill.py` (phase 3, `fuser -k 8081/tcp`). |
 
 Two independent death classes exist, and the fix children must address them
 separately:
@@ -165,6 +165,13 @@ or sibling processes in the router tree — comparing those two numbers directly
 
 ### Why the sending pid is not in this record
 
+> **Resolved by LP-0MW3PLEH8008O4I7** — the sender is named in
+> [`death-attribution-class-a-LP-0MW3PLEH8008O4I7.md`](death-attribution-class-a-LP-0MW3PLEH8008O4I7.md)
+> (sandboxed `start-proxy.sh --restart` phase 3, `fuser -k 8081/tcp`, from
+> `tests/test_start_proxy_self_kill.py`), with `uid`/`cgroup`/parent argv
+> captured by an unprivileged probe. The paragraph below records why the
+> *original* instruments could not see it.
+
 The host blocks every unprivileged observation of signal delivery:
 
 ```bash
@@ -208,6 +215,14 @@ A four-hour quiet stretch (06:14 → 10:14) with the same binaries, the same
 config, the same cgroup and no memory pressure produced **no** deaths. Whatever
 sends the `SIGKILL` is triggered by proxy traffic, which points at a
 request-path or load-guard action rather than a clock.
+
+> **Correction (LP-0MW3PLEH8008O4I7).** The correlation is with **agent/test
+> activity**, not with proxy traffic: the killer is this repository's own
+> `start-proxy.sh --restart` executed by `tests/test_start_proxy_self_kill.py`
+> (see [`death-attribution-class-a-LP-0MW3PLEH8008O4I7.md`](death-attribution-class-a-LP-0MW3PLEH8008O4I7.md)).
+> Request volume and suite runs both peak in the same busy hours, and the quiet
+> stretch is the stretch in which no suite ran. The original inference — "not a
+> clock" — stands; the request-path attribution does not.
 
 ---
 
@@ -254,6 +269,9 @@ killer, and it is on its own sufficient to void a measurement window.
    the sender (root-level observation, §5), and make the victim immune: run the
    router under its own service cgroup/user so a stray sweep cannot reach it,
    and/or restart it under `prctl(PR_SET_DUMPABLE)`-independent supervision.
+   → **Sender identified**: LP-0MW3PLEH8008O4I7,
+   [`death-attribution-class-a-LP-0MW3PLEH8008O4I7.md`](death-attribution-class-a-LP-0MW3PLEH8008O4I7.md);
+   the victim-immunity half stays with `LP-0MW3PLK5M002YPOA`.
 4. **Detection must not depend on a `Popen` handle.** The adopted-backend path
    (§7) needs a liveness probe that is independent of the process handle, or
    adoption must be refused.
@@ -280,7 +298,10 @@ product code):
   and read `si_pid`. **Result: no decoy was ever signalled**, so the sender does
   not target the binary name/argv[0].
 
-Root-only follow-ups (need operator `sudo`), in order of value:
+Root-only follow-ups (need operator `sudo`), in order of value **for
+kernel-side confirmation** — an unprivileged probe already named the sender
+(`scripts/probe_sigkill_sender.py`, LP-0MW3PLEH8008O4I7), so these are now
+corroboration rather than the only route:
 
 ```bash
 # 1. who sends the signal

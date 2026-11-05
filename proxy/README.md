@@ -1972,6 +1972,7 @@ curl -sf http://127.0.0.1:8000/health || tail -30 /tmp/proxy-startup.log
 | `--log-file <path>` | Where the detached server's stdout/stderr go. Default (no flag): a per-invocation file in `$LLAMA_PROXY_STARTUP_LOG_DIR` (default `/tmp`) plus a `proxy-startup.log` symlink to it. |
 | `--restart` | Kill any running proxy, llama-server and TTS processes first. |
 | `--keep-llama-server` | With `--restart`, preserve a warm llama-server (KV / prompt cache). |
+| `START_PROXY_PORT_KILL_DISABLED=1` | With `--restart`, skip the **port fallback** (`fuser -k 8080/8081`) only. Set it for any sandboxed/CI run of the script: that phase selects its victims by *port*, so it signals whatever holds 8080/8081 — including a live backend the caller does not supervise. Phases 1–2 (command-line selected) are unaffected. LP-0MW3PLEH8008O4I7: leaving it unset in `tests/test_start_proxy_self_kill.py` meant every suite run SIGKILLed the live TTS server and llama-server router ([evidence](../docs/death-attribution-class-a-LP-0MW3PLEH8008O4I7.md)). |
 
 > **NEVER start the proxy in the foreground under an agent tool call.**
 > A tool-call timeout SIGKILLs the entire process group, so a foreground uvicorn
