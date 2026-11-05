@@ -1847,7 +1847,32 @@ async def health_check():
         # violation means a fault in one backend could signal the other (the
         # watchdogs also log it). Fail-open — a check failure reports unknown.
         "backend_isolation": _backend_isolation_health(srv),
+        # LP-0MW3PLK5M002YPOA: the wider supervision boundary — own systemd
+        # unit/cgroup and process group/session. ``state`` is ``isolated`` /
+        # ``coupled`` / ``unknown``; ``coupled`` means a backend spawned inside
+        # the proxy's own cgroup *and* process group, i.e. inside the proxy's
+        # kill set. Advisory (fail-open), never an error.
+        "supervision_boundary": _supervision_boundary_health(srv),
     }
+
+
+def _supervision_boundary_health(srv) -> dict:
+    """Report the backend supervision-boundary verdict (fail-open).
+
+    LP-0MW3PLK5M002YPOA. Never raises: any failure reports ``unknown`` so a
+    guard mis-step cannot break /health.
+    """
+    try:
+        from proxy.backend_boundary import check_supervision_boundary
+
+        return check_supervision_boundary(srv)
+    except Exception:
+        return {
+            "guard": "supervision boundary (own systemd unit/cgroup + own PGID/SID)",
+            "state": "unknown",
+            "violation": False,
+            "reason": "check_failed",
+        }
 
 
 def _backend_isolation_health(srv) -> dict:
