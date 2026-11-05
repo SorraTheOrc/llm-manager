@@ -1663,3 +1663,193 @@ def test_lease_grace_negative_and_garbage_clamp_to_zero(caplog):
     )
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "Invalid contention_queue_lease_grace_seconds" in messages
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVV29X2E004INFL: trigger=/cause= attribution on queue lines
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_wait_for_local_slot_reports_the_budget_expiry_cause():
+    """AC1: a wait that spends its budget reports ``queue_wait_expired`` —
+    the cause is explicit, not inferred from the duration."""
+    cause: list[str] = []
+    result = await contention_queue.wait_for_local_slot(
+        0.05,
+        max_depth=4,
+        slot_free_check=lambda: False,
+        cause_out=cause,
+    )
+    assert result is None
+    assert cause == ["queue_wait_expired"]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_local_slot_reports_the_depth_cap_cause():
+    """AC1: a request that never enqueues reports ``queue_depth_exceeded``."""
+    holder = asyncio.create_task(
+        contention_queue.wait_for_local_slot(
+            5.0, max_depth=1, slot_free_check=lambda: False
+        )
+    )
+    await asyncio.sleep(0.02)
+    try:
+        cause: list[str] = []
+        result = await contention_queue.wait_for_local_slot(
+            5.0,
+            max_depth=1,
+            slot_free_check=lambda: False,
+            cause_out=cause,
+        )
+        assert result is None
+        assert cause == ["queue_depth_exceeded"]
+    finally:
+        holder.cancel()
+        try:
+            await holder
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_wait_for_local_slot_leaves_cause_empty_on_dispatch():
+    """No abandon cause is reported when the slot is free at entry."""
+    cause: list[str] = []
+    result = await contention_queue.wait_for_local_slot(
+        5.0,
+        max_depth=4,
+        slot_free_check=lambda: True,
+        cause_out=cause,
+    )
+    assert result == 0.0
+    assert cause == []
+
+
+@pytest.mark.asyncio
+async def test_concurrency_limit_queue_passes_its_entry_trigger(
+    mixed_model_config,
+):
+    """AC1: the concurrency-limit call site names its entry path."""
+    captured: dict = {}
+
+    async def _fake_queue(*_args, **kwargs):
+        captured.update(kwargs)
+        return ("fallback", None, 1.0)
+
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+    with (
+        patch("proxy.provider._get_local_concurrency_info",
+              _MutableConcurrency(active=1, max_=1)),
+        patch("proxy.provider._maybe_queue_for_local_slot", new=_fake_queue),
+        patch("proxy.provider.request_priority", return_value="low"),
+    ):
+        await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, _queue_cfg()
+        )
+
+    assert captured.get("trigger") == "concurrency_limit"
+
+
+@pytest.mark.asyncio
+async def test_concurrency_limit_fallback_log_carries_trigger_and_cause(
+    mixed_model_config, caplog,
+):
+    """AC1: the concurrency-limit fallback line (previously reason-less) names
+    both the entry path and the explicit abandon cause."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+
+    async def _fake_queue(*_args, **_kwargs):
+        return ("fallback", None, 1.0)
+
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+    setattr(request, provider.CONTENTION_QUEUE_CAUSE_ATTR, "queue_wait_expired")
+    with (
+        patch("proxy.provider._get_local_concurrency_info",
+              _MutableConcurrency(active=1, max_=1)),
+        patch("proxy.provider._maybe_queue_for_local_slot", new=_fake_queue),
+        patch("proxy.provider.request_priority", return_value="low"),
+    ):
+        await provider.proxy_with_fallback(
+            request, "v1/chat/completions", mixed_model_config, _queue_cfg()
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_fallback_after_queue" in messages
+    assert "trigger=concurrency_limit" in messages
+    assert "cause=queue_wait_expired" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_active_queue_passes_its_entry_trigger(lease_state):
+    """AC1: the lease-active retry call site names its entry path."""
+    captured: dict = {}
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _fake_queue(*_args, **kwargs):
+        captured.update(kwargs)
+        return ("fallback", None, 1.0)
+
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch("proxy.provider._maybe_queue_for_local_slot", new=_fake_queue),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, _queue_cfg()
+        )
+
+    assert captured.get("trigger") == "local_lease_active"
+
+
+@pytest.mark.asyncio
+async def test_lease_active_fallback_log_carries_trigger_and_cause(
+    lease_state, caplog,
+):
+    """AC1: the lease-active fallback line names the entry path and the
+    explicit abandon cause, alongside the pre-existing ``reason=`` token."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _fake_queue(*_args, **_kwargs):
+        return ("fallback", None, 1.0)
+
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+    request = _DummyRequest()
+    setattr(request, provider.CONTENTION_QUEUE_CAUSE_ATTR, "queue_depth_exceeded")
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch("proxy.provider._maybe_queue_for_local_slot", new=_fake_queue),
+    ):
+        await provider.proxy_with_fallback(
+            request, "v1/chat/completions", config, _queue_cfg()
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_fallback_after_queue" in messages
+    assert "reason=local_lease_active" in messages
+    assert "trigger=local_lease_active" in messages
+    assert "cause=queue_depth_exceeded" in messages

@@ -86,22 +86,37 @@ def _first_byte(ts: str, session: str = "s-1") -> str:
 
 
 def _queue_fallback(
-    ts: str, session: str, queued: float = 60.0, new_tokens: int | None = None
+    ts: str,
+    session: str,
+    queued: float = 60.0,
+    new_tokens: int | None = None,
+    reason: str | None = "local_lease_active",
+    trigger: str | None = None,
+    cause: str | None = None,
 ) -> str:
     fields = [
         "contention_queue_fallback_after_queue",
         "provider=local",
         f"session={session}",
         f"queued_duration={queued:.2f}s",
-        "reason=local_lease_active",
     ]
+    if reason is not None:
+        fields.append(f"reason={reason}")
+    if trigger is not None:
+        fields.append(f"trigger={trigger}")
+    if cause is not None:
+        fields.append(f"cause={cause}")
     if new_tokens is not None:
         fields.append(f"new_tokens={new_tokens}")
     return f"{ts} - llama-proxy - INFO - " + " ".join(fields)
 
 
 def _queue_dispatch(
-    ts: str, session: str, queued: float = 12.0, new_tokens: int | None = None
+    ts: str,
+    session: str,
+    queued: float = 12.0,
+    new_tokens: int | None = None,
+    trigger: str | None = None,
 ) -> str:
     fields = [
         "contention_queue_dispatch",
@@ -110,6 +125,8 @@ def _queue_dispatch(
         f"queued_duration={queued:.2f}s",
         "policy=queue depth=1",
     ]
+    if trigger is not None:
+        fields.append(f"trigger={trigger}")
     if new_tokens is not None:
         fields.append(f"new_tokens={new_tokens}")
     return f"{ts} - llama-proxy - INFO - " + " ".join(fields)
@@ -178,13 +195,14 @@ def _report_of(lines: list[str]) -> dict:
 
 
 def test_queue_wait_line_is_parsed_with_its_own_evidence():
-    """The post-fix enqueue line carries the request's own pricing."""
+    """The post-fix enqueue line carries the request's own pricing and the
+    entry-path ``trigger=`` (distinct from the ``saturation=`` gate)."""
     line = _queue_wait(
         "2026-10-19 14:56:57,000",
         session="herdr-1793285755-177798-1619",
         new_tokens=35077,
         rate_bucket="solitary",
-        trigger="prefill",
+        trigger="concurrency_limit",
     )
     event = parse_event(line, parse_line_timestamp(line))
 
@@ -193,7 +211,7 @@ def test_queue_wait_line_is_parsed_with_its_own_evidence():
     assert event.session == "herdr-1793285755-177798-1619"
     assert event.new_tokens == 35077
     assert event.rate_bucket == "solitary"
-    assert event.trigger == "prefill"
+    assert event.trigger == "concurrency_limit"
 
 
 def test_queue_line_with_unknown_pricing_is_not_banded():
@@ -202,7 +220,7 @@ def test_queue_line_with_unknown_pricing_is_not_banded():
     line = (
         "2026-10-19 10:00:00,000 - INFO - contention_queue_wait "
         "max_wait=60.0s max_depth=8 saturation=prefill session=s-1 "
-        "new_tokens=unknown rate_bucket=unknown trigger=prefill"
+        "new_tokens=unknown rate_bucket=unknown trigger=concurrency_limit"
     )
     event = parse_event(line, parse_line_timestamp(line))
 
@@ -210,7 +228,7 @@ def test_queue_line_with_unknown_pricing_is_not_banded():
     assert event.kind == "queue_wait"
     assert event.session == "s-1"
     assert event.new_tokens is None
-    assert event.trigger == "prefill"
+    assert event.trigger == "concurrency_limit"
 
 
 def test_queue_wait_is_never_banded_from_a_later_admission():
@@ -678,3 +696,147 @@ def test_until_before_since_is_rejected(tmp_path):
             ]
         )
     assert code == 2
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVV29X2E004INFL AC3: abandoned share split by trigger and by cause
+# ---------------------------------------------------------------------------
+
+def test_abandoned_share_is_reported_per_trigger_and_per_cause():
+    """AC3: every queue outcome is attributed to its entry path and its
+    explicit abandon cause, both per band and in the totals."""
+    lines = [
+        _queue_fallback(
+            "2026-10-19 10:00:00,000", "s-lease", queued=60.0,
+            new_tokens=6000, trigger="local_lease_active",
+            cause="queue_wait_expired",
+        ),
+        _queue_fallback(
+            "2026-10-19 10:05:00,000", "s-conc-1", queued=60.0,
+            new_tokens=7000, reason=None, trigger="concurrency_limit",
+            cause="queue_wait_expired",
+        ),
+        _queue_fallback(
+            "2026-10-19 10:06:00,000", "s-conc-2", queued=0.0,
+            new_tokens=7000, reason=None, trigger="concurrency_limit",
+            cause="queue_depth_exceeded",
+        ),
+        _queue_dispatch(
+            "2026-10-19 10:07:00,000", "s-conc-3", queued=5.0,
+            new_tokens=7000, trigger="concurrency_limit",
+        ),
+    ]
+    report = _report_of(lines)
+    totals = report["totals"]
+
+    assert totals["queue_abandoned_by_trigger"] == {
+        "concurrency_limit": 2,
+        "local_lease_active": 1,
+    }
+    assert totals["queue_dispatched_by_trigger"] == {"concurrency_limit": 1}
+    assert totals["queue_abandoned_by_cause"] == {
+        "queue_depth_exceeded": 1,
+        "queue_wait_expired": 2,
+    }
+    assert totals["abandoned_share_by_trigger"] == {
+        "concurrency_limit": round(2 / 3, 4),
+        "local_lease_active": 1.0,
+    }
+
+    band = report["bands"]["<8k"]
+    assert band["queue_abandoned_by_trigger"] == {
+        "concurrency_limit": 2,
+        "local_lease_active": 1,
+    }
+    assert band["queue_abandoned_by_cause"] == {
+        "queue_depth_exceeded": 1,
+        "queue_wait_expired": 2,
+    }
+
+
+def test_cause_is_read_from_the_field_not_inferred_from_duration():
+    """AC3: a depth-cap refusal is distinguished from a budget expiry by the
+    explicit ``cause=`` field, even when the durations contradict it."""
+    lines = [
+        # A depth refusal cannot really wait 60 s; the field is authoritative.
+        _queue_fallback(
+            "2026-10-19 10:00:00,000", "s-a", queued=60.0,
+            new_tokens=6000, reason=None, trigger="concurrency_limit",
+            cause="queue_depth_exceeded",
+        ),
+        # Conversely an expiry is an expiry even when logged with ~0 duration.
+        _queue_fallback(
+            "2026-10-19 10:01:00,000", "s-b", queued=0.0,
+            new_tokens=6000, reason=None, trigger="concurrency_limit",
+            cause="queue_wait_expired",
+        ),
+    ]
+    report = _report_of(lines)
+
+    assert report["totals"]["queue_abandoned_by_cause"] == {
+        "queue_depth_exceeded": 1,
+        "queue_wait_expired": 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVV29X2E004INFL AC4: pre-change line shapes degrade to unknown, never dropped
+# ---------------------------------------------------------------------------
+
+def test_pre_change_queue_lines_degrade_to_unknown_and_are_counted():
+    """AC4: a fallback line with neither the new ``trigger=``/``cause=`` fields
+    nor any legacy reason evidence is ``unknown`` for both — and is counted,
+    never dropped."""
+    line = _queue_fallback(
+        "2026-10-19 10:00:00,000", "s-old", queued=60.0,
+        new_tokens=None, reason=None, trigger=None, cause=None,
+    )
+    report = _report_of([line])
+
+    assert report["totals"]["queue_abandoned"] == 1
+    assert report["totals"]["queue_abandoned_by_trigger"] == {"unknown": 1}
+    assert report["totals"]["queue_abandoned_by_cause"] == {"unknown": 1}
+
+
+def test_pre_change_lease_reason_names_the_trigger_but_not_the_cause():
+    """AC4: the legacy ``reason=local_lease_active`` is unambiguous trigger
+    evidence; the missing ``cause=`` still degrades to ``unknown``."""
+    line = _queue_fallback(
+        "2026-10-19 10:00:00,000", "s-old-lease", queued=60.0,
+        new_tokens=6000, reason="local_lease_active", trigger=None, cause=None,
+    )
+    report = _report_of([line])
+
+    assert report["totals"]["queue_abandoned_by_trigger"] == {
+        "local_lease_active": 1
+    }
+    assert report["totals"]["queue_abandoned_by_cause"] == {"unknown": 1}
+
+
+def test_pre_change_enqueue_line_without_trigger_is_counted_as_unknown():
+    """AC4: an enqueue line predating ``trigger=`` is counted under ``unknown``
+    rather than dropped from the denominator."""
+    lines = [_queue_wait("2026-10-19 10:00:00,000", session="s-old")]
+    report = _report_of(lines)
+
+    assert report["queued_waits_enqueued"] == 1
+    assert report["totals"]["queue_enqueued_by_trigger"] == {"unknown": 1}
+
+
+def test_render_text_shows_the_trigger_and_cause_split():
+    """AC5: the human-readable record shows the split, not only the JSON."""
+    lines = [
+        _queue_fallback(
+            "2026-10-19 10:00:00,000", "s-lease", queued=60.0,
+            new_tokens=6000, trigger="local_lease_active",
+            cause="queue_wait_expired",
+        ),
+    ]
+    from prefill_admission_conversion import render_text
+
+    text = render_text({**_report_of(lines), "since": "a", "until": "b",
+                        "log_dir": "d", "log_files": ["proxy.log"]})
+    assert "Abandoned waits by trigger:" in text
+    assert "local_lease_active" in text
+    assert "Abandoned waits by cause:" in text
+    assert "queue_wait_expired" in text

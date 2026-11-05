@@ -309,7 +309,11 @@ async def test_queue_wait_log_carries_the_admission_decisions_own_pricing(caplog
     assert "session=herdr-1" in line
     assert "new_tokens=35077" in line
     assert "rate_bucket=contended" in line
-    assert "trigger=generating" in line
+    # Slice LP-0MVV29X2E004INFL split the two concepts: ``saturation=`` names
+    # the local gate, ``trigger=`` names the entry path. This helper was
+    # called on the default (concurrency-limit) path.
+    assert "saturation=generating" in line
+    assert "trigger=concurrency_limit" in line
     # The dispatch/fallback lines that end this wait read the same evidence
     # back off the request, so all three lines of one wait agree.
     assert (
@@ -483,3 +487,98 @@ async def test_prefill_denied_request_cap_exceeded_falls_back_to_remote(
     )
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_fallback_after_queue" in messages
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVV29X2E004INFL: entry trigger (`trigger=`) and abandon cause (`cause=`)
+# are logged, not inferred from the wait duration.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_queue_wait_enqueue_line_carries_concurrency_limit_trigger(caplog):
+    """AC2: the default (concurrency-limit) entry path is named on the enqueue
+    line, alongside the saturation gate it must not replace."""
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    cfg = _cfg(max_wait=0.05)
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        action, _, _ = await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, request, {}, {}, {}, "s2",
+        )
+
+    assert action == "fallback"
+    lines = _wait_lines(caplog)
+    assert lines, "the enqueue line must be logged"
+    assert "trigger=concurrency_limit" in lines[-1]
+    assert "saturation=" in lines[-1]
+    assert provider._queue_trigger_from_request(request) == "concurrency_limit"
+
+
+@pytest.mark.asyncio
+async def test_queue_wait_enqueue_line_carries_local_lease_active_trigger(caplog):
+    """AC2: the lease-active retry path names its trigger explicitly."""
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    cfg = _cfg(max_wait=0.05)
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, request, {}, {}, {}, "s2",
+            trigger="local_lease_active",
+        )
+
+    assert "trigger=local_lease_active" in _wait_lines(caplog)[-1]
+    assert provider._queue_trigger_from_request(request) == "local_lease_active"
+
+
+def _wait_returning(cause: str):
+    """A ``wait_for_local_slot`` stand-in that reports *cause* via cause_out."""
+
+    async def _wait(*_args, cause_out=None, **_kwargs):
+        if cause_out is not None:
+            cause_out.append(cause)
+        return None
+
+    return _wait
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cause", ["queue_wait_expired", "queue_depth_exceeded"]
+)
+async def test_fallback_wait_stamps_the_explicit_abandon_cause(cause):
+    """AC1: the queue's reported abandon cause is stamped on the request so the
+    fallback line logs it verbatim (never re-derived from ``queued_duration``)."""
+    cfg = _cfg(max_wait=0.05)
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+        patch(
+            "proxy.contention_queue.wait_for_local_slot",
+            new=_wait_returning(cause),
+        ),
+    ):
+        action, _, _ = await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, request, {}, {}, {}, "s2",
+        )
+
+    assert action == "fallback"
+    assert provider._queue_cause_from_request(request) == cause

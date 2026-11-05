@@ -316,12 +316,20 @@ async def wait_for_local_slot(
     eta_ordering: bool = False,
     promote_after_seconds: float = 0.0,
     loss_reason: str = DEFAULT_LOSS_REASON,
+    cause_out: list[str] | None = None,
 ) -> float | None:
     """Wait (bounded, cross-session) for a local slot to free.
 
     Returns the elapsed wait in seconds when a slot freed within the caps
     (the caller should dispatch local), or None when the caps were exceeded
     (the caller falls back to the next remote provider exactly as today).
+
+    When *cause_out* is supplied it receives an explicit abandon cause on a
+    ``None`` return — ``"queue_depth_exceeded"`` when the depth cap refused to
+    enqueue the request, ``"queue_wait_expired"`` when the wait budget ran out
+    — so callers can log the reason instead of inferring it from the duration
+    (LP-0MVV29X2E004INFL AC1). The parameter defaults to ``None`` (no
+    behaviour change) so existing callers keep the ``float | None`` contract.
 
     *slot_free_check* is a zero-arg callable returning True when a local
     slot is currently free (e.g. ``lambda: _get_local_concurrency_info(config)[0] < max_local``).
@@ -346,6 +354,8 @@ async def wait_for_local_slot(
         if len(_waiters) >= max_depth:
             # Depth cap exceeded — don't even enqueue; fall back immediately.
             _record_loss(loss_reason)
+            if cause_out is not None:
+                cause_out.append("queue_depth_exceeded")
             return None
         if slot_free_check():
             # Slot already free (race between the decision point and here).
@@ -404,12 +414,16 @@ async def wait_for_local_slot(
             if remaining <= 0:
                 _observe_wait(time.monotonic() - started)
                 _record_loss(loss_reason)
+                if cause_out is not None:
+                    cause_out.append("queue_wait_expired")
                 return None
             try:
                 await asyncio.wait_for(ev.wait(), timeout=remaining)
             except TimeoutError:
                 _observe_wait(time.monotonic() - started)
                 _record_loss(loss_reason)
+                if cause_out is not None:
+                    cause_out.append("queue_wait_expired")
                 return None
             if slot_free_check():
                 elapsed = time.monotonic() - started

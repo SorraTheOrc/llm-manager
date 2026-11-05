@@ -245,6 +245,50 @@ should collapse to genuinely unpricable waits (the field is omitted — logged a
   `LP-0MVV1V213002QAIR`.
 - **The eviction counts.** 392 total, unchanged by this re-banding.
 
+### Entry path and abandon cause (`LP-0MVV29X2E004INFL`)
+
+The harness now reports every queue outcome split by **entry path**
+(`trigger=concurrency_limit|local_lease_active`) and by **explicit abandon
+cause** (`cause=queue_wait_expired|queue_depth_exceeded`). The enqueue line
+keeps `saturation=` (the local gate) and gains `trigger=` (the entry path);
+the two are no longer the same field.
+
+Re-running this window with the extended harness (the command in
+[Reproducing](#reproducing)) reports:
+
+| Field | Value |
+|---|---|
+| enqueued / abandoned | 517 / 314 (60.7 %) |
+| enqueued by trigger | `unknown: 517` |
+| dispatched by trigger | `local_lease_active: 143`, `unknown: 60` |
+| abandoned by trigger | `local_lease_active: 225`, `unknown: 89` |
+| abandoned by cause | `unknown: 314` |
+| abandoned share by trigger | `local_lease_active: 61.1 % (225/368)`, `unknown: 59.7 % (89/149)` |
+
+Two readings matter:
+
+1. **Zero depth-cap refusals.** `abandoned_by_cause` contains no
+   `queue_depth_exceeded` entry — every abandonment in this window is a budget
+   expiry, and the harness now states that instead of inferring it from
+   `queued_duration >= 55 s`. The pre-change log shape has no `cause=` field, so
+   each cause degrades to `unknown`; it is never guessed from the duration.
+2. **Trigger evidence is textual, not inferred.** The `local_lease_active`
+   bucket is the pre-existing `reason=local_lease_active` token, which is
+   unambiguous. The complement (`89/149 = 59.7 %`) is the concurrency-limit
+   outcome set; the harness reports it as `unknown` because the pre-change
+   shape carries no *positive* concurrency-limit token, and it does not infer a
+   trigger from the absence of the lease reason (AC4). Post-deployment lines
+   carry `trigger=` explicitly, so this bucket resolves without inference.
+
+**Pre-change re-run caveat.** The `2026-10-27 19:00` → `2026-10-28 19:00`
+window's archives have mostly rotated out since the record was written (only
+`proxy.log.2026-10-28_16.gz` still matches the window). Re-running it now is
+*not* a faithful reproduction; the committed numbers in
+[`prefill-admission-conversion.json`](prefill-admission-conversion.json) stand.
+That shape carries no `trigger=`/`cause=` fields, so its split is
+`local_lease_active` (from the lease reason) plus `unknown`, with every cause
+`unknown` — again zero depth refusals.
+
 ## AC4 second clause — `local_eviction_after_acceptance`
 
 Counted by the committed harness over each window (`evictions` block of the
@@ -377,7 +421,12 @@ wrong on both counts and is superseded by this section.
    inventory). The queue denominator and the banding provenance are readable
    without post-processing: `queued_waits_enqueued`,
    `queued_waits_enqueued_unbanded` and `queue_banding`
-   (`own_outcome`/`own_enqueue`/`session_chain`/`unknown`).
+   (`own_outcome`/`own_enqueue`/`session_chain`/`unknown`). The entry-path and
+   abandon-cause split is likewise readable directly:
+   `queue_enqueued_by_trigger`, `queue_dispatched_by_trigger`,
+   `queue_abandoned_by_trigger`, `queue_abandoned_by_cause` and
+   `abandoned_share_by_trigger` (totals and per band;
+   `LP-0MVV29X2E004INFL`, unit-tested from synthetic lines in the same file).
 
 ## Cross-reference
 

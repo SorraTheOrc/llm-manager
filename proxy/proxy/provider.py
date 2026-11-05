@@ -9065,6 +9065,59 @@ def _set_queue_wait_on_request(request, elapsed: float) -> None:
 CONTENTION_QUEUE_NEW_TOKENS_ATTR = "_contention_queue_new_tokens"
 
 
+#: Request attribute holding the explicit abandon cause of the queue wait that
+#: just ended (LP-0MVV29X2E004INFL AC1): ``queue_wait_expired`` when the wait
+#: budget ran out, ``queue_depth_exceeded`` when the depth cap refused the
+#: enqueue. The ``contention_queue_fallback_after_queue`` line reads it back so
+#: the cause is *logged*, never inferred from ``queued_duration`` later.
+CONTENTION_QUEUE_CAUSE_ATTR = "_contention_queue_cause"
+
+
+#: Request attribute holding the entry path of a queue wait
+#: (``concurrency_limit`` | ``local_lease_active``, LP-0MVV29X2E004INFL AC2).
+#: Stamped so the enqueue and outcome lines of one wait agree even when the
+#: caller reads it back instead of threading the literal through.
+CONTENTION_QUEUE_TRIGGER_ATTR = "_contention_queue_trigger"
+
+
+def _stamp_queue_cause(request, cause: str | None) -> None:
+    """Best-effort stamp of :data:`CONTENTION_QUEUE_CAUSE_ATTR`."""
+    if cause is None:
+        return
+    try:
+        setattr(request, CONTENTION_QUEUE_CAUSE_ATTR, str(cause))
+    except Exception:
+        pass
+
+
+def _queue_cause_from_request(request) -> str | None:
+    """Read back the abandon cause stamped by the queue wait, if any."""
+    try:
+        value = getattr(request, CONTENTION_QUEUE_CAUSE_ATTR, None)
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _stamp_queue_trigger(request, trigger: str | None) -> None:
+    """Best-effort stamp of :data:`CONTENTION_QUEUE_TRIGGER_ATTR`."""
+    if trigger is None:
+        return
+    try:
+        setattr(request, CONTENTION_QUEUE_TRIGGER_ATTR, str(trigger))
+    except Exception:
+        pass
+
+
+def _queue_trigger_from_request(request) -> str | None:
+    """Read back the entry trigger stamped by the queue wait, if any."""
+    try:
+        value = getattr(request, CONTENTION_QUEUE_TRIGGER_ATTR, None)
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
 def _queue_own_new_tokens(
     config: dict,
     provider_cfg: dict,
@@ -9225,6 +9278,7 @@ async def _maybe_queue_for_local_slot(
     endpoint: str | None = None,
     priority: str | None = None,
     loss_reason: str = "fallback_after_queue",
+    trigger: str = "concurrency_limit",
 ) -> tuple[str, str | None, float | None]:
     """Queue-wait for a local slot (low/medium priority, queue policy)
     instead of immediately falling back to the next remote provider.
@@ -9422,6 +9476,7 @@ async def _maybe_queue_for_local_slot(
         decision=_admission,
     )
     _stamp_queue_new_tokens(request, _enqueue_new_tokens)
+    _stamp_queue_trigger(request, trigger)
     _enqueue_rate_bucket = getattr(_admission, "rate_bucket", None) or "unknown"
     logger.info(
         "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s "
@@ -9432,7 +9487,7 @@ async def _maybe_queue_for_local_slot(
         session_id or "unknown",
         _enqueue_new_tokens if _enqueue_new_tokens is not None else "unknown",
         _enqueue_rate_bucket,
-        _saturation or "concurrency_limit",
+        trigger,
     )
 
     _wait_started = _time.monotonic()
@@ -9454,6 +9509,7 @@ async def _maybe_queue_for_local_slot(
         )
     except Exception:
         logger.debug("retention check failed; queueing as a newcomer", exc_info=True)
+    _cause_out: list[str] = []
     elapsed = await contention_queue.wait_for_local_slot(
         max_wait_seconds=cq["max_wait_seconds"],
         max_depth=cq["max_depth"],
@@ -9477,8 +9533,17 @@ async def _maybe_queue_for_local_slot(
         # call site reports. The default is ``fallback_after_queue``; the
         # lease-protected call site passes ``local_lease_active``.
         loss_reason=loss_reason,
+        cause_out=_cause_out,
     )
     if elapsed is None:
+        # Explicit abandon cause (LP-0MVV29X2E004INFL AC1): the queue reports
+        # whether the depth cap refused the enqueue or the wait budget ran out.
+        # The fallback line logs it verbatim, so the analyser never infers the
+        # cause from ``queued_duration``.
+        _stamp_queue_cause(
+            request,
+            _cause_out[0] if _cause_out else "queue_wait_expired",
+        )
         # Caps exceeded — the caller falls back. Surface the measured wait so
         # the fallback-after-queue event can record elapsed wait time (F4 AC2).
         return ("fallback", None, _time.monotonic() - _wait_started)
@@ -14411,6 +14476,7 @@ async def _proxy_with_fallback_cycle(
                             model_config, provider_cfg, _session_id,
                             endpoint=local_endpoint,
                             priority=_priority,
+                            trigger="concurrency_limit",
                         )
                     )
                     if _cq_action == "dispatch":
@@ -14426,7 +14492,7 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
                             "queued_duration=%.2fs policy=queue depth=%d "
-                            "new_tokens=%s",
+                            "trigger=concurrency_limit new_tokens=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                             _cq_depth,
@@ -14466,10 +14532,11 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs preference=%s "
-                            "new_tokens=%s",
+                            "trigger=concurrency_limit cause=%s new_tokens=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                             _preference,
+                            _queue_cause_from_request(request) or "unknown",
                             _cq_new_tokens
                             if _cq_new_tokens is not None
                             else "unknown",
@@ -15715,6 +15782,7 @@ async def _proxy_with_fallback_cycle(
                             # does not free within the budget is a queue loss
                             # with the canonical ``local_lease_active`` reason.
                             loss_reason=SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                            trigger="local_lease_active",
                         )
                     )
                     if _lease_action == "dispatch":
@@ -15731,7 +15799,8 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
                             "queued_duration=%.2fs policy=queue depth=%d "
-                            "reason=local_lease_active new_tokens=%s",
+                            "reason=local_lease_active trigger=local_lease_active "
+                            "new_tokens=%s",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
@@ -15783,11 +15852,13 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs preference=%s "
-                            "reason=local_lease_active new_tokens=%s",
+                            "reason=local_lease_active trigger=local_lease_active "
+                            "cause=%s new_tokens=%s",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
                             _preference,
+                            _queue_cause_from_request(request) or "unknown",
                             _cq_new_tokens
                             if _cq_new_tokens is not None
                             else "unknown",
