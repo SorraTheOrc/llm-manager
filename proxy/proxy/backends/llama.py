@@ -627,6 +627,17 @@ async def _backend_watchdog_loop() -> None:
             except Exception:
                 pass
 
+            # LP-0MW3K7YO1005C41X: re-assert process-group isolation between
+            # the GPU backends (throttled internally, best-effort). A violation
+            # means a fault in this backend could now signal the TTS tree — log
+            # it loudly instead of letting the cascade happen silently.
+            try:
+                from ..backend_isolation import assert_backend_isolation
+
+                assert_backend_isolation(srv, srv.logger)
+            except Exception:
+                pass
+
             if proc is None:
                 if router_mode and not srv.backend_ready:
                     # Probe the backend before attempting restart

@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse
 
 import proxy.metrics as metrics
 from proxy import cold_start
+from proxy.backend_isolation import tracked_backend_pids
 from proxy.death_capture import decode_returncode
 
 # ---------------------------------------------------------------------------
@@ -1350,7 +1351,13 @@ def _check_unload_lru_threshold(tracker: _UnloadLruTracker) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _kill_process_group(proc, logger, sigterm_timeout: int = 5, sigkill_wait: int = 2) -> bool:
+def _kill_process_group(
+    proc,
+    logger,
+    sigterm_timeout: int = 5,
+    sigkill_wait: int = 2,
+    forbidden_pids: list[int] | None = None,
+) -> bool:
     """Kill a process and all its children by sending SIGTERM to its process group.
 
     Uses ``os.killpg()`` to signal the entire process group (PID is used as PGID
@@ -1363,10 +1370,18 @@ def _kill_process_group(proc, logger, sigterm_timeout: int = 5, sigkill_wait: in
         logger: Logger for diagnostic messages.
         sigterm_timeout: Seconds to wait after SIGTERM before sending SIGKILL.
         sigkill_wait: Seconds to wait after SIGKILL before giving up.
+        forbidden_pids: Optional list of pids that must NOT be members of the
+            target process group (LP-0MW3K7YO1005C41X). The other GPU backend's
+            tree is passed here by the stop paths; when any live forbidden pid
+            resolves to the same PGID as the target, the kill is REFUSED
+            (returns False) so a fault in one backend cannot cascade into the
+            other. Fail-closed only on positive evidence of sharing — a
+            forbidden pid whose PGID cannot be resolved is skipped.
 
     Returns:
         ``True`` if the process was successfully stopped (or was already gone),
-        ``False`` if ``proc`` was ``None``.
+        ``False`` if ``proc`` was ``None`` or the kill was refused by the
+        isolation guard.
     """
     if proc is None:
         return False
@@ -1388,6 +1403,39 @@ def _kill_process_group(proc, logger, sigterm_timeout: int = 5, sigkill_wait: in
     # Check if already dead
     if proc.poll() is not None:
         return True
+
+    # GPU-backend isolation guard (LP-0MW3K7YO1005C41X): refuse the kill when
+    # a forbidden pid (the other GPU backend's tree) is a member of the target
+    # process group. A cross-backend kill is exactly how a fault in one backend
+    # would take down the other, and with ``start_new_session=True`` spawns the
+    # two groups are disjoint by construction — this is the fail-closed backstop
+    # for that invariant.
+    if forbidden_pids:
+        try:
+            target_pgid = os.getpgid(pid)
+        except (ProcessLookupError, OSError):
+            target_pgid = None
+        if target_pgid is not None:
+            for fpid in forbidden_pids:
+                if not isinstance(fpid, int) or isinstance(fpid, bool) or fpid <= 1:
+                    continue
+                try:
+                    f_pgid = os.getpgid(fpid)
+                except (ProcessLookupError, OSError):
+                    continue
+                if f_pgid == target_pgid:
+                    logger.error(
+                        "REFUSING to kill process group %s of PID %s: forbidden "
+                        "pid %s (the other GPU backend) is a member of it — a "
+                        "cross-backend kill would let one backend's fault take "
+                        "down both (LP-0MW3K7YO1005C41X). The isolation guard "
+                        "fails closed; investigate why the process groups "
+                        "collapsed before stopping either backend.",
+                        target_pgid,
+                        pid,
+                        fpid,
+                    )
+                    return False
 
     try:
         # Try process-group signalling first (handles child processes)
@@ -2228,7 +2276,11 @@ def stop_llama_server():
            srv.logger.info("Adopted llama-server stopped (port killed)")
        elif is_real_process:
            previous_model = srv.current_model
-           _kill_process_group(srv.llama_process, srv.logger)
+           # LP-0MW3K7YO1005C41X: fail closed if the TTS tree ever lands in
+           # llama's process group — killing llama's group must not signal the
+           # TTS server.
+           _forbidden = tracked_backend_pids(srv)["tts"]
+           _kill_process_group(srv.llama_process, srv.logger, forbidden_pids=_forbidden)
            srv.llama_process = None
            try:
                if previous_model:
@@ -2543,7 +2595,11 @@ def stop_tts_server():
         srv.logger.info(f"Stopping TTS server (PID: {pid})")
         is_real_process = hasattr(srv.tts_process, 'terminate') or hasattr(srv.tts_process, 'kill')
         if is_real_process:
-            _kill_process_group(srv.tts_process, srv.logger)
+            # LP-0MW3K7YO1005C41X: killing the TTS group must never reach the
+            # llama-server tree (the guard refuses when any llama pid shares
+            # the TTS process group).
+            _forbidden = tracked_backend_pids(srv)["llama"]
+            _kill_process_group(srv.tts_process, srv.logger, forbidden_pids=_forbidden)
             srv.tts_process = None
             # Reset recovery state since this is an intentional stop, not a failure
             srv.tts_recovery_state["attempt_timestamps"] = []

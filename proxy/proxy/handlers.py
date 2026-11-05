@@ -1842,7 +1842,31 @@ async def health_check():
         # log staleness is observable without shell access (AC3).
         "llama_log_age_seconds": _llama_log_age_seconds_health(srv),
         "llama_log_source_healthy": _llama_log_source_healthy(srv),
+        # LP-0MW3K7YO1005C41X: process-group isolation between the GPU
+        # backends. ``state`` is ``isolated`` / ``violation`` / ``unknown``; a
+        # violation means a fault in one backend could signal the other (the
+        # watchdogs also log it). Fail-open — a check failure reports unknown.
+        "backend_isolation": _backend_isolation_health(srv),
     }
+
+
+def _backend_isolation_health(srv) -> dict:
+    """Report the GPU-backend process-group isolation verdict (fail-open).
+
+    LP-0MW3K7YO1005C41X. Never raises: any failure reports ``unknown`` so a
+    guard mis-step cannot break /health.
+    """
+    try:
+        from proxy.backend_isolation import check_backend_isolation
+
+        return check_backend_isolation(srv)
+    except Exception:
+        return {
+            "guard": "process-group isolation (start_new_session + disjoint PGIDs)",
+            "state": "unknown",
+            "violation": False,
+            "reason": "check_failed",
+        }
 
 
 # ---------------------------------------------------------------------------

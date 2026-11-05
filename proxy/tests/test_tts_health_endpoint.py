@@ -244,3 +244,51 @@ class TestHealthEndpointTTSFields:
         assert result["ready"] is True
         assert result["tts_server_running"] is False
         assert result["tts_server_healthy"] is False
+
+
+class TestHealthBackendIsolation:
+    """The GPU-backend isolation verdict is surfaced on /health (AC1/AC3).
+
+    LP-0MW3K7YO1005C41X: a violation (the two GPU backends sharing a process
+    group) must be observable without shell access, and a guard failure must
+    never break /health.
+    """
+
+    def _call(self, srv_mock):
+        return TestHealthEndpointTTSFields()._call_health_check(srv_mock)
+
+    def test_reports_isolated_state(self):
+        srv = _make_mock_server()
+        with patch(
+            "proxy.backend_isolation.check_backend_isolation",
+            return_value={"state": "isolated", "violation": False},
+        ):
+            result = self._call(srv)
+        assert result["backend_isolation"]["state"] == "isolated"
+        assert result["backend_isolation"]["violation"] is False
+
+    def test_reports_violation(self):
+        srv = _make_mock_server()
+        with patch(
+            "proxy.backend_isolation.check_backend_isolation",
+            return_value={
+                "state": "violation",
+                "violation": True,
+                "shared_pgids": [1234],
+            },
+        ):
+            result = self._call(srv)
+        assert result["backend_isolation"]["state"] == "violation"
+        assert result["backend_isolation"]["violation"] is True
+        assert result["backend_isolation"]["shared_pgids"] == [1234]
+
+    def test_fail_open_when_check_raises(self):
+        srv = _make_mock_server()
+        with patch(
+            "proxy.backend_isolation.check_backend_isolation",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = self._call(srv)
+        assert result["backend_isolation"]["state"] == "unknown"
+        # The rest of /health is unaffected by the guard failing.
+        assert result["status"] == "healthy"

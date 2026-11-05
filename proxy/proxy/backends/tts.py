@@ -233,6 +233,17 @@ async def _tts_watchdog_loop() -> None:
             interval = _get_tts_watchdog_interval(server_cfg)
             await asyncio.sleep(interval)
 
+            # LP-0MW3K7YO1005C41X: re-assert process-group isolation between the
+            # GPU backends (throttled internally, best-effort). A violation means
+            # a fault in the llama backend could now signal this tree — log it
+            # loudly instead of letting the cascade happen silently.
+            try:
+                from ..backend_isolation import assert_backend_isolation
+
+                assert_backend_isolation(srv, srv.logger)
+            except Exception:
+                pass
+
             proc = srv.tts_process
 
             # Check if process has exited
