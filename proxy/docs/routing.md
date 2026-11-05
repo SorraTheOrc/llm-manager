@@ -1448,6 +1448,17 @@ Key semantics (see `proxy/proxy/provider.py` `_maybe_queue_for_local_slot` and
   `llama_adaptive_timeout_*` (base 60s + 0.015/token, capped at
   `max_runtime_seconds`), so interactive clients never see queue wait + serve
   exceed the adaptive envelope.
+- **One queue budget per turn** (LP-0MVV29Y1M004GAW0): a request can reach
+  the queue twice in one turn — the `local_concurrency_limit` gate and then
+  the `local_lease_active` retry after the local dispatch was denied by the
+  holder's lease. The retry passes the request's **priority** (so `high`
+  never queues there, matching the documented contract) and the queue wait the
+  turn already spent, so the second wait is bounded by the **remainder** of
+  `contention_queue_max_wait_seconds` rather than a fresh window. Cumulative
+  queue wait for a turn therefore never exceeds the cap, and
+  `queued_duration` on the lease path reports the whole turn's wait. The
+  enqueue line carries `spent_wait=` and `budget=` alongside the configured
+  `max_wait=`.
 - **Metrics**: contention-queue observability lives in the per-request log
   lines only — there are no cumulative counters and no dedicated Prometheus
   counters (LP-0MU4NACW9001WKBP: the cumulative queued-count / queued-duration

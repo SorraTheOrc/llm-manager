@@ -1853,3 +1853,406 @@ async def test_lease_active_fallback_log_carries_trigger_and_cause(
     assert "reason=local_lease_active" in messages
     assert "trigger=local_lease_active" in messages
     assert "cause=queue_depth_exceeded" in messages
+
+
+# ===================================================================
+# The lease-active re-queue path: request priority + ONE queue budget
+# per turn (LP-0MVV29Y1M004GAW0)
+# ===================================================================
+
+
+def _tiny_queue_config(max_wait: float = 0.2, depth: int = 4) -> dict:
+    """Unclamped queue config for the sub-second budget assertions.
+
+    ``_get_contention_queue_config`` clamps the wait to a 1 s floor, so a
+    "the second wait is only the remainder" assertion would take a full second
+    per case. Patching the resolver keeps the assertion on the *arithmetic*;
+    the clamped production value is pinned by the shipped-config tests.
+    """
+    return {
+        "policy": "queue",
+        "max_wait_seconds": max_wait,
+        "max_depth": depth,
+        "lease_grace_seconds": 300,
+        "eta_ordering": False,
+        "eta_promotion_seconds": 0.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_lease_active_queue_passes_the_request_priority(lease_state):
+    """AC1: the lease-active retry passes the request's priority through.
+
+    Without it ``priority=None`` reached both ``_contention_queue_enabled``
+    and the admission guard, so the documented ``high`` never-queues contract
+    was not enforced on this path at all.
+    """
+    captured: dict = {}
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _fake_queue(*_args, **kwargs):
+        captured.update(kwargs)
+        return ("fallback_policy", None, None)
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        return _ok_response()
+
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="high"),
+        patch("proxy.provider._maybe_queue_for_local_slot", new=_fake_queue),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, _queue_cfg()
+        )
+
+    assert captured.get("priority") == "high"
+
+
+@pytest.mark.asyncio
+async def test_lease_active_queue_passes_the_wait_already_spent(lease_state):
+    """AC2: the retry tells the queue how much of the budget the turn spent."""
+    captured: dict = {}
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _fake_queue(*_args, **kwargs):
+        captured.update(kwargs)
+        return ("fallback_policy", None, None)
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        return _ok_response()
+
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+    request = _DummyRequest()
+    provider._set_queue_wait_on_request(request, 12.5)
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch("proxy.provider._maybe_queue_for_local_slot", new=_fake_queue),
+    ):
+        await provider.proxy_with_fallback(
+            request, "v1/chat/completions", config, _queue_cfg()
+        )
+
+    assert captured.get("already_waited_seconds") == 12.5
+
+
+@pytest.mark.asyncio
+async def test_lease_active_queue_passes_no_spend_without_a_marker(lease_state):
+    """AC2 (untouched path): no earlier wait → the default ``0.0`` is passed."""
+    captured: dict = {}
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _fake_queue(*_args, **kwargs):
+        captured.update(kwargs)
+        return ("fallback_policy", None, None)
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        return _ok_response()
+
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch("proxy.provider._maybe_queue_for_local_slot", new=_fake_queue),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, _queue_cfg()
+        )
+
+    assert captured.get("already_waited_seconds") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_high_priority_lease_active_request_never_queues(lease_state, caplog):
+    """AC1: a ``high`` priority request denied by a lease goes straight remote.
+
+    Behavioural proof, not a keyword assertion: the real
+    ``_maybe_queue_for_local_slot`` runs (a 0.2 s window, so a regression
+    fails fast instead of hanging for the full production budget), no queue
+    wait is logged, the queue stays empty, and the next provider serves.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+    remote_calls = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        remote_calls.append(1)
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="high"),
+        patch(
+            "proxy.router._get_contention_queue_config",
+            lambda _server: _tiny_queue_config(0.2),
+        ),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, _queue_cfg()
+        )
+
+    assert result.status_code == 200
+    assert remote_calls == [1], "a lease denial at high priority falls straight through"
+    assert contention_queue.queue_depth() == 0, "high priority must never enter the queue"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_wait" not in messages
+    assert "reason=local_lease_active" in messages
+
+
+def test_queue_wait_budget_deducts_the_wait_already_spent():
+    """AC2 unit: the second wait's budget is the remainder of one window."""
+    cfg = {
+        "server": {
+            "contention_queue_policy": "queue",
+            "contention_queue_max_wait_seconds": 30,
+        }
+    }
+
+    # Nothing spent → the full configured window (today's behaviour).
+    assert provider._contention_queue_wait_budget_seconds(cfg, 0.0) == 30.0
+    assert provider._contention_queue_wait_budget_seconds(cfg, None) == 30.0
+    # Spent some → only the remainder.
+    assert provider._contention_queue_wait_budget_seconds(cfg, 12.5) == 17.5
+    # Spent it all (or more) → no budget left, never a negative window.
+    assert provider._contention_queue_wait_budget_seconds(cfg, 30.0) == 0.0
+    assert provider._contention_queue_wait_budget_seconds(cfg, 45.0) == 0.0
+    # A nonsense negative spend can never inflate the budget past the cap.
+    assert provider._contention_queue_wait_budget_seconds(cfg, -5.0) == 30.0
+
+
+@pytest.mark.asyncio
+async def test_second_lease_queue_wait_uses_only_the_remaining_budget():
+    """AC2: a turn that already waited is bounded by the measured remainder.
+
+    Window 0.3 s, 0.25 s already spent → the second wait may run for at most
+    ~0.05 s, so the cumulative queue wait of the turn stays inside one budget
+    instead of accumulating two full windows.
+    """
+    cfg = _queue_cfg()
+    spent = 0.25
+
+    with (
+        patch(
+            "proxy.router._get_contention_queue_config",
+            lambda _server: _tiny_queue_config(0.3),
+        ),
+        patch(
+            "proxy.provider._get_local_concurrency_info",
+            _MutableConcurrency(active=1, max_=1),
+        ),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        started = time.monotonic()
+        action, _reason, elapsed = await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), {}, {}, {},
+            "turn-session",
+            priority="low",
+            trigger="local_lease_active",
+            already_waited_seconds=spent,
+        )
+        second_wait = time.monotonic() - started
+
+    assert action == "fallback"
+    assert second_wait < 0.2, (
+        "the second wait must be the ~0.05 s remainder, not a fresh 0.3 s window"
+    )
+    assert elapsed is not None
+    assert elapsed >= spent, "the reported wait is cumulative for the turn"
+    assert elapsed <= 0.3 + 0.1, (
+        "cumulative queue wait for one turn must stay inside one budget"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lease_queue_enqueue_logs_the_spent_wait_and_effective_budget(
+    caplog,
+):
+    """AC2/AC3 observability: the enqueue line names the spend and the bound.
+
+    A turn that already burned the whole window gets a ``0.0`` budget, so the
+    enqueue line must show both numbers: ``max_wait=`` stays the configured
+    window (diagnosis reads it as the configuration), ``budget=`` is what this
+    wait may actually consume.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    cfg = _queue_cfg()
+
+    with (
+        patch(
+            "proxy.router._get_contention_queue_config",
+            lambda _server: _tiny_queue_config(0.5),
+        ),
+        patch(
+            "proxy.provider._get_local_concurrency_info",
+            _MutableConcurrency(active=1, max_=1),
+        ),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        action, _reason, elapsed = await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), {}, {}, {},
+            "spent-out-session",
+            priority="low",
+            trigger="local_lease_active",
+            already_waited_seconds=0.5,
+        )
+
+    assert action == "fallback", "no budget left → the wait expires immediately"
+    assert elapsed is not None and elapsed >= 0.5
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_wait" in messages
+    assert "max_wait=0.5s" in messages, "max_wait= keeps the configured window"
+    assert "spent_wait=0.5s" in messages
+    assert "budget=0.0s" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_active_dispatch_records_cumulative_wait_on_the_request(
+    lease_state, caplog,
+):
+    """AC3: the admitted wait is recorded cumulatively for the turn.
+
+    The marker is what bounds a later re-entry and what the adaptive timeout
+    subtracts, so the dispatch path must write the turn's whole wait.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [{"name": "local-llama", "type": "local", "llama_model": "Qwen3"}]
+    }
+    local_calls = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        local_calls.append(1)
+        if len(local_calls) == 1:
+            return _lease_active_response()
+        return _ok_response()
+
+    request = _DummyRequest()
+    provider._set_queue_wait_on_request(request, 2.5)
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("dispatch", None, 4.25)),
+        ),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", config, _queue_cfg()
+        )
+
+    assert result.status_code == 200
+    assert local_calls == [1, 1]
+    assert provider._queue_wait_spent_on_request(request) == 4.25
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "queued_duration=4.25s" in messages
+
+
+async def _settle(loops: int = 5) -> None:
+    """Let queued coroutines reach their ``await`` point."""
+    for _ in range(loops):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_local_slot_reports_the_cumulative_turn_wait():
+    """AC3 unit: an admitted second wait returns the turn's total wait."""
+    free = False
+
+    def _slot_free() -> bool:
+        return free
+
+    task = asyncio.create_task(
+        contention_queue.wait_for_local_slot(
+            max_wait_seconds=5.0,
+            max_depth=4,
+            slot_free_check=_slot_free,
+            session_id="cumulative-session",
+            already_waited_seconds=5.0,
+        )
+    )
+    await _settle()
+    free = True
+    await contention_queue.wake(1)
+    elapsed = await asyncio.wait_for(task, timeout=2)
+
+    assert elapsed is not None and elapsed >= 5.0
+
+
+@pytest.mark.asyncio
+async def test_wait_for_local_slot_defaults_to_the_measured_wait():
+    """An untouched caller still gets its own measured wait (no regression)."""
+    free = False
+
+    def _slot_free() -> bool:
+        return free
+
+    task = asyncio.create_task(
+        contention_queue.wait_for_local_slot(
+            max_wait_seconds=5.0,
+            max_depth=4,
+            slot_free_check=_slot_free,
+            session_id="first-wait-session",
+        )
+    )
+    await _settle()
+    free = True
+    await contention_queue.wake(1)
+    elapsed = await asyncio.wait_for(task, timeout=2)
+
+    assert elapsed is not None and elapsed < 1.0

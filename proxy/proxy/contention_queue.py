@@ -317,12 +317,26 @@ async def wait_for_local_slot(
     promote_after_seconds: float = 0.0,
     loss_reason: str = DEFAULT_LOSS_REASON,
     cause_out: list[str] | None = None,
+    already_waited_seconds: float = 0.0,
 ) -> float | None:
     """Wait (bounded, cross-session) for a local slot to free.
 
     Returns the elapsed wait in seconds when a slot freed within the caps
     (the caller should dispatch local), or None when the caps were exceeded
     (the caller falls back to the next remote provider exactly as today).
+
+    *already_waited_seconds* is the queue wait this request already spent in
+    the *same turn* — a turn can reach the queue twice (the
+    ``local_concurrency_limit`` gate and the ``local_lease_active`` retry).
+    The caller bounds ``max_wait_seconds`` by the remainder of one budget; this
+    parameter makes the returned elapsed wait and the depth/wait bookkeeping
+    *cumulative* for the turn, so ``queued_duration=`` and the adaptive-timeout
+    subtraction see the whole wait instead of only the last slice
+    (LP-0MVV29Y1M004GAW0 AC2/AC3). It never changes wake-up logic or the
+    budget: the spend is deducted once, by the caller. The histogram observes
+    only this occupancy's own duration, so a two-wait turn is not
+    double-counted across both waits. Defaults to ``0.0`` — existing callers
+    are unchanged.
 
     When *cause_out* is supplied it receives an explicit abandon cause on a
     ``None`` return — ``"queue_depth_exceeded"`` when the depth cap refused to
@@ -350,6 +364,10 @@ async def wait_for_local_slot(
     """
     cond = _get_condition()
     started = time.monotonic()
+    try:
+        spent = max(0.0, float(already_waited_seconds or 0.0))
+    except (TypeError, ValueError):
+        spent = 0.0
     async with cond:
         if len(_waiters) >= max_depth:
             # Depth cap exceeded — don't even enqueue; fall back immediately.
@@ -359,7 +377,8 @@ async def wait_for_local_slot(
             return None
         if slot_free_check():
             # Slot already free (race between the decision point and here).
-            return 0.0
+            # The turn's earlier wait is still part of its queue spend.
+            return spent
         ev = asyncio.Event()
         ahead_of = _enqueue(
             (started, ev, session_id, retained, eta_seconds),
@@ -426,8 +445,10 @@ async def wait_for_local_slot(
                     cause_out.append("queue_wait_expired")
                 return None
             if slot_free_check():
-                elapsed = time.monotonic() - started
-                _observe_wait(elapsed)
+                # Cumulative for the turn (see *already_waited_seconds*); the
+                # histogram below records this occupancy's own duration only.
+                elapsed = spent + (time.monotonic() - started)
+                _observe_wait(time.monotonic() - started)
                 return elapsed
             # Spurious wake (another waiter claimed the slot) — keep waiting
             # for the remaining budget.

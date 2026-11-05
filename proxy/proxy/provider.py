@@ -8534,6 +8534,45 @@ def _contention_queue_expiry_seconds(config: dict | None) -> int:
     return max(1, int(math.ceil(max_wait)))
 
 
+def _contention_queue_wait_budget_seconds(
+    config: dict | None, already_waited_seconds: float | None
+) -> float:
+    """Queue wait budget left for a *second* wait in the same turn (AC2).
+
+    LP-0MVV29Y1M004GAW0: one request can reach the contention queue twice in a
+    single turn — the ``local_concurrency_limit`` gate and then the
+    ``local_lease_active`` retry after the local dispatch was denied. Charging
+    each wait the full ``contention_queue_max_wait_seconds`` lets a turn spend
+    up to twice the configured budget, which inflates both the abandoned-wait
+    denominator and the client's latency.
+
+    The spent wait is *measured* (``_contention_queue_wait_seconds``), so the
+    second wait is bounded by the remainder of the same window — never a fresh
+    budget, and never more than the configured cap. A spent wait that already
+    consumed the window yields ``0.0``: the queue then expires the wait
+    immediately (``cause=queue_wait_expired``) instead of parking the request
+    for another full window.
+
+    Returns a float because the bound is the clamped config value the queue
+    itself uses; :func:`_contention_queue_remaining_seconds` stays the
+    whole-second ``Retry-After`` projection of the same window.
+    """
+    try:
+        from proxy.router import _get_contention_queue_config
+
+        server_cfg = (
+            config.get("server", config) if isinstance(config, dict) else {}
+        )
+        window = float(_get_contention_queue_config(server_cfg)["max_wait_seconds"])
+    except Exception:  # pragma: no cover - defensive
+        return 0.0
+    try:
+        spent = max(0.0, float(already_waited_seconds or 0.0))
+    except (TypeError, ValueError):
+        spent = 0.0
+    return max(0.0, window - spent)
+
+
 def _contention_queue_remaining_seconds(
     config: dict | None, elapsed_wait_seconds: float | None
 ) -> int:
@@ -9049,11 +9088,35 @@ def _local_admission_reject_payload(attempts: list | None) -> dict | None:
 def _set_queue_wait_on_request(request, elapsed: float) -> None:
     """Record the elapsed contention-queue wait on the request so
     ``proxy_to_local`` can subtract it from the adaptive timeout budget
-    (Q2=a: total wait + serve stays within ``llama_adaptive_timeout_*``)."""
+    (Q2=a: total wait + serve stays within ``llama_adaptive_timeout_*``).
+
+    LP-0MVV29Y1M004GAW0: the value is the *cumulative* wait of the turn, and
+    it doubles as the spent-wait marker the lease-active re-queue path reads
+    back (:func:`_queue_wait_spent_on_request`) to bound its own wait by the
+    remainder of one budget."""
     try:
         setattr(request, "_contention_queue_wait_seconds", float(elapsed or 0.0))
     except Exception:
         pass
+
+
+def _queue_wait_spent_on_request(request) -> float:
+    """Queue wait this request has already spent in this turn (else ``0.0``).
+
+    LP-0MVV29Y1M004GAW0 AC2: the lease-active retry re-enters the queue after
+    the request may already have waited at the concurrency gate. The marker is
+    written by :func:`_set_queue_wait_on_request` on every queue admission, so
+    reading it here charges the turn one budget rather than two. Best-effort:
+    a missing/unparsable marker means "nothing spent yet" (today's
+    behaviour).
+    """
+    try:
+        spent = float(
+            getattr(request, "_contention_queue_wait_seconds", 0.0) or 0.0
+        )
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+    return spent if spent > 0 else 0.0
 
 
 #: Request attribute holding the queued request's OWN priced new-token count,
@@ -9279,6 +9342,7 @@ async def _maybe_queue_for_local_slot(
     priority: str | None = None,
     loss_reason: str = "fallback_after_queue",
     trigger: str = "concurrency_limit",
+    already_waited_seconds: float = 0.0,
 ) -> tuple[str, str | None, float | None]:
     """Queue-wait for a local slot (low/medium priority, queue policy)
     instead of immediately falling back to the next remote provider.
@@ -9307,6 +9371,16 @@ async def _maybe_queue_for_local_slot(
         ``deferrable`` verdict: the caller must return the retryable 429
         admission response instead of falling back to a remote provider
         (LP-0MVIKPCSG002B0NL AC4).
+
+    *already_waited_seconds* is the queue wait this turn has already spent
+    (``_queue_wait_spent_on_request``). One turn may reach the queue twice —
+    at the ``local_concurrency_limit`` gate and again on the
+    ``local_lease_active`` retry — so the second wait is bounded by the
+    *remainder* of ``contention_queue_max_wait_seconds`` rather than a fresh
+    window (LP-0MVV29Y1M004GAW0 AC2). The default of ``0.0`` keeps every other
+    caller byte-for-byte on today's behaviour, and the returned elapsed wait
+    is cumulative for the turn so ``queued_duration=``/the adaptive-timeout
+    budget see the whole wait.
 
     ``remote-ok`` never waits (LP-0MVUH9OYZ007GMWF AC4 / parent AC20). The
     value means *"local allowed, remote acceptable"* — its name is historic,
@@ -9478,16 +9552,26 @@ async def _maybe_queue_for_local_slot(
     _stamp_queue_new_tokens(request, _enqueue_new_tokens)
     _stamp_queue_trigger(request, trigger)
     _enqueue_rate_bucket = getattr(_admission, "rate_bucket", None) or "unknown"
+    # One queue budget per turn (LP-0MVV29Y1M004GAW0 AC2): whatever this turn
+    # already spent at an earlier gate is deducted from the window, so the
+    # cumulated wait of a turn can never exceed the configured cap.
+    _spent_wait_seconds = max(0.0, float(already_waited_seconds or 0.0))
+    _max_wait_seconds = _contention_queue_wait_budget_seconds(
+        config, _spent_wait_seconds
+    )
     logger.info(
         "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s "
-        "session=%s new_tokens=%s rate_bucket=%s trigger=%s",
-        cq["max_wait_seconds"],
+        "session=%s new_tokens=%s rate_bucket=%s trigger=%s "
+        "spent_wait=%.1fs budget=%.1fs",
+        float(cq["max_wait_seconds"]),
         cq["max_depth"],
         _saturation or "none",
         session_id or "unknown",
         _enqueue_new_tokens if _enqueue_new_tokens is not None else "unknown",
         _enqueue_rate_bucket,
         trigger,
+        _spent_wait_seconds,
+        _max_wait_seconds,
     )
 
     _wait_started = _time.monotonic()
@@ -9511,7 +9595,7 @@ async def _maybe_queue_for_local_slot(
         logger.debug("retention check failed; queueing as a newcomer", exc_info=True)
     _cause_out: list[str] = []
     elapsed = await contention_queue.wait_for_local_slot(
-        max_wait_seconds=cq["max_wait_seconds"],
+        max_wait_seconds=_max_wait_seconds,
         max_depth=cq["max_depth"],
         slot_free_check=lambda: _local_slot_free(
             config, max_local, endpoint=endpoint
@@ -9534,6 +9618,9 @@ async def _maybe_queue_for_local_slot(
         # lease-protected call site passes ``local_lease_active``.
         loss_reason=loss_reason,
         cause_out=_cause_out,
+        # Cumulative bookkeeping (AC3): a second wait in the same turn reports
+        # the whole turn's wait, not just this gate's slice.
+        already_waited_seconds=_spent_wait_seconds,
     )
     if elapsed is None:
         # Explicit abandon cause (LP-0MVV29X2E004INFL AC1): the queue reports
@@ -9546,7 +9633,13 @@ async def _maybe_queue_for_local_slot(
         )
         # Caps exceeded — the caller falls back. Surface the measured wait so
         # the fallback-after-queue event can record elapsed wait time (F4 AC2).
-        return ("fallback", None, _time.monotonic() - _wait_started)
+        # It is cumulative for the turn (LP-0MVV29Y1M004GAW0 AC3), so the logged
+        # ``queued_duration=`` and the deferral remainder price the whole wait.
+        return (
+            "fallback",
+            None,
+            _spent_wait_seconds + (_time.monotonic() - _wait_started),
+        )
     return ("dispatch", None, elapsed)
 
 
@@ -15773,16 +15866,24 @@ async def _proxy_with_fallback_cycle(
                     _lease_cur, _lease_max = _local_concurrency_info(
                         config, endpoint=local_endpoint, session_id=_session_id
                     )
+                    # LP-0MVV29Y1M004GAW0: this retry is the *second* queue
+                    # entry of the turn, so it must carry the request's real
+                    # priority (``high`` never queues — the documented
+                    # contract this call site used to skip) and the wait the
+                    # turn already spent, so the budget is charged once.
+                    _lease_already_waited = _queue_wait_spent_on_request(request)
                     _lease_action, _lease_reason, _lease_elapsed = (
                         await _maybe_queue_for_local_slot(
                             config, _lease_cur, _lease_max, request, body_json,
                             model_config, provider_cfg, _session_id,
                             endpoint=local_endpoint,
+                            priority=_priority,
                             # LP-0MVWPJW2700966ZU: a lease-protected slot that
                             # does not free within the budget is a queue loss
                             # with the canonical ``local_lease_active`` reason.
                             loss_reason=SKIP_REASON_LOCAL_LEASE_ACTIVE,
                             trigger="local_lease_active",
+                            already_waited_seconds=_lease_already_waited,
                         )
                     )
                     if _lease_action == "dispatch":
