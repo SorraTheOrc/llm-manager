@@ -1,0 +1,36 @@
+00000000000f0d50 <ggml_vec_dot_q4_0_q8_0>:
+   f0d89:	62 f2 fd 28 7c f6    	vpbroadcastq %rsi,%ymm6
+   f0d8f:	be f8 ff ff ff       	mov    $0xfffffff8,%esi
+   f0d94:	62 f2 7d 28 7a ee    	vpbroadcastb %esi,%ymm5
+   f0d9a:	66 0f 1f 44 00 00    	nopw   0x0(%rax,%rax,1)
+   f0da0:	c5 fa 6f 41 02       	vmovdqu 0x2(%rcx),%xmm0
+   f0da5:	41 0f b7 39          	movzwl (%r9),%edi
+   f0da9:	0f b7 31             	movzwl (%rcx),%esi
+   f0dac:	ff c0                	inc    %eax
+   f0dae:	48 83 c1 12          	add    $0x12,%rcx
+   f0db2:	49 83 c1 22          	add    $0x22,%r9
+   f0db6:	c5 fa 10 0c ba       	vmovss (%rdx,%rdi,4),%xmm1
+   f0dbb:	c5 f2 59 0c b2       	vmulss (%rdx,%rsi,4),%xmm1,%xmm1
+   f0dc0:	c5 e9 71 d0 04       	vpsrlw $0x4,%xmm0,%xmm2
+   f0dc5:	c4 e3 7d 38 c2 01    	vinserti128 $0x1,%xmm2,%ymm0,%ymm0
+   f0dcb:	62 d1 7f 28 6f 51 ff 	vmovdqu8 -0x20(%r9),%ymm2
+   f0dd2:	c5 fd db c6          	vpand  %ymm6,%ymm0,%ymm0
+   f0dd6:	c5 fd fc c5          	vpaddb %ymm5,%ymm0,%ymm0
+   f0dda:	c4 e2 7d 08 e0       	vpsignb %ymm0,%ymm0,%ymm4
+   f0ddf:	c4 e2 6d 08 c0       	vpsignb %ymm0,%ymm2,%ymm0
+   f0de4:	c5 fd 6f d7          	vmovdqa %ymm7,%ymm2
+   f0de8:	c4 e2 5d 50 d0       	{vex} vpdpbusd %ymm0,%ymm4,%ymm2
+   f0ded:	c4 e2 7d 18 c1       	vbroadcastss %xmm1,%ymm0
+   f0df2:	c5 fc 5b d2          	vcvtdq2ps %ymm2,%ymm2
+   f0df6:	c4 e2 7d b8 da       	vfmadd231ps %ymm2,%ymm0,%ymm3
+   f0dfb:	41 39 c2             	cmp    %eax,%r10d
+   f0dfe:	7f a0                	jg     f0da0 <ggml_vec_dot_q4_0_q8_0+0x50>
+   f0e00:	c4 e3 7d 19 d8 01    	vextractf128 $0x1,%ymm3,%xmm0
+   f0e06:	c5 f8 58 c3          	vaddps %xmm3,%xmm0,%xmm0
+   f0e0a:	c5 f8 12 c8          	vmovhlps %xmm0,%xmm0,%xmm1
+   f0e0e:	c5 f8 58 c1          	vaddps %xmm1,%xmm0,%xmm0
+   f0e12:	c5 fa 16 c8          	vmovshdup %xmm0,%xmm1
+   f0e16:	c5 fa 58 c1          	vaddss %xmm1,%xmm0,%xmm0
+   f0e1a:	c4 c1 7a 11 00       	vmovss %xmm0,(%r8)
+   f0e1f:	c5 f8 77             	vzeroupper
+   f0e22:	c3                   	ret

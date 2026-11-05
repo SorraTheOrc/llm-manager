@@ -1,0 +1,36 @@
+00000000000f2aa0 <ggml_vec_dot_q6_K_q8_K>:
+   f2b35:	62 f2 fd 28 7c f2    	vpbroadcastq %rdx,%ymm6
+   f2b3b:	ba 20 00 00 00       	mov    $0x20,%edx
+   f2b40:	62 f2 7d 28 7a d2    	vpbroadcastb %edx,%ymm2
+   f2b46:	48 ba 0f 0f 0f 0f 0f 	movabs $0xf0f0f0f0f0f0f0f,%rdx
+   f2b4d:	0f 0f 0f 
+   f2b50:	62 f2 fd 28 7c ea    	vpbroadcastq %rdx,%ymm5
+   f2b56:	66 2e 0f 1f 84 00 00 	cs nopw 0x0(%rax,%rax,1)
+   f2b5d:	00 00 00 
+   f2b60:	c5 fe 6f 89 80 00 00 	vmovdqu 0x80(%rcx),%ymm1
+   f2b67:	00 
+   f2b68:	c5 fa 6f 99 c0 00 00 	vmovdqu 0xc0(%rcx),%xmm3
+   f2b6f:	00 
+   f2b70:	62 c2 6d 28 04 99 64 	vpmaddubsw 0x64(%r9),%ymm2,%ymm19
+   f2b77:	00 00 00 
+   f2b7a:	62 f1 2d 20 71 51 01 	vpsrlw $0x4,0x20(%rcx),%ymm26
+   f2b81:	04 
+   f2b82:	0f b7 91 d0 00 00 00 	movzwl 0xd0(%rcx),%edx
+   f2b89:	62 42 6d 28 04 89 04 	vpmaddubsw 0x4(%r9),%ymm2,%ymm25
+   f2b90:	00 00 00 
+   f2b93:	62 c2 6d 28 04 a9 24 	vpmaddubsw 0x24(%r9),%ymm2,%ymm21
+   f2b9a:	00 00 00 
+   f2b9d:	62 f1 25 20 71 11 04 	vpsrlw $0x4,(%rcx),%ymm27
+   f2ba4:	62 c2 6d 28 04 a1 44 	vpmaddubsw 0x44(%r9),%ymm2,%ymm20
+   f2bab:	00 00 00 
+   f2bae:	62 42 6d 28 04 a1 84 	vpmaddubsw 0x84(%r9),%ymm2,%ymm28
+   f2bb5:	00 00 00 
+   f2bb8:	62 f1 0d 20 71 51 02 	vpsrlw $0x4,0x40(%rcx),%ymm30
+   f2bbf:	04 
+   f2bc0:	62 f1 15 20 71 51 03 	vpsrlw $0x4,0x60(%rcx),%ymm29
+   f2bc7:	04 
+   f2bc8:	ff c0                	inc    %eax
+   f2bca:	48 81 c1 d2 00 00 00 	add    $0xd2,%rcx
+   f2bd1:	62 e1 f5 28 db d6    	vpandq %ymm6,%ymm1,%ymm18
+   f2bd7:	62 f1 75 20 71 d1 02 	vpsrlw $0x2,%ymm1,%ymm17
+   f2bde:	c5 dd 71 d1 04       	vpsrlw $0x4,%ymm1,%ymm4

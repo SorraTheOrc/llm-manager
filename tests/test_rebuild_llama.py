@@ -9,6 +9,11 @@ $ORIGIN so the deployed artifacts resolve from the deploy dir.
 Covers the LP-0MUK0KYMV003TIWV fix: `--deploy-only` re-deploys an already-built
 artifact and must not require build-only tooling (`cmake`), so the script no
 longer aborts with "cmake missing" on hosts/CI images without a compiler.
+
+Covers LP-0MW3K7Y3C003WEXW: the build configures `-DGGML_CPU_REPACK=OFF` (the
+`ggml_cpu_extra_work_size` crash path) plus an explicit `-DGGML_NATIVE=ON`, the
+CPU-backend census gate runs BEFORE the live deploy dir is touched, and every
+deploy writes a provenance record (commit, cmake flags, artifact sha256).
 """
 import json
 import os
@@ -98,6 +103,49 @@ def _run(extra_args, env_extra=None):
     return subprocess.run([SCRIPT, *extra_args], capture_output=True, text=True, env=env)
 
 
+def _census_stub(tmp_path, *, verbose=False):
+    """A stand-in for scripts/lib/ggml_cpu_census.py (GGML_CENSUS_SCRIPT).
+
+    The real census needs a real ELF artifact; the deploy fixtures here are
+    plain files, so the gate is exercised through its documented override.
+    """
+    stub = tmp_path / "census_stub.py"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"verbose = {verbose!r}\n"
+        "library = sys.argv[1]\n"
+        "ok = not verbose\n"
+        "report = {\n"
+        "    'library': library,\n"
+        "    'generic_kernels': 3,\n"
+        "    'arch_kernels': ['ggml_vec_dot_q4_K_q8_K'],\n"
+        "    'hot_kernels': {'ggml_vec_dot_q4_K_q8_K': {'present': True,\n"
+        "        'disassembled': True, 'vector_insns': 0 if verbose else 61,\n"
+        "        'generic_tail_call': verbose}},\n"
+        "    'arch_specific': ok,\n"
+        "    'repack_registered': verbose,\n"
+        "    'repack_linked': True,\n"
+        "    'repack_markers': ['ggml_backend_cpu_repack'] if verbose else [],\n"
+        "    'expect_repack': 'off',\n"
+        "    'verdict': 'ok' if ok else 'fail',\n"
+        "    'errors': [] if ok else [\n"
+        "        'no arch-specific quant kernel codegen detected',\n"
+        "        'CPU repack extra-buffer path is REGISTERED "
+        "(GGML_CPU_REPACK=ON): this is the ggml_cpu_extra_work_size crash path'],\n"
+        "    'warnings': [],\n"
+        "}\n"
+        "print(json.dumps(report))\n"
+        "if not ok:\n"
+        "    for err in report['errors']:\n"
+        "        print('ERROR:', err, file=sys.stderr)\n"
+        "sys.exit(0 if ok else 1)\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
 def test_rebuild_llama_dry_run_json():
     assert os.path.exists(SCRIPT), f"rebuild-llama script not found at {SCRIPT}"
     proc = subprocess.run([SCRIPT, '--dry-run', '--json'], capture_output=True, text=True)
@@ -127,7 +175,8 @@ def test_deploy_only_copies_binary_and_libs_and_stops_server_first(tmp_path, mon
     deploy_bin.mkdir(parents=True)
 
     proc = _run(
-        ["--deploy-only", "--json", "--dir", str(tmp_path), "--deploy-path", str(deploy_bin / "llama-server")],
+        ["--deploy-only", "--skip-census", "--json", "--dir", str(tmp_path),
+         "--deploy-path", str(deploy_bin / "llama-server")],
         {"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"},
     )
 
@@ -180,7 +229,8 @@ def test_deploy_only_does_not_require_cmake(tmp_path):
     assert shutil.which("cmake", path=str(shadow)) is None
 
     proc = subprocess.run(
-        [SCRIPT, "--deploy-only", "--json", "--dir", str(tmp_path), "--deploy-path", str(deploy_bin / "llama-server")],
+        [SCRIPT, "--deploy-only", "--skip-census", "--json", "--dir", str(tmp_path),
+         "--deploy-path", str(deploy_bin / "llama-server")],
         capture_output=True, text=True,
         env={**os.environ, "PATH": f"{tools}{os.pathsep}{shadow}"},
     )
@@ -203,7 +253,8 @@ def test_deploy_only_requires_existing_artifact(tmp_path):
 
     # Deactivate the pkill stub so the "no artifact" guard fires before deploy
     proc = subprocess.run(
-        [SCRIPT, "--deploy-only", "--json", "--dir", str(empty), "--deploy-path", str(deploy_bin / "llama-server")],
+        [SCRIPT, "--deploy-only", "--skip-census", "--json", "--dir", str(empty),
+         "--deploy-path", str(deploy_bin / "llama-server")],
         capture_output=True, text=True,
         env={**os.environ, "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"},
     )
@@ -211,3 +262,159 @@ def test_deploy_only_requires_existing_artifact(tmp_path):
     data = json.loads(proc.stdout)
     assert data["ok"] == 0
     assert "no artifact" in data["errors"][0]
+
+
+# ---------------------------------------------------------------------------
+# LP-0MW3K7Y3C003WEXW: CPU-backend build facts and the census gate
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_plans_the_repack_free_native_cpu_build():
+    """The plan must show the two build facts the crash fix depends on."""
+    proc = subprocess.run([SCRIPT, '--dry-run', '--json'], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+
+    flags = data["cmake_flags"]
+    assert "-DGGML_CPU_REPACK=OFF" in flags, flags
+    assert "-DGGML_NATIVE=ON" in flags, flags
+    assert data["cpu_repack"] == "OFF"
+    assert data["expect_cpu_repack"] == "off"
+    # The census is planned BEFORE the live deploy dir is touched.
+    planned = data["planned_steps"][0]
+    assert planned.index("verify_cpu_backend") < planned.index("copy_binary_and_libs")
+
+
+def test_with_cpu_repack_restores_upstream_default_and_expectation():
+    proc = subprocess.run(
+        [SCRIPT, '--dry-run', '--json', '--with-cpu-repack'], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+
+    assert "-DGGML_CPU_REPACK=ON" in data["cmake_flags"]
+    assert data["expect_cpu_repack"] == "on"
+
+
+def test_unknown_expect_repack_value_is_rejected():
+    proc = subprocess.run(
+        [SCRIPT, '--dry-run', '--json', '--expect-cpu-repack', 'maybe'],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert "expect-cpu-repack" in proc.stderr
+
+
+def test_deploy_is_refused_before_touching_the_live_dir_when_census_fails(tmp_path):
+    """A CPU backend that reproduces the crash path must never be deployed.
+
+    The gate runs before the old server is stopped and before anything is
+    copied, so a failing artifact leaves the running deployment untouched.
+    """
+    _fake_build(tmp_path)
+    tools, order = _fake_tools(tmp_path)
+    stub = _census_stub(tmp_path, verbose=True)
+    deploy_bin = tmp_path / "deploy" / "bin"
+    deploy_bin.mkdir(parents=True)
+
+    proc = _run(
+        ["--deploy-only", "--json", "--dir", str(tmp_path),
+         "--deploy-path", str(deploy_bin / "llama-server")],
+        {"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}", "GGML_CENSUS_SCRIPT": str(stub)},
+    )
+
+    assert proc.returncode == 2, f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+    data = json.loads(proc.stdout)
+    assert data["ok"] == 0
+    assert "cpu_backend_census_failed" in data["errors"][0]
+
+    # Nothing was copied and the live server was never stopped.
+    assert not (deploy_bin / "llama-server").exists()
+    recorded = order.read_text(encoding="utf-8") if order.exists() else ""
+    assert "pkill" not in recorded, f"the live server must not be stopped: {recorded!r}"
+
+    # The reason is reported, not just a bare failure.
+    assert "ggml_cpu_extra_work_size" in proc.stderr
+
+
+def test_deploy_writes_a_provenance_record_with_checksums(tmp_path):
+    """AC3: the build record carries the commit, flags and artifact sha256."""
+    import hashlib
+
+    build_bin = _fake_build(tmp_path)
+    tools, _ = _fake_tools(tmp_path)
+    stub = _census_stub(tmp_path)
+    deploy_bin = tmp_path / "deploy" / "bin"
+    deploy_bin.mkdir(parents=True)
+    record = tmp_path / "record" / "build-record.json"
+
+    proc = _run(
+        ["--deploy-only", "--json", "--dir", str(tmp_path), "--record-file", str(record),
+         "--deploy-path", str(deploy_bin / "llama-server")],
+        {"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}", "GGML_CENSUS_SCRIPT": str(stub)},
+    )
+
+    assert proc.returncode == 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+    data = json.loads(proc.stdout)
+    assert data["ok"] == 1
+    assert data["build_record"] == str(record)
+    assert data["cpu_census_deployed"]["verdict"] == "ok"
+    assert data["cpu_census_built"]["arch_specific"] is True
+
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["work_item"] == "LP-0MW3K7Y3C003WEXW"
+    assert "-DGGML_CPU_REPACK=OFF" in payload["cmake_flags"]
+    assert payload["cpu_repack"] == "OFF"
+
+    deployed = {entry["path"]: entry for entry in payload["artifacts"]}
+    deployed_lib = str(deploy_bin / "libggml-cpu.so.0.20.1")
+    assert deployed_lib in deployed
+    expected = hashlib.sha256((build_bin / "libggml-cpu.so.0.20.1").read_bytes()).hexdigest()
+    assert deployed[deployed_lib]["sha256"] == expected
+
+
+def test_skip_census_deploys_non_elf_fixtures(tmp_path):
+    """--skip-census is the documented emergency bypass for the artifact gate."""
+    _fake_build(tmp_path)
+    tools, _ = _fake_tools(tmp_path)
+    deploy_bin = tmp_path / "deploy" / "bin"
+    deploy_bin.mkdir(parents=True)
+
+    proc = _run(
+        ["--deploy-only", "--skip-census", "--json", "--dir", str(tmp_path),
+         "--deploy-path", str(deploy_bin / "llama-server")],
+        {"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert proc.returncode == 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+    data = json.loads(proc.stdout)
+    assert data["census_skipped"] is True
+    assert data["cpu_census_deployed"] is None
+    assert (deploy_bin / "llama-server").exists()
+
+
+def test_build_only_stages_the_artifact_without_touching_the_live_deploy_dir():
+    """--build-only is the staging path for a coordinated restart (AC4).
+
+    It must plan no stop/copy/patch steps, so an operator can inspect the
+    artifact and its census before deciding when to promote it.
+    """
+    proc = subprocess.run(
+        [SCRIPT, '--dry-run', '--json', '--build-only'], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+
+    planned = data["planned_steps"][0]
+    assert "verify_cpu_backend" in planned
+    for forbidden in ("stop_old_server", "copy_binary_and_libs", "patch_runpath", "restart_service"):
+        assert forbidden not in planned, f"--build-only must not plan {forbidden}: {planned}"
+
+
+def test_build_only_and_deploy_only_are_mutually_exclusive():
+    proc = subprocess.run(
+        [SCRIPT, '--dry-run', '--json', '--build-only', '--deploy-only'],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert "mutually exclusive" in proc.stderr
