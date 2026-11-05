@@ -1439,9 +1439,11 @@ server:
   #   `resident_prefix_insufficient` and follows the normal fallback chain,
   #   exactly like `large_context_bypass` today; the `contention_queue_*`
   #   budget is untouched (a denied request never enters the queue).
-  # - `local_idle_admit_*` (LP-0MVGD9Z8Z0055Y5J) is the LAST rung of the
-  #   ladder: an idle GPU still overrides a residency denial, so enabling this
-  #   gate cannot make an idle local backend refuse cold work.
+  # - `local_idle_admit_*` (LP-0MVGD9Z8Z0055Y5J) is the last ECONOMIC rung of
+  #   the ladder: an idle GPU still overrides a residency denial, so enabling
+  #   this gate cannot make an idle local backend refuse cold work. Below it,
+  #   `local_last_resort_*` (LP-0MVWAMY8M001KE4W) is the final rung and only
+  #   fires when no remote provider can serve the request.
   # - Fail-open: a missing/stale snapshot, a session that owns no slot, or a
   #   build that does not report `context_tokens` (llama.cpp b8782 dropped
   #   `n_past`) degrades to the session-owns-slot check and then to the
@@ -2653,6 +2655,62 @@ server:
   # override rather than admitting on a guess.
   local_idle_admit_enabled: true
   local_idle_admit_seconds: 60
+
+  # -----------------------------------------------------------------------
+  # Last-resort local admission (LP-0MVWAMY8M001KE4W)
+  # -----------------------------------------------------------------------
+  # The FINAL rung of the local admission ladder (after the idle-admit rung
+  # above and after every other gate). When every remote provider is measured
+  # unavailable NOW and the GPU has been idle for
+  # ``local_last_resort_idle_seconds``, the prompt is served locally with its
+  # own size-appropriate deadline instead of answering the retryable
+  # ``All providers exhausted`` 503.
+  #
+  # Measured 2026-10-30 (24 h window): 236 of the 686 ``All providers
+  # exhausted`` warnings landed inside idle gaps that carried 98 inbound
+  # requests and ZERO streams, while the remote chain was empty
+  # (``usage_limit_reset_pending`` ~23 h, ``quota_exhausted`` ~18 days,
+  # ``outside available_times``). The idle-admit rung fired 1,337 times in the
+  # same window and refused 1,291 (96.6 %) on ``prefill_budget_exceeded``
+  # (``new_tokens`` p50 79,136 — inside the 120 k warm cap).
+  #
+  # The rung is narrow by construction — it cannot widen admission in the
+  # normal path:
+  #   * the remote chain must be MEASURED empty at decision time (the
+  #     resolver's own eligibility vocabulary: recorded chain skips, cooldown,
+  #     pending usage-limit reset, quota hard stop, ``available_times``), so
+  #     any available remote keeps today's behaviour;
+  #   * the GPU must be provably idle (nothing queued, generating, prefilling,
+  #     loading or switching), which also bounds last-resort concurrency at
+  #     ONE dispatch — a second request is refused exactly as today;
+  #   * the prompt must fit the model's own routing warm cap
+  #     (``local_large_context_warm_cache_threshold`` / the per-slot clamp /
+  #     a per-entry ``max_context_tokens``): this rung never overrides a
+  #     capacity limit, only the economic ones.
+  #
+  # Each admission logs
+  # ``local_last_resort_admit provider=... model=... reason=...
+  #   estimated_tokens=... new_tokens=... idle_seconds=...
+  #   threshold_seconds=... deadline_s=... warm_cap=...
+  #   remote_exhausted=true session=... turn=...`` — the measurement surface
+  # for the post-deploy (>= 24 h) attribution.
+  #
+  # ``local_last_resort_idle_seconds`` is the KILL SWITCH: ``0`` (or a
+  # malformed/non-positive value) restores today's decision matrix
+  # byte-for-byte. Default is ON (300 s = the >5 min idle-gap definition the
+  # measurement window used).
+  local_last_resort_idle_seconds: 300
+  # Prefill deadline a last-resort dispatch uses INSTEAD of
+  # ``local_prefill_deadline_seconds`` (default 600 s). It exists because
+  # admitting a 79 k-token cold prompt under the normal deadline would only
+  # convert the 503 into a ``prefill_deadline`` eviction: at the measured
+  # prompt-eval p50 (~193 tok/s) 79 k needs ~410 s. Values are clamped to
+  # 900 s (the ``local_dispatch_max_prefill_seconds`` lifetime wedge ceiling) and
+  # a malformed/non-positive value falls back to 600 s; the effective
+  # first-byte ceiling is still the tighter of this and
+  # ``local_dispatch_first_byte_timeout_seconds``. It applies to last-resort
+  # dispatches only — every other local dispatch keeps the normal deadline.
+  local_last_resort_deadline_seconds: 600
 
   # -----------------------------------------------------------------------
   # Expected-reuse prefix credit (LP-0MVI2XOTY008Q4UV)

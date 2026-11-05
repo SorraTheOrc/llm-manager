@@ -1124,8 +1124,11 @@ now walks a **five-rung ladder**, in this order:
    measurement (`estimated_tokens - min(context_tokens, estimated_tokens)`), so
    the cold budget is evaluated against real prefill work; a cold miss is
    `large_context_bypass`.
-5. **Idle-exempt override** — last, so an idle GPU still serves cold work
-   (`local_idle_admit_*`, below). It may override rungs 2 and 4, never rung 1.
+5. **Idle-exempt override** — after the economic rungs, so an idle GPU still
+   serves cold work (`local_idle_admit_*`, below). It may override rungs 2 and
+   4, never rung 1.
+6. **Last-resort override** — the final rung (`local_last_resort_*`, below),
+   reached only when no remote provider can serve the request at all.
 
 ```yaml
 server:
@@ -1277,6 +1280,83 @@ Idle-admitted requests are expected to be **slow** (prefill p90 269.8 s, max
 817 s in the baseline window) — that is the deliberate trade of idle GPU time
 for remote spend, and it is why the override never fires while anything is
 queued or in flight.
+
+## Last-resort local admission (LP-0MVWAMY8M001KE4W)
+
+The idle-admit rung above still prices the dispatch with the flat
+`local_cold_prefill_budget_tokens` cap (25,000), so it declines most of the
+work an idle GPU could take. Measured over the 24 h window
+2026-10-29 23:43:30 → 2026-10-30 23:43:30:
+
+- the idle ladder fired **1,337** times and refused **1,291 (96.6 %)** on
+  `routing_idle_admit_refused reason=prefill_budget_exceeded` — `new_tokens`
+  p50 **79,136** (all inside the 120 k warm cap), `idle_seconds` p50 197 s;
+- **236** of the window's 686 `All providers exhausted` warnings landed inside
+  idle gaps that carried **98 inbound requests and zero streams**;
+- in those gaps the remote chain was empty every time
+  (`usage_limit_reset_pending` ~23 h, `quota_exhausted` ~18 days,
+  `outside available_times`).
+
+The final rung of the admission ladder closes that gap: when there is
+**provably nowhere else to send the request**, an idle GPU served slowly beats
+a retryable 503.
+
+```yaml
+server:
+  local_last_resort_idle_seconds: 300     # 0 disables the rung entirely
+  local_last_resort_deadline_seconds: 600 # size-appropriate prefill deadline
+```
+
+The rung sits **after every existing gate** (an ordinary request never reaches
+it) and admits only when all of the following hold:
+
+1. the rung is enabled (`local_last_resort_idle_seconds` > 0);
+2. the estimated prompt fits the model's own routing warm cap
+   (`local_large_context_warm_cache_threshold` / the per-slot clamp, tightened
+   by a per-entry `max_context_tokens`) — a prompt that cannot fit a slot is
+   never admitted by this rung;
+3. the remote chain is **measured empty at decision time** via
+   `_remote_chain_has_capacity` — the resolver's own eligibility vocabulary
+   (recorded chain-resolution skips, cooldown, pending usage-limit reset, quota
+   hard stop, `available_times`), not "we have not tried yet";
+4. nothing local is queued, generating, prefilling, loading or switching
+   (`_local_idle_blocker`), which also bounds last-resort concurrency at
+   **one** dispatch — a second request while a last-resort dispatch runs is
+   refused exactly as today;
+5. the local model has been idle for at least the configured threshold.
+
+**Deadline.** A prompt admitted on an idle GPU needs more time than the normal
+`local_prefill_deadline_seconds` (a 79 k cold prompt needs ~410 s at the
+measured ~193 tok/s), so a last-resort dispatch uses
+`local_last_resort_deadline_seconds` instead — clamped to 900 s (the
+`local_dispatch_max_prefill_seconds` lifetime wedge bound), falling back to
+600 s when malformed, and still bounded by the tighter of itself and
+`local_dispatch_first_byte_timeout_seconds`. Every other dispatch keeps the
+normal deadline; without this the rung would only convert the 503 into a
+`prefill_deadline` eviction.
+
+**Fail-safe.** Any error resolving remote availability or reading the idle
+clock denies (today's behaviour) and never fails a request. Over-admitting
+locally on an unreadable chain state is the worse error, so the check defaults
+to "a remote may exist".
+
+**Kill switch.** `local_last_resort_idle_seconds: 0` (or a
+malformed/non-positive value) restores today's decision matrix
+byte-for-byte. Default is **ON**.
+
+**Observability.** Each admission logs
+
+```
+local_last_resort_admit provider=… model=… reason=remote_exhausted_idle_gpu
+  estimated_tokens=… new_tokens=… idle_seconds=… threshold_seconds=…
+  deadline_s=… warm_cap=… remote_exhausted=true session=… turn=…
+```
+
+and records a `status=last_resort_admit` attempt so the fallback diagnostics
+carry it. The post-deploy (≥ 24 h) attribution reads `All providers exhausted`
+inside idle gaps together with `local_eviction_after_acceptance`
+(`reason=prefill_deadline`) and discarded prefill tokens: the rung is only a
+success if the 503s fall and neither eviction metric rises.
 
 ## Slot Contention: reservations first, the queue as a straggler net
 

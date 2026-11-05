@@ -1824,7 +1824,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     # before the SSE headers arrive (previously the poll sat
                     # after ``stream_cm.__aenter__`` and never ran during a real
                     # prefill).
-                    _first_byte_ceiling = _get_first_byte_timeout_seconds(srv)
+                    _first_byte_ceiling = _get_first_byte_timeout_seconds(srv, request)
                     _first_byte_poll_seconds = float(
                         server_config.get(
                             "local_dispatch_lease_prefill_poll_seconds", 10
@@ -1945,7 +1945,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 # ``return_progress`` the headers arrive at prefill
                                 # start, so this peek — not the first-byte monitor — is
                                 # where that bound now applies.
-                                _prefetch_timeout = _get_first_byte_timeout_seconds(srv)
+                                _prefetch_timeout = _get_first_byte_timeout_seconds(srv, request)
                                 if isinstance(_dispatch_start, float):
                                     _peek_elapsed = max(
                                         0.0, time.monotonic() - _dispatch_start
@@ -2311,7 +2311,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         _prefill_deadline_fired = False
                         if isinstance(_exc, asyncio.TimeoutError):
                             try:
-                                _prefill_deadline = _get_prefill_deadline_seconds(srv)
+                                _prefill_deadline = _get_prefill_deadline_seconds(srv, request)
                                 if (
                                     _prefill_deadline > 0
                                     and _first_byte_ceiling <= _prefill_deadline

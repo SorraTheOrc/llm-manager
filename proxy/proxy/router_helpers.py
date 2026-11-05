@@ -1153,7 +1153,7 @@ def _get_max_prefill_seconds(srv) -> float:
         return 900.0
 
 
-def _get_first_byte_timeout_seconds(srv) -> float:
+def _get_first_byte_timeout_seconds(srv, request=None) -> float:
     """Return the initial first-byte wait ceiling in seconds (default 840).
 
     Bounds how long a local dispatch may wait for its first data chunk before
@@ -1171,6 +1171,10 @@ def _get_first_byte_timeout_seconds(srv) -> float:
     (LP-0MVIQ0G2M0006QF6) is a *safety detour* deliberately set well below
     the wedge bound so a stalled local prefill becomes a fast remote answer
     instead of a multi-minute hang.
+
+    *request* is optional and only matters for a last-resort dispatch
+    (LP-0MVWAMY8M001KE4W): such a dispatch was admitted past the normal
+    deadline on purpose, so its size-scaled deadline is used instead.
     """
     try:
         server_cfg = srv.config.get("server", {})
@@ -1178,14 +1182,38 @@ def _get_first_byte_timeout_seconds(srv) -> float:
         ceiling = float(raw) if raw is not None else 840.0
     except Exception:
         ceiling = 840.0
-    deadline = _get_prefill_deadline_seconds(srv)
+    deadline = _get_prefill_deadline_seconds(srv, request)
     if deadline > 0:
         # Tighten toward the deadline; a zero wedge bound means "no ceiling".
         return deadline if ceiling <= 0 else min(ceiling, deadline)
     return ceiling
 
 
-def _get_prefill_deadline_seconds(srv) -> float:
+#: Request attribute carrying an accepted last-resort local admission
+#: (LP-0MVWAMY8M001KE4W), stamped by :func:`proxy.provider._evaluate_last_resort_admission`.
+#: Mirrors ``proxy.provider.LOCAL_LAST_RESORT_ATTR`` (kept as a literal in
+#: both modules: neither may take a module-level import of the other).
+LOCAL_LAST_RESORT_ATTR = "_local_last_resort_admission"
+
+
+def _last_resort_deadline_seconds(request) -> float:
+    """Return the size-scaled deadline of an accepted last-resort dispatch.
+
+    ``0.0`` for every ordinary dispatch (the request carries no last-resort
+    admission), so the documented ``local_prefill_deadline_seconds`` behaviour
+    is unchanged byte-for-byte. Never raises.
+    """
+    try:
+        decision = getattr(request, LOCAL_LAST_RESORT_ATTR, None)
+        if not isinstance(decision, dict):
+            return 0.0
+        value = float(decision.get("deadline_s") or 0.0)
+    except Exception:
+        return 0.0
+    return value if value > 0 else 0.0
+
+
+def _get_prefill_deadline_seconds(srv, request=None) -> float:
     """Return the prefill deadline in seconds; 0 disables.
 
     The fallback used when the key is absent is
@@ -1206,6 +1234,12 @@ def _get_prefill_deadline_seconds(srv) -> float:
     ``local_dispatch_first_byte_timeout_seconds`` (840 s) so it is the bound
     that actually fires. Precedence: the prefill deadline wins over the wedge
     bound; both are bounded by ``local_dispatch_max_prefill_seconds``.
+
+    *request* is optional and only matters for a last-resort dispatch
+    (LP-0MVWAMY8M001KE4W): such a dispatch was admitted past this deadline on
+    purpose, so its own size-scaled ``local_last_resort_deadline_seconds`` is
+    used instead — never a smaller value — and a disabled (0) normal deadline
+    no longer means "unbounded" for it.
     """
     from proxy.prefill_eta import DEFAULT_PREFILL_DEADLINE_SECONDS
 
@@ -1213,15 +1247,13 @@ def _get_prefill_deadline_seconds(srv) -> float:
     try:
         server_cfg = srv.config.get("server", {})
         raw = server_cfg.get("local_prefill_deadline_seconds", fallback)
-        return float(raw) if raw is not None else fallback
+        base = float(raw) if raw is not None else fallback
     except Exception:
-        return fallback
-    try:
-        server_cfg = srv.config.get("server", {})
-        raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)
-        return float(raw) if raw is not None else 840.0
-    except Exception:
-        return 840.0
+        base = fallback
+    override = _last_resort_deadline_seconds(request)
+    if override <= 0:
+        return base
+    return override if base <= 0 else max(base, override)
 
 
 # ===================================================================

@@ -2563,9 +2563,10 @@ DECISION_ADMIT_PREDICTED: str = "admit_predicted"
 DECISION_SKIP_PREDICTED: str = "skip_predicted"
 
 #: Skip reasons an idle local backend may override (LP-0MVGD9Z8Z0055Y5J). The
-#: idle-exempt override is the LAST rung of the admission ladder, so the new
-#: residency gate must not silently disable it: an idle GPU still serves cold
-#: work. The physical `context_too_large` cap is never overridable.
+#: idle-exempt override is the last *economic* rung of the admission ladder (the
+#: last-resort rung below it only fires when no remote can serve the request),
+#: so the residency gate must not silently disable it: an idle GPU still serves
+#: cold work. The physical `context_too_large` cap is never overridable.
 IDLE_OVERRIDABLE_SKIP_REASONS: tuple[str, ...] = (
     "large_context_bypass",
     SKIP_REASON_RESIDENT_PREFIX,
@@ -3588,6 +3589,261 @@ def _idle_admission_budget_verdict(
     except Exception:
         logger.debug("idle admission budget verdict failed", exc_info=True)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Last-resort local admission (LP-0MVWAMY8M001KE4W)
+#
+# The idle-admit rung above overrides the ECONOMIC bypass on an idle GPU, but
+# it is still priced by the flat ``local_cold_prefill_budget_tokens`` cap
+# (25,000). Measured 2026-10-30 (24 h window): the idle ladder fired 1,337
+# times and refused 1,291 (96.6 %) on ``prefill_budget_exceeded``
+# (``new_tokens`` p50 79,136, all inside the 120 k warm cap; ``idle_seconds``
+# p50 197 s), while the remote chain was empty every time. 236 of the window's
+# 686 ``All providers exhausted`` warnings landed inside idle gaps that
+# carried 98 inbound requests and **zero** streams.
+#
+# The rung below is the LAST rung of the local admission ladder: when there is
+# provably nowhere else to send the request, an idle GPU served slowly is
+# better than a retryable 503. It is deliberately narrow — the remote chain
+# must be measured empty at decision time, the GPU must have been idle for
+# ``local_last_resort_idle_seconds``, and the prompt must fit the model's own
+# routing warm cap (which is why raising the flat cold-prefill cap would have
+# been the wrong fix) — and it awards a size-appropriate prefill deadline
+# instead of the one it was admitted past.
+# ---------------------------------------------------------------------------
+
+LAST_RESORT_REASON = "remote_exhausted_idle_gpu"
+"""Reason recorded when the last-resort rung admits a request."""
+
+DEFAULT_LAST_RESORT_IDLE_SECONDS = 300.0
+"""Idle age required before the rung may fire (the measured >5 min gap)."""
+
+DEFAULT_LAST_RESORT_DEADLINE_SECONDS = 600.0
+"""Prefill deadline a last-resort dispatch uses instead of the normal one."""
+
+MAX_LAST_RESORT_DEADLINE_SECONDS = 900.0
+"""Hard cap: the lifetime wedge bound (``local_dispatch_max_prefill_seconds``)."""
+
+#: Request attribute carrying the accepted last-resort admission. Mirrors
+#: ``proxy.router_helpers.LOCAL_LAST_RESORT_ATTR`` (kept as a literal in both
+#: modules for the same reason as ``TENANCY_SKIP_REASON``: neither may take a
+#: module-level import of the other). ``router_helpers`` reads it to widen the
+#: first-byte ceiling; this module reads it to keep the dispatch-time admission
+#: guards inert for a dispatch the rung already priced.
+LOCAL_LAST_RESORT_ATTR = "_local_last_resort_admission"
+
+
+def _last_resort_config(server_config: dict | None) -> tuple[float, float]:
+    """Return ``(idle_seconds, deadline_seconds)`` for the last-resort rung.
+
+    ``local_last_resort_idle_seconds`` (default 300 s, the >5 min idle-gap
+    definition behind the measured window) is the kill switch: a missing,
+    malformed, boolean or non-positive value disables the rung entirely, so
+    ``0`` restores today's decision matrix byte-for-byte (AC7).
+
+    ``local_last_resort_deadline_seconds`` (default 600 s) is the prefill
+    deadline a last-resort dispatch uses instead of
+    ``local_prefill_deadline_seconds``. A malformed or non-positive value
+    falls back to the default — the rung must never admit a dispatch with no
+    deadline — and every value is clamped to
+    :data:`MAX_LAST_RESORT_DEADLINE_SECONDS` so a config typo cannot outlive
+    the lifetime wedge ceiling.
+    """
+    if not isinstance(server_config, dict):
+        return 0.0, DEFAULT_LAST_RESORT_DEADLINE_SECONDS
+
+    def _positive_float(raw) -> float | None:
+        """Parse a knob into a positive float; ``None`` means unusable."""
+        if isinstance(raw, bool) or raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    raw_idle = server_config.get(
+        "local_last_resort_idle_seconds", DEFAULT_LAST_RESORT_IDLE_SECONDS
+    )
+    idle_seconds = _positive_float(raw_idle)
+    raw_deadline = server_config.get(
+        "local_last_resort_deadline_seconds", DEFAULT_LAST_RESORT_DEADLINE_SECONDS
+    )
+    deadline_seconds = _positive_float(raw_deadline)
+    if deadline_seconds is None:
+        deadline_seconds = DEFAULT_LAST_RESORT_DEADLINE_SECONDS
+    deadline_seconds = min(deadline_seconds, MAX_LAST_RESORT_DEADLINE_SECONDS)
+    if idle_seconds is None:
+        return 0.0, deadline_seconds
+    return idle_seconds, deadline_seconds
+
+
+def _remote_chain_exhausted(
+    request,
+    provider_cfg: dict,
+    model_config: dict | None,
+    config: dict,
+) -> bool:
+    """True when no remote provider could serve this request **now**.
+
+    Delegates to :func:`_remote_chain_has_capacity` — the resolver's own
+    eligibility vocabulary applied read-only (recorded chain-resolution skips,
+    cooldown, pending usage-limit reset, quota hard stop, ``available_times``)
+    — rather than re-deriving availability here, so the rung and the
+    ``All providers exhausted`` verdict can never disagree about what "empty"
+    means.
+
+    Fail-safe: an exception (or a model config whose remote availability cannot
+    be read) is *not* proof of exhaustion, so it returns ``False`` and the rung
+    stays inert — today's behaviour. Over-admitting locally on an unreadable
+    chain state is the worse error (AC6).
+    """
+    try:
+        local_name = provider_cfg.get("name") if isinstance(provider_cfg, dict) else None
+        available = _remote_chain_has_capacity(
+            request, model_config, config, exclude_name=local_name
+        )
+    except Exception:
+        logger.debug("last-resort remote availability check failed", exc_info=True)
+        return False
+    return not available
+
+
+def _evaluate_last_resort_admission(
+    config: dict,
+    provider_cfg: dict,
+    model_config: dict | None,
+    request,
+    estimated_tokens: int,
+    cached_ratio: float = 0.0,
+) -> dict | None:
+    """Decide whether an idle local GPU should serve a request no remote can.
+
+    Only reached when the normal ladder already declined local. All of the
+    following must hold (any failure ⇒ ``None``, today's behaviour):
+
+    1. the rung is enabled (``local_last_resort_idle_seconds`` > 0);
+    2. the estimated prompt fits the model's own routing warm cap, honouring a
+       per-entry ``max_context_tokens`` ceiling — this rung never overrides a
+       capacity limit, only the economic ones (AC5);
+    3. the remote chain is measured **empty at decision time** — the resolver's
+       own availability predicate, not "we did not try yet" (AC2);
+    4. nothing local is in flight, generating, prefilling, queued or loading
+       (:func:`_local_idle_blocker`), which is what bounds last-resort
+       concurrency at one dispatch (AC4);
+    5. the local model has been idle for at least the configured threshold.
+
+    Returns ``None`` when the rung does not apply, else the decision dict the
+    caller stamps on the request (and logs) — carrying ``deadline_s``, the
+    size-appropriate prefill deadline the dispatch must use instead of
+    ``local_prefill_deadline_seconds`` (AC3).
+    """
+    try:
+        server_config = (
+            config.get("server", config) if isinstance(config, dict) else {}
+        )
+        idle_threshold, deadline_seconds = _last_resort_config(server_config)
+        if idle_threshold <= 0:
+            return None
+        try:
+            estimate = int(estimated_tokens or 0)
+        except (TypeError, ValueError):
+            return None
+        if estimate <= 0:
+            return None
+
+        # (2) The prompt must fit the model's own routing warm cap.
+        _, warm_cap = _effective_large_context_thresholds(config)
+        entry_limit = _provider_context_limit(provider_cfg)
+        if entry_limit > 0:
+            warm_cap = min(warm_cap, entry_limit) if warm_cap > 0 else entry_limit
+        if warm_cap <= 0 or estimate > warm_cap:
+            logger.debug(
+                "last_resort_blocked reason=warm_cap estimate=%d warm_cap=%d",
+                estimate,
+                warm_cap,
+            )
+            return None
+
+        # (3) Nowhere else to go: the remote chain is measured empty NOW.
+        if not _remote_chain_exhausted(request, provider_cfg, model_config, config):
+            return None
+
+        # (4) The GPU must be provably idle (this is also the concurrency
+        # bound: an in-flight last-resort dispatch makes the blocker fire, so a
+        # second request is refused exactly as today).
+        endpoint = _get_local_provider_endpoint(provider_cfg, config)
+        blocker = _local_idle_blocker(endpoint)
+        if blocker is not None:
+            logger.debug(
+                "last_resort_blocked reason=%s endpoint=%s estimate=%d",
+                blocker,
+                endpoint or "default",
+                estimate,
+            )
+            return None
+
+        # (5) Long enough idle to be a genuine serving gap.
+        from proxy.local_activity import local_idle_seconds
+
+        idle_seconds = local_idle_seconds()
+        if idle_seconds < idle_threshold:
+            return None
+
+        try:
+            ratio = min(1.0, max(0.0, float(cached_ratio or 0.0)))
+        except (TypeError, ValueError):
+            ratio = 0.0
+        return {
+            "admitted": True,
+            "reason": LAST_RESORT_REASON,
+            "idle_seconds": idle_seconds,
+            "threshold_seconds": idle_threshold,
+            "deadline_s": deadline_seconds,
+            "remote_exhausted": True,
+            "estimated_tokens": estimate,
+            "new_tokens": max(0, int(round(estimate * (1.0 - ratio)))),
+            "warm_cap": warm_cap,
+        }
+    except Exception:
+        logger.debug("last-resort admission evaluation failed", exc_info=True)
+        return None
+
+
+def _log_last_resort_admit(
+    decision: dict,
+    provider_name: str,
+    model: str | None,
+    session_id: str | None,
+) -> None:
+    """Emit the ``local_last_resort_admit`` line (AC9).
+
+    The structured line is the measurement surface AC8 reads: it names the
+    prompt size, the idle age and the deadline the dispatch was given, and it
+    always reports ``remote_exhausted=true`` because that is a precondition of
+    the rung. Never raises into the request path.
+    """
+    try:
+        logger.info(
+            "local_last_resort_admit provider=%s model=%s reason=%s "
+            "estimated_tokens=%d new_tokens=%d idle_seconds=%.1f "
+            "threshold_seconds=%.1f deadline_s=%.1f warm_cap=%d "
+            "remote_exhausted=true session=%s%s",
+            provider_name,
+            model or "unknown",
+            decision.get("reason") or LAST_RESORT_REASON,
+            int(decision.get("estimated_tokens") or 0),
+            int(decision.get("new_tokens") or 0),
+            float(decision.get("idle_seconds") or 0.0),
+            float(decision.get("threshold_seconds") or 0.0),
+            float(decision.get("deadline_s") or 0.0),
+            int(decision.get("warm_cap") or 0),
+            session_id or "unknown",
+            turn_field(),
+        )
+    except Exception:
+        logger.debug("last-resort admit log line failed", exc_info=True)
 
 
 def _provider_context_limit(provider_cfg: dict) -> int:
@@ -8604,6 +8860,7 @@ async def _prefill_admission_guard(
     reason_label: str | None = None,
     free_slot: bool = False,
     capacity_admitted: bool = False,
+    last_resort_admitted: bool = False,
 ):
     """Evaluate (and log) the prefill-ETA admission guard.
 
@@ -8636,10 +8893,27 @@ async def _prefill_admission_guard(
     prefill deadline, so the flat cold-prefill token cap must not override it
     (the measured bounds still do). Without it the two gates contradict each
     other: routing admitted the prompt and the guard then always refused it.
+
+    *last_resort_admitted* (LP-0MVWAMY8M001KE4W) says the ladder's FINAL rung
+    admitted this dispatch against a provably idle GPU and priced it against
+    its own ``local_last_resort_deadline_seconds``. The flat cold-prefill cap
+    and the normal prefill deadline are precisely the bounds that rung exists
+    to overrule when there is nowhere else to send the request, so the guard is
+    inert for it — the equivalent of ``capacity_admitted`` for the
+    capacity-blind last-resort case. Every other path keeps both bounds.
     """
     try:
         from proxy import prefill_eta
 
+        if last_resort_admitted:
+            logger.info(
+                "local_admission_guard_skipped reason=last_resort_admitted "
+                "estimated_tokens=%d session=%s%s",
+                max(0, int(estimated_tokens or 0)),
+                session_id or "unknown",
+                turn_field(),
+            )
+            return None
         if estimated_tokens <= 0:
             return None
         server_cfg = config.get("server", config) if isinstance(config, dict) else {}
@@ -9091,6 +9365,9 @@ async def _maybe_queue_for_local_slot(
         endpoint=endpoint,
         capacity_admitted=bool(
             getattr(request, LOCAL_CAPACITY_ADMISSION_ATTR, None)
+        ),
+        last_resort_admitted=bool(
+            getattr(request, LOCAL_LAST_RESORT_ATTR, None)
         ),
     )
     if _admission is not None and not _admission.admit:
@@ -14575,6 +14852,59 @@ async def _proxy_with_fallback_cycle(
                         )
                         _skip_local = False
                         _skip_reason = None
+
+                # Last-resort rung (LP-0MVWAMY8M001KE4W): the FINAL rung of the
+                # ladder, after every existing gate. When no remote provider
+                # could serve this request now AND the GPU has been idle for
+                # ``local_last_resort_idle_seconds``, serve it locally with a
+                # size-appropriate deadline instead of answering the retryable
+                # ``All providers exhausted`` 503. Narrow by construction (warm
+                # cap, measured-empty remote chain, provably idle GPU), and
+                # absent entirely when the knob is 0.
+                if _skip_local:
+                    _last_resort = _evaluate_last_resort_admission(
+                        config,
+                        provider_cfg,
+                        model_config,
+                        request,
+                        _estimated_tokens,
+                        _routing_cached_ratio,
+                    )
+                    if _last_resort is not None:
+                        # Stamp the accepted admission so the dispatch-time
+                        # prefill-ETA guard stays inert (this rung priced the
+                        # dispatch against an idle GPU) and the router uses the
+                        # rung's deadline instead of the normal one.
+                        try:
+                            setattr(
+                                request,
+                                LOCAL_LAST_RESORT_ATTR,
+                                dict(_last_resort),
+                            )
+                        except Exception:
+                            pass
+                        _log_last_resort_admit(
+                            _last_resort,
+                            provider_name,
+                            _llama_model,
+                            _session_id,
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="last_resort_admit",
+                            reason=_last_resort["reason"],
+                            estimated_tokens=_last_resort["estimated_tokens"],
+                            new_tokens=_last_resort["new_tokens"],
+                            idle_seconds=round(_last_resort["idle_seconds"], 1),
+                            threshold_seconds=_last_resort["threshold_seconds"],
+                            deadline_seconds=_last_resort["deadline_s"],
+                            remote_exhausted=True,
+                        )
+                        _skip_local = False
+                        _skip_reason = None
+
                 if _skip_local:
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
@@ -14819,6 +15149,9 @@ async def _proxy_with_fallback_cycle(
                     free_slot=True,
                     capacity_admitted=bool(
                         getattr(request, LOCAL_CAPACITY_ADMISSION_ATTR, None)
+                    ),
+                    last_resort_admitted=bool(
+                        getattr(request, LOCAL_LAST_RESORT_ATTR, None)
                     ),
                 )
                 if _direct_admission is not None and not _direct_admission.admit:
