@@ -58,6 +58,15 @@ The router exposes:
 
 - `models.ini` must include both the embeddings model and the primary model preset.
 - `llama_models_max` limits concurrent models and controls LRU eviction.
+- **Startup `current_model` (LP-0MVWBYAGL004BV8X).** After the router preload
+  completes, `current_model` is set to the first **non-embed** preset in the
+  resolved preload list, so model-scoped paths (slot polling, `/status`
+  capacity reporting, SSE per-slot detail) target the chat child rather than
+  an embed preset such as `mxbai-embed`. It falls back to the first preload
+  entry only when every entry is an embed preset, and stays unset when the
+  preload list is empty (the first dispatch then resolves it). The embed
+  heuristic is a case-insensitive `embed` substring match, the same one used
+  by `_non_embed_model_ids` in `proxy/router_helpers.py`.
 - The proxy health endpoint (`/health`) is readiness-gated (`ready: true/false`) and includes active backend probing (`backend_reachable`). After router/worker crashes it reports `status: degraded` until watchdog recovery completes.
 - Router worker zombie/defunct states are treated as backend failures and trigger self-healing.
 - During active self-healing, requests return `503` with `Retry-After: 30` and a `backend_recovery_in_progress` error payload.

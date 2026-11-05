@@ -172,6 +172,20 @@ def _srv():
     return sys.modules[__name__]
 
 
+def _select_current_model_from_preload(resolved: list[str]) -> str | None:
+    """Select a chat model from the resolved preload list for ``current_model``.
+
+    LP-0MVWBYAGL004BV8X: prefer a non-embed model so that model-scoped paths
+    (slot polling, ``/status`` capacity reporting, SSE per-slot detail) target
+    the chat child rather than an embed preset such as ``mxbai-embed``.
+
+    Returns the first non-embed model id, falling back to ``resolved[0]`` when
+    every preload entry is embed, or ``None`` when ``resolved`` is empty.
+    """
+    non_embed = _non_embed_model_ids(resolved)
+    return non_embed[0] if non_embed else resolved[0] if resolved else None
+
+
 async def _release_lease_on_session_eviction(session_id: str) -> None:
     """Callback invoked when a session is evicted from the session manager.
 
@@ -988,8 +1002,7 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                         if not await router_preload_models(resolved):
                             raise RuntimeError(f"Router preload failed for {router_preload_list}")
                         logger.info(f"Router preload complete: {router_preload_list}")
-                        if resolved:
-                            current_model = resolved[0]
+                        current_model = _select_current_model_from_preload(resolved)
 
                     return
 
@@ -1804,6 +1817,9 @@ from .router import (  # noqa: E402, F401
     log_response_chunk,
     proxy_to_local,
     proxy_to_remote,
+)
+from .router_helpers import (  # noqa: E402
+    _non_embed_model_ids,
 )
 from .session import (  # noqa: E402, F401
     ContentOnlyConsoleHandler,
