@@ -2,7 +2,7 @@
 
 Work item: **LP-0MW3PLK5M002YPOA** (second half of parent **AC2** —
 "kills stop",
-[`LP-0MW2RI9AM007O1FO`](../AGENTS.md)). Supersedes the *name-based* hardening
+`LP-0MW2RI9AM007O1FO`). Supersedes the *name-based* hardening
 branch of the kill hypothesis space: the decoy experiment in
 [`docs/death-attribution-LP-0MW3K7WYV001XLL1.md`](../death-attribution-LP-0MW3K7WYV001XLL1.md)
 §9 proved the sweep does **not** select `argv[0]`, and the class-A child
