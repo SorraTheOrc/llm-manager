@@ -213,6 +213,12 @@ RE_GUARD_FREE_SLOT = re.compile(r"\bfree_slot=(true|false)")
 RE_GUARD_RATE_BUCKET = re.compile(r"\brate_bucket=([A-Za-z_]+)")
 RE_GUARD_CONTENDED_SAMPLES = re.compile(r"\bcontended_samples=(\d+)")
 RE_GUARD_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
+#: The measured occupant hold priced into that occupancy term
+#: (LP-0MVV29YDQ00437N6): the live prefilling occupants' remaining prefill
+#: service or dispatch-lease hold, whichever is larger. ``0.0`` means the guard
+#: had no usable occupant evidence (the fail-open path); ``None`` on lines that
+#: predate the field, never a fabricated value.
+RE_GUARD_OCCUPANT_HOLD = re.compile(r"\boccupant_hold_s=([\d.]+)")
 RE_GUARD_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
 
 # Status-poll payload (LP-0MVGR2OXT0096OGK M3): ``status_request`` lines carry
@@ -745,6 +751,9 @@ class LogEvent:
     rate_bucket: str | None = None
     contended_samples: int | None = None
     eta_occupancy_s: str | None = None
+    #: The measured occupant hold taken into the occupancy term
+    #: (LP-0MVV29YDQ00437N6). ``None`` on lines that predate the field.
+    occupant_hold_s: str | None = None
     # Measured pool state on the ``local_admission_guard`` record
     # (LP-0MVGR2OXT0096OGK M1, ``local_admission_guard`` kind): the number of
     # slots decoding, the number of prefills in flight, and whether a slot was
@@ -1306,6 +1315,11 @@ def parse_log_line(line: str) -> LogEvent | None:
             rate_bucket=_first(RE_GUARD_RATE_BUCKET, msg),
             contended_samples=_int(RE_GUARD_CONTENDED_SAMPLES, msg),
             eta_occupancy_s=_first(RE_GUARD_ETA_OCCUPANCY, msg),
+            # Measured blocker evidence (LP-0MVV29YDQ00437N6 AC5): additive and
+            # absent on earlier lines, so a refusal can be attributed to the
+            # measured occupant hold instead of inferred from the aggregate
+            # ``eta_occupancy_s``.
+            occupant_hold_s=_first(RE_GUARD_OCCUPANT_HOLD, msg),
             new_tokens=_int(RE_GUARD_NEW_TOKENS, msg),
             # The pricing policy on the decision line (``reject`` / ``observe``
             # / ``off``): the matched prefill-ETA accuracy splits a rollout

@@ -194,6 +194,36 @@ def _report_of(lines: list[str]) -> dict:
     return build_report(events, files=[])
 
 
+def test_admission_line_carries_the_measured_occupant_hold():
+    """LP-0MVV29YDQ00437N6 AC5: the guard line reports the *measured* occupant
+    hold it priced the occupancy term with, so the post-fix window can
+    attribute a refusal to blocker evidence.
+
+    A line that predates the field keeps ``None`` (an absence, never ``0.0`` —
+    which would claim the guard measured a zero hold).
+    """
+    line = (
+        "2026-10-19 10:00:00,000 - INFO - local_admission_guard "
+        "decision=reject reason=eta_exceeds_budget enforced=true "
+        "eta_prefill_s=13.5 eta_occupancy_s=45.0 occupant_hold_s=45.0 "
+        "projected_wait_s=58.5 budget_s=30.0 new_tokens=5715 session=s-1"
+    )
+    event = parse_event(line, parse_line_timestamp(line))
+
+    assert event is not None
+    assert event.kind == "admission"
+    assert event.occupant_hold_s == 45.0
+    assert event.eta_occupancy_s == 45.0
+
+    legacy = (
+        "2026-10-19 10:00:00,000 - INFO - local_admission_guard "
+        "decision=admit reason=within_budget enforced=false "
+        "eta_prefill_s=13.5 eta_occupancy_s=13.5 projected_wait_s=27.0 "
+        "budget_s=30.0 new_tokens=5715 session=s-1"
+    )
+    assert parse_event(legacy, parse_line_timestamp(legacy)).occupant_hold_s is None
+
+
 def test_queue_wait_line_is_parsed_with_its_own_evidence():
     """The post-fix enqueue line carries the request's own pricing and the
     entry-path ``trigger=`` (distinct from the ``saturation=`` gate)."""

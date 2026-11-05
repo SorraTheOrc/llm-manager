@@ -1574,9 +1574,11 @@ eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_to
   new_tokens   = est_tokens * (1 - cached_ratio)    # must actually be prefilled
 
 projected_wait = own_prefill_seconds + occupied_seconds
-  occupied_seconds = max(eta_prefill * gate_occupancy, sum(remaining occupant service))
-    # remaining occupant service is re-priced from the occupant's remaining
-    # uncached new tokens at the contended co-residency rate (see below)
+  occupied_seconds = max(eta_prefill * gate_occupancy, sum(remaining occupant hold))
+    # remaining occupant hold is per record
+    #   max(remaining occupant prefill service, remaining dispatch-lease hold)
+    # — the service is re-priced from the occupant's remaining uncached new
+    # tokens at the contended co-residency rate (see below)
   busy_slots       = min(slot_pool, max(generating_concurrency, prefills_in_flight))
   gate_occupancy   = min(busy_slots, prefills_in_flight)   # in-flight PREFILLS only
 
@@ -1754,6 +1756,21 @@ inactive or already-served record, or an uncalibrated contended window
 contributes nothing — fail-open by construction, never a guessed multiplier.
 The deadline bound is evaluated against this same projected time to first byte,
 so admission and the deadline can no longer disagree about who the occupant is.
+
+**Blocker-hold pricing** (LP-0MVV29YDQ00437N6). The per-wait diagnosis
+([`docs/dev/queue-wait-abandonment-diagnosis.md`](../../docs/dev/queue-wait-abandonment-diagnosis.md),
+`LP-0MVV29XPT003OXI5`) measured the occupancy term at *exactly* the symmetric
+floor in 163 of 169 abandoned waits that had an admission decision (median
+projection 28.4 s against the 60 s budget actually spent). The dominant blocker
+class was `prefill_in_flight` (65.3 %), so each live prefilling occupant now
+also prices its remaining **dispatch-lease hold** (`expires_at` on the record —
+the monotonic bound on how long the local slot stays leased to that holder) and
+the per-record term is `max(prefill service, lease hold)`. Still measured
+evidence only: it raises the symmetric floor and never lowers it, it is not
+configurable, and a record with neither signal contributes nothing. The
+`occupant_hold_s` field on the decision line reports the measured hold
+(`0.0` = no usable evidence). The `lease_holder_generating` minority (13.4 %)
+is unchanged — renewals are capped by `LP-0MVOJ6KAW004EBV0`, not priced here.
 
 **Contended (co-residency) rate selection** (LP-0MVS9Y76R004B5M8). Prefill is
 serialised but prefill+decode batching is not, so an occupant that is

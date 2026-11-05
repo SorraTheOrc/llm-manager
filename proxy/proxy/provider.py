@@ -7249,7 +7249,7 @@ the occupied gate ahead of it* against the budget, so it needs the number of
 def _local_occupant_prefill_seconds(
     endpoint: str | None = None, session_id: str | None = None
 ) -> float:
-    """Measured remaining prefill service owed by other sessions' prefills.
+    """Measured remaining *hold* owed by other sessions' live prefills.
 
     LP-0MVOFVCA2008DQVE: the symmetric ``eta * busy_slots`` occupancy floor
     prices an occupant at the newcomer's own prefill, which is wrong when a
@@ -7257,7 +7257,10 @@ def _local_occupant_prefill_seconds(
     occupant from its own dispatch record so the deadline bound sees the real
     time to first byte; since LP-0MVS9YK9P006M1NQ the projection re-prices the
     occupant's remaining uncached *new tokens* at the contended co-residency
-    rate instead of decaying its optimistic admission ETA.
+    rate instead of decaying its optimistic admission ETA, and since
+    LP-0MVV29YDQ00437N6 it also carries the occupant's remaining dispatch-lease
+    hold (whichever is larger) so the diagnosed ``prefill_in_flight`` blocker
+    class is priced rather than assumed to owe nothing.
 
     Never raises: a routing decision must not break on an observability gap
     (0.0 leaves the symmetric floor in charge).

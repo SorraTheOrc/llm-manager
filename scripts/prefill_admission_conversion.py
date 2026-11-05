@@ -124,6 +124,11 @@ _KV_CAUSE = re.compile(r"\bcause=([A-Za-z_]+)")
 _KV_PROJECTED_WAIT = re.compile(r"\bprojected_wait_s=([\d.]+)")
 _KV_ETA_PREFILL = re.compile(r"\beta_prefill_s=([\d.]+)")
 _KV_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
+#: The measured occupant hold priced into the occupancy term
+#: (LP-0MVV29YDQ00437N6): the live prefilling occupants' remaining prefill
+#: service or dispatch-lease hold, whichever is larger. ``0.0`` means no usable
+#: occupant evidence (the fail-open path), never "the occupant owed nothing".
+_KV_OCCUPANT_HOLD = re.compile(r"\boccupant_hold_s=([\d.]+)")
 _KV_BUSY_SLOTS = re.compile(r"\bbusy_slots=(\d+)")
 _KV_IN_FLIGHT_PREFILLS = re.compile(r"\bin_flight_prefills=(\d+)")
 _KV_BUDGET_S = re.compile(r"\bbudget_s=([\d.]+)")
@@ -256,6 +261,10 @@ class Event:
     projected_wait_s: float | None = None
     eta_prefill_s: float | None = None
     eta_occupancy_s: float | None = None
+    #: Measured occupant hold taken into the occupancy term
+    #: (LP-0MVV29YDQ00437N6); ``None`` on lines emitted before the field
+    #: existed, ``0.0`` when the guard had no usable occupant evidence.
+    occupant_hold_s: float | None = None
     busy_slots: int | None = None
     in_flight_prefills: int | None = None
     budget_s: float | None = None
@@ -291,6 +300,7 @@ def parse_event(line: str, ts: datetime) -> Event | None:
             projected_wait_s=_float(_KV_PROJECTED_WAIT, line),
             eta_prefill_s=_float(_KV_ETA_PREFILL, line),
             eta_occupancy_s=_float(_KV_ETA_OCCUPANCY, line),
+            occupant_hold_s=_float(_KV_OCCUPANT_HOLD, line),
             busy_slots=_int(_KV_BUSY_SLOTS, line),
             in_flight_prefills=_int(_KV_IN_FLIGHT_PREFILLS, line),
             budget_s=_float(_KV_BUDGET_S, line),
