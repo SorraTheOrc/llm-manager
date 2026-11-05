@@ -186,6 +186,39 @@ the exactly-once fix lands — encoded `xfail(strict=True)` naming
 LP-0MVYWLBV70018ZZB, so the assertion is pinned and the marker cannot be
 forgotten.
 
+#### The recovery WARNING names the request it could not account for
+
+(LP-0MVYWLHNI000AQ7X, parent AC5.) The self-healing clamp is the detector for
+this leak class, so its WARNING is kept — but it used to carry only the counts,
+which left the recoveries with no antecedent log signal (12 % in the parent's
+evidence) unattributable without a fresh investigation. The line now appends
+the leaking request's identifying fields when they are determinable:
+
+```
+local_active_queries counter recovered: reset from N to M (M active dispatch
+records) session=… turn=… record=… release_reason=… release_age_s=…
+```
+
+- `session` / `turn` / `record` name the **active** dispatch records (the live
+  work the clamp keeps, comma-separated, capped at
+  `LOCAL_DISPATCH_RELEASE_HISTORY_LIMIT`); when none is active they name the
+  most recently released record, which is the only identity a leak that has
+  just been released leaves behind. `record` is the dispatch-record id
+  `<endpoint>|<session>`.
+- `release_reason` (`measured_cache_deficit`, `prefill_deadline`,
+  `client_disconnect`, `explicit_release`, `request_completed`,
+  `no_progress_watchdog`, `idle_timeout`, `orphan_cleanup`, `non_explicit`,
+  `disconnect`, `session_evicted`) and `release_age_s` come from the most
+  recent `lease_released` inside `LOCAL_DISPATCH_RELEASE_MAX_AGE_SECONDS`; an
+  older release is unrelated churn and is not named.
+- Any field that cannot be determined is `unknown`, so the detector always
+  fires and the reset values (`prev` → `active_count`) are unchanged.
+
+The identity is captured where it is already known — on the dispatch record at
+admission (`session`, `turn`) and in a bounded in-memory release history next
+to the existing `lease_released` line — so the clamp tick reads a snapshot
+only: no new lock, no new hot-path work.
+
 ### 5. Remote Model Handling
 
 For remote models (`proxy_to_remote()`):

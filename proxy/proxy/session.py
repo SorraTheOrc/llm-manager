@@ -1482,12 +1482,30 @@ async def _invalidate_session_and_slot(
                     or k == session_id
                 ]
                 for k in matching:
-                    del srv.local_dispatch_records[k]
+                    removed_record = srv.local_dispatch_records.pop(k, None)
                     try:
                         _srv().logger.info(
                             "lease_released session=%s reason=%s",
                             session_id if session_id else "unknown",
                             reason or "invalidation",
+                        )
+                    except Exception:
+                        pass
+                    # LP-0MVYWLHNI000AQ7X AC1: release attribution for the
+                    # self-healing clamp. Imported here (session.py does not
+                    # import router_helpers at module scope) and fail-soft, so
+                    # an invalidation can never fail on the enrichment.
+                    try:
+                        from proxy.router_helpers import (
+                            _note_local_dispatch_release,
+                        )
+
+                        _note_local_dispatch_release(
+                            srv,
+                            session_id,
+                            reason=reason or "invalidation",
+                            record=removed_record,
+                            record_key=k,
                         )
                     except Exception:
                         pass

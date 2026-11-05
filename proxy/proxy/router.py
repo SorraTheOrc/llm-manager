@@ -209,6 +209,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _local_dispatch_occupancy_evidence,
     _mark_local_dispatch_terminal,
     _normalize_outgoing_headers,
+    _note_local_dispatch_release,
     _occupancy_divergence_reason,
     _prefetch_measured_cache_abort,
     _prefill_thrash_fingerprint,
@@ -909,7 +910,7 @@ async def _cleanup_after_request(
                         records = getattr(srv, "local_dispatch_records", {})
                         record_key = _dispatch_lease_key(backend, session_id)
                         if record_key in records:
-                            del records[record_key]
+                            removed_record = records.pop(record_key, None)
                             try:
                                 srv.logger.info(
                                     "lease_released session=%s reason=non_explicit",
@@ -918,6 +919,16 @@ async def _cleanup_after_request(
                                 )
                             except Exception:
                                 pass
+                            # LP-0MVYWLHNI000AQ7X AC1: release attribution for
+                            # the self-healing clamp.
+                            _note_local_dispatch_release(
+                                srv,
+                                session_id,
+                                reason="non_explicit",
+                                record=removed_record,
+                                record_key=record_key,
+                                endpoint=backend,
+                            )
             except Exception:
                 pass
 
@@ -956,7 +967,7 @@ async def _cleanup_after_request(
                     records = getattr(srv, "local_dispatch_records", {})
                     record_key = _dispatch_lease_key(backend, session_id)
                     if record_key in records:
-                        del records[record_key]
+                        removed_record = records.pop(record_key, None)
                         try:
                             srv.logger.info(
                                 "lease_released session=%s reason=disconnect",
@@ -965,6 +976,15 @@ async def _cleanup_after_request(
                             )
                         except Exception:
                             pass
+                        # LP-0MVYWLHNI000AQ7X AC1: release attribution for the
+                        # self-healing clamp.
+                        _note_local_dispatch_release(
+                            srv,
+                            session_id,
+                            reason="disconnect",
+                            record=removed_record,
+                            record_key=record_key,
+                        )
         except Exception:
             pass
         # A disconnect also drops the prefill hold (if the client vanished

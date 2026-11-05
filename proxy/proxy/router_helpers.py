@@ -3457,6 +3457,11 @@ async def _increment_local_active_queries(
                         "expires_at": time.monotonic() + lease_timeout,
                         "model_name": model_name,
                         "endpoint": backend,
+                        # LP-0MVYWLHNI000AQ7X AC1: the dispatch identity the
+                        # self-healing clamp reports (it runs outside any
+                        # request context, so the turn cannot be read there).
+                        "session": session_key,
+                        "turn": get_turn_id() or "",
                         # LP-0MVYZEYZY003IQAH: per-dispatch identity so a
                         # late teardown/release can be scoped to its own
                         # dispatch instead of the shared session record.
@@ -4543,6 +4548,11 @@ async def _try_acquire_local_dispatch(
                         ]
                         own_record["dispatch_token"] = dispatch_token
                     own_record["expires_at"] = now + lease_timeout
+                    # LP-0MVYWLHNI000AQ7X AC1: a re-acquired record belongs to
+                    # this turn now, so the clamp names the live turn.
+                    _own_turn = get_turn_id(request)
+                    if _own_turn:
+                        own_record["turn"] = _own_turn
                 else:
                     dispatch_token = _new_dispatch_token()
                     _credit_taken = True
@@ -4553,6 +4563,11 @@ async def _try_acquire_local_dispatch(
                         "expires_at": now + lease_timeout,
                         "model_name": model_name,
                         "endpoint": backend,
+                        # LP-0MVYWLHNI000AQ7X AC1: the dispatch identity the
+                        # self-healing clamp reports (it runs outside any
+                        # request context, so the turn cannot be read there).
+                        "session": session_key,
+                        "turn": get_turn_id(request) or "",
                         # LP-0MVYZEYZY003IQAH: per-dispatch identity so a late
                         # teardown/release can be scoped to its own dispatch
                         # instead of the shared session record.
@@ -4674,7 +4689,7 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
                     except Exception:
                         pass
                 else:
-                    del srv.local_dispatch_records[record_key]
+                    released_record = srv.local_dispatch_records.pop(record_key, None)
                     removed = True
                     try:
                         srv.logger.info(
@@ -4685,6 +4700,15 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
                         )
                     except Exception:
                         pass
+                    # LP-0MVYWLHNI000AQ7X AC1: release attribution for the clamp.
+                    _note_local_dispatch_release(
+                        srv,
+                        session_id,
+                        reason="explicit_release",
+                        record=released_record,
+                        record_key=record_key,
+                        endpoint=endpoint,
+                    )
             elif endpoint and (endpoint, session_id) in srv.local_dispatch_records:
                 # Belt-and-braces: tuple-key form for any caller that passes
                 # the endpoint directly.
@@ -4701,7 +4725,9 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
                     except Exception:
                         pass
                 else:
-                    del srv.local_dispatch_records[(endpoint, session_id)]
+                    released_record = srv.local_dispatch_records.pop(
+                        (endpoint, session_id), None
+                    )
                     removed = True
                     try:
                         srv.logger.info(
@@ -4711,6 +4737,15 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
                         )
                     except Exception:
                         pass
+                    # LP-0MVYWLHNI000AQ7X AC1: release attribution for the clamp.
+                    _note_local_dispatch_release(
+                        srv,
+                        session_id,
+                        reason="explicit_release",
+                        record=released_record,
+                        record_key=(endpoint, session_id),
+                        endpoint=endpoint,
+                    )
     except Exception:
         raise
     # Free the slot registry entry
@@ -5455,6 +5490,17 @@ async def _release_unserved_dispatch(
                     )
                 except Exception:
                     pass
+                # LP-0MVYWLHNI000AQ7X AC1: remember what was released (and
+                # why) so the self-healing clamp can name it when its
+                # increment never came back.
+                _note_local_dispatch_release(
+                    srv,
+                    session_key,
+                    reason=release_reason,
+                    record=released_record,
+                    record_key=record_key,
+                    endpoint=endpoint,
+                )
     except Exception:
         pass
     # Pop the per-session prefill marker (own session only). A cancelled
@@ -6020,6 +6066,16 @@ def _release_client_disconnect_dispatch(
             )
         except Exception:
             pass
+        # LP-0MVYWLHNI000AQ7X AC1: release attribution for the clamp. This
+        # path is synchronous by design (AC3 of LP-0MVLFVY6K003VYEL), and the
+        # helper is deliberately lock-free and non-awaiting.
+        _note_local_dispatch_release(
+            srv,
+            session_key,
+            reason="client_disconnect",
+            record=released_record,
+            endpoint=endpoint,
+        )
 
     marker_popped = False
     try:
@@ -6243,6 +6299,14 @@ async def _release_completed_dispatch(
             )
         except Exception:
             pass
+        # LP-0MVYWLHNI000AQ7X AC1: release attribution for the clamp.
+        _note_local_dispatch_release(
+            srv,
+            session_key,
+            reason="request_completed",
+            record=record,
+            endpoint=endpoint,
+        )
         try:
             from proxy.session import _free_slot_assignment
 
@@ -6531,6 +6595,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
+                    # LP-0MVYWLHNI000AQ7X AC1: release attribution for the clamp.
+                    _note_local_dispatch_release(
+                        srv,
+                        session_key,
+                        reason="no_progress_watchdog",
+                        record=released_record,
+                        record_key=sid,
+                        endpoint=endpoint_from_record,
+                    )
                     # Deferred: free slot assignment and preflight tracking
                     # after the lock, and close the upstream stream.
                     deferred_watchdog.append(
@@ -6599,6 +6672,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
+                    # LP-0MVYWLHNI000AQ7X AC1: release attribution for the clamp.
+                    _note_local_dispatch_release(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        reason="idle_timeout",
+                        record=idle_record,
+                        record_key=sid,
+                        endpoint=_endpoint_from_record(record),
+                    )
                 else:
                     verify_candidates.append((sid, record))
     except Exception:
@@ -6774,6 +6856,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
+                    # LP-0MVYWLHNI000AQ7X AC1: release attribution for the clamp.
+                    _note_local_dispatch_release(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        reason="orphan_cleanup",
+                        record=record,
+                        record_key=sid,
+                        endpoint=_endpoint_from_record(record),
+                    )
         except Exception:
             pass
     # LP-0MUGQHPJ50046LV8: close upstream streams for watchdog-released
@@ -7031,14 +7122,27 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                     if srv.local_active_queries > active_count:
                         prev = srv.local_active_queries
                         srv.local_active_queries = active_count
+                        # LP-0MVYWLHNI000AQ7X AC1: name the requests this
+                        # recovery could not account for, so a recurrence is
+                        # diagnosable from this line alone. Read-only and
+                        # lock-free: the clamp's own snapshot plus the bounded
+                        # release history (AC2). AC4: only the payload grows —
+                        # ``prev``/``active_count`` are untouched.
+                        identity = _local_dispatch_recovery_identifying_fields(srv)
                         try:
                             srv.logger.warning(
                                 "local_active_queries counter recovered: "
                                 "reset from %d to %d (%d active dispatch "
-                                "records)",
+                                "records) session=%s turn=%s record=%s "
+                                "release_reason=%s release_age_s=%s",
                                 prev,
                                 active_count,
                                 active_count,
+                                identity["session"],
+                                identity["turn"],
+                                identity["record"],
+                                identity["release_reason"],
+                                identity["release_age_s"],
                             )
                         except Exception:
                             pass
@@ -7092,6 +7196,232 @@ def _count_active_local_dispatch_records(srv) -> int | None:
         )
     except Exception:
         return None
+
+
+# -------------------------------------------------------------------
+# Recovery-WARNING identifying fields (LP-0MVYWLHNI000AQ7X AC1/AC2)
+# -------------------------------------------------------------------
+#
+# The self-healing clamp is the detector for the ``local_active_queries``
+# leak, but its WARNING named only the counts, so 12 % of the recoveries in
+# the parent's evidence could not be attributed to a request without a new
+# investigation. The clamp runs on a 10 s background tick, *outside* any
+# request context, so the leaking request cannot be read from the context
+# there. It is captured where it is already known instead:
+#
+# * at admission, on the dispatch record itself (``session`` / ``turn``), so
+#   the clamp names the dispatch it is keeping, and
+# * at release, next to the existing ``lease_released ... reason=...`` line, in
+#   a small bounded in-memory history, so the clamp names the most recent
+#   release that explains the extra increment.
+#
+# Nothing here takes a lock and nothing is awaited: release paths must stay
+# synchronous (``_release_client_disconnect_dispatch`` is cancellation-proof
+# by design) and the clamp only *reads* the snapshot it already tolerates
+# being slightly stale (AC2, AC4).
+
+#: Placeholder for an identifying field that could not be determined.
+UNKNOWN_LOCAL_DISPATCH_IDENTIFIER = "unknown"
+
+#: How many recent releases the clamp can attribute a leak to.
+LOCAL_DISPATCH_RELEASE_HISTORY_LIMIT = 4
+
+#: How long a release stays attributable. The clamp ticks every 10 s and a
+#: leaked increment is repaired on the first tick that sees it; an older
+#: release is someone else's normal churn and naming it would mislead.
+LOCAL_DISPATCH_RELEASE_MAX_AGE_SECONDS = 300.0
+
+#: Server attribute holding the bounded release history (set lazily).
+LOCAL_DISPATCH_RELEASE_HISTORY_ATTR = "local_dispatch_release_history"
+
+
+def _local_dispatch_identifier(value) -> str:
+    """Render one identifying field, degrading to ``unknown``.
+
+    A missing, empty or non-string-safe value must never break the WARNING
+    that is the detector, so an unrepresentable value is reported as
+    ``unknown`` rather than raised or silently dropped (AC1).
+    """
+    if value is None:
+        return UNKNOWN_LOCAL_DISPATCH_IDENTIFIER
+    try:
+        rendered = str(value).strip()
+    except Exception:
+        return UNKNOWN_LOCAL_DISPATCH_IDENTIFIER
+    return rendered or UNKNOWN_LOCAL_DISPATCH_IDENTIFIER
+
+
+def _local_dispatch_record_identity(
+    record_key=None,
+    *,
+    record=None,
+    session=None,
+    endpoint=None,
+) -> str:
+    """Return the dispatch-record id (``<endpoint>|<session>``) or ``unknown``."""
+    if record_key is not None:
+        return _dispatch_key_label(record_key)
+    if isinstance(record, dict):
+        session = session or record.get("session")
+        endpoint = endpoint if endpoint is not None else record.get("endpoint")
+    if not session:
+        return UNKNOWN_LOCAL_DISPATCH_IDENTIFIER
+    if endpoint:
+        return f"{endpoint}|{session}"
+    return _local_dispatch_identifier(session)
+
+
+def _note_local_dispatch_release(
+    srv,
+    session=None,
+    *,
+    reason=None,
+    record=None,
+    record_key=None,
+    endpoint=None,
+    turn=None,
+) -> None:
+    """Remember one released dispatch for the clamp WARNING (AC1).
+
+    Called next to the existing ``lease_released session=... reason=...`` log
+    lines, so the fields are exactly the state a release already has and the
+    release paths stay synchronous (no lock, no ``await``). Bounded and
+    fail-soft: an unknown field becomes ``unknown`` and a broken server object
+    can never turn a release into a failure.
+    """
+    try:
+        record = record if isinstance(record, dict) else {}
+        entry = {
+            "session": _local_dispatch_identifier(
+                session or record.get("session")
+            ),
+            "turn": _local_dispatch_identifier(turn or record.get("turn")),
+            "record": _local_dispatch_record_identity(
+                record_key,
+                record=record,
+                session=session,
+                endpoint=endpoint,
+            ),
+            "reason": _local_dispatch_identifier(reason),
+            "released_at": time.monotonic(),
+        }
+        history = getattr(srv, LOCAL_DISPATCH_RELEASE_HISTORY_ATTR, None)
+        if not isinstance(history, list):
+            history = []
+            setattr(srv, LOCAL_DISPATCH_RELEASE_HISTORY_ATTR, history)
+        history.append(entry)
+        del history[: -LOCAL_DISPATCH_RELEASE_HISTORY_LIMIT]
+    except Exception:
+        pass
+
+
+def _unique_identifiers(values) -> str:
+    """Join distinct identifiers with ``,`` (order preserved, never empty)."""
+    seen: list[str] = []
+    for value in values:
+        rendered = _local_dispatch_identifier(value)
+        if rendered == UNKNOWN_LOCAL_DISPATCH_IDENTIFIER:
+            continue
+        if rendered not in seen:
+            seen.append(rendered)
+    return ",".join(seen) if seen else UNKNOWN_LOCAL_DISPATCH_IDENTIFIER
+
+
+def _local_dispatch_recovery_identifying_fields(srv) -> dict:
+    """Identifying fields for the ``counter recovered`` WARNING (AC1).
+
+    Read-only, lock-free and bounded: the clamp already holds
+    ``local_active_queries_lock`` and tolerates a stale record view, so this
+    reads the same snapshot the clamp counts plus the bounded release history.
+
+    * Active dispatch records are named first — they are the live work the
+      clamp keeps (one entry per record, capped at
+      :data:`LOCAL_DISPATCH_RELEASE_HISTORY_LIMIT`).
+    * The release reason comes from the most recent release inside
+      :data:`LOCAL_DISPATCH_RELEASE_MAX_AGE_SECONDS`; when no record is active,
+      that release also supplies ``session``/``turn``/``record`` (the leaking
+      request has just been released, so it is the only identity available).
+
+    Every field degrades to ``unknown`` so the WARNING always fires (AC1).
+    """
+    fields = {
+        "session": UNKNOWN_LOCAL_DISPATCH_IDENTIFIER,
+        "turn": UNKNOWN_LOCAL_DISPATCH_IDENTIFIER,
+        "record": UNKNOWN_LOCAL_DISPATCH_IDENTIFIER,
+        "release_reason": UNKNOWN_LOCAL_DISPATCH_IDENTIFIER,
+        "release_age_s": UNKNOWN_LOCAL_DISPATCH_IDENTIFIER,
+    }
+    active_entries: list[dict] = []
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if isinstance(records, dict):
+            for key, record in records.items():
+                if not isinstance(record, dict) or not record.get("active"):
+                    continue
+                active_entries.append(
+                    {
+                        "session": record.get("session")
+                        or _dispatch_key_session_id(key),
+                        "turn": record.get("turn"),
+                        "record": _local_dispatch_record_identity(key),
+                    }
+                )
+                if len(active_entries) >= LOCAL_DISPATCH_RELEASE_HISTORY_LIMIT:
+                    break
+    except Exception:
+        active_entries = []
+
+    latest_release = None
+    release_age = None
+    try:
+        history = getattr(srv, LOCAL_DISPATCH_RELEASE_HISTORY_ATTR, None)
+        now = time.monotonic()
+        if isinstance(history, list):
+            for candidate in reversed(history):
+                if not isinstance(candidate, dict):
+                    continue
+                try:
+                    age = now - float(candidate.get("released_at"))
+                except (TypeError, ValueError):
+                    continue
+                if age > LOCAL_DISPATCH_RELEASE_MAX_AGE_SECONDS:
+                    # Older releases are unrelated churn: the leak this tick
+                    # repairs was released inside the window or not at all.
+                    continue
+                latest_release = candidate
+                release_age = max(0.0, age)
+                break
+    except Exception:
+        latest_release = None
+        release_age = None
+
+    if active_entries:
+        fields["session"] = _unique_identifiers(
+            entry["session"] for entry in active_entries
+        )
+        fields["turn"] = _unique_identifiers(
+            entry["turn"] for entry in active_entries
+        )
+        fields["record"] = _unique_identifiers(
+            entry["record"] for entry in active_entries
+        )
+    if latest_release is not None:
+        fields["release_reason"] = _local_dispatch_identifier(
+            latest_release.get("reason")
+        )
+        if release_age is not None:
+            fields["release_age_s"] = f"{release_age:.1f}"
+        if not active_entries:
+            fields["session"] = _local_dispatch_identifier(
+                latest_release.get("session")
+            )
+            fields["turn"] = _local_dispatch_identifier(
+                latest_release.get("turn")
+            )
+            fields["record"] = _local_dispatch_identifier(
+                latest_release.get("record")
+            )
+    return fields
 
 
 # ===================================================================

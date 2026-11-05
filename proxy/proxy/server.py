@@ -202,6 +202,7 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
             _dispatch_lease_key,
             _emit_eviction_after_acceptance,
             _endpoint_from_record,
+            _note_local_dispatch_release,
             _record_abandoned_identity,
             _release_local_dispatch,
             _resolve_abandoned_slot_identity,
@@ -302,6 +303,16 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
             "lease_released session=%s reason=session_evicted",
             session_id if session_id else "unknown",
         )
+        # LP-0MVYWLHNI000AQ7X AC1: release attribution for the self-healing
+        # clamp (the evicted session's request never runs its own cleanup).
+        for record_endpoint, record in released_records:
+            _note_local_dispatch_release(
+                _srv,
+                session_id,
+                reason="session_evicted",
+                record=record,
+                endpoint=record_endpoint,
+            )
         # Report each accepted-but-unserved dispatch exactly once (AC3); a
         # session with no dispatch record was never accepted, so it is normal
         # churn — no ERROR, no counter increment (AC2).
