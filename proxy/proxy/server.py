@@ -196,10 +196,16 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
     try:
         import proxy.server as _srv
         from proxy.router_helpers import (
+            _claim_local_dispatch_credit,
+            _close_stream_cm,
             _dispatch_key_session_id,
+            _dispatch_lease_key,
             _emit_eviction_after_acceptance,
             _endpoint_from_record,
+            _record_abandoned_identity,
             _release_local_dispatch,
+            _resolve_abandoned_slot_identity,
+            _spawn_detached_release,
         )
 
         # LP-0MVN4LCED00661MX AC1 (``slot_assignment_freed``): capture the
@@ -232,12 +238,6 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # AC1 (LP-0MVRMI5HK00558TB): capture the slot identities the evicted
         # session owns BEFORE the release frees the assignments (the release
         # below pops the records, the markers and the slot registry entries).
-        from proxy.router_helpers import (
-            _close_stream_cm,
-            _record_abandoned_identity,
-            _resolve_abandoned_slot_identity,
-            _spawn_detached_release,
-        )
 
         abandoned_slots = []
         for record_endpoint, _record in released_records:
@@ -266,6 +266,21 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # Release every record owned by the session: the legacy string key
         # first, then each per-endpoint record (AC1). ``_release_local_dispatch``
         # also frees the corresponding slot assignments and prefill markers.
+        #
+        # LP-0MVWF78QK0060TZH AC1/AC2 (row 13 of the AC2 audit): releasing an
+        # evicted session's records used to drop the record and keep its
+        # ``local_active_queries`` increment — the session is gone, so no
+        # owning request cleanup exists to release it and the counter stayed
+        # inflated until the self-healing clamp repaired it. The credit is now
+        # claimed together with its record in one critical section, so a racing
+        # completion cleanup for the same lease cannot decrement it twice.
+        for record_endpoint, record in released_records:
+            record_key = _dispatch_lease_key(record_endpoint, session_id)
+            # One credit per outstanding dispatch on the record: the session is
+            # gone, so every one of them is released here (a single shared
+            # record can hold several after overlapping turns).
+            while await _claim_local_dispatch_credit(_srv, record_key):
+                pass
         await _release_local_dispatch(_srv, session_id)
         for record_endpoint in {ep for ep, _ in released_records if ep}:
             await _release_local_dispatch(_srv, session_id, endpoint=record_endpoint)

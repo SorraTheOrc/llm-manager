@@ -3159,96 +3159,237 @@ async def _await_first_byte_with_prefill_monitor(
         raise
 
 
+def _dispatch_credit_tokens(record) -> list | None:
+    """Return the outstanding credit tokens of a dispatch record (or ``None``).
+
+    Parent LP-0MVWF78QK0060TZH **AC1/AC2** (implementation child
+    LP-0MVYWLBV70018ZZB) combines with the per-dispatch identity of
+    LP-0MVYZEYZY003IQAH: a dispatch record is keyed ``(endpoint, session)``, so
+    a session's overlapping dispatches (a single-flight duplicate, a queued
+    sibling, a back-to-back next turn) all share one record. Each dispatch takes
+    one ``local_active_queries`` credit and one token, and the record keeps the
+    outstanding ones in ``dispatch_credits`` (oldest first) so that *every*
+    credit can be released exactly once even though there is only one record.
+
+    ``None`` means the record predates the credit list (a legacy record, or a
+    hand-built record in a test): callers fall back to the pre-change
+    one-credit-per-record behaviour.
+    """
+    if not isinstance(record, dict):
+        return None
+    credits = record.get("dispatch_credits")
+    if not isinstance(credits, list):
+        return None
+    return list(credits)
+
+
+def _outstanding_dispatch_credits(srv) -> int:
+    """Count the counter credits currently held by dispatch records.
+
+    A record without a credit list (legacy/hand-built) counts as one credit
+    while it is ``active``, so the count is identical to
+    ``_count_active_local_dispatch_records`` for every shape that predates
+    multi-dispatch records.
+    """
+    records = getattr(srv, "local_dispatch_records", None)
+    if not isinstance(records, dict):
+        return 0
+    total = 0
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        credits = _dispatch_credit_tokens(record)
+        if credits is None:
+            if record.get("active"):
+                total += 1
+        else:
+            total += len(credits)
+    return total
+
+
+async def _claim_local_dispatch_credit(
+    srv,
+    record_key,
+    *,
+    dispatch_token: int | None = None,
+    pop_record: bool = False,
+) -> dict | None:
+    """Atomically release one counter credit held by a dispatch record.
+
+    Parent LP-0MVWF78QK0060TZH **AC1/AC2** (implementation child
+    LP-0MVYWLBV70018ZZB). The counter and the record set are mutated inside a
+    *single* critical section — ``local_active_queries_lock`` first, then
+    ``local_dispatch_records_lock`` (the order
+    :func:`_try_acquire_local_dispatch` uses, so the two can never interleave).
+    That pairing is what makes a release exactly-once when two mechanisms race
+    for one request: the disconnect release plus ``router._cleanup_after_request``,
+    a completed-record sweep plus the completion cleanup, a session eviction
+    plus the in-flight request's cleanup. Whichever runs first claims the
+    credit; the other finds it gone. The counter therefore never drops below
+    the number of credits actually outstanding (AC2).
+
+    One credit is released when either
+
+    * the record still holds an outstanding credit — *dispatch_token* selects
+      its own credit (LP-0MVYZEYZY003IQAH), an untracked caller (``None``) or a
+      token this record no longer holds releases the oldest outstanding one.
+      When credits remain the record stays ``active`` with its attribution
+      moved to the oldest live dispatch, so a stale teardown can never clear a
+      newer dispatch's live-work attribution; only the last credit transitions
+      the record (``pop_record`` deletes it, otherwise it is marked inactive
+      with the tenant lease window), or
+    * the record is gone but ``local_active_queries`` still exceeds the credits
+      outstanding across all records. That is the shape the release cores
+      (:func:`_release_unserved_dispatch`,
+      :func:`_release_client_disconnect_dispatch`) deliberately leave behind:
+      they pop the record and leave the decrement to the owning request's single
+      end-of-request cleanup.
+
+    With neither, the call is a no-op — never a second decrement for a credit
+    another path already released.
+
+    Returns the record when this call released a credit, otherwise ``None``.
+    Legacy state without a dispatch-record registry falls back to the pre-fix
+    unconditional decrement (there is no record to pair it with).
+    """
+    try:
+        async with srv.local_active_queries_lock:
+            records = getattr(srv, "local_dispatch_records", None)
+            records_lock = getattr(srv, "local_dispatch_records_lock", None)
+            if records is None or records_lock is None or record_key is None:
+                srv.local_active_queries = max(0, srv.local_active_queries - 1)
+                return {}
+            async with records_lock:
+                record = records.get(record_key)
+                credits = _dispatch_credit_tokens(record)
+                if isinstance(record, dict) and credits:
+                    if dispatch_token is not None and dispatch_token in credits:
+                        credits.remove(dispatch_token)
+                    else:
+                        credits.pop(0)
+                    srv.local_active_queries = max(0, srv.local_active_queries - 1)
+                    record["dispatch_credits"] = credits
+                    if credits:
+                        # Another dispatch of the session is still in flight:
+                        # keep the record active and hand the attribution to the
+                        # oldest live dispatch (LP-0MVYZEYZY003IQAH).
+                        record["dispatch_token"] = credits[0]
+                        return record
+                    record["active"] = False
+                    record["dispatch_token"] = None
+                    if pop_record:
+                        records.pop(record_key, None)
+                    else:
+                        record["expires_at"] = (
+                            time.monotonic() + _get_lease_timeout_seconds(srv)
+                        )
+                    return record
+                if (
+                    isinstance(record, dict)
+                    and record.get("active")
+                    and credits is None
+                ):
+                    # Legacy record with no credit list: one credit per record.
+                    srv.local_active_queries = max(0, srv.local_active_queries - 1)
+                    record["active"] = False
+                    if pop_record:
+                        records.pop(record_key, None)
+                    else:
+                        record["expires_at"] = (
+                            time.monotonic() + _get_lease_timeout_seconds(srv)
+                        )
+                    return record
+                if int(getattr(srv, "local_active_queries", 0)) > (
+                    _outstanding_dispatch_credits(srv)
+                ):
+                    srv.local_active_queries = max(0, srv.local_active_queries - 1)
+                    return {}
+                return None
+    except Exception as exc:
+        # Established log wording (pinned by
+        # ``proxy/tests/test_local_dispatch_gate.py``): the record could not be
+        # transitioned, so its credit was not released either — both belong to
+        # the same critical section, which is the point.
+        record_session = (
+            _dispatch_key_session_id(record_key)
+            if record_key is not None
+            else None
+        )
+        try:
+            srv.logger.warning(
+                "Failed to mark dispatch record inactive for session=%s: %s: %s",
+                record_session if record_session else "unknown",
+                type(exc).__name__,
+                exc,
+            )
+        except Exception:
+            pass
+        return None
+
+
 async def _decrement_local_active_queries(
     srv,
     session_key: str | None = None,
     backend: str | None = None,
     dispatch_token: int | None = None,
-) -> None:
-    """Safely decrement the local-only active queries counter.
+) -> bool:
+    """Release exactly one ``local_active_queries`` credit.
 
-    When *session_key* is provided, the corresponding dispatch record
-    (if any) is marked as inactive with a future *expires_at* timestamp,
-    keeping the lease alive for the owner session until the timeout.
+    When *session_key* is provided, the corresponding dispatch record's credit
+    is consumed: the record (if any) is marked as inactive with a future
+    *expires_at* timestamp, keeping the lease alive for the owner session until
+    the timeout.
 
     The *backend* parameter specifies the endpoint URL of the llama-server
     instance; it is used to build a per-endpoint dispatch-lease key so the
     correct server's record is updated (LP-0MRPILSMW004T4H8).
 
-    *dispatch_token* scopes the teardown to the dispatch that owns it
+    *dispatch_token* scopes the release to the credit this dispatch took
     (LP-0MVYZEYZY003IQAH): when the shared per-session record has already been
     re-acquired by a newer turn of the same session, the late teardown of the
-    previous turn must not clear the newer dispatch's live-work attribution.
-    ``None`` (an untracked caller) keeps the pre-change unconditional behaviour.
+    previous turn releases *its own* credit without clearing the newer
+    dispatch's live-work attribution. ``None`` (an untracked caller) keeps the
+    pre-change unconditional behaviour.
+
+    Exactly-once is enforced by :func:`_claim_local_dispatch_credit`: a call
+    that cannot claim a credit is a no-op returning ``False``. Returns ``True``
+    when this call released a credit.
     """
-    try:
-        async with srv.local_active_queries_lock:
-            srv.local_active_queries = max(0, srv.local_active_queries - 1)
-    except Exception as exc:
-        session_hint = f" session={session_key}" if session_key else ""
+    record_key = (
+        _dispatch_lease_key(backend, session_key)
+        if session_key is not None
+        else None
+    )
+    released_record = await _claim_local_dispatch_credit(
+        srv, record_key, dispatch_token=dispatch_token
+    )
+    if released_record:
+        record_session = _dispatch_key_session_id(record_key) or "unknown"
+        if (
+            dispatch_token is not None
+            and released_record.get("dispatch_token") not in (None, dispatch_token)
+        ):
+            # The record now belongs to a newer dispatch of the same session:
+            # this turn's attribution teardown was skipped, its credit was not.
+            try:
+                srv.logger.debug(
+                    "lease_teardown_skipped session=%s "
+                    "reason=newer_dispatch_active",
+                    record_session,
+                )
+            except Exception:
+                pass
         try:
-            srv.logger.warning(
-                "Failed to decrement local_active_queries: %s: %s%s",
-                type(exc).__name__,
-                exc,
-                session_hint,
+            srv.logger.info(
+                "lease_renewed session=%s timeout=%.0fs",
+                record_session,
+                _get_lease_timeout_seconds(srv),
             )
-        except Exception:
-            pass
-
-    if session_key is not None:
-        try:
-            lock = getattr(srv, "local_dispatch_records_lock", None)
-            if lock is not None:
-                lease_timeout = _get_lease_timeout_seconds(srv)
-                record_key = _dispatch_lease_key(backend, session_key)
-                async with lock:
-                    record_key = _dispatch_lease_key(backend, session_key)
-
-                    if record_key in srv.local_dispatch_records:
-                        record = srv.local_dispatch_records[record_key]
-                        if not _record_owned_by_token(record, dispatch_token):
-                            # A newer dispatch of the same session already owns
-                            # this shared record; this turn's late teardown must
-                            # not clear its live-work attribution.
-                            try:
-                                srv.logger.debug(
-                                    "lease_teardown_skipped session=%s "
-                                    "reason=newer_dispatch_active",
-                                    _dispatch_key_session_id(record_key)
-                                    if _dispatch_key_session_id(record_key)
-                                    else "unknown",
-                                )
-                            except Exception:
-                                pass
-                        else:
-                            record["active"] = False
-                            record["expires_at"] = (
-                                time.monotonic() + lease_timeout
-                            )
-                            try:
-                                srv.logger.info(
-                                    "lease_renewed session=%s timeout=%.0fs",
-                                    _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
-
-                                    lease_timeout,
-                                )
-                            except Exception as exc:
-                                try:
-                                    srv.logger.warning(
-                                        "Failed to log lease_renewed for session=%s: %s: %s",
-                                        _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
-
-                                        type(exc).__name__,
-                                        exc,
-                                    )
-                                except Exception:
-                                    pass
         except Exception as exc:
             try:
                 srv.logger.warning(
-                    "Failed to mark dispatch record inactive for session=%s: %s: %s",
-                    session_key if session_key else "unknown",
+                    "Failed to log lease_renewed for session=%s: %s: %s",
+                    record_session,
                     type(exc).__name__,
                     exc,
                 )
@@ -3264,6 +3405,8 @@ async def _decrement_local_active_queries(
         await wake(1)
     except Exception:
         pass
+
+    return released_record is not None
 
 
 async def _increment_local_active_queries(
@@ -3305,6 +3448,7 @@ async def _increment_local_active_queries(
                 record_key = _dispatch_lease_key(backend, session_key)
                 async with lock:
                     record_key = _dispatch_lease_key(backend, session_key)
+                    dispatch_token = _new_dispatch_token()
 
                     srv.local_dispatch_records[record_key] = {
                         "backend": backend,
@@ -3316,7 +3460,12 @@ async def _increment_local_active_queries(
                         # LP-0MVYZEYZY003IQAH: per-dispatch identity so a
                         # late teardown/release can be scoped to its own
                         # dispatch instead of the shared session record.
-                        "dispatch_token": _new_dispatch_token(),
+                        "dispatch_token": dispatch_token,
+                        # LP-0MVWF78QK0060TZH AC1/AC2: the outstanding counter
+                        # credits this record holds (this anonymous dispatch is
+                        # one), so an overwritten record's leftover credit is
+                        # still releasable by the counter-vs-outstanding rule.
+                        "dispatch_credits": [dispatch_token],
                         # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                         # A record that never makes progress is bounded by
                         # ``local_dispatch_no_progress_timeout_seconds`` from
@@ -4205,6 +4354,10 @@ async def _try_acquire_local_dispatch(
     """
     # Guard: skip if dispatch tracking is not initialised
     if not hasattr(srv, "local_dispatch_records") or not hasattr(srv, "local_dispatch_records_lock"):
+        # Legacy state has no record to pair a credit with: the anonymous
+        # increment path keeps its unconditional accounting and this request
+        # must not decrement a credit it never took (it carries no dispatch
+        # token, which is what the release paths key on).
         return (True, None, 0, 1.0)
 
     _gate_refused, _gate_reason, _gate_remaining = _local_dispatch_gate(
@@ -4353,34 +4506,77 @@ async def _try_acquire_local_dispatch(
                         return (False, active_owner, _generating_count, max(1.0, lease_timeout))
 
 
-                srv.local_active_queries += 1
-
-                dispatch_token = _new_dispatch_token()
-                srv.local_dispatch_records[record_key] = {
-                    "backend": backend,
-                    "started_at": now,
-                    "active": True,
-                    "expires_at": now + lease_timeout,
-                    "model_name": model_name,
-                    "endpoint": backend,
-                    # LP-0MVYZEYZY003IQAH: per-dispatch identity so a late
-                    # teardown/release can be scoped to its own dispatch
-                    # instead of the shared session record.
-                    "dispatch_token": dispatch_token,
-                    # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
-                    "last_progress": 0,
-                    "last_progress_ts": now,
-                    # LP-0MVN4LCED00661MX AC2: admitted-dispatch evidence.
-                    # LP-0MVODJ3P6000AIUM AC1/AC4: verbatim admission-time
-                    # snapshot when one was threaded; explicit ``None`` markers
-                    # (never a recompute) otherwise.
-                    **_dispatch_evidence(
-                        body_json,
-                        model_name,
-                        session_key,
-                        admission_evidence=admission_evidence,
-                    ),
-                }
+                # Exactly-once credit (LP-0MVWF78QK0060TZH AC1/AC2, merged with
+                # the per-dispatch identity of LP-0MVYZEYZY003IQAH): one credit
+                # and one token per *dispatch*. A re-acquisition by the very
+                # same dispatch — ``_try_acquire_local_dispatch`` called again
+                # inside one request (a provider retry loop) — must not take a
+                # second credit: that dispatch has a single end-of-request
+                # cleanup, so the extra increment could never be released (AC2
+                # audit row 20). Any other acquisition (a new turn, a queued
+                # sibling, a single-flight duplicate) is a distinct in-flight
+                # request: it takes its own credit and its own token, and the
+                # record keeps both in ``dispatch_credits`` so each can be
+                # released exactly once. A record that is already active is
+                # *preserved* (``started_at``, ``stream_cm`` pin, evidence,
+                # progress baseline) instead of overwritten, so an overlapping
+                # dispatch can never erase the live one's identity.
+                _prior_token = _dispatch_token_from_request(request)
+                _resume_token = (
+                    _prior_token is not None
+                    and isinstance(own_record, dict)
+                    and _prior_token in (_dispatch_credit_tokens(own_record) or ())
+                )
+                if isinstance(own_record, dict) and own_record.get("active"):
+                    _existing_credits = _dispatch_credit_tokens(own_record)
+                    if _resume_token:
+                        dispatch_token = _prior_token
+                        _credit_taken = False
+                        if _existing_credits is None:
+                            own_record["dispatch_credits"] = [dispatch_token]
+                    else:
+                        dispatch_token = _new_dispatch_token()
+                        _credit_taken = True
+                        own_record["dispatch_credits"] = [
+                            *(_existing_credits or []),
+                            dispatch_token,
+                        ]
+                        own_record["dispatch_token"] = dispatch_token
+                    own_record["expires_at"] = now + lease_timeout
+                else:
+                    dispatch_token = _new_dispatch_token()
+                    _credit_taken = True
+                    srv.local_dispatch_records[record_key] = {
+                        "backend": backend,
+                        "started_at": now,
+                        "active": True,
+                        "expires_at": now + lease_timeout,
+                        "model_name": model_name,
+                        "endpoint": backend,
+                        # LP-0MVYZEYZY003IQAH: per-dispatch identity so a late
+                        # teardown/release can be scoped to its own dispatch
+                        # instead of the shared session record.
+                        "dispatch_token": dispatch_token,
+                        # LP-0MVWF78QK0060TZH AC1/AC2: the outstanding counter
+                        # credits this record holds, oldest first, so every
+                        # dispatch's increment can be released exactly once.
+                        "dispatch_credits": [dispatch_token],
+                        # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                        "last_progress": 0,
+                        "last_progress_ts": now,
+                        # LP-0MVN4LCED00661MX AC2: admitted-dispatch evidence.
+                        # LP-0MVODJ3P6000AIUM AC1/AC4: verbatim admission-time
+                        # snapshot when one was threaded; explicit ``None``
+                        # markers (never a recompute) otherwise.
+                        **_dispatch_evidence(
+                            body_json,
+                            model_name,
+                            session_key,
+                            admission_evidence=admission_evidence,
+                        ),
+                    }
+                if _credit_taken:
+                    srv.local_active_queries += 1
                 # LP-0MVYZEYZY003IQAH: stamp the owning request so its
                 # end-of-request teardown/release can be scoped to this
                 # dispatch (a same-session re-dispatch replaces the token).
@@ -5944,12 +6140,19 @@ async def _release_completed_dispatch(
 
     Releases, in order: the record (marked ``terminal`` with a
     ``completed_at`` stamp before deletion, so a record that somehow survives
-    is recognisable by the sweep's guard), the session's
-    ``local_prefill_in_flight`` marker, and the session's slot assignment;
-    then wakes the cross-session contention queue. Emits one distinct
-    ``lease_released session=... reason=request_completed endpoint=...`` line
-    per released record — never ``no_progress_watchdog`` and never
-    ``tenancy_lease_expired``.
+    is recognisable by the sweep's guard), **the record's counter credit**, the
+    session's ``local_prefill_in_flight`` marker, and the session's slot
+    assignment; then wakes the cross-session contention queue. Emits one
+    distinct ``lease_released session=... reason=request_completed
+    endpoint=...`` line per released record — never ``no_progress_watchdog``
+    and never ``tenancy_lease_expired``.
+
+    Parent LP-0MVWF78QK0060TZH **AC1/AC2** (row 19 of the AC2 audit): every
+    released lease carried its own increment, so releasing the record without
+    it left one unit counted for the proxy's lifetime whenever a request leased
+    two local endpoints. The credit is now claimed *with* the pop by
+    :func:`_claim_local_dispatch_credit` — one critical section, so a racing
+    eviction or sweep can only ever release it once.
 
     Idempotent: with no active record left the call is a no-op returning
     ``False`` and logging nothing, so it can never race the endpoint-matched
@@ -5976,6 +6179,11 @@ async def _release_completed_dispatch(
         lock = getattr(srv, "local_dispatch_records_lock", None)
         if lock is None:
             return False
+        # Collect the candidates first (read-only), then claim each credit
+        # together with its release. Claiming takes the counter lock *before*
+        # the records lock — the documented order — so it cannot be nested in
+        # this read pass without inverting that order.
+        candidates: list = []
         async with lock:
             for key in list(records.keys()):
                 if key == served_key:
@@ -5988,10 +6196,26 @@ async def _release_completed_dispatch(
                 record = records.get(key)
                 if not isinstance(record, dict) or not record.get("active"):
                     continue
-                record["terminal"] = True
-                record["completed_at"] = time.monotonic()
-                records.pop(key, None)
-                released.append(record)
+                candidates.append(key)
+        for key in candidates:
+            # LP-0MVWF78QK0060TZH AC1/AC2 (row 19): releasing the *other*
+            # endpoint's lease without its credit left one increment counted
+            # for the rest of the proxy's life. The claim pairs the decrement
+            # with the pop in one critical section, so a racing eviction or
+            # sweep can only ever release it once.
+            record = await _claim_local_dispatch_credit(
+                srv, key, pop_record=True
+            )
+            if not record:
+                continue
+            if record.get("active"):
+                # Another dispatch of this session is still in flight on that
+                # endpoint and now owns the record: its credit was released,
+                # the lease was not, so the slot must not be freed here.
+                continue
+            record["terminal"] = True
+            record["completed_at"] = time.monotonic()
+            released.append(record)
     except Exception:
         return False
 

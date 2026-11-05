@@ -123,7 +123,7 @@ async def _stamp_measured_prefill_record(srv, endpoint, session_id, measured) ->
 import proxy.metrics as metrics  # noqa: E402
 from proxy import cold_start  # noqa: E402
 from proxy import measured_prefill as _measured_prefill  # noqa: E402
-from proxy.disconnect_reaper import client_disconnect_observed  # noqa: E402
+from proxy.disconnect_reaper import client_disconnect_observed  # noqa: E402,F401
 from proxy.lifecycle import (  # noqa: E402
     _compute_adaptive_timeout,
     _is_self_healing_active,
@@ -982,6 +982,56 @@ async def _cleanup_after_request(
                     pass
         except Exception:
             pass
+
+
+async def _release_single_flight_detour(
+    srv,
+    session_id: str | None,
+    *,
+    endpoint: str | None,
+    request: Request,
+    model_name: str | None,
+    session_explicit: bool,
+) -> None:
+    """Finish the accounting for a request refused by the single-flight guard.
+
+    Parent LP-0MVWF78QK0060TZH **AC1/AC2**, rows 16/17 (and their buffered twin
+    row 18) of the AC2 audit. The ``local_active_queries`` increment happens at
+    lease acquisition — *before* the single-flight guard runs — so both detour
+    handlers used to assume every refused request owned a credit: the streaming
+    handler suppressed the decrement (``decrement_local=False``) and then
+    deleted the dispatch record, and the buffered handler decremented
+    unconditionally. Both halves were wrong for the shape the guard produces:
+
+    * the lease the refusal leaves behind belongs to the **in-flight** request
+      that the coordinator just detected — it already holds the counter's one
+      credit and the one record for ``(endpoint, session)``;
+    * the refused request's own credit — it did acquire, so it owns exactly one
+      and must release exactly that one (LP-0MVYZEYZY003IQAH scopes the release
+      to its own dispatch token, so the in-flight owner's credit and
+      attribution survive), but;
+    * it must **not** delete the dispatch record: the record (and the rest of
+      its attribution) belongs to the in-flight request the coordinator just
+      detected. Deleting it stranded that owner's own decrement, which is the
+      streaming leak the audit measured as the dominant ``2→1`` recovery shape.
+
+    ``_cleanup_after_request`` owns both halves — it releases this request's
+    credit with its token and (for non-explicit sessions) removes a record it
+    created — so the detour only has to stop deleting the record itself. The
+    caller's ``session_explicit`` is threaded through for exactly that reason:
+    an explicit session keeps its record (marked inactive only once the last
+    credit is released, which is the in-flight owner's own teardown), while an
+    anonymous one still removes a record it owns.
+    """
+    await _cleanup_after_request(
+        srv,
+        session_id,
+        decrement_local=True,
+        session_explicit=session_explicit,
+        model_name=model_name,
+        request=request,
+        backend=endpoint,
+    )
 
 
 # ===================================================================
@@ -2156,27 +2206,38 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # the connection. Pre-fix that cancellation skipped
                         # the whole cleanup (no chunk loop had started), so
                         # the dispatch record and marker outlived the client.
-                        # The reaper recorded its confirmed verdict on the
-                        # ASGI scope before cancelling; release synchronously
-                        # (no ``await`` that a second cancel could skip) and
-                        # schedule the counter cleanup as a detached task,
-                        # then let the cancellation propagate.
-                        if client_disconnect_observed(request):
-                            _release_client_disconnect_dispatch(
-                                srv, session_id, endpoint=endpoint,
+                        # The reaper records its confirmed verdict on the ASGI
+                        # scope before cancelling; release synchronously (no
+                        # ``await`` that a second cancel could skip) and
+                        # schedule the counter cleanup as a detached task, then
+                        # let the cancellation propagate.
+                        #
+                        # LP-0MVWF78QK0060TZH AC1/AC2 (row 4 of the AC2 audit):
+                        # the release used to be conditional on that verdict, so
+                        # any other cancellation (client-stall guard, a
+                        # supervisor/queue cancellation, a cancel that raced the
+                        # reaper's verdict) skipped it and leaked the record
+                        # *and* its ``local_active_queries`` credit. A cancelled
+                        # request has no owner left to release them, so the
+                        # cancellation itself must — unconditionally. The
+                        # exactly-once claim in ``_cleanup_after_request`` keeps
+                        # this safe when a verdict *was* recorded (the reaper's
+                        # own release has already consumed the record).
+                        _release_client_disconnect_dispatch(
+                            srv, session_id, endpoint=endpoint,
+                            request=request,
+                        )
+                        _spawn_detached_release(
+                            _cleanup_after_request(
+                                srv, session_id,
+                                disconnected=True,
+                                decrement_local=True,
+                                session_explicit=session_explicit,
+                                model_name=model_name,
                                 request=request,
+                                backend=endpoint,
                             )
-                            _spawn_detached_release(
-                                _cleanup_after_request(
-                                    srv, session_id,
-                                    disconnected=True,
-                                    decrement_local=True,
-                                    session_explicit=session_explicit,
-                                    model_name=model_name,
-                                    request=request,
-                                    backend=endpoint,
-                                )
-                            )
+                        )
                         raise
                     except MeasuredCacheAbortDetourError as _abort_exc:
                         # ── Option D early release (LP-0MVR7IN0O000DPXN) ──
@@ -3545,23 +3606,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             # LP-0MUCEFCV5006UKSZ: identical request already in flight — the
             # original prefill continues. Return a retryable 409 + Retry-After
             # so the client backs off instead of re-prefilling.
-            await _cleanup_after_request(
-                srv, session_id,
-                decrement_local=False,
-                model_name=model_name,
+            await _release_single_flight_detour(
+                srv,
+                session_id,
+                endpoint=endpoint,
                 request=request,
-                backend=endpoint,
+                model_name=model_name,
+                session_explicit=session_explicit,
             )
-            if session_explicit and session_id:
-                try:
-                    lock = getattr(srv, "local_dispatch_records_lock", None)
-                    if lock is not None:
-                        async with lock:
-                            record_key = _dispatch_lease_key(endpoint, session_id)
-                            if record_key in getattr(srv, "local_dispatch_records", {}):
-                                del srv.local_dispatch_records[record_key]
-                except Exception:
-                    pass
             retry_after = int(
                 server_config.get("session_single_flight_duplicate_retry_after_seconds", 10)
                 or 10
@@ -3584,24 +3636,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                 headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
             )
         except SessionSingleFlightRejectedError as exc:
-            await _cleanup_after_request(
-                srv, session_id,
-                decrement_local=False,
-                model_name=model_name,
+            await _release_single_flight_detour(
+                srv,
+                session_id,
+                endpoint=endpoint,
                 request=request,
-                backend=endpoint,
+                model_name=model_name,
+                session_explicit=session_explicit,
             )
-            # Clean up any dispatch record that was created before the rejection
-            if session_explicit and session_id:
-                try:
-                    lock = getattr(srv, "local_dispatch_records_lock", None)
-                    if lock is not None:
-                        async with lock:
-                            record_key = _dispatch_lease_key(endpoint, session_id)
-                            if record_key in getattr(srv, "local_dispatch_records", {}):
-                                del srv.local_dispatch_records[record_key]
-                except Exception:
-                    pass
             payload = {
                 "error": {
                     "type": "session_single_flight",
@@ -3777,22 +3819,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             backend=endpoint,
                         )
         except SessionSingleFlightDuplicateError as exc:
-            await _cleanup_after_request(
-                srv, session_id,
-                decrement_local=True,
+            await _release_single_flight_detour(
+                srv,
+                session_id,
+                endpoint=endpoint,
                 request=request,
-                backend=endpoint,
+                model_name=model_name,
+                session_explicit=session_explicit,
             )
-            if session_explicit and session_id:
-                try:
-                    lock = getattr(srv, "local_dispatch_records_lock", None)
-                    if lock is not None:
-                        async with lock:
-                            record_key = _dispatch_lease_key(endpoint, session_id)
-                            if record_key in getattr(srv, "local_dispatch_records", {}):
-                                del srv.local_dispatch_records[record_key]
-                except Exception:
-                    pass
             retry_after = int(
                 server_config.get("session_single_flight_duplicate_retry_after_seconds", 10)
                 or 10
@@ -3815,23 +3849,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                 headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
             )
         except SessionSingleFlightRejectedError as exc:
-            await _cleanup_after_request(
-                srv, session_id,
-                decrement_local=True,
+            await _release_single_flight_detour(
+                srv,
+                session_id,
+                endpoint=endpoint,
                 request=request,
-                backend=endpoint,
+                model_name=model_name,
+                session_explicit=session_explicit,
             )
-            # Clean up any dispatch record that was created before the rejection
-            if session_explicit and session_id:
-                try:
-                    lock = getattr(srv, "local_dispatch_records_lock", None)
-                    if lock is not None:
-                        async with lock:
-                            record_key = _dispatch_lease_key(endpoint, session_id)
-                            if record_key in getattr(srv, "local_dispatch_records", {}):
-                                del srv.local_dispatch_records[record_key]
-                except Exception:
-                    pass
             payload = {
                 "error": {
                     "type": "session_single_flight",

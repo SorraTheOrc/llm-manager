@@ -43,13 +43,16 @@ Acceptance-criterion map
   self-healing clamp and asserts that the ``local_active_queries counter
   recovered`` WARNING never appears.
 - **AC3 — RED on the current tree.** The duplicate-fan-out scenario below is
-  the audited leak, so the invariant and the clamp assertions fail on ``dev``
-  before the exactly-once fix (child LP-0MVYWLBV70018ZZB) lands. The
-  assertions are marked ``xfail(strict=True)`` — the repository's red-first
-  encoding (see ``test_abandoned_local_dispatch.py``) — so this test-only item
-  can land with a green suite while the assertion stays pinned; the
-  implementation child removes the marker as it turns the assertion green
-  (``strict`` means it cannot be forgotten).
+  the audited leak, so the invariant and the clamp assertions failed on ``dev``
+  before the exactly-once fix. The assertions were marked
+  ``xfail(strict=True)`` — the repository's red-first encoding (see
+  ``test_abandoned_local_dispatch.py``) — so the test-only item could land with
+  a green suite while the assertion stayed pinned. The implementation child
+  (LP-0MVYWLBV70018ZZB) removed the markers as it turned them green: the
+  single-flight duplicate now re-uses the in-flight lease's credit instead of
+  taking a second one, so the counter and the active-record count stay equal at
+  every step and the clamp has nothing to repair. ``strict`` meant a marker
+  could not be forgotten, and the row now runs unmarked.
 - **AC4 — hermetic and deterministic.** No network and no llama-server: the
   upstream is a per-stream fake (paced SSE chunks / a blocking prefill / a
   measured ``prompt_progress`` stream), the connection gates are stubbed, and
@@ -739,22 +742,10 @@ async def test_three_mixed_streams_keep_counter_equal_to_active_records(monkeypa
 
 
 # ---------------------------------------------------------------------------
-# AC1 / AC2 / AC3 — RED: the audited duplicate fan-out leaks one increment
+# AC1 / AC2 / AC3 — the audited duplicate fan-out no longer leaks an increment
 # ---------------------------------------------------------------------------
 
-_RED_FIRST = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED on the current tree: the streaming single-flight duplicate detour "
-        "runs _cleanup_after_request(decrement_local=False) and deletes the "
-        "dispatch record after re-acquiring the lease, so one increment is "
-        "never decremented and the self-healing clamp fires. Green once "
-        f"{IMPLEMENTATION_ITEM} decrements exactly once on every release path."
-    ),
-)
 
-
-@_RED_FIRST
 @pytest.mark.asyncio
 async def test_duplicate_fan_out_keeps_counter_equal_to_active_records(monkeypatch):
     """AC1/AC3: mixed-outcome concurrency *plus* a rejected duplicate stream.
@@ -776,7 +767,6 @@ async def test_duplicate_fan_out_keeps_counter_equal_to_active_records(monkeypat
     assert not observations.clamped
 
 
-@_RED_FIRST
 @pytest.mark.asyncio
 async def test_duplicate_fan_out_never_triggers_the_recovery_clamp(monkeypatch):
     """AC2/AC3: the clamp's WARNING must never appear for a contended workload.

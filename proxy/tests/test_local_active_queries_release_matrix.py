@@ -22,17 +22,18 @@ Rows are named by their AC2-audit table number (comment
 ``LP-C0MW31NHW8004PADI`` on the parent) so a verdict can be traced straight
 back to the audit.
 
-Red-first encoding
-------------------
+Exactly-once encoding
+---------------------
 
-``xfail(strict=True)`` — the repository's red-first convention (see
-``test_abandoned_local_dispatch.py`` and
-``test_local_active_queries_invariant.py``) — marks the rows the audit
-verdicts **missing**/leaking. This keeps the test-only item landable with a
-green suite while the assertion stays pinned, and ``strict`` means the marker
-cannot be forgotten: the implementation item removes it as it turns the row
-green. Rows the audit verdicts *exactly once* (or *no decrement by design*)
-run unmarked and must pass both before and after the fix.
+The rows the audit verdicts **missing**/leaking were pinned red with
+``xfail(strict=True)`` (the repository's red-first convention, see
+``test_abandoned_local_dispatch.py``) so this test-only item could land with a
+green suite while the assertions stayed executable. Implementation child
+LP-0MVYWLBV70018ZZB removed the markers as it fixed each path; ``strict``
+guaranteed a marker could not be forgotten, and every row now runs unmarked.
+Rows the audit verdicts *exactly once* (or *no decrement by design*) passed
+both before and after the fix, so the matrix still catches a regression that
+trades one leak for a double decrement.
 
 Acceptance-criterion map
 ------------------------
@@ -52,11 +53,15 @@ Acceptance-criterion map
   ``row-6-measured-cache-deficit-abort`` and
   ``row-8-eviction-after-acceptance`` (38 % / 36 % of the ante-nascent
   population) each assert the counter is not left elevated.
-- **AC3 — RED on the current tree for the leaking rows.**
+- **AC3 — RED on the pre-fix tree for the leaking rows.**
   ``row-4``, ``row-13``, ``row-16``, ``row-17``, ``row-19`` and ``row-20``
-  carry the ``xfail(strict=True)`` marker; the non-leaking rows pass, which is
-  what makes the matrix a check on the AC2 table's verdicts rather than a
-  restatement of them.
+  carried the ``xfail(strict=True)`` marker and failed on ``dev`` before
+  LP-0MVYWLBV70018ZZB; the non-leaking rows passed, which is what makes the
+  matrix a check on the AC2 table's verdicts rather than a restatement of them.
+  All six now pass and are unmarked, and
+  ``test_double_release_of_one_lease_keeps_the_counter_at_zero`` /
+  ``test_eviction_does_not_release_another_sessions_credit`` pin the AC2
+  idempotence property that makes that possible.
 - **AC4 — hermetic.** No network, no llama-server: the router-level rows reuse
   the in-process fake-upstream harness of
   ``test_local_active_queries_invariant.py`` and the helper-level rows drive
@@ -104,7 +109,7 @@ from test_local_active_queries_invariant import (
 
 from proxy import prefill_eta
 
-#: The implementation child that turns the pinned rows green.
+#: The implementation child that turned the pinned (red) rows green.
 IMPLEMENTATION_ITEM = "LP-0MVYWLBV70018ZZB"
 
 MODEL = "Qwen3"
@@ -118,17 +123,6 @@ ENDPOINT_B = "http://127.0.0.1:8092"
 #: acquires at least one lease, so this is a real observation, not a constant
 #: the row is compared against without evidence.
 PRE_REQUEST_VALUE = 0
-
-_RED_FIRST = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED on the current tree: the AC2 audit verdicts this release path as "
-        "leaking the increment (or as leaving it without a decrement owner). "
-        "Green once "
-        f"{IMPLEMENTATION_ITEM} decrements exactly once on every release path."
-    ),
-)
-
 
 # ---------------------------------------------------------------------------
 # Context and shared observations
@@ -216,6 +210,7 @@ async def _acquire(
     endpoint: str | None = None,
     max_local: int = 4,
     session: str | None = None,
+    request: Any = None,
 ) -> int:
     """Take a real local dispatch lease through the production choke point."""
     acquired, owner, active_count, _retry_after = (
@@ -225,6 +220,7 @@ async def _acquire(
             session if session is not None else ctx.session,
             endpoint if endpoint is not None else ctx.endpoint,
             model_name=MODEL,
+            request=request,
         )
     )
     assert acquired is True, (
@@ -546,7 +542,7 @@ async def _row_slot_assignment_free(ctx: _Ctx) -> None:
 
 
 async def _row_streaming_duplicate(ctx: _Ctx) -> None:
-    """Row 16 — streaming single-flight duplicate (``decrement_local=False``)."""
+    """Row 16 — streaming single-flight duplicate (takes no credit)."""
     first = _PacedUpstream()
     ctx.plans["stream-a"] = first
     original = asyncio.create_task(_drive(_Request(ctx.session, "stream-a")))
@@ -557,9 +553,17 @@ async def _row_streaming_duplicate(ctx: _Ctx) -> None:
         "an identical in-flight prompt must take the duplicate detour (409), "
         f"got {_status(duplicate)}"
     )
-    assert await _read_counter(ctx.srv) == 2, (
-        "the duplicate re-acquired the lease before the single-flight guard "
-        "ran, so the leak is visible as an extra increment"
+    # The duplicate re-used the in-flight request's lease, so it owns no
+    # ``local_active_queries`` credit and must leave that lease — and its one
+    # record — alone. Pre-fix this read 2/1: the duplicate took a second
+    # increment and then deleted the record, stranding the original's
+    # decrement (the audited ``2→1`` recovery shape).
+    assert await _read_counter(ctx.srv) == 1, (
+        "the duplicate took no credit: the in-flight lease keeps the counter's "
+        "one unit"
+    )
+    assert _active_records(ctx.srv) == 1, (
+        "the duplicate must not delete the in-flight request's dispatch record"
     )
 
     first.push(_FINISH_CHUNK)
@@ -587,9 +591,17 @@ async def _row_streaming_rejected(ctx: _Ctx) -> None:
         "a third concurrent stream on one session must be rejected by the "
         f"single-flight queue, got {_status(rejected)}"
     )
-    assert await _read_counter(ctx.srv) == 3, (
-        "all three streams took their increment before the guard ran, so the "
-        "rejection's `decrement_local=False` detour leaks one"
+    # Two admitted dispatches, one shared lease record: the first and second
+    # acquisitions each own one credit, and the rejected third must release its
+    # own credit (pre-fix this read 3 — one per request — and the rejected
+    # request's increment was never released).
+    assert await _read_counter(ctx.srv) == 2, (
+        "the two admitted streams each own a credit; the rejection must "
+        "release its own and nothing else"
+    )
+    assert _active_records(ctx.srv) == 1, (
+        "the rejected stream must not delete the admitted streams' dispatch "
+        "record"
     )
 
     # Let both admitted streams finish so the row settles.
@@ -636,10 +648,17 @@ async def _row_cancelled_without_disconnect_verdict(ctx: _Ctx) -> None:
         await task
     except asyncio.CancelledError:
         pass
-    # The request never recorded a disconnect verdict, so the ``CancelledError``
-    # branch released nothing: the record and the increment are both still here.
-    assert await _read_counter(ctx.srv) == 1, (
-        "harness bug: the cancelled dispatch should still hold its increment"
+    # The request never recorded a disconnect verdict, so pre-fix the
+    # ``CancelledError`` branch released nothing and the record *and* its
+    # increment outlived the cancelled request. The release is now
+    # unconditional: the record goes synchronously and the credit is released
+    # by the detached cleanup ``_assert_restored`` observes.
+    assert not ctx.srv.local_dispatch_records, (
+        "a cancelled dispatch must release its record even with no recorded "
+        "client-disconnect verdict"
+    )
+    assert ctx.session not in ctx.srv.local_prefill_in_flight, (
+        "a cancelled dispatch must drop its prefill marker"
     )
 
 
@@ -661,15 +680,20 @@ async def _row_cross_endpoint_completion_release(ctx: _Ctx) -> None:
 
 
 async def _row_same_session_reacquisition(ctx: _Ctx) -> None:
-    """Row 20 — a second acquisition for an already-counted lease."""
-    await _acquire(ctx, endpoint=ENDPOINT_A)
-    await _acquire(ctx, endpoint=ENDPOINT_A)
-    assert await _read_counter(ctx.srv) == 2, (
-        "a same-session re-acquisition increments again for a lease that is "
-        "already counted"
+    """Row 20 — an in-request re-acquisition takes no second credit."""
+    request = _Request(ctx.session, "row-20-reacquisition")
+    await _acquire(ctx, endpoint=ENDPOINT_A, request=request)
+    await _acquire(ctx, endpoint=ENDPOINT_A, request=request)
+    assert await _read_counter(ctx.srv) == 1, (
+        "a re-acquisition by the *same* dispatch (a provider retry loop) has a "
+        "single end-of-request cleanup, so it must not take a second credit"
     )
     assert len(ctx.srv.local_dispatch_records) == 1, (
-        "the re-acquisition overwrites the single per-session record"
+        "the re-acquisition re-uses the session's single per-endpoint record"
+    )
+    record = _only_record(ctx.srv)
+    assert record["dispatch_credits"] == [request._local_dispatch_token], (
+        "one dispatch, one credit, one token"
     )
     await router._cleanup_after_request(
         ctx.srv,
@@ -677,20 +701,22 @@ async def _row_same_session_reacquisition(ctx: _Ctx) -> None:
         decrement_local=True,
         session_explicit=True,
         model_name=MODEL,
+        request=request,
         backend=ENDPOINT_A,
     )
 
 
 async def _row_session_eviction(ctx: _Ctx) -> None:
-    """Row 13 — session eviction releases the record without its increment."""
+    """Row 13 — session eviction releases the record *and* its credit."""
     await _acquire(ctx)
     await server._release_lease_on_session_eviction(ctx.session)
     assert not ctx.srv.local_dispatch_records, (
         "the eviction callback must release every record the session owns"
     )
-    assert await _read_counter(ctx.srv) == 1, (
-        "the record is gone but the increment stays: the AC2 audit's row 13 "
-        "has no decrement owner"
+    assert await _read_counter(ctx.srv) == PRE_REQUEST_VALUE, (
+        "evicting a session used to strand its local_active_queries increment "
+        "(no owning request cleanup remains): the eviction must release the "
+        "credit along with the record"
     )
 
 
@@ -706,7 +732,6 @@ class _Row:
     id: str
     summary: str
     drive: Callable[[_Ctx], Awaitable[None]]
-    red_first: bool = False
 
 
 MATRIX: tuple[_Row, ...] = (
@@ -774,37 +799,31 @@ MATRIX: tuple[_Row, ...] = (
         "row-4-cancelled-without-disconnect-verdict",
         "reaper cancellation with no client-disconnect verdict",
         _row_cancelled_without_disconnect_verdict,
-        red_first=True,
     ),
     _Row(
         "row-13-session-eviction",
-        "session eviction (record released, increment left behind)",
+        "session eviction (record released, credit released with it)",
         _row_session_eviction,
-        red_first=True,
     ),
     _Row(
         "row-16-streaming-single-flight-duplicate",
-        "streaming single-flight duplicate (decrement_local=False)",
+        "streaming single-flight duplicate (leases the in-flight request's credit)",
         _row_streaming_duplicate,
-        red_first=True,
     ),
     _Row(
         "row-17-streaming-single-flight-rejected",
         "streaming single-flight rejection (queue_full)",
         _row_streaming_rejected,
-        red_first=True,
     ),
     _Row(
         "row-19-cross-endpoint-completion-release",
         "cross-endpoint completion release",
         _row_cross_endpoint_completion_release,
-        red_first=True,
     ),
     _Row(
         "row-20-same-session-reacquisition",
         "same-session re-acquisition of an already-counted lease",
         _row_same_session_reacquisition,
-        red_first=True,
     ),
 )
 
@@ -823,15 +842,8 @@ def _deterministic_prefill_eta():
 
 
 def _params() -> list:
-    """Render the matrix as pytest parameters, keeping each row's verdict."""
-    return [
-        pytest.param(
-            row,
-            id=row.id,
-            marks=(_RED_FIRST,) if row.red_first else (),
-        )
-        for row in MATRIX
-    ]
+    """Render the matrix as pytest parameters."""
+    return [pytest.param(row, id=row.id) for row in MATRIX]
 
 
 @pytest.mark.asyncio
@@ -841,6 +853,79 @@ async def test_release_path_returns_counter_to_pre_request_value(row, monkeypatc
     ctx = await _context(monkeypatch, f"sess-{row.id}")
     await row.drive(ctx)
     await _assert_restored(ctx)
+
+
+# ---------------------------------------------------------------------------
+# AC2 — the release is idempotent when two mechanisms run for one request
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_double_release_of_one_lease_keeps_the_counter_at_zero(monkeypatch):
+    """AC2: a second release mechanism for the same lease releases no credit.
+
+    The shapes AC2 names are a disconnect release plus
+    ``_cleanup_after_request``, a sweep plus the completion cleanup, and an
+    eviction plus an orphaned request's cleanup. Each pairing reduces to "the
+    owning cleanup released the credit first, then a second release ran" — and
+    the counter must stay at the pre-request value instead of going below the
+    active-record count.
+    """
+    ctx = await _context(monkeypatch, "sess-row-2-double-release")
+    await _acquire(ctx)
+    await router._cleanup_after_request(
+        ctx.srv,
+        ctx.session,
+        decrement_local=True,
+        session_explicit=True,
+        model_name=MODEL,
+        backend=ctx.endpoint,
+    )
+    assert await _read_counter(ctx.srv) == PRE_REQUEST_VALUE
+
+    # Every second-release shape: the helper directly, a repeat cleanup, and the
+    # completed-dispatch release. None may take the counter below zero.
+    assert (
+        await helpers._decrement_local_active_queries(
+            ctx.srv, session_key=ctx.session, backend=ctx.endpoint
+        )
+        is False
+    ), "the credit was already released: the helper must be a no-op"
+    await router._cleanup_after_request(
+        ctx.srv,
+        ctx.session,
+        decrement_local=True,
+        session_explicit=True,
+        model_name=MODEL,
+        backend=ctx.endpoint,
+    )
+    assert await helpers._release_completed_dispatch(
+        ctx.srv, ctx.session, served_endpoint=ctx.endpoint
+    ) is False, "a released lease must not be released twice"
+    await _assert_restored(ctx)
+
+
+@pytest.mark.asyncio
+async def test_eviction_does_not_release_another_sessions_credit(monkeypatch):
+    """AC2: an eviction releases only the evicted session's credit.
+
+    The guarded decrement compares the counter with the active-record count, so
+    it must never consume another live session's credit to balance its own —
+    that is the "counter below the active-record count" failure AC2 forbids.
+    """
+    ctx = await _context(monkeypatch, "sess-row-13-evicted")
+    await _acquire(ctx)
+    await _acquire(ctx, session="sess-row-13-live")
+    assert await _read_counter(ctx.srv) == 2
+    assert _active_records(ctx.srv) == 2
+
+    await server._release_lease_on_session_eviction(ctx.session)
+
+    assert await _read_counter(ctx.srv) == 1, (
+        "the eviction must release the evicted session's credit and leave the "
+        "live session's credit counted"
+    )
+    assert _active_records(ctx.srv) == 1
 
 
 @pytest.mark.asyncio
