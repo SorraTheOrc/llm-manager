@@ -457,6 +457,34 @@ on a stale wait estimate. `prefill_budget_seconds` is a configuration constant
   the active-record count instead of only resetting when no records are
   active, so a leak that coexists with real work cannot persist (AC2).
 
+### Per-dispatch attribution (LP-0MVYZEYZY003IQAH)
+
+`local_in_flight_requests`, `local_owner_session_id` and `local_active_query`
+reflect the in-flight dispatch from **admission through first byte** — the whole
+prefill — not only generation. A dispatch is live work while its record is
+`active`; a `lease_renewed` retained lease (`active: false` with a future
+`expires_at`) reserves the slot for the owning session (post-stream cooldown)
+but is **not** live work and never counts toward these fields. The attribution
+is sampled **after** the `/slots` query in the same poll, so fresh busy slot
+detail can never be paired with an attribution snapshot taken before a
+dispatch admitted during a multi-second poll (LP-0MVZ3V8UR003KCSZ).
+
+A dispatch record is keyed `(endpoint, session_id)`, so back-to-back turns of
+the same session share a key. Each acquisition stamps a per-dispatch token and a
+teardown/release carrying a different token is a no-op, so a late turn-N
+teardown cannot clear turn-N+1's live-work attribution
+(LP-0MVZ3V8J1006YGFN). This closed the 2026-11-01/02 residual class in which a
+prefilling slot read `saturated` with empty live-work fields. The cache-served
+`available_slots` paired with a fresh `saturated` hint is a **separate** family
+tracked by LP-0MVXSX0TZ00798KA and is not fixed here.
+
+`saturated_without_live_work_attribution.csv` carries the live-work evidence
+columns `local_in_flight_requests`, `local_active_query`,
+`local_owner_session_id`, `slots_stale` and `slot_counts_stale` after its
+original seven, so a residual poll is re-checkable from the artifact alone
+(LP-0MVZ3V96D007A825). The columns are empty when the poll's schema does not
+carry the field — never fabricated.
+
 ## Consumer contract — herdr `downtime-worker.ts` (AC6)
 
 The consumer change lives in ContextHub

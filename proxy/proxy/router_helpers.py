@@ -27,6 +27,7 @@ Includes:
 
 import asyncio
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -58,6 +59,57 @@ def _srv():
 # ===================================================================
 # Per-endpoint dispatch-lease key helpers (LP-0MRPILSMW004T4H8)
 # ===================================================================
+
+#: Monotonic identity for each acquired dispatch (LP-0MVYZEYZY003IQAH).
+#:
+#: A dispatch record is keyed ``(endpoint, session_id)``, so a back-to-back next
+#: turn of the same session re-acquires the *same* record key. The teardown of
+#: the previous turn can therefore land after the newer turn's admission (measured
+#: 0.3-0.6 s later in production) and, without an identity to compare, clear the
+#: newer dispatch's live-work attribution for its whole prefill. Each acquire
+#: stamps a token on the record and on the owning request; a teardown/release
+#: carrying a token only acts on the record whose token still matches.
+_dispatch_token_counter = itertools.count(1)
+
+
+def _new_dispatch_token() -> int:
+    """Return a fresh, monotonically increasing dispatch identity token."""
+    return next(_dispatch_token_counter)
+
+
+def _dispatch_token_from_request(request) -> int | None:
+    """Return the dispatch token stamped on *request* (or ``None``).
+
+    ``None`` means the caller did not acquire through a tracked dispatch (e.g.
+    the explicit ``/v1/leases/release`` endpoint or a session eviction), so the
+    legacy unconditional behaviour applies.
+    """
+    if request is None:
+        return None
+    try:
+        token = getattr(request, "_local_dispatch_token", None)
+    except Exception:
+        return None
+    return token if isinstance(token, int) else None
+
+
+def _record_owned_by_token(record: dict | None, token: int | None) -> bool:
+    """Whether *record* belongs to the dispatch identified by *token*.
+
+    ``token is None`` (an untracked caller) or a record with no token (a legacy
+    record / a record created by a path that does not stamp one) is treated as
+    owned, preserving the pre-change unconditional behaviour. Only a record that
+    carries a *different* token belongs to a newer dispatch.
+    """
+    if not isinstance(record, dict):
+        return True
+    if token is None:
+        return True
+    record_token = record.get("dispatch_token")
+    if record_token is None:
+        return True
+    return record_token == token
+
 
 def _dispatch_lease_key(endpoint: str | None, session_id: str) -> str | tuple:
     """Build the dispatch-lease record key.
@@ -3111,6 +3163,7 @@ async def _decrement_local_active_queries(
     srv,
     session_key: str | None = None,
     backend: str | None = None,
+    dispatch_token: int | None = None,
 ) -> None:
     """Safely decrement the local-only active queries counter.
 
@@ -3121,6 +3174,12 @@ async def _decrement_local_active_queries(
     The *backend* parameter specifies the endpoint URL of the llama-server
     instance; it is used to build a per-endpoint dispatch-lease key so the
     correct server's record is updated (LP-0MRPILSMW004T4H8).
+
+    *dispatch_token* scopes the teardown to the dispatch that owns it
+    (LP-0MVYZEYZY003IQAH): when the shared per-session record has already been
+    re-acquired by a newer turn of the same session, the late teardown of the
+    previous turn must not clear the newer dispatch's live-work attribution.
+    ``None`` (an untracked caller) keeps the pre-change unconditional behaviour.
     """
     try:
         async with srv.local_active_queries_lock:
@@ -3147,28 +3206,44 @@ async def _decrement_local_active_queries(
                     record_key = _dispatch_lease_key(backend, session_key)
 
                     if record_key in srv.local_dispatch_records:
-                        srv.local_dispatch_records[record_key]["active"] = False
-                        srv.local_dispatch_records[record_key]["expires_at"] = (
-                            time.monotonic() + lease_timeout
-                        )
-                        try:
-                            srv.logger.info(
-                                "lease_renewed session=%s timeout=%.0fs",
-                                _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
-
-                                lease_timeout,
-                            )
-                        except Exception as exc:
+                        record = srv.local_dispatch_records[record_key]
+                        if not _record_owned_by_token(record, dispatch_token):
+                            # A newer dispatch of the same session already owns
+                            # this shared record; this turn's late teardown must
+                            # not clear its live-work attribution.
                             try:
-                                srv.logger.warning(
-                                    "Failed to log lease_renewed for session=%s: %s: %s",
-                                    _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
-
-                                    type(exc).__name__,
-                                    exc,
+                                srv.logger.debug(
+                                    "lease_teardown_skipped session=%s "
+                                    "reason=newer_dispatch_active",
+                                    _dispatch_key_session_id(record_key)
+                                    if _dispatch_key_session_id(record_key)
+                                    else "unknown",
                                 )
                             except Exception:
                                 pass
+                        else:
+                            record["active"] = False
+                            record["expires_at"] = (
+                                time.monotonic() + lease_timeout
+                            )
+                            try:
+                                srv.logger.info(
+                                    "lease_renewed session=%s timeout=%.0fs",
+                                    _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
+
+                                    lease_timeout,
+                                )
+                            except Exception as exc:
+                                try:
+                                    srv.logger.warning(
+                                        "Failed to log lease_renewed for session=%s: %s: %s",
+                                        _dispatch_key_session_id(record_key) if _dispatch_key_session_id(record_key) else "unknown",
+
+                                        type(exc).__name__,
+                                        exc,
+                                    )
+                                except Exception:
+                                    pass
         except Exception as exc:
             try:
                 srv.logger.warning(
@@ -3238,6 +3313,10 @@ async def _increment_local_active_queries(
                         "expires_at": time.monotonic() + lease_timeout,
                         "model_name": model_name,
                         "endpoint": backend,
+                        # LP-0MVYZEYZY003IQAH: per-dispatch identity so a
+                        # late teardown/release can be scoped to its own
+                        # dispatch instead of the shared session record.
+                        "dispatch_token": _new_dispatch_token(),
                         # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                         # A record that never makes progress is bounded by
                         # ``local_dispatch_no_progress_timeout_seconds`` from
@@ -4276,6 +4355,7 @@ async def _try_acquire_local_dispatch(
 
                 srv.local_active_queries += 1
 
+                dispatch_token = _new_dispatch_token()
                 srv.local_dispatch_records[record_key] = {
                     "backend": backend,
                     "started_at": now,
@@ -4283,6 +4363,10 @@ async def _try_acquire_local_dispatch(
                     "expires_at": now + lease_timeout,
                     "model_name": model_name,
                     "endpoint": backend,
+                    # LP-0MVYZEYZY003IQAH: per-dispatch identity so a late
+                    # teardown/release can be scoped to its own dispatch
+                    # instead of the shared session record.
+                    "dispatch_token": dispatch_token,
                     # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                     "last_progress": 0,
                     "last_progress_ts": now,
@@ -4297,6 +4381,14 @@ async def _try_acquire_local_dispatch(
                         admission_evidence=admission_evidence,
                     ),
                 }
+                # LP-0MVYZEYZY003IQAH: stamp the owning request so its
+                # end-of-request teardown/release can be scoped to this
+                # dispatch (a same-session re-dispatch replaces the token).
+                if request is not None:
+                    try:
+                        request._local_dispatch_token = dispatch_token
+                    except Exception:
+                        pass
                 # LP-0MVUVHAQP001IRKK: pin the slot identity on the record at
                 # admission (before any release can free the assignment) so
                 # every abandonment path can name the slot it gave up on.
@@ -4361,36 +4453,68 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     ``POST /v1/leases/release`` endpoint provides, allowing callers
     (e.g. other internal components) to proactively release a lease
     without going through the HTTP layer.
+
+    When *request* carries a dispatch token (LP-0MVYZEYZY003IQAH), the release
+    is scoped to that dispatch: a late abandonment release for an older turn
+    must not delete a newer dispatch's record on the same session key. A caller
+    with no token (the explicit release endpoint, a session eviction) keeps the
+    unconditional behaviour.
     """
     removed = False
     record_key = _dispatch_lease_key(endpoint, session_id)
+    dispatch_token = _dispatch_token_from_request(request)
     try:
         async with srv.local_dispatch_records_lock:
             if record_key in srv.local_dispatch_records:
-                del srv.local_dispatch_records[record_key]
-                removed = True
-                try:
-                    srv.logger.info(
-                        "lease_released session=%s reason=explicit_release",
-                        session_id if session_id else "unknown",
+                if not _record_owned_by_token(
+                    srv.local_dispatch_records[record_key], dispatch_token
+                ):
+                    try:
+                        srv.logger.debug(
+                            "lease_release_skipped session=%s "
+                            "reason=newer_dispatch_active",
+                            session_id if session_id else "unknown",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    del srv.local_dispatch_records[record_key]
+                    removed = True
+                    try:
+                        srv.logger.info(
+                            "lease_released session=%s reason=explicit_release",
+                            session_id if session_id else "unknown",
 
-                        extra=_client_identity_extra(request),
-                    )
-                except Exception:
-                    pass
+                            extra=_client_identity_extra(request),
+                        )
+                    except Exception:
+                        pass
             elif endpoint and (endpoint, session_id) in srv.local_dispatch_records:
                 # Belt-and-braces: tuple-key form for any caller that passes
                 # the endpoint directly.
-                del srv.local_dispatch_records[(endpoint, session_id)]
-                removed = True
-                try:
-                    srv.logger.info(
-                        "lease_released session=%s reason=explicit_release",
-                        session_id[:8] if session_id else "unknown",
-                        extra=_client_identity_extra(request),
-                    )
-                except Exception:
-                    pass
+                if not _record_owned_by_token(
+                    srv.local_dispatch_records[(endpoint, session_id)],
+                    dispatch_token,
+                ):
+                    try:
+                        srv.logger.debug(
+                            "lease_release_skipped session=%s "
+                            "reason=newer_dispatch_active",
+                            session_id[:8] if session_id else "unknown",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    del srv.local_dispatch_records[(endpoint, session_id)]
+                    removed = True
+                    try:
+                        srv.logger.info(
+                            "lease_released session=%s reason=explicit_release",
+                            session_id[:8] if session_id else "unknown",
+                            extra=_client_identity_extra(request),
+                        )
+                    except Exception:
+                        pass
     except Exception:
         raise
     # Free the slot registry entry
@@ -5081,18 +5205,48 @@ async def _release_unserved_dispatch(
     removed = False
     released_record = None
     record_key = _dispatch_lease_key(endpoint, session_key)
+    # LP-0MVYZEYZY003IQAH: scope the release to the dispatch that owns it. A
+    # late abandonment of turn N must not delete turn N+1's record when the
+    # same session has already re-acquired the shared key. ``None`` (an
+    # untracked caller) keeps the unconditional behaviour.
+    dispatch_token = _dispatch_token_from_request(request)
     try:
         async with srv.local_dispatch_records_lock:
             if record_key in srv.local_dispatch_records:
-                released_record = srv.local_dispatch_records.pop(record_key)
-                removed = True
+                if _record_owned_by_token(
+                    srv.local_dispatch_records[record_key], dispatch_token
+                ):
+                    released_record = srv.local_dispatch_records.pop(record_key)
+                    removed = True
+                else:
+                    try:
+                        srv.logger.debug(
+                            "lease_release_skipped session=%s "
+                            "reason=newer_dispatch_active",
+                            session_key if session_key else "unknown",
+                        )
+                    except Exception:
+                        pass
             elif endpoint and (endpoint, session_key) in srv.local_dispatch_records:
                 # Belt-and-braces: tuple-key form for callers that pass the
                 # endpoint directly (mirrors ``_release_local_dispatch``).
-                released_record = srv.local_dispatch_records.pop(
-                    (endpoint, session_key)
-                )
-                removed = True
+                if _record_owned_by_token(
+                    srv.local_dispatch_records[(endpoint, session_key)],
+                    dispatch_token,
+                ):
+                    released_record = srv.local_dispatch_records.pop(
+                        (endpoint, session_key)
+                    )
+                    removed = True
+                else:
+                    try:
+                        srv.logger.debug(
+                            "lease_release_skipped session=%s "
+                            "reason=newer_dispatch_active",
+                            session_key if session_key else "unknown",
+                        )
+                    except Exception:
+                        pass
             if removed:
                 try:
                     srv.logger.info(

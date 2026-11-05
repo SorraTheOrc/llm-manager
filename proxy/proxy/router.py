@@ -888,6 +888,14 @@ async def _cleanup_after_request(
             srv,
             session_key=session_id,
             backend=backend,
+            # LP-0MVYZEYZY003IQAH: scope the teardown to the dispatch this
+            # request acquired, so a late teardown cannot clear a newer turn's
+            # live-work attribution on the shared session record.
+            dispatch_token=(
+                getattr(request, "_local_dispatch_token", None)
+                if request is not None
+                else None
+            ),
         )
         # For non-explicit sessions (no session affinity), immediately
         # remove the dispatch record instead of letting it linger with
@@ -2414,6 +2422,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     srv,
                                     session_id,
                                     endpoint=endpoint,
+                                    # LP-0MVYZEYZY003IQAH: scope the release to
+                                    # this turn's dispatch, so a newer turn
+                                    # that already re-acquired the session
+                                    # record is not deleted by a late release.
+                                    request=request,
                                     abandoned_slot_id=slot_id,
                                     upstream_stream_cm=cm,
                                 )

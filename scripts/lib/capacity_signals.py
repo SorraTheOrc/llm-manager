@@ -97,8 +97,8 @@ STATUS_POLL_RE = re.compile(r"\bstatus_request\b")
 
 #: Fields read off a status poll line (``key=value``, value is non-space).
 STATUS_FIELD_RE = re.compile(
-    r"\b(?P<key>capacity_hint|slots_stale|slots_detail_stale|available_slots|"
-    r"local_active_query|active_query|local_in_flight_requests|"
+    r"\b(?P<key>capacity_hint|slots_stale|slots_detail_stale|slot_counts_stale|available_slots|"
+    r"local_active_query|active_query|local_in_flight_requests|local_owner_session_id|"
     r"status_schema_version|latency_ms)=(?P<value>[^\s]+)"
 )
 

@@ -2987,6 +2987,30 @@ counts are measured by `scripts/capacity_signal_verification.py`
 the relaxed "no live local work" population the 336-skip baseline was derived
 with).
 
+#### Per-dispatch live-work attribution (LP-0MVYZEYZY003IQAH)
+
+`local_in_flight_requests`, `local_owner_session_id` and `local_active_query`
+describe the **in-flight dispatch** from admission through first byte — the
+whole prefill — not just generation. A dispatch is live work while its record
+is `active`; a `lease_renewed` retained lease (`active: false`, future
+`expires_at`) reserves the slot for the owning session but is **not** live
+work. The status handler samples this attribution **after** the `/slots` query
+in the same poll, so fresh busy detail cannot be paired with an attribution
+snapshot taken before a dispatch admitted during a multi-second poll
+(LP-0MVZ3V8UR003KCSZ).
+
+A dispatch record is keyed `(endpoint, session_id)`, so back-to-back turns of
+one session share a key. Each acquisition stamps a per-dispatch token on the
+record and the owning request; a teardown (`_decrement_local_active_queries`)
+or release (`_release_local_dispatch`, `_release_unserved_dispatch`) carrying a
+different token is a no-op (LP-0MVZ3V8J1006YGFN). Without that scoping, a late
+turn-N teardown cleared turn-N+1's live-work attribution for its whole prefill
+— the 2026-11-01/02 residual class (72 polls, 65 of them mis-attributed to
+`session_evicted` by the nearest-event lookback).
+
+The cache-served `available_slots` paired with a fresh `saturated` hint is a
+**separate** family tracked by LP-0MVXSX0TZ00798KA, not fixed here.
+
 #### Abandoned local dispatches (LP-0MVRMI5HK00558TB AC1)
 
 An *abandoned* dispatch is one the proxy stops waiting for while llama-server

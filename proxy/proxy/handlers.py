@@ -685,7 +685,7 @@ async def get_llama_local_status(request: Request):
     except Exception:
         active = False
 
-    # -- local active queries (non-blocking snapshot, LP-0MSL2ZLLS009RVKR) --
+    # -- local active queries: sampled AFTER the /slots query --------------
     # The global counter above also counts remote provider streams, so herdr
     # dispatch needs a local-only signal. local_active_query=true implies
     # active_query=true (local activity is a subset of all activity).
@@ -695,24 +695,11 @@ async def get_llama_local_status(request: Request):
     # not from ``local_active_queries``, whose retained post-stream leases no
     # longer correspond to work. The counter remains the legacy fallback when
     # the server has no dispatch-record registry at all.
-    live_local_requests: int | None = None
-    local_active_query = False
-    try:
-        from proxy.router_helpers import (
-            _count_active_local_dispatch_records as _count_active_records,
-        )
-
-        live_local_requests = _count_active_records(srv)
-    except Exception:
-        live_local_requests = None
-    if live_local_requests is not None:
-        local_active_query = live_local_requests > 0
-    else:
-        try:
-            async with srv.local_active_queries_lock:
-                local_active_query = srv.local_active_queries > 0
-        except Exception:
-            local_active_query = False
+    #
+    # LP-0MVZ3V8UR003KCSZ: this record-registry read is taken *after* the
+    # /slots query (see the consolidated live-work block below), never here,
+    # so the payload cannot pair fresh busy slot detail with an attribution
+    # snapshot taken before a dispatch admitted during a multi-second poll.
 
     # -- slots query (lightweight, short timeout) -------------------------
     available_slots = 0
@@ -1086,31 +1073,57 @@ async def get_llama_local_status(request: Request):
         # Derivation is best-effort; leave the counts-derived value.
         availability_unknown = bool(counts_stale or detail_stale)
 
-    # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
-    # The owner id is normalised to its bare session-id string: per-endpoint
-    # leases are keyed by ``(endpoint, session_id)`` tuples and the raw key
-    # must never be serialised into the status payload as an array
-    # (WL-0MUKY4MAX0008I0L).
+    # -- live-work attribution (LP-0MR9G183O004SJLO, LP-0MVZ3V8UR003KCSZ) --
+    # Sampled here — *after* the /slots query — so the payload is
+    # self-consistent: a dispatch admitted during a multi-second status poll
+    # cannot yield fresh busy slot detail paired with an empty attribution
+    # snapshot taken before its admission (LP-0MVZ3V8UR003KCSZ AC1).
+    #
+    # One registry read derives both the in-flight count and the owner, so
+    # ``local_in_flight_requests``, ``local_owner_session_id`` and
+    # ``local_active_query`` can never disagree with each other. The owner id
+    # is normalised to its bare session-id string: per-endpoint leases are
+    # keyed by ``(endpoint, session_id)`` tuples and the raw key must never be
+    # serialised into the status payload as an array (WL-0MUKY4MAX0008I0L).
+    live_local_requests: int | None = None
+    local_active_query = False
     local_owner_session_id = None
     local_owner_lease_remaining_seconds = None
     try:
         from proxy.router_helpers import _dispatch_key_session_id
 
         lock = getattr(srv, "local_dispatch_records_lock", None)
-        records = getattr(srv, "local_dispatch_records", {})
-        if lock is not None:
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is None:
+            # Legacy mode: no dispatch-record registry at all.
+            live_local_requests = None
+        elif lock is not None:
             async with lock:
+                live_local_requests = 0
                 for sid, rec in list(records.items()):
-                    if rec.get("active"):
-                        session_id = _dispatch_key_session_id(sid)
-                        if not isinstance(session_id, str):
-                            continue
-                        local_owner_session_id = session_id
-                        remaining = rec.get("expires_at", 0) - time.monotonic()
-                        local_owner_lease_remaining_seconds = max(0.0, remaining)
-                        break
+                    if not isinstance(rec, dict) or not rec.get("active"):
+                        continue
+                    live_local_requests += 1
+                    if local_owner_session_id is not None:
+                        continue
+                    session_id = _dispatch_key_session_id(sid)
+                    if not isinstance(session_id, str):
+                        continue
+                    local_owner_session_id = session_id
+                    remaining = rec.get("expires_at", 0) - time.monotonic()
+                    local_owner_lease_remaining_seconds = max(0.0, remaining)
+        else:
+            live_local_requests = None
     except Exception:
-        pass
+        live_local_requests = None
+    if live_local_requests is not None:
+        local_active_query = live_local_requests > 0
+    else:
+        try:
+            async with srv.local_active_queries_lock:
+                local_active_query = srv.local_active_queries > 0
+        except Exception:
+            local_active_query = False
 
     # -- prefill / queue ETA estimate (LP-0MVGDUV5E005UWBQ) -----------------
     # Published so a dispatcher can pace BEFORE launching a session instead of
@@ -1339,6 +1352,11 @@ async def get_llama_local_status(request: Request):
         "availability_unknown": bool(availability_unknown),
         "total_slots": total_slots,
         "slots_stale": slots_stale,
+        # LP-0MVZ3V96D007A825: the counts-cache half of ``slots_stale`` is
+        # published separately so the residual-attribution CSV can name which
+        # cache served the poll (the counts-stale family is
+        # LP-0MVXSX0TZ00798KA). Additive: older parsers ignore it.
+        "slot_counts_stale": bool(counts_stale),
         "slots_stale_reason": slots_stale_reason,
         "slots_max_snapshot_age_seconds": slots_max_snapshot_age_seconds,
         # Per-phase read-path timing + provenance (LP-0MVVXGHT1001I5YX
