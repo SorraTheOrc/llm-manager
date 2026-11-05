@@ -49,6 +49,7 @@ import discord_notify
 import performance_metrics
 import recommendations
 import reporting
+import wasted_compute
 
 DEFAULT_LOG_DIR = "/var/log/llama-proxy"
 DEFAULT_HOURS = 24
@@ -399,6 +400,12 @@ def _run(args: argparse.Namespace) -> int:
             metrics_config=metrics_config,
             metrics_state=metrics_state,
             update_metrics=not args.no_metrics_update,
+            wasted_compute=wasted_compute.analyse_window(
+                Path(args.log_dir),
+                window_start,
+                window_end,
+                llama_log_dir=Path(args.llama_log_dir),
+            ),
         )
     except OSError as exc:
         raise AnalysisFailure(str(exc)) from exc
@@ -410,6 +417,7 @@ def _run(args: argparse.Namespace) -> int:
         run.stale_rate_target,
         metrics_config=metrics_config,
         metrics_state=metrics_state,
+        wasted=run.wasted_compute,
     )
     # Delivery happens for every successful run — the report is the deliverable,
     # so a run that produced one is a run that ships it (LP-0MW2BD6G8001E960).

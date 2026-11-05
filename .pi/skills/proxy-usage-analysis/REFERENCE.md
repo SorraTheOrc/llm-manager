@@ -873,6 +873,90 @@ unmeasurable) and `verdict`. It is produced by the same derivation as the
 rendered table, so the two views can never disagree, and it is **read-only**:
 the single state write happens while the report is built.
 
+## Wasted GPU compute (LP-0MW2SQNHJ0044PV6)
+
+`report.md` carries three wasted-compute renderings, and `--json` carries the
+same figures. The analysis is produced by
+`scripts/wasted_compute.py`, which drives the committed analyser
+`proxy/scripts/analyse_prefill_deadline_residual.py` by path and normalises
+its payload — the attribution rules live there, never in the skill.
+
+| Rendering | Anchor in `report.md` |
+|---|---|
+| Summary table | `## Wasted GPU compute (summary)` — after the scorecard, before `## Summary by hour` |
+| Detail section | `## Wasted GPU compute` — after `## Prefill admission regression` |
+| Appendix | `## Appendix: wasted GPU compute — definitions and basis` — the last section |
+
+### `--json` block
+
+```json
+"wasted_compute": {
+  "status": "ok",
+  "hours": 5.609,
+  "reasons": [
+    {"reason": "prefill_deadline", "total": 20, "user": 19, "audit": 1,
+     "per_hour": 3.566, "user_per_hour": 3.387}
+  ],
+  "composite_user_events": 23,
+  "composite_user_per_hour": 4.101,
+  "rate_target_per_hour": 0.5,
+  "rate_ok": false,
+  "attribution": {"predicted-warmth": 14, "capacity": 6, "occupancy": 0},
+  "occupancy_share": 0.0,
+  "capacity_share": 0.3,
+  "abandoned_prefill_overlap": {"events": 0, "total": 20,
+                                "basis": "measured_stop", "measured_available": true},
+  "release_cancel": {"releases_total": 32, "releases_with_observed_cancel": 32,
+                     "cancel_to_stop_p50_s": 0.0, "cancel_to_stop_p90_s": 4.489},
+  "waste": {"priced_tokens_discarded": 120497,
+            "tokens_evaluated_after_cancel": 2048,
+            "wasted_tokens": 122545,
+            "backend_completed_prefills": 730,
+            "client_consumed_local_streams": 389},
+  "coverage": {"verdict": "mismatch", "exact": false},
+  "proxy_restarts_in_window": 0,
+  "backend_restarts_in_window": 0,
+  "restart_free": true,
+  "verdict": "fail",
+  "caveats": ["llama-server log coverage is 'mismatch' (867 backend segments joined against 32 releases): the per-release and backend figures are indicative, not exact"]
+}
+```
+
+Contract:
+
+- **`status`** — `ok`, or `unavailable` with `reason` naming what was missing
+  (analyser absent, no `proxy.log*`, analysis failed). The report renders the
+  reason; a missing section never fails the run. When a run was not given the
+  analysis at all (a library caller), the key is `null`.
+- **`composite_user_per_hour`** — `prefill_deadline` + `measured_cache_deficit`
+  for non-`audit-` sessions, divided by the analysed window length. Both
+  reasons are counted together so a reason conversion cannot read as an
+  improvement.
+- **`occupancy_share` / `capacity_share`** — shares of `prefill_deadline`
+  events by attribution class. Guards: occupancy ≤ 25 %, capacity < 50 %
+  (`occupancy_ok` / `capacity_ok` carry the verdicts).
+- **`restart_free`** — no proxy restart recorded by the analyser and no
+  `backend_restart` eviction. A restart re-prices capacity and discards
+  prefills, so `verdict` is `inconclusive` whenever this is `false`. A
+  backend restart with no dispatch in flight leaves no eviction event, so the
+  flag is a **lower bound** on restarts (stated in the appendix).
+- **`waste.priced_tokens_discarded`** — the `new_tokens` priced by each
+  `prefill_deadline` event, summed; the analyser reports per-event tokens for
+  deadline events only, so an early `measured_cache_deficit` abort (whose loss
+  is bounded by design) is not in this sum.
+- **`coverage`** — the analyser's `abandoned_prefill_windows.coverage`
+  verdict. `exact` only when the backend segments join 1:1 to the window's
+  releases; otherwise `coverage.exact` is `false`, the per-release and backend
+  figures are **indicative**, and a caveat says so.
+- **`verdict`** — `pass` (rate and both guards pass in a restart-free
+  window), `fail` (rate over target, occupancy over 25 %, or capacity ≥ 50 %),
+  or `inconclusive` (everything passes but the window contains a restart).
+- All keys are **additive**; no existing `--json` key changes value or
+  meaning.
+
+Thresholds are the producer-agreed criterion on LP-0MVN3KMGI009BZ0D (option
+b2) and are repeated in the report appendix alongside the window's caveats.
+
 ## Verifying the daily path is agent-free
 
 The daily report is produced solely by the 05:00 cron — the deterministic

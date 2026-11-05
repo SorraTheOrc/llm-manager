@@ -34,6 +34,7 @@ import llama_log_parser
 import log_parser
 import performance_metrics
 import recommendations
+import wasted_compute
 from aggregation import AnalysisResult, SessionStats
 from llama_log_parser import CHEAP, FAST, TOTAL
 
@@ -138,6 +139,9 @@ class AnalysisRun:
     # the rendered summary table used.
     metrics_config: str | Path | None = None
     metrics_state: str | Path | None = None
+    # Wasted-GPU-compute analysis for this window (LP-0MW2SQNHJ0044PV6),
+    # carried so ``--json`` emits the same block the rendered report shows.
+    wasted_compute: wasted_compute.WastedCompute | None = None
 
 
 def _fmt_ts(ts: datetime | None) -> str:
@@ -1250,6 +1254,7 @@ def build_report(
     metrics_config: str | Path | None = None,
     metrics_state: str | Path | None = None,
     update_metrics: bool = False,
+    wasted: wasted_compute.WastedCompute | None = None,
 ) -> str:
     recs = recommendations.generate_recommendations(summary, config, mode_map)
     hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
@@ -1318,6 +1323,12 @@ def build_report(
     _append_performance_metric_details(
         ap, metrics_config=metrics_config, metrics_state=metrics_state
     )
+
+    # Wasted-GPU-compute summary (LP-0MW2SQNHJ0044PV6): the operator's headline
+    # for "compute burned on work nobody received", placed before the first
+    # data section so it is read with the scorecard rather than after the
+    # detail it summarises.
+    _append_wasted_compute_summary(ap, wasted)
 
     _append_summary_by_hour(ap, summary)
 
@@ -1427,6 +1438,11 @@ def build_report(
     # admission-budget numbers the 24 h certification reads, split into user
     # and agent-audit traffic.
     _append_prefill_regression_section(ap, summary)
+
+    # Wasted-GPU-compute detail (LP-0MW2SQNHJ0044PV6): the cause attribution and
+    # waste accounting behind the summary table, next to the prefill evidence it
+    # explains. Definitions and caveats live in the appendix.
+    _append_wasted_compute_section(ap, wasted)
 
     # Contended-pricing observability (LP-0MVS9YKHL007UBBZ, parent AC1/AC4):
     # admission verdicts split by the rate bucket the ETA was priced from and
@@ -1573,6 +1589,9 @@ def build_report(
         "cheap live triggers can exceed fast despite the file fallback being lower "
         "(LP-0MTNIJQ8U007AGVW)."
     )
+    # Appendix last (LP-0MW2SQNHJ0044PV6): definitions, measurement basis and the
+    # caveats that make a wasted-compute figure exact rather than indicative.
+    _append_wasted_compute_appendix(ap, wasted)
     return "\n".join(lines) + "\n"
 
 
@@ -2285,6 +2304,243 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
             ap(f"| {reason} | {count} | "
                f"{_pct(count, len(eviction_events)):.1f}% | "
                f"{snapshots} |")
+
+
+def _wc_verdict_label(value: str) -> str:
+    return {
+        "pass": "PASS",
+        "fail": "FAIL",
+        "inconclusive": "NOT CERTIFIED",
+        "unknown": "UNKNOWN",
+    }.get(value, value.upper())
+
+
+def _wc_rate(value: float | None, digits: int = 2) -> str:
+    return "unknown" if value is None else f"{value:.{digits}f}"
+
+
+def _wc_share(value: float) -> str:
+    return f"{value * 100.0:.0f}%"
+
+
+def _append_wasted_compute_summary(ap, wasted: wasted_compute.WastedCompute | None) -> None:
+    """Append the ``## Wasted GPU compute (summary)`` table near the start.
+
+    One row per figure the operator acts on, with its target and verdict, so
+    *minimising wasted GPU compute* is read as a scorecard line rather than
+    inferred from the detail sections. Omitted entirely when the run was not
+    given the analysis (LP-0MW2SQNHJ0044PV6 AC2).
+    """
+    if wasted is None:
+        return
+    ap("")
+    ap("## Wasted GPU compute (summary)")
+    ap("")
+    if not wasted.available:
+        ap(f"_Not available for this window: {wasted.reason}._")
+        return
+    ap(
+        "GPU compute burned on work no client received (dispatch accepted, "
+        "then released before its first byte). Detail and definitions follow "
+        "in **Wasted GPU compute** and the appendix. Thresholds are the "
+        "producer-agreed criterion on LP-0MVN3KMGI009BZ0D."
+    )
+    ap("")
+    ap("| Figure | Value | Target | Verdict |")
+    ap("|---|---|---|---|")
+    ap(
+        f"| Post-acceptance evictions | {wasted.total_events} "
+        f"({_wc_rate(wasted.events_per_hour)}/h) | minimise | — |"
+    )
+    ap(
+        f"| User-class prefill failures (`prefill_deadline` + "
+        f"`measured_cache_deficit`) | {wasted.composite_user_events} "
+        f"({_wc_rate(wasted.composite_user_per_hour)}/h) | "
+        f"≤ {wasted.rate_target_per_hour:.1f}/h | "
+        f"{'PASS' if wasted.rate_ok else 'FAIL'} |"
+    )
+    ap(
+        f"| Occupancy-attributed share | {_wc_share(wasted.occupancy_share)} of "
+        f"{wasted.attribution_total} deadline events | "
+        f"≤ {wasted_compute.OCCUPANCY_GUARD * 100:.0f}% | "
+        f"{'PASS' if wasted.occupancy_ok else 'FAIL'} |"
+    )
+    ap(
+        f"| Capacity-attributed share | {_wc_share(wasted.capacity_share)} | "
+        f"< {wasted_compute.CAPACITY_FLOOR * 100:.0f}% | "
+        f"{'PASS' if wasted.capacity_ok else 'FAIL'} |"
+    )
+    ap(
+        f"| Wasted GPU tokens (priced prefill discarded at the deadline + "
+        f"evaluated after cancel) | {wasted.wasted_tokens} | minimise | — |"
+    )
+    restart = (
+        "yes"
+        if wasted.restart_free
+        else f"no — {wasted.proxy_restarts} proxy / "
+        f"{wasted.backend_restart_evictions} backend restart(s)"
+    )
+    ap(f"| Restart-free window | {restart} | required | "
+       f"{'PASS' if wasted.restart_free else 'FAIL'} |")
+    ap(f"| **Overall** | | | **{_wc_verdict_label(wasted.verdict)}** |")
+    if wasted.caveats:
+        ap("")
+        ap("Caveats: " + "; ".join(wasted.caveats) + ".")
+
+
+def _append_wasted_compute_section(ap, wasted: wasted_compute.WastedCompute | None) -> None:
+    """Append the ``## Wasted GPU compute`` detail section (AC3)."""
+    if wasted is None or not wasted.available:
+        return
+    ap("")
+    ap("## Wasted GPU compute")
+    ap("")
+    ap(
+        "Cause and cost of the dispatches released after acceptance in this "
+        "window. Rates use the analysed window length; `user` excludes "
+        "`audit-*` sessions, which are agent gate runs rather than served "
+        "traffic. Attribution covers `prefill_deadline` events only: "
+        "`predicted-warmth` = we priced a warm prefix that did not exist, "
+        "`capacity` = an honest price the GPU still could not deliver, "
+        "`occupancy` = another tenant held the slot pool."
+    )
+    ap("")
+    ap("| Reason | Total | User | Audit | Per hour | User per hour |")
+    ap("|---|---|---|---|---|---|")
+    for row in wasted.reasons:
+        ap(
+            f"| `{row.reason}` | {row.total} | {row.user} | {row.audit} | "
+            f"{_wc_rate(row.per_hour)} | {_wc_rate(row.user_per_hour)} |"
+        )
+    ap("")
+    ap("| Attribution | Events | Share |")
+    ap("|---|---|---|")
+    for name in wasted_compute.ATTRIBUTION_CLASSES:
+        count = wasted.attribution.get(name, 0)
+        share = (count / wasted.attribution_total) if wasted.attribution_total else 0.0
+        ap(f"| {name} | {count} | {_wc_share(share)} |")
+    ap("")
+    ap("| Waste | Value |")
+    ap("|---|---|")
+    ap(
+        f"| Priced prefill tokens discarded at the deadline | "
+        f"{wasted.priced_tokens_discarded} |"
+    )
+    ap(
+        f"| Tokens evaluated after the backend cancel | "
+        f"{wasted.tokens_after_cancel} |"
+    )
+    ap(f"| Total wasted GPU tokens | {wasted.wasted_tokens} |")
+    if wasted.backend_completed is not None and wasted.client_consumed is not None:
+        ap(
+            f"| Backend prefills completed / consumed by a client | "
+            f"{wasted.backend_completed} / {wasted.client_consumed} |"
+        )
+    ap("")
+    ap("| Release → cancel | Value |")
+    ap("|---|---|")
+    ap(
+        f"| Releases with an observed backend cancel | {wasted.releases_observed} "
+        f"of {wasted.releases_total} |"
+    )
+    cancel_cell = (
+        "unavailable"
+        if wasted.cancel_p90_s is None
+        else f"{_wc_rate(wasted.cancel_p50_s)} s / {_wc_rate(wasted.cancel_p90_s)} s"
+    )
+    ap(f"| Cancel → backend stop (p50 / p90) | {cancel_cell} |")
+    ap(
+        f"| Abandoned-prefill overlap (basis `{wasted.overlap_basis}`) | "
+        f"{wasted.overlap_events} of {wasted.overlap_total} deadline events |"
+    )
+    if wasted.caveats:
+        ap("")
+        ap("Caveats: " + "; ".join(wasted.caveats) + ".")
+
+
+def _append_wasted_compute_appendix(ap, wasted: wasted_compute.WastedCompute | None) -> None:
+    """Append the wasted-compute appendix last (AC4): definitions and basis."""
+    if wasted is None:
+        return
+    ap("")
+    ap("## Appendix: wasted GPU compute — definitions and basis")
+    ap("")
+    if not wasted.available:
+        ap(f"_Not produced for this window: {wasted.reason}._")
+        return
+    ap("| Term | Definition |")
+    ap("|---|---|")
+    ap(
+        "| Post-acceptance eviction | `local_eviction_after_acceptance`: the "
+        "dispatch was routed to the local model and released before the "
+        "client received a first byte |"
+    )
+    ap(
+        "| `prefill_deadline` | the hard backstop expired with no first byte: "
+        "the client waited the whole deadline, then was detoured |"
+    )
+    ap(
+        "| `measured_cache_deficit` | the measured prefill contradicted the "
+        "warm-cache price, so the dispatch was released early (a cheaper "
+        "outcome for the same defect) |"
+    )
+    ap(
+        "| User-class composite rate | `prefill_deadline` + "
+        "`measured_cache_deficit` for non-`audit` sessions, per hour. The two "
+        "reasons are counted together so a reason conversion cannot pass as "
+        "the defect disappearing |"
+    )
+    ap(
+        "| Occupancy / capacity share | share of `prefill_deadline` events "
+        "attributed to another tenant / to an honest price the GPU could not "
+        "deliver; the guards are occupancy ≤ 25 % and capacity < 50 % |"
+    )
+    ap(
+        "| Priced prefill tokens discarded | the `new_tokens` each deadline "
+        "event had priced as new compute, summed: GPU work promised and lost |"
+    )
+    ap(
+        "| Tokens evaluated after cancel | tokens the backend computed after "
+        "the release (≤ one `ubatch` by design): the measured tail of waste |"
+    )
+    ap(
+        "| Restart-free window | no proxy restart (analyser re-base events) "
+        "and no backend restart that discarded an in-flight dispatch. A "
+        "restart both re-prices capacity and drops prefills, so a window with "
+        "one cannot certify anything |"
+    )
+    ap("")
+    ap("**Measurement basis.** "
+       f"`{wasted.overlap_basis}` ("
+       "`measured_stop` joins each release to the backend's observed cancel→stop "
+       "latency; `legacy_rate_estimate` bounds it by `tokens ÷ 43.1 tok/s` and "
+       "overstates the backlog by two to three orders of magnitude). Backend "
+       f"log coverage: `{wasted.coverage_verdict or 'none supplied'}`.")
+    ap("")
+    ap("**Thresholds.** ≤ "
+       f"{wasted.rate_target_per_hour:.1f} user-class events/h; occupancy ≤ "
+       f"{wasted_compute.OCCUPANCY_GUARD * 100:.0f} %; capacity < "
+       f"{wasted_compute.CAPACITY_FLOOR * 100:.0f} %; measured over a "
+       "restart-free ≥ 24 h window (producer decision, option b2, recorded on "
+       "LP-0MVN3KMGI009BZ0D AC4).")
+    ap("")
+    ap("**Caveats.**")
+    ap("")
+    if wasted.caveats:
+        for caveat in wasted.caveats:
+            ap(f"- {caveat}")
+    else:
+        ap("- None for this window.")
+    ap(
+        "- A backend restart with no dispatch in flight leaves no eviction "
+        "event, so the restart-free flag is a lower bound on restarts."
+    )
+    ap(
+        "- The attribution rules, abandoned-prefill model and backend "
+        "accounting are computed by "
+        "`proxy/scripts/analyse_prefill_deadline_residual.py`; this report "
+        "consumes its payload rather than recomputing them."
+    )
 
 
 def _append_prefill_regression_section(ap, summary: AnalysisResult) -> None:
@@ -4110,6 +4366,7 @@ def run_analysis(
     metrics_config: str | Path | None = None,
     metrics_state: str | Path | None = None,
     update_metrics: bool = False,
+    wasted_compute: wasted_compute.WastedCompute | None = None,
 ) -> AnalysisRun:
     """Discover log files, stream-parse them, aggregate sessions, and write
     the CSVs and report into ``output_dir``.
@@ -4200,6 +4457,7 @@ def run_analysis(
             metrics_config=metrics_config,
             metrics_state=metrics_state,
             update_metrics=update_metrics,
+            wasted=wasted_compute,
         ),
         encoding="utf-8",
     )
@@ -4211,6 +4469,7 @@ def run_analysis(
         stale_rate_target=stale_rate_target,
         metrics_config=metrics_config,
         metrics_state=metrics_state,
+        wasted_compute=wasted_compute,
     )
 
 
@@ -4258,6 +4517,7 @@ def summary_to_json(
     *,
     metrics_config: str | Path | None = None,
     metrics_state: str | Path | None = None,
+    wasted: wasted_compute.WastedCompute | None = None,
 ) -> dict:
     """Machine-readable summary of the analysis (one dict; JSON-serialisable).
 
@@ -4391,6 +4651,11 @@ def summary_to_json(
                 )
             )
         ),
+        # Wasted-GPU-compute block (LP-0MW2SQNHJ0044PV6): the same figures the
+        # rendered summary table, detail section and appendix show. ``None``
+        # when this run was not given the analysis (e.g. a library caller);
+        # ADDITIVE — no key above changes value or meaning.
+        "wasted_compute": wasted.to_json() if wasted is not None else None,
         # LP-0MVOAQDB4002D56G (parent AC4): the prefill-regression checks the
         # 24 h certification needs. All ADDITIVE — no key above changes value
         # or meaning.

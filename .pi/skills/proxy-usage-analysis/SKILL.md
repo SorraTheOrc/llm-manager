@@ -14,6 +14,12 @@ Markdown report with highlighted, data-backed recommendations — including an
 errors observed in the window, and a **provider context-skips** breakdown for
 the per-provider context-ceiling skips (`routing_skip_provider_context`).
 
+The report also carries a **wasted GPU compute** surface — a summary table
+near the start, a detail section and an appendix — so the volume of GPU
+compute burned on work no client received, and its cause, are tracked
+rather than hand-scanned. See [Wasted GPU
+compute](#wasted-gpu-compute-lp-0mw2sqnhj0044pv6).
+
 The report also opens with a **performance metrics scorecard**: the ten
 metrics the proxy is held to, each with its best recorded baseline, an
 evidence-based target, this window's actual value and a direction-aware
@@ -60,7 +66,7 @@ Options:
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
 | `--stale-rate-target` | `0.05` | Target share of status polls allowed to report `slots_stale=true`; drives the **Local capacity signals** section's met/unmet outcome and `--json`'s `capacity_signals.slots_stale.passed`. Mirrors `scripts/capacity_signal_verification.py --stale-rate-target` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings — plus `performance_metrics` — the scorecard block keyed by metric id and its `performance_metrics_counts` totals) |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings — plus `performance_metrics` — the scorecard block keyed by metric id and its `performance_metrics_counts` totals, and `wasted_compute` — the wasted-GPU-compute block, `null` when the analysis was not produced) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 | `--metrics-config` | `metrics/performance_metrics.yaml` | Path to the committed performance-metric defaults (metric detail copy and any seeded history); read-only at runtime, never written |
 | `--metrics-state` | `<output-dir>/performance_metrics_state.yaml` | Path to the live performance-metric history file this run records its window in |
@@ -390,6 +396,59 @@ record stored verbatim (LP-0MVODJ3P6000AIUM): `new_tokens > local_cold_prefill_b
 is therefore genuine evidence of an over-budget admission, never a re-pricing
 artefact. A record created without an admission snapshot reports `0`/`unknown`
 instead of a recomputed value.
+
+## Wasted GPU compute (LP-0MW2SQNHJ0044PV6)
+
+The report answers the operating question behind the eviction count: **how
+much GPU compute did this window burn on work nobody received, and why?** The
+goal of the surface is to make *minimising wasted GPU compute* a tracked
+number rather than a hand-scan of `proxy.log`.
+
+It appears in three places in `report.md`:
+
+| Where | What it holds |
+|---|---|
+| `## Wasted GPU compute (summary)` — after the scorecard, before the first data section | one row per headline figure with its target and verdict: evictions/h, the user-class composite rate vs its threshold, occupancy and capacity shares, wasted GPU tokens, restart-free status, overall verdict |
+| `## Wasted GPU compute` — in the body, after **Prefill admission regression** | per-reason table (total / user / audit / per hour), attribution table with shares, waste table, release→cancel table |
+| `## Appendix: wasted GPU compute — definitions and basis` — last section | term definitions, the measured vs legacy abandoned-prefill basis, thresholds and their origin, and the per-window caveats |
+
+The figures, and what each is for:
+
+| Figure | Meaning | Why it matters |
+|---|---|---|
+| Post-acceptance evictions (total, /h) | every `local_eviction_after_acceptance`, all reasons | the gross volume of accepted-then-unserved work |
+| **User-class composite rate** | `prefill_deadline` + `measured_cache_deficit`, non-`audit` sessions, per hour | the conversion-proof gate: `measured_cache_deficit` is an *early abort* of the same defect, so counting it stops a reason conversion looking like an improvement |
+| Occupancy share | share of deadline events where another tenant held the slot pool | fairness/head-of-line class; the only one an admission change can fix |
+| Capacity share | share attributed to an honest cold price the GPU could not deliver | distinguishes "our pricing is wrong" from "this box is too slow" |
+| Wasted GPU tokens | priced prefill discarded at the deadline + tokens evaluated after the backend cancel | the number to drive down; the tail is measured (≤ 1 ubatch by design) |
+| Release→cancel (p50/p90) | latency from release to the backend stopping that task | sizes the real abandoned window instead of estimating it from tokens ÷ rate |
+| Restart-free | no proxy restart and no backend restart that discarded an in-flight dispatch | a window with a restart cannot certify anything: the restart re-prices capacity and drops prefills |
+
+**Thresholds** are the producer-agreed criterion recorded on
+LP-0MVN3KMGI009BZ0D (option b2): ≤ **0.5** user-class events/h, occupancy ≤
+**25 %**, capacity < **50 %**, measured over a **restart-free ≥ 24 h** window.
+The appendix repeats them next to the window's own caveats, so a figure is
+never read as certified when it is not.
+
+**One source of truth.** `scripts/wasted_compute.py` does not re-implement
+the attribution rules: it drives the committed analyser
+`proxy/scripts/analyse_prefill_deadline_residual.py` (imported by path) and
+normalises its payload. If the analyser is absent (a non-source install) or the
+analysis fails, the section renders a named reason instead of a number, and
+the run still succeeds.
+
+**Honest degradation.** Three inputs can be missing or unreliable, and each
+turns into a stated caveat rather than a wrong figure: no `llama-server` log
+(the per-release and backend numbers are unavailable), a log whose coverage
+verdict is not `exact` (the per-release join is *indicative* — this is the
+confusion that produced a wrong "restart-free" claim on 2026-11-04), and a
+window containing a restart (`verdict: NOT CERTIFIED`).
+
+**Runtime cost.** The analyser re-reads the same `proxy.log*` files the report
+already parsed. Measured on this host: a 6.99 h window (108 k in-window lines,
+56 files) completes in well under a minute; a 24 h cron run therefore pays a
+few extra minutes on top of its existing tens of seconds. The report stays
+deterministic and the extra work never fails the run.
 
 ## Contention-prediction measurement (LP-0MVGR2OXT0096OGK)
 
