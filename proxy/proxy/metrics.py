@@ -63,6 +63,16 @@ functions are no-ops and generate_metrics() returns an explanatory payload.
 Quota labels never carry an API key **value**: ``account`` is the account key
 derived from the provider entry's ``api_key_env`` name (e.g.
 ``OPENCODE_2_API_KEY``) and ``entry`` is the configured provider entry name.
+
+Extended by LP-0MVWPJW2700966ZU (contention-queue observability, uncovered gap
+E6 of LP-0MVTV6GA8002P7QU):
+- proxy_contention_queue_depth (gauge) — requests currently waiting in the
+  bounded local contention queue
+- proxy_contention_queue_wait_seconds (histogram) — elapsed wait per completed
+  queue wait, admitted and timed-out alike
+- proxy_contention_queue_loss_total{reason="..."} (counter) — requests the
+  queue dropped (depth cap / wait-budget expiry) by canonical fall-through
+  reason (``fallback_after_queue`` / ``local_lease_active``)
 """
 
 from collections.abc import Iterable
@@ -164,6 +174,27 @@ llama_host_memory_sample_timestamp_seconds = None
 #: so the protection is verifiable from a scrape instead of from ps.
 llama_oom_score_adj = None
 
+# Contention-queue observability (LP-0MVWPJW2700966ZU, uncovered gap E6 of
+# LP-0MVTV6GA8002P7QU). ``docs/dev/single-slot-impact.md`` §6 recorded that the
+# bounded local contention queue was only visible after the fact, from the
+# nightly usage-analysis report (``queue_wait_ms`` / ``fallback_after_queue``),
+# so a queue filling up at one slot could not alert. These three series make
+# depth, wait and loss live:
+#
+# - ``proxy_contention_queue_depth`` (gauge) — waiters currently queued
+# - ``proxy_contention_queue_wait_seconds`` (histogram) — elapsed wait per
+#   completed wait, including timed-out waits (so the loss latency is in the
+#   distribution, not only the wins)
+# - ``proxy_contention_queue_loss_total{reason}`` (counter) — requests the
+#   queue dropped (depth cap or wait-budget expiry), labelled with the
+#   canonical fall-through reason token (``fallback_after_queue`` /
+#   ``local_lease_active``)
+#
+# Observability only: no queue behaviour, cap or config value changes.
+proxy_contention_queue_depth = None
+proxy_contention_queue_wait_seconds = None
+proxy_contention_queue_loss_total = None
+
 # Post-acceptance local evictions (LP-0MVN4LCED00661MX, parent AC7): an accepted
 # local dispatch released before producing a first byte is a defect signal, so
 # it is counted by reason and alertable (>0 for a within-budget prompt). The
@@ -196,6 +227,36 @@ if _enabled:
         llama_local_evictions_after_acceptance_total = Counter(
             'llama_local_evictions_after_acceptance_total',
             'Accepted local dispatches evicted before their first byte, by reason',
+            ['reason'],
+        )
+        # Contention-queue observability (LP-0MVWPJW2700966ZU). One unlabelled
+        # depth gauge and one unlabelled wait histogram keep cardinality flat;
+        # the loss counter is the only labelled series and its ``reason``
+        # values come from the canonical fall-through vocabulary. The histogram
+        # buckets span a sub-100 ms win through the shipped 30 s wait budget
+        # (and the clamped ceiling), so a queue whose waits creep past the
+        # budget is visible before it starts dropping requests.
+        proxy_contention_queue_depth = Gauge(
+            'proxy_contention_queue_depth',
+            'Requests currently waiting in the bounded local contention queue',
+        )
+        if Histogram is not None:
+            try:
+                proxy_contention_queue_wait_seconds = Histogram(
+                    'proxy_contention_queue_wait_seconds',
+                    'Elapsed wait of a request in the bounded local contention '
+                    'queue (observed for admitted and timed-out waits alike)',
+                    buckets=(
+                        0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                        10.0, 20.0, 30.0, 60.0, 120.0,
+                    ),
+                )
+            except Exception:
+                proxy_contention_queue_wait_seconds = None
+        proxy_contention_queue_loss_total = Counter(
+            'proxy_contention_queue_loss_total',
+            'Requests dropped by the local contention queue (depth cap or wait '
+            'budget expiry) by canonical fall-through reason',
             ['reason'],
         )
         # Token-rate metrics: gauge for current tokens/sec, histogram for distribution
@@ -449,6 +510,60 @@ def record_local_eviction_after_acceptance(reason: str):
         return
     try:
         llama_local_evictions_after_acceptance_total.labels(reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_contention_queue_depth(depth: int):
+    """Set ``proxy_contention_queue_depth`` to the current waiter count.
+
+    Called on every mutation of the contention queue's waiter set (enqueue and
+    dequeue), so a scrape never reads a value stale by more than one admission
+    decision (LP-0MVWPJW2700966ZU AC2). Best-effort no-op when
+    prometheus_client is unavailable.
+    """
+    if not _enabled or proxy_contention_queue_depth is None:
+        return
+    try:
+        proxy_contention_queue_depth.set(max(0, int(depth)))
+    except Exception:
+        pass
+
+
+def observe_contention_queue_wait(seconds: float):
+    """Observe one completed contention-queue wait on the histogram.
+
+    Observed for admitted **and** timed-out waits, so the loss latency (the
+    budget that was spent before the fall-through) is part of the distribution
+    rather than only the successful wins. Best-effort no-op when
+    prometheus_client is unavailable.
+    """
+    if not _enabled or proxy_contention_queue_wait_seconds is None:
+        return
+    try:
+        proxy_contention_queue_wait_seconds.observe(max(0.0, float(seconds)))
+    except Exception:
+        pass
+
+
+def record_contention_queue_loss(reason: str):
+    """Increment ``proxy_contention_queue_loss_total{reason}``.
+
+    Args:
+        reason: The canonical fall-through reason token recorded by the
+            router/provider for this loss — ``fallback_after_queue`` (the wait
+            budget expired or the depth cap refused to enqueue) or
+            ``local_lease_active`` (a lease-protected slot did not free within
+            the budget). Never a free-form cause string: the label values are
+            the vocabulary the usage-analysis report already uses, so a live
+            alert and the nightly report speak the same language.
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or proxy_contention_queue_loss_total is None:
+        return
+    try:
+        proxy_contention_queue_loss_total.labels(reason=reason).inc()
     except Exception:
         pass
 

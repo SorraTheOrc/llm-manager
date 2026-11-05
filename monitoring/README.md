@@ -522,6 +522,42 @@ nothing while its `/slots` sample is stale, and
 `gpu:computing_workload:bool` then records no series either (see the three
 properties under the workload rule above).
 
+#### Contention-queue series (LP-0MVWPJW2700966ZU)
+
+The bounded local contention queue (`contention_queue_*` in
+`proxy/config.yaml`) only showed up after the fact, in the nightly
+`proxy-usage-analysis` report (`queue_wait_ms`, `fallback_after_queue`). At a
+single slot the queue is the primary cost centre, so these live series make a
+queue that fills and drops alertable. They are published by the proxy
+(`proxy/proxy/metrics.py`) at the queue's own admit / wait / drop points, so a
+scrape is never stale by more than one admission decision.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `proxy_contention_queue_depth` | gauge | requests currently waiting in the local contention queue |
+| `proxy_contention_queue_wait_seconds` | histogram | elapsed wait per completed wait, admitted **and** timed-out (the loss latency is in the distribution) |
+| `proxy_contention_queue_loss_total{reason}` | counter | requests the queue dropped (depth cap or wait-budget expiry) by canonical fall-through reason: `fallback_after_queue` (concurrency cap) or `local_lease_active` (lease-protected slot) |
+
+```promql
+# Is a queue forming at one slot right now?
+proxy_contention_queue_depth
+
+# Queue loss rate over 15m, by fall-through reason
+sum by (reason) (rate(proxy_contention_queue_loss_total[15m]))
+
+# p90 wait over 15m (histogram_quantile needs the _bucket series)
+histogram_quantile(0.9, rate(proxy_contention_queue_wait_seconds_bucket[15m]))
+
+# Fraction of queue waits that end in a loss
+sum(rate(proxy_contention_queue_loss_total[15m]))
+  / sum(rate(proxy_contention_queue_wait_seconds_count[15m]))
+```
+
+The series are observability only: no queue behaviour, cap or config value is
+changed. A missing series reads as **no queue activity**, since the gauge is
+published (to zero) by ``reset()`` and every dequeue; a proxy that has never
+queued reports ``0``.
+
 ### Why not `amd-smi`, `rocm-smi` or `amdtop`?
 
 The report and the alert rules measure GPU use from **power draw** because the

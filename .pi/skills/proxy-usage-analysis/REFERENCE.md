@@ -1520,6 +1520,36 @@ the same window can legitimately report `local_busy` 12.6 % next to a
 power-based 39.3 % — and only the former answers whether local capacity was
 contended.
 
+## Contention-queue Prometheus series (LP-0MVWPJW2700966ZU)
+
+The nightly report's queue evidence is retrospective: the `queue_wait_ms` split
+in the prefill breakdown and the `fallback_after_queue` reason are computed
+from the *logs* of a finished window (`docs/dev/single-slot-impact.md` §6,
+uncovered gap E6). At a single slot a filled queue is the primary cost centre,
+so the proxy also publishes the same three quantities **live** from
+`proxy/proxy/metrics.py`, updated at the contention queue's own admit / wait /
+drop points:
+
+| Series | Type | Meaning |
+|---|---|---|
+| `proxy_contention_queue_depth` | gauge | requests currently waiting in the local contention queue |
+| `proxy_contention_queue_wait_seconds` | histogram | elapsed wait per completed wait, admitted **and** timed-out |
+| `proxy_contention_queue_loss_total{reason}` | counter | requests dropped by the queue (depth cap / wait-budget expiry) by canonical fall-through reason |
+
+The `reason` label reuses the report's canonical vocabulary, so a live alert
+and the nightly report speak the same language:
+
+- `fallback_after_queue` — the wait budget expired, or the depth cap refused to
+  enqueue the request at the concurrency limit.
+- `local_lease_active` — a lease-protected slot did not free within the budget.
+
+The live series and the report are complementary, not redundant: the report
+answers *how much queue time did this window accumulate, per session*, while
+the counter answers *is a queue dropping requests right now*, which a nightly
+window cannot. A missing series reads as no queue activity (the proxy publishes
+the gauge to zero on every dequeue). See
+[monitoring/README.md](../../../monitoring/README.md) for the PromQL examples.
+
 ## Legacy reason normalisation
 
 The parser maps legacy reason spellings to their current names so historical and

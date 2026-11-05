@@ -51,6 +51,66 @@ class _GaugeChild:
         self._value.v = int(value)
 
 
+class _HistogramChild:
+    """A histogram instance/child: count, sum and cumulative bucket counts.
+
+    Mirrors the real client's ``_count`` / ``_sum`` accessors (both expose
+    ``.get()``) so a test can read a histogram identically under the stub and
+    the real library. Buckets are cumulative, as Prometheus expects.
+    """
+
+    def __init__(self, buckets):
+        self._buckets = tuple(buckets)
+        self._count = _Value()
+        self._sum = _Value()
+        self._bucket_counts = [0 for _ in self._buckets]
+
+    def observe(self, value):
+        value = float(value)
+        self._count.v += 1
+        self._sum.v += value
+        for index, bound in enumerate(self._buckets):
+            if value <= bound:
+                self._bucket_counts[index] += 1
+
+
+#: Default bucket bounds, matching the real client's default layout closely
+#: enough for behaviour assertions (never for exposition fidelity).
+_DEFAULT_HISTOGRAM_BUCKETS = (
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75,
+    1.0, 2.5, 5.0, 7.5, 10.0, 30.0,
+)
+
+
+class Histogram:
+    def __init__(self, name: str, desc: str, labelnames: list[str] | None = None,
+                 buckets=None):
+        self._name = name
+        self._desc = desc
+        self._labelnames = list(labelnames) if labelnames else []
+        self._buckets = tuple(buckets) if buckets else _DEFAULT_HISTOGRAM_BUCKETS
+        self._child = _HistogramChild(self._buckets)
+        self._store = {}
+
+    @property
+    def _count(self):
+        return self._child._count
+
+    @property
+    def _sum(self):
+        return self._child._sum
+
+    def observe(self, value):
+        # Unlabelled histogram: the real client records on the single child.
+        self._child.observe(value)
+
+    def labels(self, **kw):
+        key = tuple(kw.get(k) for k in self._labelnames)
+        if key not in self._store:
+            self._store[key] = _HistogramChild(self._buckets)
+        return self._store[key]
+
+
 class Gauge:
     def __init__(self, name: str, desc: str, labelnames: list[str] | None = None):
         self._name = name

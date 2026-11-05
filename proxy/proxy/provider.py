@@ -9224,6 +9224,7 @@ async def _maybe_queue_for_local_slot(
     session_id: str | None,
     endpoint: str | None = None,
     priority: str | None = None,
+    loss_reason: str = "fallback_after_queue",
 ) -> tuple[str, str | None, float | None]:
     """Queue-wait for a local slot (low/medium priority, queue policy)
     instead of immediately falling back to the next remote provider.
@@ -9471,6 +9472,11 @@ async def _maybe_queue_for_local_slot(
         ),
         eta_ordering=bool(cq.get("eta_ordering", False)),
         promote_after_seconds=float(cq.get("eta_promotion_seconds", 0) or 0),
+        # LP-0MVWPJW2700966ZU: the queue records a loss on its own drop points
+        # (depth cap, wait expiry) with the canonical fall-through reason this
+        # call site reports. The default is ``fallback_after_queue``; the
+        # lease-protected call site passes ``local_lease_active``.
+        loss_reason=loss_reason,
     )
     if elapsed is None:
         # Caps exceeded — the caller falls back. Surface the measured wait so
@@ -15705,6 +15711,10 @@ async def _proxy_with_fallback_cycle(
                             config, _lease_cur, _lease_max, request, body_json,
                             model_config, provider_cfg, _session_id,
                             endpoint=local_endpoint,
+                            # LP-0MVWPJW2700966ZU: a lease-protected slot that
+                            # does not free within the budget is a queue loss
+                            # with the canonical ``local_lease_active`` reason.
+                            loss_reason=SKIP_REASON_LOCAL_LEASE_ACTIVE,
                         )
                     )
                     if _lease_action == "dispatch":
