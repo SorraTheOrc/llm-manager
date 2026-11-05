@@ -3077,6 +3077,15 @@ server:
   backend_retry_base_delay_seconds: 0.25
   backend_retry_max_delay_seconds: 2.0
   backend_retry_jitter_ratio: 0.25
+  # TTL (seconds) of the local-backend-unreachable routing skip
+  # (LP-0MW42T6IJ006EQA3). A *deterministic* connection-refused local
+  # dispatch fails fast after a single attempt (no 8x backoff retries) and
+  # arms this skip, so the local route is not re-dispatched — and a stale
+  # slots snapshot (> local_slots_max_snapshot_age_seconds) also skips the
+  # route pre-dispatch. The skip is bounded and cleared by a successful
+  # dispatch / fresh probe, so a recovered backend is used again immediately
+  # (no permanent quarantine). Default: 60.
+  local_backend_skip_seconds: 60
   llama_watchdog_interval_seconds: 5
   llama_backend_probe_timeout_seconds: 2
   llama_self_heal_max_attempts: 3

@@ -71,7 +71,12 @@ from proxy.local_route_starvation import (
     record_local_route_arm,
 )
 from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
-from proxy.observability import _record_backend_signal
+from proxy.observability import (
+    _arm_local_backend_unreachable,
+    _is_connection_refused,
+    _local_backend_unreachable_remaining_seconds,
+    _record_backend_signal,
+)
 from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
@@ -11732,6 +11737,22 @@ def _handle_connection_error_in_fallback(
                 error=str(type(exc).__name__),
             )
             return True
+        # LP-0MW42T6IJ006EQA3 AC1/AC3: a *refused* connection on a local
+        # dispatch is deterministic — the backend has no listener. The
+        # fail-fast inside ``_call_with_backend_retries`` already arms the
+        # routing skip; arming here too covers a cycle whose local dispatch
+        # surface raised directly (UI/direct ``proxy_to_local`` paths), so a
+        # chain-hold cycle restarts with local skipped, never re-dispatching
+        # the dead backend (no per-cycle retry storm).
+        if provider_type == "local" and _is_connection_refused(exc):
+            _arm_local_backend_unreachable(config)
+            logger.warning(
+                "backend_fail_fast provider=%s type=%s reason=connection_refused "
+                "→ failing over to next provider%s",
+                provider_name,
+                provider_type,
+                turn_field(),
+            )
         cooldown = cooldown_seconds
         if provider_type == "remote" and cooldown_seconds > 0:
             count = _provider_failure_count.get(provider_name, 0)
@@ -14454,6 +14475,46 @@ async def _proxy_with_fallback_cycle(
                 # explicit ``endpoint`` the legacy default is used, keeping
                 # single-server deployments working without changes.
                 local_endpoint = _get_local_provider_endpoint(provider_cfg, config)
+                # LP-0MW42T6IJ006EQA3 AC2: skip local BEFORE dispatch when the
+                # backend is known unreachable — a deterministic
+                # connection-refused fail-fast armed the skip deadline, or the
+                # slots snapshot is older than the configured staleness bound.
+                # No connection is attempted: the chain falls to the next
+                # provider while the skip is armed. The state is TTL-bounded
+                # and cleared by a successful dispatch / fresh probe, so a
+                # recovered backend is re-tried immediately (AC3 — no
+                # permanent quarantine).
+                _backend_skip_remaining = _local_backend_unreachable_remaining_seconds(
+                    config
+                )
+                if _backend_skip_remaining > 0:
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="backend_unreachable_skip",
+                        reason="backend_unreachable",
+                        skip_remaining_seconds=round(_backend_skip_remaining, 1),
+                    )
+                    fallback_reason = "backend_unreachable"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _note_local_fallback_reason(
+                        request, "backend_unreachable", _backend_skip_remaining
+                    )
+                    logger.info(
+                        "routing_skip_local provider=%s model=%s session=%s "
+                        "preference=%s skip_remaining=%.0fs "
+                        "reason=backend_unreachable → skipping local, "
+                        "routing to next remote provider%s",
+                        provider_name,
+                        provider_cfg.get("llama_model") or "unknown",
+                        _session_id or "unknown",
+                        _preference,
+                        _backend_skip_remaining,
+                        turn_field(),
+                    )
+                    continue
                 # LP-0MVKUKFHH005UDWL: post-deadline prefill-thrash cooldown.
                 # A session whose last local dispatch was cancelled by the
                 # prefill deadline must not immediately re-dispatch the

@@ -35,6 +35,11 @@ import proxy.metrics as metrics
 from proxy import cold_start
 from proxy.backend_isolation import tracked_backend_pids
 from proxy.death_capture import decode_returncode
+from proxy.observability import (
+    _clear_local_backend_unreachable,
+    _is_connection_refused,
+    _record_connection_refused_fail_fast,
+)
 
 # ---------------------------------------------------------------------------
 # llama-server reuse across proxy-only restarts (LP-0MUCEFCL6001ZXYN)
@@ -853,11 +858,20 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
 
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
-       try:
-           return await call_factory()
-       except Exception as exc:
-           last_exc = exc
-           if not srv._is_retryable_backend_exception(exc) or attempt >= max_attempts:
+        try:
+            result = await call_factory()
+            # A served dispatch proves the backend is reachable again: release
+            # any pre-dispatch routing skip (LP-0MW42T6IJ006EQA3 AC3).
+            _clear_local_backend_unreachable()
+            return result
+        except Exception as exc:
+            last_exc = exc
+            # Fail fast on a deterministic connection-refused backend
+            # (LP-0MW42T6IJ006EQA3 AC1): nothing in the backoff horizon can
+            # fix a refused connect, so retrying only burns ~28 s/request.
+            if _is_connection_refused(exc):
+                _record_connection_refused_fail_fast(path, stream, attempt, max_attempts, exc)
+            if not srv._is_retryable_backend_exception(exc) or attempt >= max_attempts:
                srv._record_backend_signal(srv._classify_backend_exception(exc))
                try:
                    srv.backend_ready = False
@@ -865,20 +879,20 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
                    pass
                raise
 
-           signal_name = srv._classify_backend_exception(exc)
-           srv._record_backend_signal(signal_name)
-           delay = srv._compute_retry_delay(attempt, base_delay, max_delay, jitter_ratio)
-           srv.logger.warning(
-               "backend_retry path=%s stream=%s attempt=%s/%s delay=%.3fs signal=%s error=%s",
-               path,
-               stream,
-               attempt,
-               max_attempts,
-               delay,
-               signal_name,
-               type(exc).__name__,
-           )
-           await asyncio.sleep(delay)
+            signal_name = srv._classify_backend_exception(exc)
+            srv._record_backend_signal(signal_name)
+            delay = srv._compute_retry_delay(attempt, base_delay, max_delay, jitter_ratio)
+            srv.logger.warning(
+                "backend_retry path=%s stream=%s attempt=%s/%s delay=%.3fs signal=%s error=%s",
+                path,
+                stream,
+                attempt,
+                max_attempts,
+                delay,
+                signal_name,
+                type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
 
     if last_exc is not None:
        raise last_exc

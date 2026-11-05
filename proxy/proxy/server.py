@@ -386,6 +386,12 @@ async def _dispatch_cleanup_loop() -> None:
 # Health/readiness signal for local backend
 backend_ready: bool = False
 
+# LP-0MW42T6IJ006EQA3: monotonic deadline until which local routing skips
+# the backend (armed by a deterministic connection-refused local dispatch or
+# a failed reachability probe; cleared by a successful dispatch or probe).
+# ``0.0`` = not armed. Owned by ``proxy.observability`` helpers.
+local_backend_unreachable_until: float = 0.0
+
 # Self-healing state for backend recovery attempts
 backend_recovery_state: dict = {
     "in_progress": False,

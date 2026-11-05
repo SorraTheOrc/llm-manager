@@ -1740,10 +1740,34 @@ async def health_check():
     # took the wrong action. Reachability is now the signal in router mode and
     # ``llama_server_managed`` keeps an unmanaged backend distinguishable.
     backend_reachable = False
+    probe_ran = False
     if llama_server_managed or router_mode:
         backend_reachable = bool(
             await srv._probe_backend_reachable(llama_port)
         )
+        probe_ran = True
+    # LP-0MW42T6IJ006EQA3 AC2/AC3: write the measured reachability through
+    # to the routing skip state so /health's probe (already paid for) keeps
+    # the pre-dispatch gate fresh without per-request probing at dispatch
+    # time. ``backend_reachable=false`` arms a TTL-bounded skip; a healthy
+    # probe clears it, so a recovered backend is re-tried immediately. Only
+    # written when the probe actually ran (an unmanaged, non-router backend
+    # is not probed — ``False`` there is "not measured", not "dead").
+    if probe_ran:
+        try:
+            from proxy.observability import (
+                _arm_local_backend_unreachable,
+                _clear_local_backend_unreachable,
+            )
+
+            if backend_reachable:
+                _clear_local_backend_unreachable()
+            else:
+                _arm_local_backend_unreachable(
+                    {"server": server_cfg} if isinstance(server_cfg, dict) else None
+                )
+        except Exception:
+            pass
     llama_running = bool(
         llama_server_managed or (router_mode and backend_reachable)
     )

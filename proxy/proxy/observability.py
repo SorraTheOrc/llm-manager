@@ -53,6 +53,7 @@ See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 
 import asyncio
 import contextlib
+import errno
 import json
 import re
 import threading
@@ -118,6 +119,173 @@ def _classify_backend_exception(exc: Exception) -> str:
     if isinstance(exc, (httpx.ReadTimeout, httpx.TimeoutException)):
         return "timeout_failures"
     return "other_failures"
+
+
+# ===================================================================
+# Local-backend reachability skip state (LP-0MW42T6IJ006EQA3)
+#
+# The 2026-11-05 21:36 incident: a dead llama-server (killed ~15:13) was
+# still advertised available, so every request dispatched local and burned
+# ~28 s on ``backend_retry_attempts=8`` x chain-hold cycles of deterministic
+# ``ConnectError`` (connection refused) before falling to a remote provider.
+# The retry loop retried a *deterministic* error — nothing inside the
+# backoff horizon can fix a refused connect — and no pre-dispatch check
+# consulted the reachability evidence ``/health`` already had.
+#
+# This module owns the reachability bookkeeping shared by the dispatcher
+# (lifecycle.py), the ``/health`` handler (handlers.py) and the routing
+# cycle (provider.py):
+#
+#   - :func:`_is_connection_refused` — deterministic connection-refused
+#     detection used by the dispatch fail-fast (AC1).
+#   - the skip deadline on the server module
+#     (``srv.local_backend_unreachable_until``), armed by a refused local
+#     dispatch or a failed reachability probe and cleared by a successful
+#     dispatch or probe (AC3 — bounded, so a recovered backend is re-tried
+#     promptly, never a permanent quarantine).
+#   - :func:`_local_backend_unreachable_remaining_seconds` — the pre-dispatch
+#     routing gate combining the armed deadline with the slots-snapshot
+#     staleness signal (AC2).
+# ===================================================================
+
+
+def _local_backend_skip_seconds(config: dict | None = None) -> float:
+    """TTL (seconds) of the local-backend-unreachable routing skip.
+
+    Reads ``server.local_backend_skip_seconds`` (default 60). The skip is
+    bounded so a recovered backend is re-tried promptly (AC3): a real
+    dispatcher re-arms it on the next refused attempt, and a fresh
+    ``/health`` probe clears it before the TTL when health is being polled.
+    """
+    server_cfg = {}
+    if isinstance(config, dict):
+        server_cfg = config.get("server") or {}
+        if not isinstance(server_cfg, dict):
+            server_cfg = {}
+    try:
+        val = float(server_cfg.get("local_backend_skip_seconds") or 60)
+    except (TypeError, ValueError):
+        val = 60.0
+    return val if val > 0 else 60.0
+
+
+def _arm_local_backend_unreachable(config: dict | None = None) -> None:
+    """Arm the routing skip: local is not to be dispatched for
+    ``local_backend_skip_seconds``."""
+    try:
+        _srv().local_backend_unreachable_until = (
+            time.monotonic() + _local_backend_skip_seconds(config)
+        )
+    except Exception:
+        pass
+
+
+def _clear_local_backend_unreachable() -> None:
+    """Clear the routing skip — the backend just proved reachable."""
+    try:
+        _srv().local_backend_unreachable_until = 0.0
+    except Exception:
+        pass
+
+
+def _is_connection_refused(exc: Exception) -> bool:
+    """Return True when *exc* is a deterministic connection-refused error.
+
+    A refused connection (``ECONNREFUSED``) is deterministic: the local port
+    has no listener and nothing inside the retry/backoff horizon can change
+    that, so retrying it only burns latency (AC1). Non-refused connect
+    errors (timeouts, DNS, network unreachable) stay retryable. The cause
+    chain is walked because httpx attaches the socket error via ``from`` and
+    an OSError may or may not be a ``ConnectionRefusedError`` instance.
+    """
+    if not isinstance(exc, httpx.ConnectError):
+        return False
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionRefusedError):
+            return True
+        if isinstance(cur, OSError) and cur.errno == errno.ECONNREFUSED:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return "connection refused" in f"{exc}".lower()
+
+
+def _record_connection_refused_fail_fast(
+    path: str, stream: bool, attempt: int, max_attempts: int, exc: Exception
+) -> None:
+    """Record, arm and re-raise a deterministic connection-refused error.
+
+    The local dispatch retry loop (``lifecycle._call_with_backend_retries``)
+    calls this instead of retrying (LP-0MW42T6IJ006EQA3 AC1): a refused
+    connect cannot be fixed by the backoff horizon, so retrying it only burns
+    ~28 s per request (8 attempts x chain-hold cycles on 2026-11-05). The
+    caller's fallback chain serves the next provider after the raise.
+
+    Effects (all idempotent): the ``connect_failures`` signal is recorded,
+    ``backend_ready`` flips to ``False``, the routing skip is armed (AC2/AC3,
+    read by the pre-dispatch gate) and a log line naming the fail-fast reason
+    is emitted.
+    """
+    srv = _srv()
+    _record_backend_signal("connect_failures")
+    try:
+        srv.backend_ready = False
+    except Exception:
+        pass
+    _arm_local_backend_unreachable(getattr(srv, "config", None))
+    try:
+        srv.logger.warning(
+            "backend_fail_fast path=%s stream=%s attempt=%s/%s "
+            "signal=%s error=%s reason=connection_refused",
+            path,
+            stream,
+            attempt,
+            max_attempts,
+            "connect_failures",
+            type(exc).__name__,
+        )
+    except Exception:
+        pass
+    raise exc
+
+
+def _local_backend_unreachable_remaining_seconds(config: dict | None = None) -> float:
+    """Seconds local routing should keep skipping the backend (0 = usable).
+
+    Two independent signals (AC2):
+
+    1. the armed fail-fast deadline
+       (``srv.local_backend_unreachable_until``, set by a refused local
+       dispatch or a failed reachability probe);
+    2. a slots snapshot older than the configured staleness bound
+       (``local_slots_max_snapshot_age_seconds``) — a dead backend leaves
+       the counts cache stale (6.5 h in the incident), and a missing
+       snapshot (``None``) is *not* evidence of staleness, mirroring
+       :func:`slots_snapshot_too_old`.
+
+    Returns 0.0 when neither signal says unreachable, so a healthy backend is
+    always dispatched (fail-open).
+    """
+    srv = _srv()
+    try:
+        deadline = float(getattr(srv, "local_backend_unreachable_until", 0.0) or 0.0)
+        if deadline > 0:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                return remaining
+    except Exception:
+        pass
+    try:
+        stamp = last_known_slot_counts_stamp()
+        if stamp is not None:
+            ceiling = local_slots_max_snapshot_age_seconds(config)
+            if slots_snapshot_too_old(max(0.0, time.monotonic() - stamp), ceiling):
+                return _local_backend_skip_seconds(config)
+    except Exception:
+        pass
+    return 0.0
 
 
 # ===================================================================

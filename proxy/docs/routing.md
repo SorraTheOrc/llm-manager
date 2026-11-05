@@ -1669,6 +1669,84 @@ through the request's own bounds:
 | local-only chain (no remote provider) | unchanged refusal — there is nothing to bounce to, and the ETA bound is the honest answer to a caller whose budget cannot cover the prefill |
 | pin-local / `local-only` intent | unchanged (the pin branch runs first, including bounded deferral escalation) |
 
+### Local-route ConnectError fail-fast + pre-dispatch skip (LP-0MW42T6IJ006EQA3)
+
+The 2026-11-05 21:36 incident: a dead llama-server (killed ≈15:13, port 8080
+not listening) was still advertised available, so every request dispatched
+local and burned **~28 s** — `backend_retry_attempts=8` backoff (0.25 → 2 s)
+x chain-hold cycles of deterministic `ConnectError` (`connect_failures`)
+before falling to a remote provider, then poisoned the session with a
+cooldown. A refused connect is deterministic: nothing inside the backoff
+horizon can make a dead port answer, so retrying it only wastes time.
+
+The fail-fast shipped in LP-0MW0KZR7A003UFQK covers *provably dead remote
+chains* (deterministic skips / terminal refusals), not a connection-refused
+local backend, and no pre-dispatch check consulted the reachability evidence
+`/health` already had. The fix has three parts:
+
+1. **Fail fast on a refused connect (AC1).** The local dispatch's backend
+   retry loop (`_call_with_backend_retries`) detects a deterministic
+   connection-refused `httpx.ConnectError` (cause chain carries
+   `ECONNREFUSED` / `ConnectionRefusedError`) and raises after a **single
+   attempt** — no backoff, no retry — logging:
+
+   ```
+   backend_fail_fast path=… stream=… attempt=1/8 signal=connect_failures
+     error=ConnectError reason=connection_refused
+   ```
+
+   The caller's fallback chain serves the next provider immediately. The
+   same line (and the skip arm) fires at the cycle level when the
+   dispatch surface raised directly, so every refused local entry is
+   attributable.
+
+2. **Pre-dispatch skip when the backend is known unreachable (AC2).** The
+   routing cycle skips the local provider **before any connection attempt**
+   when either signal says unreachable:
+
+   - the armed skip deadline (an in-process TTL deadline underlying
+     ``routing_skip_local reason=backend_unreachable``), written by a refused
+     local dispatch (fail-fast) and by `/health`'s own probe
+     (`backend_reachable=false` — the probe is already paid for, so the
+     routing gate gets its freshness without per-request probing);
+   - a slots snapshot older than `server.local_slots_max_snapshot_age_seconds`
+     (the 6.5 h-stale snapshot of the incident). A missing snapshot is *not*
+     evidence of staleness (mirrors `slots_snapshot_too_old`).
+
+   The skip is logged with the existing `routing_skip_local` vocabulary and
+   recorded as `status=backend_unreachable_skip`:
+
+   ```
+   routing_skip_local provider=local-qwen3 model=… session=… preference=…
+     skip_remaining=60s reason=backend_unreachable → skipping local,
+     routing to next remote provider
+   ```
+
+   Because the skip is checked at the top of the local entry, a chain-hold
+   cycle that restarts from the first provider never re-dispatches the dead
+   backend — the retry storm (8 attempts x N cycles) cannot recur.
+
+3. **Bounded, self-healing state (AC3).** The skip is TTL-bounded
+   (`server.local_backend_skip_seconds`, default 60): a successful local
+   dispatch or a healthy `/health` probe clears it immediately, and expiry
+   lets the next request re-try local. A recovered backend is therefore used
+   again at the next request/probe — never a permanent quarantine, and never
+   a per-turn retry storm while the backend is down (the skip persists across
+   turns until cleared or expired).
+
+Knobs (all in `proxy/config.yaml`, defaults shown):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `server.local_backend_skip_seconds` | `60` | TTL of the routing skip armed by a refused connect / failed probe |
+| `server.local_slots_max_snapshot_age_seconds` | cadence-derived (~300) | staleness ceiling for the secondary slot-snapshot signal |
+| `server.backend_retry_attempts` | `8` | unchanged — still applies to *transient* (retryable) connect errors |
+
+Regression rows live in `tests/test_local_route_connecterror_fail_fast.py`:
+(i) dead backend → single-attempt fallthrough to remote; (ii) recovered
+backend → local route restored; (iii) routing skips local pre-dispatch when
+`/health` shows unreachable.
+
 ### Measured attribution of the first rung-enabled 24 h window (LP-0MVZ5WV6W008UO5F)
 
 Window 2026-11-01 11:09:07 → 2026-11-02 11:09:07 (the rung was enabled at
