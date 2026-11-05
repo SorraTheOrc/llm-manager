@@ -432,64 +432,6 @@ models:
         priorities: [low, medium, high]
         type: local
         llama_model: Qwen3
-      # MunitoAI Free (LP-0MV5UPXKL002MSKB): free-tier remote fallback, sits
-      # immediately after local. Uses a separate key resolved from
-      # ~/.pi/agent/auth.json under either ``munitoai_free`` or the
-      # documented hyphenated ``munitoai-free`` — the resolver strips
-      # _API_KEY from MUNITOAI_FREE_API_KEY and tries both the underscore
-      # and hyphenated stems (LP-0MVBJXZY5002UW10). No ``available_times``
-      # window — eligible around the clock.
-      # ``display_name`` marks the free tier so X-Resolved-Model shows
-      # ``MunitoAI Free/<model>`` vs the paid ``MunitoAI/<model>`` in Pi
-      # (LP-0MVCQ36QV009QX8K).
-      - name: munitoai-free
-        priorities: [low, medium, high]
-        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
-        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
-        # this the proxy re-probes the endpoint during exhaustion.
-        # On a quota 429 the parsed reset also quarantines the failing
-        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
-        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
-        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
-        # the account key is api_key_env@endpoint:model, so same-gateway
-        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
-        #
-        # Daily free limit (LP-0MVT8SAZE00570J5): when MunitoAI answers 429
-        # ``insufficient_quota`` / ``free_daily_limit_exceeded`` with an
-        # ABSOLUTE reset ("It resets at 2026-10-30 00:00 UTC") the
-        # usage-limit reset path runs BEFORE the header cooldown above and
-        # quarantines this key's account until that instant (+ margin),
-        # bounded to the advertised daily period — so the tier is not
-        # re-probed every ~60 s for the rest of the UTC day. The paid
-        # ``munitoai`` entry below uses a different ``api_key_env`` and stays
-        # eligible in the same request.
-        respect_ratelimit_headers: true
-        display_name: MunitoAI Free
-        type: remote
-        provider: MunitoAI
-        endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_FREE_API_KEY
-        forward_session_headers: false
-        model: deepseek-ai/deepseek-v4-flash
-        # Context ceiling (LP-0MVF9N31A0006VH5): MunitoAI free-tier
-        # x-ratelimit-limit-input-tokens=150000 per rolling 60s
-        # (probed 2026-10-19; see the sourced-limits block above).
-        max_context_tokens: 150000
-        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
-        # only a small number of requests per rolling 60s window, so the proxy
-        # dispatches to it only while that window has capacity. Over-budget
-        # requests from NEW sessions pass straight through to the next tier
-        # (never parked); a session already served by this entry waits a
-        # bounded time for the window to reset, preserving its prompt cache.
-        # Tune per chain with `models.<name>.budget` or per entry with this
-        # entry's own `budget` block (LP-0MVDVK5TM004TQQV); otherwise the
-        # server.provider_rate_limit_wait_* / provider_affinity_ttl_* defaults
-        # apply.
-        # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
-        # tier is a bonus tier, so bursts spill to the paid tiers instead.
-        # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
-        # both see the full 3-per-window cap.
-        rate_limit_rpm: 3
       - name: opencode-go-3
         priorities: [low, medium, high]
         display_name: OpenCode Go 3
@@ -563,8 +505,75 @@ models:
         #
         # model: muse-spark-1.3-contributor
         # api: openai-responses
+      # MunitoAI Free (LP-0MV5UPXKL002MSKB, LP-0MVWG4U7F0009LTH): free-tier
+      # remote fallback placed AFTER the three timed opencode-go accounts and
+      # BEFORE the paid ``munitoai`` tier. The free tier draws on a daily-reset
+      # allowance (LP-0MVT8SAZE00570J5), so spending it while a costed tier is
+      # eligible (UTC 00:00-01:00, 04:00-06:00, 10:00-00:00) wastes tokens that
+      # are only useful during the opencode gap periods (UTC 01:00-04:00 and
+      # 06:00-10:00, LP-0MU1RXEPL005CK97) — where this entry is now the first
+      # non-local tier that can serve.
+      # Uses a separate key resolved from ~/.pi/agent/auth.json under either
+      # ``munitoai_free`` or the documented hyphenated ``munitoai-free`` — the
+      # resolver strips _API_KEY from MUNITOAI_FREE_API_KEY and tries both the
+      # underscore and hyphenated stems (LP-0MVBJXZY5002UW10). No
+      # ``available_times`` window — eligible around the clock. The entry's own
+      # knobs (rate limit, reset-header handling, context ceiling) are unchanged
+      # by the repositioning.
+      # ``display_name`` marks the free tier so X-Resolved-Model shows
+      # ``MunitoAI Free/<model>`` vs the paid ``MunitoAI/<model>`` in Pi
+      # (LP-0MVCQ36QV009QX8K).
+      - name: munitoai-free
+        priorities: [low, medium, high]
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        #
+        # Daily free limit (LP-0MVT8SAZE00570J5): when MunitoAI answers 429
+        # ``insufficient_quota`` / ``free_daily_limit_exceeded`` with an
+        # ABSOLUTE reset ("It resets at 2026-10-30 00:00 UTC") the
+        # usage-limit reset path runs BEFORE the header cooldown above and
+        # quarantines this key's account until that instant (+ margin),
+        # bounded to the advertised daily period — so the tier is not
+        # re-probed every ~60 s for the rest of the UTC day. The paid
+        # ``munitoai`` entry below uses a different ``api_key_env`` and stays
+        # eligible in the same request.
+        respect_ratelimit_headers: true
+        display_name: MunitoAI Free
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_FREE_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): MunitoAI free-tier
+        # x-ratelimit-limit-input-tokens=150000 per rolling 60s
+        # (probed 2026-10-19; see the sourced-limits block above).
+        max_context_tokens: 150000
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune per chain with `models.<name>.budget` or per entry with this
+        # entry's own `budget` block (LP-0MVDVK5TM004TQQV); otherwise the
+        # server.provider_rate_limit_wait_* / provider_affinity_ttl_* defaults
+        # apply.
+        # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
+        # tier is a bonus tier, so bursts spill to the paid tiers instead.
+        # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 3-per-window cap.
+        rate_limit_rpm: 3
       # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
-      # after the opencode-go chain. Restricted to 10:00-23:00 UTC so
+      # after the free tier, which itself trails the opencode-go chain
+      # (LP-0MVWG4U7F0009LTH). Restricted to 10:00-23:00 UTC so
       # paid dispatches fall within business hours.
       - name: munitoai
         priorities: [low, medium, high]

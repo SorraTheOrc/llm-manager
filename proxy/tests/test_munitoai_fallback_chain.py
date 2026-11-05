@@ -2,13 +2,19 @@
 (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z).
 
 The MunitoAI tiers are the remote fallbacks of the ``plan`` / ``author`` /
-``code`` chains: ``munitoai-free`` sits directly after the local Qwen3
-provider (first remote tier), and ``munitoai`` sits directly before the
-``deepseek-flash`` final tier, in both the authoritative base config
-(``config.yaml``, the single authoritative config after the mode axis was
-removed, LP-0MVDT94F0003VHUA AC4). These tests assert the *resolved* runtime config through the
-production merge path, so the tier cannot silently drop out of a profile or
-drift in the chain order.
+``code`` chains. ``munitoai`` sits directly before the ``deepseek-flash`` final
+tier in all three chains, in the authoritative base config (``config.yaml``,
+the single authoritative config after the mode axis was removed,
+LP-0MVDT94F0003VHUA AC4).
+
+``munitoai-free``'s *position* differs by chain since LP-0MVWG4U7F0009LTH:
+``author`` / ``code`` keep it as the first remote tier directly after local
+(``FREE_TIER_DIRECTLY_AFTER_LOCAL``), while ``plan`` places it after the three
+timed ``opencode-go`` accounts and before the paid ``munitoai`` tier, so free
+tokens are spent only during the opencode gap periods. The entry itself is
+identical in every chain. These tests assert the *resolved* runtime config
+through the production merge path, so the tier cannot silently drop out of a
+profile or drift in the chain order.
 
 They also pin the two runtime facts the tier depends on: the resolved-model
 header value derived from the entry, and resolution of the ``MUNITOAI_API_KEY``
@@ -84,9 +90,24 @@ MUNITOAI_ENTRY = {
 
 CHAINS = ("plan", "author", "code")
 
+#: Models whose free tier still sits directly after local. ``plan`` moved its
+#: free tier behind the timed ``opencode-go`` accounts (LP-0MVWG4U7F0009LTH),
+#: so it is excluded here and covered by the plan-specific tests below.
+FREE_TIER_DIRECTLY_AFTER_LOCAL = ("author", "code")
+
+OPENCODE_NAMES = ("opencode-go-3", "opencode-go-2", "opencode-go")
+
 
 def _providers(cfg: dict, model: str) -> list[dict]:
     return cfg["models"][model]["providers"]
+
+
+def _names(providers: list[dict]) -> list[str]:
+    return [provider["name"] for provider in providers]
+
+
+def _free_index(providers: list[dict]) -> int:
+    return _names(providers).index("munitoai-free")
 
 
 def _first_opencode_index(providers: list[dict]) -> int:
@@ -96,21 +117,32 @@ def _first_opencode_index(providers: list[dict]) -> int:
     raise AssertionError("chain must retain an opencode-go tier")
 
 
-@pytest.mark.parametrize("model", CHAINS)
+@pytest.mark.parametrize("model", FREE_TIER_DIRECTLY_AFTER_LOCAL)
 def test_base_chain_places_munitoai_free_after_local_qwen3(model):
-    """config.yaml lists munitoai-free directly after the local Qwen3 provider."""
+    """author/code: config.yaml lists munitoai-free directly after local Qwen3."""
     providers = _providers(load_profile("config.yaml"), model)
     assert providers[0]["name"] == "local-qwen3"
     assert providers[1] == MUNITOAI_FREE_ENTRY
 
 
-@pytest.mark.parametrize("model", CHAINS)
+def test_plan_chain_places_munitoai_free_after_the_opencode_tiers():
+    """plan: the free tier follows every opencode-go tier (LP-0MVWG4U7F0009LTH).
+
+    The same entry dict is shipped — only its chain position moved, so a
+    property drift is caught here as well as in the author/code case.
+    """
+    providers = _providers(load_profile("config.yaml"), "plan")
+    assert providers[0]["name"] == "local-qwen3"
+    free_index = _free_index(providers)
+    assert providers[free_index] == MUNITOAI_FREE_ENTRY
+    assert free_index > max(_names(providers).index(name) for name in OPENCODE_NAMES)
+
+
+@pytest.mark.parametrize("model", FREE_TIER_DIRECTLY_AFTER_LOCAL)
 def test_munitoai_free_precedes_the_first_opencode_tier(model):
-    """munitoai-free is the first remote tier, ahead of every opencode-go tier."""
+    """author/code: munitoai-free is the first remote tier, ahead of opencode."""
     providers = _providers(load_profile("config.yaml"), model)
-    munitoai_index = next(
-        index for index, provider in enumerate(providers) if provider["name"] == "munitoai-free"
-    )
+    munitoai_index = _free_index(providers)
     assert munitoai_index == 1
     assert munitoai_index < _first_opencode_index(providers)
 
@@ -141,7 +173,11 @@ def test_merged_profile_places_munitoai_free_after_local_qwen3(mode, model):
     """The position survives the mode merge (fast overlay + base inheritance)."""
     providers = _providers(get_merged_config(mode), model)
     assert providers[0]["name"] == "local-qwen3"
-    assert providers[1] == MUNITOAI_FREE_ENTRY
+    # Position is model-dependent: plan trails the opencode tiers, author and
+    # code lead with the free tier (LP-0MVWG4U7F0009LTH).
+    expected_free_index = 4 if model == "plan" else 1
+    assert _free_index(providers) == expected_free_index
+    assert providers[expected_free_index] == MUNITOAI_FREE_ENTRY
     paid_index = next(
         index for index, provider in enumerate(providers) if provider["name"] == "munitoai"
     )
@@ -151,8 +187,13 @@ def test_merged_profile_places_munitoai_free_after_local_qwen3(mode, model):
 
 
 def test_munitoai_free_is_always_available():
-    """No available_times window means the tier is eligible around the clock."""
-    entry = _providers(load_profile("config.yaml"), "plan")[1]
+    """No available_times window means the tier is eligible around the clock.
+
+    This is what lets the reordered ``plan`` chain rely on it during the
+    opencode gap periods.
+    """
+    providers = _providers(load_profile("config.yaml"), "plan")
+    entry = providers[_free_index(providers)]
     assert entry["name"] == "munitoai-free"
     assert "available_times" not in entry
 
@@ -190,7 +231,7 @@ def test_munitoai_resolved_model_header(model):
     (LP-0MVCQ36QV009QX8K). The two strings must never be identical.
     """
     providers = _providers(get_merged_config("fast"), model)
-    free_entry = providers[1]
+    free_entry = providers[_free_index(providers)]
     paid_entry = next(p for p in providers if p["name"] == "munitoai")
     free_value = _build_resolved_model_value(free_entry)
     paid_value = _build_resolved_model_value(paid_entry)

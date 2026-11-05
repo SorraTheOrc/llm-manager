@@ -298,8 +298,7 @@ budget used to leave the request nowhere to go but an upstream 429. `plan`,
 as well as `medium`/`high`:
 
 ```text
-priorities: [low, medium, high]   # local-qwen3, munitoai-free,
-                                 # opencode-go-3, opencode-go-2, opencode-go
+priorities: [low, medium, high]   # opencode-go-3, opencode-go-2, opencode-go
 priorities: [medium, high]        # munitoai, deepseek-flash
 ```
 
@@ -307,7 +306,12 @@ The resulting `low` chain is the model's own provider order filtered by the
 label (LP-0MVGPZWY0001JD1D), so it reads directly off the `providers` list:
 
 ```text
-chain(low) = [local-qwen3, munitoai-free, opencode-go-3, opencode-go-2, opencode-go]
+chain(low, plan)             = [local-qwen3, opencode-go-3, opencode-go-2,
+                                opencode-go, munitoai-free, munitoai,
+                                deepseek-flash]
+chain(low, author | code)    = [local-qwen3, munitoai-free, opencode-go-3,
+                                opencode-go-2, opencode-go, munitoai,
+                                deepseek-flash]
 ```
 
 Those entries keep the off-peak `available_times` windows added by
@@ -317,6 +321,24 @@ widened by this change. The cheap priority window (`server.priority_window`,
 default local `Europe/Dublin` 01:00–10:00 = UTC 00:00–09:00) overlaps the
 opencode windows in ~3 of its 9 hours (UTC 00:00–01:00 and 04:00–06:00); the UTC
 01:00–04:00 and 06:00–10:00 gaps are deliberate paid-spend avoidance.
+
+#### Free tier after the timed accounts in `plan` (LP-0MVWG4U7F0009LTH)
+
+`munitoai-free` draws on a **daily-reset allowance** (LP-0MVT8SAZE00570J5), so
+the token it spends is gone for the rest of the UTC day. Placing it directly
+after local meant every request that overflowed the local slots burned that
+allowance *before* the timed `opencode-go` accounts, even inside the 14 hours
+per day those accounts are eligible — wasting free capacity that would
+otherwise have covered the gap periods (UTC 01:00-04:00 and 06:00-10:00,
+LP-0MU1RXEPL005CK97), when the opencode accounts are unavailable anyway.
+
+The `plan` chain therefore lists `munitoai-free` **after** all three
+`opencode-go` entries and **before** the paid `munitoai` tier (`author` and
+`code` keep the original order). The entry's own knobs — `rate_limit_rpm: 3`,
+`respect_ratelimit_headers`, `max_context_tokens`, `display_name` — and its
+absence of `available_times` are unchanged, so the tier stays eligible around
+the clock and is still the last **free** resort inside an opencode window once
+all three accounts are exhausted.
 
 Capacity vs resilience — the three entries are **not** interchangeable:
 

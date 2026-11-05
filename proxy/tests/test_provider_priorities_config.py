@@ -44,12 +44,26 @@ from proxy.utils import _validate_config, load_config
 # Frozen chains (AC3). These are the chains the shipped config resolves to;
 # the labels must reproduce them exactly. The ``low`` chain gains the paid
 # tail since LP-0MVY8REC80097HI0 (previously it stopped at the opencode
-# entries).
+# entries). ``plan`` moved its free tier behind the opencode-go accounts in
+# LP-0MVWG4U7F0009LTH; ``author``/``code`` are unchanged by that item.
 # ---------------------------------------------------------------------------
 
 CHAIN_MODELS = ("plan", "author", "code")
 
 PLAN_PROVIDER_ORDER = [
+    "local-qwen3",
+    "opencode-go-3",
+    "opencode-go-2",
+    "opencode-go",
+    "munitoai-free",
+    "munitoai",
+    "deepseek-flash",
+]
+#: ``author`` / ``code`` keep the original position: the free tier is the first
+#: remote tier, directly after local. Only ``plan`` moved its free tier behind
+#: the timed ``opencode-go`` accounts (LP-0MVWG4U7F0009LTH) so free tokens are
+#: spent in the opencode gap periods rather than during their windows.
+AUTHOR_CODE_PROVIDER_ORDER = [
     "local-qwen3",
     "munitoai-free",
     "opencode-go-3",
@@ -79,8 +93,8 @@ ALL_PRIORITIES = (PRIORITY_LOW, PRIORITY_MEDIUM, PRIORITY_HIGH)
 def _expected_chain(model_name: str, priority: str) -> list[str]:
     """Frozen expectation: the chain the shipped config resolves to (AC3)."""
     if model_name in CHAIN_MODELS:
-        providers = PLAN_PROVIDER_ORDER
-        return PLAN_LOW_CHAIN if priority == PRIORITY_LOW else providers
+        providers = PLAN_PROVIDER_ORDER if model_name == "plan" else AUTHOR_CODE_PROVIDER_ORDER
+        return PLAN_LOW_CHAIN if priority == PRIORITY_LOW and model_name == "plan" else providers
     if model_name == "compact":
         return COMPACT_PROVIDER_ORDER
     return UNLABELLED_MODELS[model_name]
