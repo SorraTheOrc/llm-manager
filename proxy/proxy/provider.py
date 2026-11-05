@@ -6028,6 +6028,13 @@ EXHAUSTION_CODE_ALL = "all_exhausted"
 EXHAUSTION_CODE_TIME_WINDOW = "outside_time_window"
 EXHAUSTION_CODE_SLOTS = "all_slots_exhausted"
 EXHAUSTION_CODE_LOCAL_ADMISSION = "local_admission_reject"
+#: The whole chain is blocked by known-until scheduling gates (scheduled
+#: ``available_times`` windows, usage-limit resets, quota quarantines), so the
+#: client is told *when* it reopens rather than receiving the opaque
+#: ``all_exhausted`` 503 it used to retry every minute for hours
+#: (LP-0MVWC9CZH004OZYN AC4). Additive: the retained prose ``error`` stays
+#: ``All providers exhausted`` for older clients.
+EXHAUSTION_CODE_TIME_WINDOW_BLOCKED = "no_provider_available_in_window"
 
 
 def _build_local_admission_reject_response(
@@ -12147,6 +12154,78 @@ def _attempt_is_terminal_request_scoped(attempt: Any) -> bool:
     return status_code not in _RETRYABLE_4XX_STATUSES
 
 
+@dataclass(frozen=True)
+class _ReopeningCandidate:
+    """One deterministically skipped entry's honest reopening instant.
+
+    *seconds* is the wait from now until the gate reopens; *provider* and
+    *reason* let the response ``detail`` and the chain-end ``blocked=[...]``
+    evidence name *which* entry reopens first and *why* it was closed
+    (LP-0MVWC9CZH004OZYN AC2/AC4/AC-O6).
+    """
+
+    provider: str
+    reason: str
+    seconds: float
+
+
+def _deterministic_reopening_candidates(
+    skips: dict[str, str],
+    model_config: dict | None,
+    config: dict | None = None,
+) -> list[_ReopeningCandidate]:
+    """Per-skip reopening instants for a deterministically skipped chain.
+
+    The single computation of "when does each blocked entry come back" — the
+    earliest-instant rule (AC2), the ``detail`` provider/gate naming (AC4) and
+    the ``blocked=[...]`` chain-end evidence (AC-O6) all read it, so there is
+    no second earliest-instant computation (LP-0MW0KZR7A003UFQK AC11).
+
+    Only honestly-derivable instants are emitted — a usage-limit reset
+    countdown, the next ``available_times`` window start, the soonest quota
+    window reset. A skip whose instant cannot be computed is omitted (the
+    caller fails open rather than guessing, AC8).
+    """
+    candidates: list[_ReopeningCandidate] = []
+    providers = [
+        p for p in ((model_config or {}).get("providers") or []) if isinstance(p, dict)
+    ]
+    by_name = {str(p.get("name", "")): p for p in providers}
+    for name, reason in skips.items():
+        provider_cfg = by_name.get(name)
+        if provider_cfg is None:
+            continue
+        waiters = {
+            "usage_limit_reset_pending": lambda: float(
+                _usage_reset_remaining(_usage_limit_account_key(provider_cfg))
+            ),
+            "outside_available_window": lambda: (
+                _seconds_until_next_window(provider_cfg, config=config) or 0.0
+            ),
+            "quota_hard_stop": lambda: _quota_hard_stop_wait_seconds(
+                provider_cfg, config
+            ),
+            # AC1 lists ``quota_exhausted`` as a known-until gate whose reset
+            # interval is known; it shares the quota-window rollover
+            # computation with the hard stop rather than adding a second one.
+            "quota_exhausted": lambda: _quota_hard_stop_wait_seconds(
+                provider_cfg, config
+            ),
+        }
+        compute = waiters.get(reason)
+        if compute is None:
+            continue
+        try:
+            seconds = float(compute())
+        except Exception:
+            continue
+        if seconds > 0:
+            candidates.append(
+                _ReopeningCandidate(provider=name, reason=reason, seconds=seconds)
+            )
+    return candidates
+
+
 def _earliest_deterministic_reset_seconds(
     skips: dict[str, str],
     model_config: dict | None,
@@ -12161,38 +12240,14 @@ def _earliest_deterministic_reset_seconds(
 
     Only honestly-derivable instants are considered — a usage-limit reset
     countdown, the next ``available_times`` window start, the soonest quota
-    window reset for a hard-stopped account. ``None`` when none is derivable
-    (the verdict still fails fast; the caller then keeps the exhaustion
-    payload's own timing).
+    window reset for a hard-stopped or quota-exhausted account. ``None`` when
+    none is derivable (the verdict still fails fast; the caller then keeps the
+    exhaustion payload's own timing).
     """
-    candidates: list[float] = []
-    providers = [
-        p for p in ((model_config or {}).get("providers") or []) if isinstance(p, dict)
-    ]
-    by_name = {str(p.get("name", "")): p for p in providers}
-    for name, reason in skips.items():
-        provider_cfg = by_name.get(name)
-        waiters = {
-            "usage_limit_reset_pending": lambda: float(
-                _usage_reset_remaining(_usage_limit_account_key(provider_cfg))
-            ),
-            "outside_available_window": lambda: (
-                _seconds_until_next_window(provider_cfg, config=config) or 0.0
-            ),
-            "quota_hard_stop": lambda: _quota_hard_stop_wait_seconds(provider_cfg, config),
-        }
-        compute = waiters.get(reason)
-        if compute is None or provider_cfg is None:
-            continue
-        try:
-            seconds = float(compute())
-        except Exception:
-            continue
-        if seconds > 0:
-            candidates.append(seconds)
+    candidates = _deterministic_reopening_candidates(skips, model_config, config)
     if not candidates:
         return None
-    return int(min(candidates))
+    return int(min(candidate.seconds for candidate in candidates))
 
 
 def _quota_hard_stop_wait_seconds(
@@ -12404,8 +12459,102 @@ def _with_retry_timing(
     )
 
 
+def _planned_unavailable_detail(
+    verdict: dict,
+    model_config: dict | None = None,
+    config: dict | None = None,
+) -> str:
+    """Name the earliest reopening provider and its gate (AC4).
+
+    The prose ``error`` deliberately stays ``All providers exhausted`` for
+    older clients; this ``detail`` is where a newer client learns *which*
+    entry reopens first and *what* closed it.
+    """
+    skips = verdict.get("skips") or {}
+    candidates = _deterministic_reopening_candidates(skips, model_config, config)
+    if candidates:
+        first = min(candidates, key=lambda candidate: candidate.seconds)
+        return (
+            "no provider is available now: the earliest reopening provider is "
+            f"{first.provider} (blocked by {first.reason}) at "
+            f"{_retry_at_isoformat(int(first.seconds))}"
+        )
+    # No computable instant, but the chain is still known-blocked: name a
+    # blocked entry without inventing a time (AC8 fail-open).
+    if skips:
+        name = sorted(skips)[0]
+        return (
+            "no provider is available now: every provider in the chain is "
+            f"blocked by a scheduled or account gate (first blocked: {name}, "
+            f"reason {skips[name]})"
+        )
+    return "no provider is available now: every provider in the chain is blocked"
+
+
+def _build_planned_unavailable_response(
+    verdict: dict | None,
+    config: dict | None = None,
+    model_config: dict | None = None,
+) -> Response | None:
+    """Build the planned-unavailable 503 from a residual-chain verdict.
+
+    The whole chain is blocked by *known-until* gates (AC1's classification
+    lives in :func:`_residual_chain_verdict`), so instead of the opaque
+    ``all_exhausted`` 503 the client gets a stable ``code``, the honest
+    **earliest** recovery instant and a truncation flag when the advertised
+    delay is capped (LP-0MVWC9CZH004OZYN AC2/AC3/AC4).
+
+    Returns ``None`` when the verdict carries no computable reopening instant
+    or that instant is already past — the caller then keeps the generic
+    exhausted response, so a stale or fabricated ``retry_at`` is never
+    advertised (AC8 fail-open).
+
+    ``retry_at`` is the **untruncated** instant: when the true wait exceeds
+    ``server.max_retry_after_seconds`` the advertised ``retry_after`` is capped
+    (as every other refusal is) but the body still carries ``retry_at`` and
+    ``retry_after_truncated: true`` so a client can sleep through the whole
+    window instead of polling every hour (AC3 — no silent cap).
+    """
+    if not isinstance(verdict, dict):
+        return None
+    true_wait = verdict.get("retry_after_seconds")
+    if true_wait is None:
+        return None
+    try:
+        true_wait = int(true_wait)
+    except (TypeError, ValueError):
+        return None
+    if true_wait <= 0:
+        # The earliest recovery is already past: the chain is available now,
+        # so no stale timer may be advertised (AC2 row c / AC8).
+        return None
+
+    capped = min(true_wait, _max_retry_after_seconds(config))
+    truncated = true_wait > capped
+    payload: dict[str, Any] = {
+        "error": "All providers exhausted",
+        "code": EXHAUSTION_CODE_TIME_WINDOW_BLOCKED,
+        "retryable": True,
+        "retry_after": capped,
+        "retry_at": _retry_at_isoformat(true_wait),
+        "detail": _planned_unavailable_detail(verdict, model_config, config),
+    }
+    if truncated:
+        payload["retry_after_truncated"] = True
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=503,
+        media_type="application/json",
+        headers={"Retry-After": str(capped), "Cache-Control": "no-store"},
+    )
+
+
 def _log_chain_planned_unavailable(
-    path: str, verdict: dict, effect: str = "hold=skipped"
+    path: str,
+    verdict: dict,
+    effect: str = "hold=skipped",
+    model_config: dict | None = None,
+    config: dict | None = None,
 ) -> None:
     """Log the chain-end line that distinguishes fail-fast from a hold (AC3).
 
@@ -12414,20 +12563,47 @@ def _log_chain_planned_unavailable(
     its extension), so a fail-fast return is distinguished from
     ``Chain exhausted ... holding`` by the explicit ``hold=skipped
     reason=deterministic_residual_chain`` marker on the same line.
+
+    AC-O6 (LP-0MVWC9CZH004OZYN) extends the same line with the aggregate
+    ``retry_at`` and a ``blocked=[provider:gate@instant, ...]`` list, so the
+    condition is diagnosable without joining per-provider skip lines. One line
+    per request, never per entry.
     """
     try:
+        retry_after = verdict.get("retry_after_seconds")
+        retry_at = "unknown"
+        try:
+            if retry_after is not None and int(retry_after) > 0:
+                retry_at = _retry_at_isoformat(int(retry_after))
+        except (TypeError, ValueError):
+            retry_at = "unknown"
+        blocked = "none"
+        try:
+            candidates = _deterministic_reopening_candidates(
+                verdict.get("skips") or {}, model_config, config
+            )
+            if candidates:
+                blocked = "[" + ", ".join(
+                    f"{c.provider}:{c.reason}@{_retry_at_isoformat(int(c.seconds))}"
+                    for c in sorted(candidates, key=lambda c: c.seconds)
+                ) + "]"
+        except Exception:
+            blocked = "none"
         logger.info(
             "chain_planned_unavailable model=%s reason=%s %s "
-            "retry_after=%s providers=%d deterministic_skips=%s terminal=%s",
+            "retry_at=%s retry_after=%s providers=%d deterministic_skips=%s "
+            "blocked=%s terminal=%s",
             path,
             "deterministic_residual_chain",
             effect,
-            verdict.get("retry_after_seconds"),
+            retry_at,
+            retry_after,
             int(verdict.get("providers") or 0),
             ",".join(
                 f"{name}:{reason}" for name, reason in (verdict.get("skips") or {}).items()
             )
             or "none",
+            blocked,
             ",".join(verdict.get("terminal") or []) or "none",
         )
     except Exception:
@@ -13286,18 +13462,31 @@ async def _proxy_with_remote_fallback_cycle(
     _set_chain_fail_fast_verdict(request, _fail_fast)
     _fail_fast_retry = None
     if _fail_fast is not None:
-        _log_chain_planned_unavailable(path, _fail_fast)
+        _log_chain_planned_unavailable(
+            path, _fail_fast, model_config=model_config, config=config
+        )
         _fail_fast_retry = _fail_fast.get("retry_after_seconds")
 
     # Distinguishable exhaustion: when time windows are the *only* reason no
     # provider could be used, surface a specific message instead of the generic
-    # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
+    # "All providers exhausted" (LP-0MS4ETBNO0022QAC). Kept first so its
+    # sole-cause triggers keep their exact body (LP-0MVWC9CZH004OZYN AC5).
     time_window_exhausted = _build_time_window_exhausted_response(
         attempts, unavailable, any_provider_tried, model_config=model_config,
         config=config, earliest_retry_after=_fail_fast_retry,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
+
+    # Mixed-but-fully-planned chain (LP-0MVWC9CZH004OZYN AC1/AC2/AC3/AC4):
+    # every entry is blocked by a known-until scheduling gate, so advertise the
+    # honest earliest reopening instant instead of the opaque all_exhausted
+    # 503. A ``None`` return fails open to the generic fallbacks below (AC8).
+    planned_unavailable = _build_planned_unavailable_response(
+        _fail_fast, config=config, model_config=model_config,
+    )
+    if planned_unavailable is not None:
+        raise ChainExhaustedError(planned_unavailable)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
@@ -15859,18 +16048,31 @@ async def _proxy_with_fallback_cycle(
     _set_chain_fail_fast_verdict(request, _fail_fast)
     _fail_fast_retry = None
     if _fail_fast is not None:
-        _log_chain_planned_unavailable(path, _fail_fast)
+        _log_chain_planned_unavailable(
+            path, _fail_fast, model_config=model_config, config=config
+        )
         _fail_fast_retry = _fail_fast.get("retry_after_seconds")
 
     # Distinguishable exhaustion: when time windows are the *only* reason no
     # provider could be used, surface a specific message instead of the generic
-    # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
+    # "All providers exhausted" (LP-0MS4ETBNO0022QAC). Kept first so its
+    # sole-cause triggers keep their exact body (LP-0MVWC9CZH004OZYN AC5).
     time_window_exhausted = _build_time_window_exhausted_response(
         attempts, unavailable, any_provider_tried, model_config=model_config,
         config=config, earliest_retry_after=_fail_fast_retry,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
+
+    # Mixed-but-fully-planned chain (LP-0MVWC9CZH004OZYN AC1/AC2/AC3/AC4):
+    # every entry is blocked by a known-until scheduling gate, so advertise the
+    # honest earliest reopening instant instead of the opaque all_exhausted
+    # 503. A ``None`` return fails open to the generic fallbacks below (AC8).
+    planned_unavailable = _build_planned_unavailable_response(
+        _fail_fast, config=config, model_config=model_config,
+    )
+    if planned_unavailable is not None:
+        raise ChainExhaustedError(planned_unavailable)
 
     if not any_provider_tried:
         raise ChainExhaustedError(

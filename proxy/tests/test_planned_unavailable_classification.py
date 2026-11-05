@@ -220,6 +220,33 @@ class TestAC1Classification:
         )
         assert verdict is None
 
+    def test_budget_skip_is_transient_not_planned(self):
+        """AC1/AC11: a budget-skipped entry stays transient (generic exhaustion).
+
+        ``provider_budget_exhausted`` is an attempt *status*, never a
+        chain-resolution *skip reason*, and AC11 forbids classifying on the
+        attempt-status vocabulary or forking a second record. A budget rollover
+        is short and already timed by ``_budget_window_retry_after``, so a
+        budget-blocked chain keeps today's generic response rather than being
+        guessed into a long planned-unavailable wait.
+        """
+        request = _StubRequest()
+        provider._note_chain_resolution_skip(request, "p1", "outside_available_window")
+        attempts = [
+            {
+                "provider": "p2",
+                "status": "provider_budget_exhausted",
+                "status_code": 429,
+            }
+        ]
+        assert (
+            provider._residual_chain_verdict(
+                request, _chain("p1", "p2"), attempts, _config()
+            )
+            is None
+        )
+        assert "provider_budget_exhausted" not in provider.DETERMINISTIC_CHAIN_SKIP_REASONS
+
     def test_terminal_4xx_alongside_deterministic_skips_is_planned(self):
         """AC1 (amended): a terminal request-scoped 4xx alongside deterministic skips still classifies.
 
@@ -519,7 +546,7 @@ class TestAC8FailOpen:
     """Any unparseable window, missing reset, or internal exception falls back to generic."""
 
     def test_unparseable_window_fails_open(self):
-        """AC8: an unparseable available_times falls back to generic exhausted."""
+        """AC8: an unparseable available_times yields no retry_at and a generic fallback."""
         request = _StubRequest()
         provider._note_chain_resolution_skip(request, "p1", "outside_available_window")
 
@@ -531,90 +558,92 @@ class TestAC8FailOpen:
         }
 
         with patch("proxy.provider.datetime", _FixedDateTime):
-            # _seconds_until_next_window should raise or return None for bad windows
-            with patch.object(provider, "_seconds_until_next_window", side_effect=ValueError("bad window")):
+            with patch.object(
+                provider,
+                "_seconds_until_next_window",
+                side_effect=ValueError("bad window"),
+            ):
+                # The chain is still provably dead (every entry deterministically
+                # skipped) but no reopening instant is derivable.
                 verdict = provider._residual_chain_verdict(
                     request, bad_window_config, [], _config()
                 )
-        # The verdict itself fires because the chain is provably dead;
-        # but _earliest_deterministic_reset_seconds should return None for bad windows.
-        # The response builder should fail-open.
-        with patch("proxy.provider.datetime", _FixedDateTime):
-            try:
-                with patch.object(provider, "_seconds_until_next_window", side_effect=ValueError("bad window")):
-                    response = provider._build_planned_unavailable_response(verdict, _config())
-            except AttributeError:
-                pytest.skip("provider._build_planned_unavailable_response does not exist yet")
-            except Exception:
-                # Internal exception → fail-open to generic path.
-                # This is acceptable — the classifier still returns a verdict,
-                # but the response builder's error handling sends the client
-                # to the generic exhausted path.
-                pytest.skip("response builder raises on bad window (fail-open)")
+                assert verdict is not None
+                assert verdict["retry_after_seconds"] is None, (
+                    "an unparseable window must not fabricate a retry_at"
+                )
+                # No computable instant ⇒ the builder fails open to the generic
+                # exhausted response rather than guessing.
+                assert (
+                    provider._build_planned_unavailable_response(
+                        verdict, _config(), bad_window_config
+                    )
+                    is None
+                )
 
     def test_missing_reset_instant_fails_open(self):
         """AC8: a usage-limit skip with no computable reset falls back."""
-        request = _StubRequest()
-        provider._note_chain_resolution_skip(request, "p1", "usage_limit_reset_pending")
-
-        with patch("proxy.provider.datetime", _FixedDateTime):
-            with patch.object(provider, "_usage_limit_account_key", return_value="p1"):
-                with patch.object(provider, "_usage_reset_remaining", side_effect=KeyError("no data")):
-                    result = provider._earliest_deterministic_reset_seconds(
-                        {"p1": "usage_limit_reset_pending"},
-                        _chain("p1"),
-                        _config(),
-                    )
-        # A KeyError in the compute function should be swallowed → None
+        with patch.object(provider, "_usage_limit_account_key", return_value="p1"):
+            with patch.object(
+                provider, "_usage_reset_remaining", side_effect=KeyError("no data")
+            ):
+                result = provider._earliest_deterministic_reset_seconds(
+                    {"p1": "usage_limit_reset_pending"},
+                    _chain("p1"),
+                    _config(),
+                )
+        # A KeyError in the compute function is swallowed → None (no guess).
         assert result is None
 
-    def test_unknown_gate_status_fails_open(self):
-        """AC8: an unknown gate status in the verdict fails open at response level."""
-        request = _StubRequest()
-        provider._note_chain_resolution_skip(request, "p1", "outside_available_window")
+    def test_no_computable_instant_never_builds_a_response(self):
+        """AC8: a verdict without a reopening instant never yields a fabricated retry_at."""
+        assert (
+            provider._build_planned_unavailable_response(
+                {"skips": {"p1": "some_new_unknown_gate"}, "retry_after_seconds": None},
+                _config(),
+                _chain("p1"),
+            )
+            is None
+        )
 
-        with patch("proxy.provider.datetime", _FixedDateTime):
-            with patch.object(provider, "_seconds_until_next_window", return_value=1800):
-                verdict = provider._residual_chain_verdict(
-                    request, _chain("p1"), [], _config()
-                )
-
-        assert verdict is not None
-
-        # Manually inject an unknown gate into the skips
-        verdict["skips"]["p1"] = "some_new_unknown_gate"
-
-        with patch("proxy.provider.datetime", _FixedDateTime):
-            try:
-                response = provider._build_planned_unavailable_response(verdict, _config())
-            except AttributeError:
-                pytest.skip("provider._build_planned_unavailable_response does not exist yet")
-            except Exception:
-                pytest.skip("response builder raises on unknown gate (fail-open)")
-
-        # If we got here without skipping, the response body should not carry
-        # the new planned-unavailable code for an unknown gate.
-        body = _body(response)
-        assert body.get("code") != "no_provider_available_in_window" or body["code"] == "no_provider_available_in_window"
+    def test_already_past_recovery_never_builds_a_response(self):
+        """AC8 / AC2 row (c): a non-positive wait fails open, never a stale retry_at."""
+        assert (
+            provider._build_planned_unavailable_response(
+                {"skips": {"p1": "outside_available_window"}, "retry_after_seconds": 0},
+                _config(),
+                _chain("p1"),
+            )
+            is None
+        )
 
 
 # ---------------------------------------------------------------------------
-# Red-baseline: tests that fail against current code
+# Green phase: the builder now exists and the incident scenario is planned
 # ---------------------------------------------------------------------------
 
-class TestRedBaseline:
-    """These tests fail today because the classifier response builder does not exist."""
+class TestBuilderLanded:
+    """The red-baseline guards from the test-first child, flipped green.
 
-    def test_build_planned_unavailable_response_does_not_exist_yet(self):
-        """Red baseline: the planned-unavailable response builder does not exist."""
-        assert not hasattr(provider, "_build_planned_unavailable_response"), \
-            "_build_planned_unavailable_response should not exist yet"
+    LP-0MVYVWS4U008UC5N committed these as ``assert not hasattr(...)`` red
+    guards; LP-0MVYVWDT30034GUY lands the builder, so they now assert the
+    implementation and the incident outcome.
+    """
 
-    def test_incident_scenario_yields_generic_exhausted_not_planned_unavailable(self):
-        """Red baseline: the 08:16 incident scenario currently yields generic all_exhausted.
+    def test_build_planned_unavailable_response_exists(self):
+        """The planned-unavailable response builder is implemented."""
+        assert hasattr(provider, "_build_planned_unavailable_response")
+        assert (
+            provider.EXHAUSTION_CODE_TIME_WINDOW_BLOCKED
+            == "no_provider_available_in_window"
+        )
 
-        The current _build_exhausted_response returns 503 with code=all_exhausted
-        and a cap-derived retry_after, not a planned-unavailable response.
+    def test_incident_scenario_yields_planned_unavailable(self):
+        """The 08:16 incident chain now yields the planned-unavailable 503.
+
+        The remote-only chain is exactly the shape the classifier targets: all
+        four entries blocked by known-until gates, the honest answer being the
+        10:00 UTC window edge (AC2 row a).
         """
         request = _StubRequest()
         provider._note_chain_resolution_skip(request, "opencode-go", "outside_available_window")
@@ -622,12 +651,152 @@ class TestRedBaseline:
         provider._note_chain_resolution_skip(request, "opencode-go-3", "quota_exhausted")
         provider._note_chain_resolution_skip(request, "munitoai-free", "usage_limit_reset_pending")
 
-        # The residual_chain_verdict should classify this as planned-unavailable,
-        # but the chain-end path still calls _build_exhausted_response.
         with patch("proxy.provider.datetime", _FixedDateTime):
             verdict = provider._residual_chain_verdict(
-                request, _plan_chain(), [], _config()
+                request, _plan_remote_chain(), [], _config()
             )
-        # The verdict might or might not exist yet (depends on seed); the point
-        # is the RESPONSE builder for planned-unavailable does not.
-        assert not hasattr(provider, "_build_planned_unavailable_response")
+            assert verdict is not None
+            response = provider._build_planned_unavailable_response(
+                verdict, config=_config(), model_config=_plan_remote_chain()
+            )
+
+        assert response is not None
+        body = _body(response)
+        assert response.status_code == 503
+        assert body["code"] == "no_provider_available_in_window"
+        assert body["retryable"] is True
+        # AC2: the untruncated instant is the 10:00 UTC window edge, not the
+        # 17-day quota reset and not now + 3600 s.
+        assert body["retry_at"].startswith("2026-10-31T10:00")
+        # AC3: the default 3600 s cap truncates the 6240 s wait, and says so.
+        assert body["retry_after"] == 3600
+        assert body["retry_after_truncated"] is True
+        assert response.headers.get("Retry-After") == "3600"
+
+    def test_incident_scenario_with_wide_cap_advertises_the_window_edge(self):
+        """AC2 row (a): with an ample cap the advertised wait is the 6240 s edge."""
+        request = _StubRequest()
+        provider._note_chain_resolution_skip(request, "opencode-go", "outside_available_window")
+        provider._note_chain_resolution_skip(request, "opencode-go-2", "outside_available_window")
+        provider._note_chain_resolution_skip(request, "opencode-go-3", "quota_exhausted")
+        provider._note_chain_resolution_skip(request, "munitoai-free", "usage_limit_reset_pending")
+
+        wide = _config(max_retry_after=86400)
+        with patch("proxy.provider.datetime", _FixedDateTime):
+            verdict = provider._residual_chain_verdict(
+                request, _plan_remote_chain(), [], wide
+            )
+            assert verdict is not None
+            response = provider._build_planned_unavailable_response(
+                verdict, config=wide, model_config=_plan_remote_chain()
+            )
+
+        assert response is not None
+        body = _body(response)
+        assert body["retry_after"] == 6240
+        assert body.get("retry_after_truncated") is not True
+        assert response.headers.get("Retry-After") == "6240"
+
+
+# ---------------------------------------------------------------------------
+# Chain-end integration: the wired response and the AC-O6 log line
+# ---------------------------------------------------------------------------
+
+class TestChainEndIntegration:
+    """The planned-unavailable response is actually wired into the chain end."""
+
+    def _mixed_chain(self):
+        """One window-blocked entry + one usage-limit-quarantined entry.
+
+        Mixed known-until gates are the shape the sole-cause window response
+        deliberately declines, so this is exactly where the new response must
+        take over (AC1/AC5).
+        """
+        return {
+            "providers": [
+                {"name": "a", "type": "remote", "endpoint": "https://a.example/v1",
+                 "available_times": ["00:00-01:00"]},
+                {"name": "b", "type": "remote", "endpoint": "https://b.example/v1",
+                 "api_key_env": "B_KEY"},
+            ]
+        }
+
+    def test_mixed_known_until_chain_returns_planned_unavailable(self):
+        """The chain end returns the new 503 with code/retryable/retry_at."""
+        import time as _time
+
+        model_config = self._mixed_chain()
+        config = {
+            "server": {
+                "max_retry_after_seconds": 86400,
+                "chain_hold_seconds": 1,
+                "chain_hold_max_cycles": 1,
+                "chain_hold_total_seconds": 0,
+                "provider_cooldown_seconds": 30,
+            }
+        }
+        key = provider._usage_limit_account_key(model_config["providers"][1])
+        provider._usage_reset_at[key] = _time.time() + 57687
+        try:
+            with patch("proxy.provider.datetime", _FixedDateTime):
+                response = _run(
+                    provider.proxy_with_remote_fallback(
+                        _StubRequest(), "v1/chat/completions", model_config, config
+                    )
+                )
+        finally:
+            provider._usage_reset_at.pop(key, None)
+
+        body = _body(response)
+        assert response.status_code == 503
+        assert body["code"] == "no_provider_available_in_window"
+        assert body["retryable"] is True
+        assert body["error"] == "All providers exhausted"
+        assert body["retry_at"].startswith("2026-11-01T00:00")
+        assert response.headers.get("retry-after") == str(body["retry_after"])
+
+    def test_chain_end_emits_one_planned_unavailable_line(self, caplog):
+        """AC-O6: exactly one chain-end line carrying retry_at and blocked=[...]."""
+        import time as _time
+
+        model_config = self._mixed_chain()
+        config = {
+            "server": {
+                "max_retry_after_seconds": 86400,
+                "chain_hold_seconds": 1,
+                "chain_hold_max_cycles": 1,
+                "chain_hold_total_seconds": 0,
+                "provider_cooldown_seconds": 30,
+            }
+        }
+        key = provider._usage_limit_account_key(model_config["providers"][1])
+        provider._usage_reset_at[key] = _time.time() + 57687
+        try:
+            with caplog.at_level("INFO", logger="llama-proxy"):
+                with patch("proxy.provider.datetime", _FixedDateTime):
+                    _run(
+                        provider.proxy_with_remote_fallback(
+                            _StubRequest(), "v1/chat/completions", model_config, config
+                        )
+                    )
+        finally:
+            provider._usage_reset_at.pop(key, None)
+
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("chain_planned_unavailable")
+        ]
+        assert len(lines) == 1, f"expected exactly one chain-end line, got {len(lines)}"
+        line = lines[0]
+        assert "retry_at=2026-11-01T00:00" in line
+        assert "blocked=[" in line
+        assert "a:outside_available_window@" in line
+        assert "holding" not in line
+
+
+def _run(coro):
+    """Run an async chain call from a synchronous test."""
+    import asyncio
+
+    return asyncio.run(coro)
