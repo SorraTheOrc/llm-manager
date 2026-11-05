@@ -241,6 +241,31 @@ def test_probe_death_falls_back_to_the_returncode_for_an_unpeekable_handle():
     assert status.signal_name == "SIGKILL"
 
 
+def test_dump_ignores_a_non_path_log_dir(tmp_path, monkeypatch, caplog):
+    """A duck-typed ``log_dir`` must never write files into the cwd.
+
+    Regression pin: a mocked ``srv.log_dir`` (``MagicMock`` is ``os.PathLike``)
+    wrote ``MagicMock/mock.log_dir/<id>/death_window_*.json`` into the worktree
+    and tripped the pre-push gate's live-repo-mutation guard.
+    """
+    from unittest.mock import MagicMock
+
+    monkeypatch.chdir(tmp_path)
+    clock = _Clock()
+    capture = dc.DeathCapture(clock=clock, sampler=_FixedSampler(clock))
+    record = capture.death_record(
+        label="tts_server", status=dc.decode_returncode(-signal.SIGKILL)
+    )
+
+    logger = logging.getLogger("test.death_capture.mockdir")
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        path = capture.dump(record, log_dir=MagicMock(name="log_dir"), logger=logger)
+
+    assert path is None
+    assert list(tmp_path.iterdir()) == []
+    assert caplog.records  # the record is still summarised in the log
+
+
 # ---------------------------------------------------------------------------
 # AC4 — host sampling and the death-window ring
 # ---------------------------------------------------------------------------

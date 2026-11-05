@@ -103,7 +103,7 @@ def signal_name(signum) -> str:
     try:
         return signal.Signals(int(signum)).name
     except (TypeError, ValueError):
-        return "SIG%s" % signum
+        return f"SIG{signum}"
 
 
 class DeathStatus(NamedTuple):
@@ -134,9 +134,9 @@ class DeathStatus(NamedTuple):
     def describe(self) -> str:
         """Human/log form: ``SIGSEGV(11)/139`` or ``exit code 3``."""
         if self.kind == "signal":
-            return "%s(%s)/%s" % (self.signal_name, self.signal_number, self.code)
+            return f"{self.signal_name}({self.signal_number})/{self.code}"
         if self.kind == "exit":
-            return "exit code %s" % self.code
+            return f"exit code {self.code}"
         return "unknown cause"
 
     def restart_reason(self, label: str) -> str:
@@ -147,10 +147,10 @@ class DeathStatus(NamedTuple):
         restart is never anonymous and never a blanket ``137``.
         """
         if self.kind == "signal":
-            return "%s_signal_%s" % (label, self.signal_name)
+            return f"{label}_signal_{self.signal_name}"
         if self.kind == "exit":
-            return "%s_exit_code_%s" % (label, self.code)
-        return "%s_unknown_exit" % label
+            return f"{label}_exit_code_{self.code}"
+        return f"{label}_unknown_exit"
 
     def as_dict(self) -> dict:
         return {
@@ -315,7 +315,7 @@ def read_process_rss_bytes(pid) -> int | None:
     if pid is None:
         return None
     try:
-        text = Path("/proc/%d/status" % int(pid)).read_text(encoding="utf-8")
+        text = Path(f"/proc/{int(pid)}/status").read_text(encoding="utf-8")
     except (OSError, TypeError, ValueError):
         return None
     for line in text.splitlines():
@@ -484,9 +484,23 @@ def _isoformat(timestamp: float) -> str:
 
 def _gib(value) -> str:
     try:
-        return "%.1fGiB" % (float(value) / (1024**3))
+        return f"{float(value) / (1024**3):.1f}GiB"
     except (TypeError, ValueError):
         return "unknown"
+
+
+def _as_log_directory(value) -> Path | None:
+    """Accept only a real path as the dump directory.
+
+    A duck-typed object (a ``MagicMock`` test double, for instance) is
+    ``os.PathLike`` and ``Path()`` happily turns it into a literal
+    ``MagicMock/...`` directory in the process cwd — which is how a mocked
+    ``srv.log_dir`` once wrote death records into a checkout and tripped the
+    gate's live-repo-mutation guard. Only real paths are written to.
+    """
+    if isinstance(value, (str, Path)):
+        return Path(value)
+    return None
 
 
 class DeathCapture:
@@ -583,21 +597,21 @@ class DeathCapture:
         death = record.get("death") or {}
         summary = record.get("summary") or {}
         parts = [
-            "label=%s" % record.get("label"),
-            "cause=%s" % (death.get("describe") or "unknown cause"),
-            "restart_reason=%s" % (record.get("restart_reason") or "unknown"),
-            "window=%ss" % record.get("window_seconds"),
-            "samples=%s" % record.get("sample_count"),
-            "gtt_max=%s" % _gib(summary.get("gtt_used_max_bytes")),
-            "mem_available_min=%s" % _gib(summary.get("mem_available_min_bytes")),
+            f"label={record.get('label')}",
+            f"cause={death.get('describe') or 'unknown cause'}",
+            f"restart_reason={record.get('restart_reason') or 'unknown'}",
+            f"window={record.get('window_seconds')}s",
+            f"samples={record.get('sample_count')}",
+            f"gtt_max={_gib(summary.get('gtt_used_max_bytes'))}",
+            f"mem_available_min={_gib(summary.get('mem_available_min_bytes'))}",
         ]
         events = summary.get("cgroup_memory_events") or {}
         if events:
             parts.append(
-                "cgroup_oom_kills=%s" % events.get("oom_kill", events.get("oom", 0))
+                f"cgroup_oom_kills={events.get('oom_kill', events.get('oom', 0))}"
             )
         if dump_path:
-            parts.append("dump=%s" % dump_path)
+            parts.append(f"dump={dump_path}")
         return " ".join(parts)
 
     def dump(
@@ -615,15 +629,15 @@ class DeathCapture:
         restart into a second failure.
         """
         path: str | None = None
-        if log_dir:
+        directory = _as_log_directory(log_dir)
+        if directory is not None:
             try:
-                directory = Path(log_dir)
                 directory.mkdir(parents=True, exist_ok=True)
-                name = filename or "death_window_%s_%s.json" % (
-                    record.get("label", "unknown"),
-                    datetime.fromtimestamp(
-                        float(record.get("detected_at_unix") or time.time()), tz=UTC
-                    ).strftime("%Y%m%dT%H%M%SZ"),
+                stamp = datetime.fromtimestamp(
+                    float(record.get("detected_at_unix") or time.time()), tz=UTC
+                ).strftime("%Y%m%dT%H%M%SZ")
+                name = filename or (
+                    f"death_window_{record.get('label', 'unknown')}_{stamp}.json"
                 )
                 target = directory / name
                 target.write_text(
