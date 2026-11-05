@@ -117,6 +117,16 @@ _KV_CONTENDED_SAMPLES = re.compile(r"\bcontended_samples=(\d+)")
 _KV_QUEUED = re.compile(r"\bqueued_duration=([\d.]+)s")
 _KV_TRIGGER = re.compile(r"\btrigger=([A-Za-z_]+)")
 _KV_CAUSE = re.compile(r"\bcause=([A-Za-z_]+)")
+#: Guard-projection vocabulary (LP-0MVV29XPT003OXI5). Read here so the per-wait
+#: diagnosis reuses one parser instead of growing a second one. ``\bbudget_s=``
+#: never matches ``deadline_budget_s=`` (no word boundary inside
+#: ``deadline_budget_s``) nor ``budget_tokens=``.
+_KV_PROJECTED_WAIT = re.compile(r"\bprojected_wait_s=([\d.]+)")
+_KV_ETA_PREFILL = re.compile(r"\beta_prefill_s=([\d.]+)")
+_KV_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
+_KV_BUSY_SLOTS = re.compile(r"\bbusy_slots=(\d+)")
+_KV_IN_FLIGHT_PREFILLS = re.compile(r"\bin_flight_prefills=(\d+)")
+_KV_BUDGET_S = re.compile(r"\bbudget_s=([\d.]+)")
 
 _TS_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
@@ -240,6 +250,15 @@ class Event:
     #: ``queue_depth_exceeded``), logged by the fallback line. Never inferred
     #: from the duration (LP-0MVV29X2E004INFL AC1/AC3).
     cause: str | None = None
+    #: The occupancy terms the admission guard priced the request with
+    #: (LP-0MVV29XPT003OXI5). Parsed here, consumed by
+    #: ``scripts/queue_wait_diagnosis.py``; every other consumer ignores them.
+    projected_wait_s: float | None = None
+    eta_prefill_s: float | None = None
+    eta_occupancy_s: float | None = None
+    busy_slots: int | None = None
+    in_flight_prefills: int | None = None
+    budget_s: float | None = None
 
 
 def parse_event(line: str, ts: datetime) -> Event | None:
@@ -269,6 +288,12 @@ def parse_event(line: str, ts: datetime) -> Event | None:
             reason=_first(_KV_REASON, line),
             rate_bucket=_first(_KV_RATE_BUCKET, line),
             contended_samples=_int(_KV_CONTENDED_SAMPLES, line),
+            projected_wait_s=_float(_KV_PROJECTED_WAIT, line),
+            eta_prefill_s=_float(_KV_ETA_PREFILL, line),
+            eta_occupancy_s=_float(_KV_ETA_OCCUPANCY, line),
+            busy_slots=_int(_KV_BUSY_SLOTS, line),
+            in_flight_prefills=_int(_KV_IN_FLIGHT_PREFILLS, line),
+            budget_s=_float(_KV_BUDGET_S, line),
         )
     if "dispatch_first_byte_ms=" in line:
         return Event(
