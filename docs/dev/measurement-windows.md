@@ -293,6 +293,31 @@ attributed automatically rather than reconstructed.
   is deliberately **out of scope** for mechanism A. If the calendar proves
   insufficient, file that as a linked follow-up rather than growing this item.
 
+### 7.1 Measurement safety — the llama log may live in a rotated sibling
+
+A restart that **preserves** llama-server (the `--keep-llama-server` default)
+rotates `llama-server.log` while the adopted backend still holds the
+**pre-rotation inode**. Its output then continues in the renamed sibling
+(`llama-server.1.log`), and the watched `llama-server.log` stays frozen —
+`/health` shows `llama_log_source_healthy: false` and `llama_log_age_seconds`
+keeps growing. Rotation is now deferred while a live writer holds the file
+(LP-0MVZ4UDF10029NDS), so this should not occur after that fix is deployed, but
+a window measured on an older build can still have its llama-side data in a
+rotated sibling.
+
+Before trusting a window's llama log, resolve the file the running backend is
+actually writing to:
+
+```bash
+readlink /proc/$(pgrep -f 'llama-server.*--models-preset' | head -1)/fd/1
+```
+
+If that path is not `…/llama-server.log`, read the window's llama data from the
+reported sibling (and record the substitution with the window's evidence).
+Never restart llama-server merely to "fix" the log: preserving the warm prompt
+cache is deliberate; restart only via `/skill:start-proxy`.
+
+
 ## 8. Maintenance
 
 - Refresh §2 and the calendar table whenever a restart lands or an item is

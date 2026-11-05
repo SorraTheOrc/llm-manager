@@ -329,6 +329,40 @@ def _log_has_live_writer(log_path: Path, exclude_pid: int | None = None) -> bool
     return False
 
 
+def _resolve_live_backend_log_path(srv) -> str | None:
+    """Resolve the file a running llama-server's stdout actually points at.
+
+    LP-0MVZ4UDF10029NDS AC4: when the watched ``llama-server.log`` has no live
+    writer, the backend may still be writing to a rotated sibling because a
+    restart renamed the file *after* the backend opened it. The backend's own
+    ``/proc/<pid>/fd/1`` (and fd 2) names the file its output really lands in,
+    so diagnostics can point at the live inode instead of only reporting a
+    boolean. Returns ``None`` when no backend fd resolves to a real file.
+    """
+    try:
+        server_config = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+        llama_port = int(server_config.get("llama_server_port", 8080) or 8080)
+    except Exception:
+        llama_port = 8080
+    try:
+        from proxy.backend_rss import discover_llama_pids
+
+        for pid in discover_llama_pids(llama_port):
+            for fd in (1, 2):
+                try:
+                    target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if not target.startswith("/"):
+                    continue
+                real = os.path.realpath(target)
+                if os.path.isfile(real):
+                    return real
+    except Exception:
+        pass
+    return None
+
+
 def _verify_adopted_log_relay(srv) -> None:
     """Verify the adopted backend's log relay is attached (LP-0MVECX47Z004LJAQ).
 
@@ -337,13 +371,17 @@ def _verify_adopted_log_relay(srv) -> None:
     holder keeps the log file open, the relay is healthy and nothing needs
     re-attaching.
 
-    If the log file exists but nobody holds it open for writing (the pre-fix
-    pipe-based backend whose reader thread died with the old proxy),
-    re-attachment is impossible: log a WARNING and mark the llama log source
-    unhealthy (visible in ``/health``) — AC2: no silent freeze. We deliberately
-    do NOT restart the backend here, which would discard the warm prompt cache
-    (AC5). When the log file is absent entirely we cannot judge and leave the
-    source unflagged (fail-safe).
+    If the log file exists but nobody holds it open for writing, either the
+    backend was spawned by a pre-fix proxy through a stdout pipe whose reader
+    thread died with the old proxy, or a restart rotated the log out from under
+    a preserved backend (LP-0MVZ4UDF10029NDS) so its output is landing in a
+    ``.N.log`` sibling. Re-attachment is impossible either way: log a WARNING
+    naming the watched path and the backend's real ``/proc/<pid>/fd/1`` target,
+    and mark the llama log source unhealthy (visible in ``/health``) — AC2/AC4:
+    no silent freeze, self-explaining diagnostics. We deliberately do NOT
+    restart the backend here, which would discard the warm prompt cache (AC5).
+    When the log file is absent entirely we cannot judge and leave the source
+    unflagged (fail-safe).
     """
     log_path = _resolve_llama_log_path(srv)
     if not log_path.exists():
@@ -366,15 +404,30 @@ def _verify_adopted_log_relay(srv) -> None:
         except Exception:
             pass
         return
+    # LP-0MVZ4UDF10029NDS AC4: name the file the backend's output is *actually*
+    # going to (typically a rotated sibling such as llama-server.1.log after a
+    # restart rotated the watched path out from under the preserved backend),
+    # so the frozen-path condition is self-explaining rather than only a
+    # ``/health`` boolean. Resolved via the backend's ``/proc/<pid>/fd/1``.
+    live_log_path = _resolve_live_backend_log_path(srv)
+    live_log_detail = (
+        live_log_path
+        if live_log_path
+        else "unresolved (no llama-server fd points at a regular file)"
+    )
     try:
         srv.logger.warning(
             "Adopted llama-server log relay is NOT attached — no live writer "
-            "on %s: the backend was likely spawned with a proxy-owned stdout "
-            "pipe whose reader died with the previous proxy. Re-attachment is "
-            "impossible; llama-server.log cannot receive new lines. Marking "
-            "llama log source unhealthy; restart llama-server to restore "
-            "logging (LP-0MVECX47Z004LJAQ).",
+            "on %s; the backend's output is actually going to %s. This happens "
+            "when a restart rotates llama-server.log while a preserved backend "
+            "still holds the pre-rotation inode. Re-attachment is impossible "
+            "without restarting llama-server; more importantly, do NOT restart "
+            "it merely to fix logging (the warm prompt cache is deliberate). "
+            "Read the live file named above for diagnostics, or resolve it with "
+            "readlink /proc/$(pgrep -f 'llama-server.*--models-preset' | head -1)/fd/1 "
+            "(LP-0MVZ4UDF10029NDS).",
             log_path,
+            live_log_detail,
         )
     except Exception:
         pass
@@ -1801,8 +1854,15 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
     # Rotate llama-server logs (keep last 15)
     if srv.log_dir:
        llama_log_path = srv.log_dir / "llama-server.log"
-       srv.rotate_llama_logs(llama_log_path, keep=15)
-       srv.llama_log_file = open(llama_log_path, "w")
+       rotated = srv.rotate_llama_logs(llama_log_path, keep=15)
+       # LP-0MVZ4UDF10029NDS: when a preserved llama-server still holds
+       # llama-server.log open, rotation is deferred (``rotated is False``) and
+       # the sink must APPEND. Truncating with ``"w"`` would discard the live
+       # window in place, and rotating would strand the backend's output in a
+       # renamed sibling while the proxy watches this path. Appending keeps the
+       # backend's pre-rotation inode as the watched path (AC3).
+       append = rotated is False
+       srv.llama_log_file = open(llama_log_path, "a" if append else "w")
     else:
        srv.llama_log_file = subprocess.DEVNULL
 
@@ -1906,11 +1966,37 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
 
 
 
-def rotate_llama_logs(current_log: Path, keep: int = 15):
-    """Rotate llama-server logs, keeping the last N copies."""
+def rotate_llama_logs(current_log: Path, keep: int = 15) -> bool:
+    """Rotate llama-server logs, keeping the last N copies.
+
+    Returns ``True`` when the caller may safely create/truncate a fresh
+    ``current_log`` (nothing existed, or rotation completed), and ``False``
+    when rotation was deferred because a live writer still holds the file.
+
+    LP-0MVZ4UDF10029NDS: a llama-server preserved across a proxy restart keeps
+    the **pre-rotation** inode open on stdout/stderr. Renaming
+    ``llama-server.log`` moves that live stream into ``llama-server.1.log``
+    while the proxy watches (and later truncates) the fresh path, so the
+    watched log freezes and ``/health`` reports
+    ``llama_log_source_healthy=false``. Never rotate a file that a live writer
+    other than this proxy still holds — the backend owns the sink, and its
+    inode must remain the watched path.
+    """
     srv = _srv()
     if not current_log.exists():
-       return
+       return True
+
+    if _log_has_live_writer(current_log, exclude_pid=os.getpid()):
+       try:
+           srv.logger.info(
+               "Deferring llama-server log rotation: a live writer still "
+               "holds %s (preserved backend); rotating would strand its "
+               "output in a rotated sibling",
+               current_log,
+           )
+       except Exception:
+           pass
+       return False
 
     # Find existing rotated logs
     srv.log_dir = current_log.parent
@@ -1943,6 +2029,8 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
     # Rotate current log to .1
     if current_log.exists():
        current_log.rename(srv.log_dir / f"{base_name}.1{suffix}")
+
+    return True
 
 
 

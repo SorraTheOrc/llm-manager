@@ -344,6 +344,26 @@ rotations):
 `window_end_gap_seconds: 1.0`, **`coverage.verdict_met: true`** — this closes
 AC3 of LP-0MVLHMAWV008EKTI: the 24 h re-anchored window is fully covered.
 
+#### Measurement safety — the llama log may be a rotated sibling
+
+A restart that **preserves** llama-server (the `--keep-llama-server` default)
+used to rotate `llama-server.log` while the adopted backend still held the
+**pre-rotation inode**, so its output continued in `llama-server.1.log` and the
+watched `llama-server.log` froze (`/health`:
+`llama_log_source_healthy: false`). Rotation is now deferred while a live
+writer holds the file (LP-0MVZ4UDF10029NDS), but a window measured on an older
+build can still have its llama-side data in a rotated sibling. Before reading a
+window's llama log, resolve the file the running backend is actually writing:
+
+```bash
+readlink /proc/$(pgrep -f 'llama-server.*--models-preset' | head -1)/fd/1
+```
+
+If that is not `…/llama-server.log`, take the window's llama data from the
+reported sibling and record the substitution alongside the evidence. Do **not**
+restart llama-server merely to restore the log — the warm prompt cache is
+deliberately preserved; restart only via `/skill:start-proxy`.
+
 ### Verdicts
 
 | AC | Verdict | Evidence |
