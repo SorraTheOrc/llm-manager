@@ -3510,3 +3510,119 @@ See `proxy/tests/test_provider_fallback.py` (`TestSiblingFallbackCore` and the
 `sibling_*` async tests) for coverage of thresholding, extended cooldown,
 window expiry, brand quarantine, 429 non-counting, and direct sibling routing
 after the threshold trips.
+
+## Planned-unavailable chain: scheduled gaps are deferred and reported (LP-0MVWC9CZH004OZYN)
+
+Some gaps in a model's provider chain are **scheduled**, not failures: an
+`available_times` window is closed until a known UTC edge, a usage-limit
+quarantine has a known reset instant, or a quota window rolls over at a known
+time. Before this change the client received the opaque
+`503 All providers exhausted` and a cap-derived `Retry-After`, so an
+unattended worker retried every minute for hours even though the honest answer
+was "the chain reopens at 10:00 UTC".
+
+When the *whole* residual chain is blocked by those known-until gates, the
+proxy now returns a distinguishable **planned-unavailable** response instead.
+
+### The response
+
+```json
+{
+  "error": "All providers exhausted",
+  "code": "no_provider_available_in_window",
+  "retryable": true,
+  "retry_after": 3600,
+  "retry_at": "2026-10-31T10:00:00+00:00",
+  "retry_after_truncated": true,
+  "detail": "no provider is available now: the earliest reopening provider is opencode-go (blocked by outside_available_window) at 2026-10-31T10:00:00+00:00"
+}
+```
+
+- `code` is the stable discriminator (`EXHAUSTION_CODE_TIME_WINDOW_BLOCKED`).
+- `error` keeps the historical `All providers exhausted` prose, so older
+  clients that string-match it are unaffected (additive fields only).
+- `Retry-After` (header) always equals the body `retry_after`.
+- `detail` names the earliest reopening provider and the gate that closed it.
+
+### The known-until vs transient split
+
+Classification reads the **chain-resolution skip record** (`{provider:
+skip_reason}` on the request), *not* the per-attempt status vocabulary — the
+two differ (`quota_hard_stop` vs `quota_exhausted`,
+`usage_limit_reset_pending` vs `usage_limit_reset`), and classifying on the
+wrong one silently disables the verdict.
+
+| Class | Skip reasons |
+|---|---|
+| **Known-until** (a wait will reopen it) | `outside_available_window`, `usage_limit_reset_pending`, `quota_exhausted`, `quota_hard_stop` |
+| **Derived** (neutral: does not veto the verdict) | `failure_domain`, `usage_limit_account` |
+| **Transient** (a single one keeps today's behaviour) | `provider_cooldown`, budget skips, and anything unrecognised |
+
+The closed sets live in `DETERMINISTIC_CHAIN_SKIP_REASONS` /
+`DERIVED_CHAIN_SKIP_REASONS` in `proxy/proxy/provider.py`. A **new** skip
+reason defaults to transient — it must be added to the set deliberately.
+
+A terminal request-scoped refusal (a non-retryable HTTP 4xx, i.e. anything in
+400–499 except 408/425/429) does not defeat the verdict: no wait can change a
+prompt the upstream will always reject (`_attempt_is_terminal_request_scoped`).
+A single transient attempt (connection error, 5xx, 429, timeout, cooldown,
+budget skip) keeps today's generic exhaustion behaviour byte-identically.
+
+### The earliest-instant rule (vs the chain-hold's maximum)
+
+`retry_at` is the **earliest** instant *any* chain entry becomes eligible —
+the minimum over window edges and known resets — because that is what a client
+needs. It is deliberately *not* the maximum: the maximum is dominated by the
+slowest blocker (measured 2026-11-03: one entry ~15 h out, another ~14 days),
+and advertising it would park the client far longer than capacity needs.
+
+The chain-hold wrapper keeps its own conservative semantics: it bounds a hold
+by the real wait and refuses to hold a provably dead chain at all, so the two
+numbers are intentionally kept separate (`_earliest_deterministic_reset_seconds`
+for the client; `_bounded_hold_seconds` for the wrapper).
+
+### The truncation flag (no silent cap)
+
+`server.max_retry_after_seconds` still caps the advertised delay so no client
+is told to sleep for days. When the true wait exceeds the cap the body carries
+the **untruncated** `retry_at` **and** `retry_after_truncated: true`, so a
+client can choose to sleep through the whole window instead of polling every
+hour. The cap is never silent.
+
+### Pinned `local-preferred` clients
+
+A pinned request never consults the remote tiers for a *service* decision, but
+its refusal must still be honest about *when* the chain can serve. When the
+local route is refused and the remote slice of the chain is deterministically
+known-until blocked, the pinned client receives the same
+`no_provider_available_in_window` response (with the earliest remote reopening
+instant) rather than a bare `429 Local admission refused` carrying an unrelated
+local-capacity timer.
+
+### Fail-open
+
+Any unparseable `available_times` window, missing reset instant, unknown gate
+status, or internal exception falls back to today's generic exhausted
+response. A provider with no computable reopening instant disqualifies the
+classification; the proxy never fabricates a `retry_at`.
+
+### Observability
+
+One `chain_planned_unavailable` line per request (never per entry) names the
+aggregate instant and every blocked entry with its gate and reopening instant:
+
+```
+chain_planned_unavailable model=plan retry_at=2026-10-31T10:00:00Z retry_after=6240 providers=4 deterministic_skips=opencode-go:outside_available_window,... blocked=[opencode-go:outside_available_window@2026-10-31T10:00:00Z, ...] terminal=none
+```
+
+The `proxy-usage-analysis` report classifies this line distinctly from
+`Chain exhausted ... holding` ("Chain-end outcomes"), and never counts a
+fail-fast as hold latency.
+
+### Operator decision: defer and report, never paper over the gap
+
+Adding an always-on remote provider to cover the scheduled gaps was
+**explicitly rejected** (operator decision 2026-10-31). During the scheduled
+windows some requests *must* be deferred; this response makes that deferral
+honest and actionable rather than appearing as a failure. Do not re-time a
+provider's `available_times` to hide a gap either — the gap is the design.

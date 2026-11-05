@@ -85,6 +85,23 @@
 #                     deepseek, opencode-go-deepseek)
 #                     are currently timed to off-peak UTC windows
 #                     (see their entries).
+#
+#                     Planned-unavailable classification
+#                     (LP-0MVWC9CZH004OZYN): when *every* remaining provider
+#                     is blocked by a known-until gate — an
+#                     ``available_times`` window, a usage-limit reset, a quota
+#                     window rollover — the proxy answers with the
+#                     ``no_provider_available_in_window`` 503 instead of the
+#                     generic ``all_exhausted`` body. Its ``retry_at`` is the
+#                     **earliest** instant any entry reopens (the next window
+#                     edge, or the soonest reset), and ``retry_after_truncated:
+#                     true`` marks a cap-limited advertisement while
+#                     ``retry_at`` keeps the untruncated instant. Scheduled
+#                     gaps are deferred-and-reported by design — do not add an
+#                     always-on remote provider to hide them, and do not
+#                     re-time a window to close a gap (operator decision
+#                     2026-10-31). See "Planned-unavailable chain" in
+#                     ``proxy/docs/routing.md``.
 #                     Example:
 #                       - name: deepseek-v4.1-flash
 #                         type: remote
