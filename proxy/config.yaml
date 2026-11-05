@@ -1030,6 +1030,20 @@ server:
   # to an adopted backend). Raising a child's score is always permitted, so the
   # kernel prefers the model backend over the proxy in every deployment mode.
   llama_server_oom_score_adj: 800
+  # --- Death-signal decoding + death-window capture (LP-0MW3K7WD6003TJKZ) ---
+  # The proxy used to report a blanket ``llama_server_exit_code_137`` for every
+  # backend/TTS death while kern.log held the real signal. Death records now
+  # carry the decoded cause (``llama_server_signal_SIGSEGV`` with its
+  # signal number and ``128+N`` code) and a bounded second-resolution window of
+  # the host state before the death. See docs/death-signal-observability.md.
+  #
+  # Arm the per-second ring buffer. Off by default (it costs one /proc +
+  # sysfs read per second); arm it while attributing a death.
+  death_capture_enabled: false
+  # Sampling interval, retained-window length and hard sample cap for the ring.
+  death_capture_interval_seconds: 1
+  death_capture_window_seconds: 120
+  death_capture_capacity: 240
   # Router model-health monitoring cadence (seconds).
   # Preferred key (used by backend health loop):
   llama_model_health_interval_seconds: 10

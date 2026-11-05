@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse
 
 import proxy.metrics as metrics
 from proxy import cold_start
+from proxy.death_capture import decode_returncode
 
 # ---------------------------------------------------------------------------
 # llama-server reuse across proxy-only restarts (LP-0MUCEFCL6001ZXYN)
@@ -1007,8 +1008,10 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
        while time.time() - start_time < timeout:
            # Check if llama process died
            if srv.llama_process is not None and srv.llama_process.poll() is not None:
-               exit_code = srv.llama_process.returncode
-               srv.logger.error(f"llama-server process exited with code {exit_code}")
+               death = decode_returncode(srv.llama_process.returncode)
+               srv.logger.error(
+                   "llama-server died during startup: %s", death.describe()
+               )
                return False
 
            try:
@@ -2402,9 +2405,9 @@ def start_tts_server() -> subprocess.Popen | None:
     try:
         proc.wait(timeout=0.5)
         # Process exited before timeout -> it failed
-        exit_code = proc.returncode
+        death = decode_returncode(proc.returncode)
         srv.logger.warning(
-            f"TTS server exited immediately with code {exit_code}"
+            "TTS server exited immediately: %s", death.describe()
         )
         return None
     except subprocess.TimeoutExpired:
@@ -2452,8 +2455,10 @@ async def wait_for_tts_server(tts_port: int = 8081, timeout: int = 30) -> bool:
         while time.time() - start_time < timeout:
             # Check if tts process died
             if srv.tts_process is not None and hasattr(srv.tts_process, 'poll') and srv.tts_process.poll() is not None:
-                exit_code = srv.tts_process.returncode
-                srv.logger.error(f"TTS server process exited with code {exit_code}")
+                death = decode_returncode(srv.tts_process.returncode)
+                srv.logger.error(
+                    "TTS server died during startup: %s", death.describe()
+                )
                 return False
 
             try:

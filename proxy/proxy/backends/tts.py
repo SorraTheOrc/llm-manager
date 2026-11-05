@@ -10,6 +10,11 @@ backend_health module.
 import asyncio
 import time
 
+from .. import death_capture as _death_capture
+
+#: ``restart_reason`` label for TTS server deaths (see LP-0MW3K7WD6003TJKZ).
+_TTS_DEATH_LABEL = "tts_server"
+
 
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
@@ -75,11 +80,18 @@ def _tts_recovery_snapshot() -> dict:
 # ===================================================================
 
 
-async def _attempt_tts_self_heal() -> bool:
+async def _attempt_tts_self_heal(restart_reason: str = "unspecified") -> bool:
     """Attempt TTS server self-healing with capped retry attempts.
 
     Follows a similar but simpler pattern to llama-server self-healing:
     configurable max attempts within a time window, with clear logging.
+
+    *restart_reason* is the decoded death cause that triggered the restart
+    (``tts_server_signal_SIGKILL``, ``tts_server_exit_code_1``, …). It is
+    logged on every attempt line and stored in
+    ``tts_recovery_state["last_restart_reason"]`` so a TTS restart is never
+    anonymous — the watchdog previously logged only ``code=-9``
+    (LP-0MW3K7WD6003TJKZ AC3).
     """
     from ..backend_health import (
         _get_tts_self_heal_max_attempts,
@@ -100,6 +112,7 @@ async def _attempt_tts_self_heal() -> bool:
     srv.tts_recovery_state["attempt_timestamps"] = attempts
     srv.tts_recovery_state["max_attempts"] = max_attempts
     srv.tts_recovery_state["window_seconds"] = window_seconds
+    srv.tts_recovery_state["last_restart_reason"] = restart_reason
 
     if len(attempts) >= max_attempts:
         srv.tts_recovery_state["in_progress"] = False
@@ -126,10 +139,12 @@ async def _attempt_tts_self_heal() -> bool:
             attempt_number = len(attempts)
 
             srv.logger.warning(
-                "TTS self-heal attempt %s/%s started (window=%ss)",
+                "TTS self-heal attempt %s/%s started (window=%ss, "
+                "restart_reason=%s)",
                 attempt_number,
                 max_attempts,
                 window_seconds,
+                restart_reason,
             )
 
             try:
@@ -225,24 +240,26 @@ async def _tts_watchdog_loop() -> None:
                 srv.logger.warning(
                     "TTS watchdog: tts_process is None, attempting restart"
                 )
-                await _attempt_tts_self_heal()
+                await _attempt_tts_self_heal(restart_reason="tts_process_missing")
                 continue
 
-            code = None
-            try:
-                code = proc.poll()
-            except Exception:
-                code = None
-
-            if code is None:
+            death = _death_capture.probe_death(proc)
+            if death is None:
                 # Process is still running, nothing to do
                 continue
 
-            # Process has exited
+            # Process has exited: name the true cause and keep the death
+            # window (LP-0MW3K7WD6003TJKZ AC3/AC4).
+            restart_reason = death.restart_reason(_TTS_DEATH_LABEL)
             srv.logger.error(
-                "TTS watchdog: TTS server exited with code=%s", code
+                "TTS watchdog: TTS server died: %s (restart_reason=%s)",
+                death.describe(),
+                restart_reason,
             )
-            await _attempt_tts_self_heal()
+            _death_capture.record_death(
+                srv, _TTS_DEATH_LABEL, death, state_attr="tts_recovery_state"
+            )
+            await _attempt_tts_self_heal(restart_reason=restart_reason)
 
         except asyncio.CancelledError:
             srv.logger.info("TTS watchdog loop cancelled")

@@ -402,6 +402,11 @@ backend_watchdog_task: asyncio.Task | None = None
 # Background TTS watchdog task (started in lifespan)
 tts_watchdog_task: asyncio.Task | None = None
 
+# Background death-capture sampling task (LP-0MW3K7WD6003TJKZ). It self-disables
+# unless ``server.death_capture_enabled`` is true, so it can be spawned
+# unconditionally alongside the watchdogs.
+death_capture_task: asyncio.Task | None = None
+
 # TTS self-healing recovery state
 # Mirrors backend_recovery_state but for TTS server
 # "in_progress": bool, "attempt_timestamps": list[float],
@@ -1098,6 +1103,7 @@ def _startup_launch_watchdog_tasks():
     double-initialization).
     """
     global backend_watchdog_task, tts_watchdog_task, model_health_task
+    global death_capture_task
     loop = asyncio.get_running_loop()
     if backend_watchdog_task is None:
         backend_watchdog_task = loop.create_task(_backend_watchdog_loop())
@@ -1105,6 +1111,10 @@ def _startup_launch_watchdog_tasks():
         tts_watchdog_task = loop.create_task(_tts_watchdog_loop())
     if model_health_task is None:
         model_health_task = loop.create_task(_router_model_health_loop())
+    if death_capture_task is None:
+        from .death_capture import death_capture_loop
+
+        death_capture_task = loop.create_task(death_capture_loop())
 
 
 def _startup_restore_provider_state() -> tuple[int, int]:
@@ -1410,6 +1420,7 @@ async def _shutdown_cleanup_tasks():
     Sets each task reference to ``None`` after completion.
     """
     global _dispatch_cleanup_task, backend_watchdog_task, tts_watchdog_task
+    global death_capture_task
     if _dispatch_cleanup_task is not None:
         _dispatch_cleanup_task.cancel()
         try:
@@ -1433,6 +1444,14 @@ async def _shutdown_cleanup_tasks():
         except (Exception, asyncio.CancelledError):
             pass
         tts_watchdog_task = None
+
+    if death_capture_task is not None:
+        death_capture_task.cancel()
+        try:
+            await death_capture_task
+        except (Exception, asyncio.CancelledError):
+            pass
+        death_capture_task = None
 
 
 async def _shutdown_http_client():

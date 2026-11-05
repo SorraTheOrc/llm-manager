@@ -14,6 +14,11 @@ from pathlib import Path
 
 import httpx
 
+from .. import death_capture as _death_capture
+
+#: ``restart_reason`` label for llama-server deaths (see LP-0MW3K7WD6003TJKZ).
+_LLAMA_DEATH_LABEL = "llama_server"
+
 
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
@@ -641,14 +646,10 @@ async def _backend_watchdog_loop() -> None:
                     )
                 continue
 
-            code = None
-            try:
-                code = proc.poll()
-            except Exception:
-                code = None
+            death = _death_capture.probe_death(proc)
 
             worker_unhealthy = False
-            if code is None:
+            if death is None:
                 worker_unhealthy = srv._worker_process_unhealthy(proc)
                 if not worker_unhealthy:
                     # LP-0MRCQW0HC000J4F9: Worker is healthy but backend_ready may
@@ -665,7 +666,7 @@ async def _backend_watchdog_loop() -> None:
                             srv.backend_recovery_state["last_failure"] = None
                     continue
 
-            if code is None and worker_unhealthy:
+            if death is None:
                 srv.logger.error(
                     "watchdog detected unhealthy worker while main process "
                     "is alive model=%s",
@@ -677,10 +678,23 @@ async def _backend_watchdog_loop() -> None:
                 except Exception:
                     pass
             else:
+                # LP-0MW3K7WD6003TJKZ AC1/AC2: report the true termination
+                # cause (signal name and 128+N code) instead of a blanket
+                # ``exit code=137``, and keep the second-resolution death
+                # window as the attribution evidence.
                 srv.logger.error(
-                    "watchdog detected llama-server exit code=%s model=%s",
-                    code,
+                    "watchdog detected llama-server death: %s "
+                    "(restart_reason=%s) model=%s",
+                    death.describe(),
+                    death.restart_reason(_LLAMA_DEATH_LABEL),
                     srv.current_model,
+                )
+                _death_capture.record_death(
+                    srv,
+                    _LLAMA_DEATH_LABEL,
+                    death,
+                    extra={"model": srv.current_model},
+                    state_attr="backend_recovery_state",
                 )
 
             # LP-0MRCQW0HC000J4F9: Before marking backend_ready=False and
@@ -698,10 +712,10 @@ async def _backend_watchdog_loop() -> None:
                     adopted = _adopt_reachable_backend(srv, llama_port)
                     srv.logger.info(
                         "watchdog: process exited but backend reachable on port %d, "
-                        "resetting backend_ready to True (process exited code=%s, "
+                        "resetting backend_ready to True (process exit: %s, "
                         "adopted=%s)",
                         llama_port,
-                        code,
+                        death.describe() if death is not None else "worker_unhealthy",
                         adopted,
                     )
                     srv.backend_ready = True
@@ -717,8 +731,8 @@ async def _backend_watchdog_loop() -> None:
                 recovered = await srv._attempt_router_self_heal(
                     reason=(
                         "worker_unhealthy"
-                        if code is None
-                        else f"llama_server_exit_code_{code}"
+                        if death is None
+                        else death.restart_reason(_LLAMA_DEATH_LABEL)
                     )
                 )
                 srv.logger.info(
