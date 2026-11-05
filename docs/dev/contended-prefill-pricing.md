@@ -120,7 +120,8 @@ dependency order):
 | 3 | `LP-0MVS9YK9P006M1NQ` | Occupant-remaining priced from new tokens at the contended rate |
 | 4 | `LP-0MVS9YKHL007UBBZ` | Decision-log and usage-report surface for `rate_bucket` |
 | 5 | `LP-0MVTKTOVI006ZONN` | Post-change 24 h measurement window vs the 85 % baseline (record: [`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md)) |
-| 6 | `LP-0MVS9Z034006MFZ6` | Docs and rollback (this page) |
+| 6 | `LP-0MVV29XDW006VTWK` | Diurnally matched pre-change baseline restatement — 52.6 % working baseline (record: [`prefill-admission-conversion-diurnal-baseline.md`](prefill-admission-conversion-diurnal-baseline.md)) |
+| 7 | `LP-0MVS9Z034006MFZ6` | Docs and rollback (this page) |
 
 Related origin items: `LP-0MVKUKF65008D5UN` (conservative ETA for large
 prompts), `LP-0MVICD2YW004DJPV` (occupancy-aware symmetric floor),
@@ -136,6 +137,16 @@ events") is **not** met on the literal reading: the genuine comparator is
 152 events (6.3 / h) pre-change and 392 (16.3 / h) post-change (×2.6), with
 one genuinely new class, `measured_cache_deficit` (0 → 234). That class is
 triaged in `LP-0MVV9JWL9003A6XR` as expected behaviour of the measured-cache
-early-abort feature, not a defect. The
-stricter working baseline (36.9 %) was not cleared — that regression is tracked
-in `LP-0MVV1V213002QAIR`.
+early-abort feature, not a defect.
+
+The **working baseline** for that share is the **diurnally matched** pre-change
+window `2026-10-28 00:10:18` → `2026-10-29 00:10:18` (24 h, ending exactly at
+the deploy, fully pre-change code): **52.6 %** (71/135), recorded in
+[`prefill-admission-conversion-diurnal-baseline.md`](prefill-admission-conversion-diurnal-baseline.md)
+(`LP-0MVV29XDW006VTWK`). The like-for-like change is `52.6 % → 60.7 %`
+(**+8.1 points**), and it was not cleared — that regression is tracked in
+`LP-0MVV1V213002QAIR`. The `36.9 %` figure from the `19:00`→`19:00` window is
+retained as the **historical** pre-change reference, not as the working
+baseline: 15.7 of the 23.8-point move from it is diurnal mix, since both
+pre-change windows are served by identical code. The literal **85 %** bar is
+unchanged.
