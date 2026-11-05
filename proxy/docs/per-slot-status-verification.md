@@ -795,10 +795,15 @@ change:
      `slot_counts_stale=true` — the counts were served from the last-known
      cache (89 of the 144 counts-stale polls that night reported
      `available_slots>0`, 54 of them `saturated`) while the hint came from fresh
-     detail. The handler reconciles `available_slots` only when *detail* is
-     stale, never when *counts* are, so the pair can disagree. Disclosed by
-     `slot_counts_stale`; recorded as `discovered-from:LP-0MVUTYHG7001S6BM` and
-     not changed here.
+     detail. At the time of that observation the handler reconciled
+     `available_slots` only when *detail* was stale, never when *counts* were,
+     so the pair could disagree. **Fixed since** by LP-0MVXSX0TZ00798KA: a
+     counts-stale pair is withheld (`available_slots: 0` +
+     `availability_unknown: true`) while the fresh detail keeps driving
+     `capacity_hint` and `slots[]` — see
+     [Counts-stale never asserts availability](#counts-stale-never-asserts-availability-lp-0mvxsx0tz00798ka)
+     and its pinned test. Recorded as
+     `discovered-from:LP-0MVUTYHG7001S6BM`.
 2. **`latency_ms=3355` with `slots_detail_stale=false` (06:57:36).**
    **Not reproduced as a distinct defect.** `latency_ms` is the whole poll, not
    the `/slots` detail budget: the handler issues up to three sequential bounded
