@@ -12839,6 +12839,50 @@ def _build_planned_unavailable_response(
     )
 
 
+def _pinned_remote_planned_unavailable_response(
+    request,
+    model_config: dict | None,
+    attempts: list[dict[str, Any]] | None,
+    config: dict | None = None,
+) -> Response | None:
+    """Planned-unavailable response for a pinned refusal on a blocked chain (AC7).
+
+    A ``local-preferred`` request never consults the remote tiers for a
+    *service* decision (the pin is honoured), but its refusal should still be
+    honest about *when* the chain can serve: the 2026-10-31 08:16 incident
+    answered the pinned client with a bare ``429 Local admission refused`` and
+    an unrelated local-capacity timer while every remote entry was scheduled
+    off until 10:00 UTC.
+
+    The classification reuses the sanctioned seam rather than a second
+    classifier (LP-0MW0KZR7A003UFQK AC11): the request-scoped skip record that
+    chain resolution already filled (:func:`_chain_resolution_skips`), the
+    remote-only slice of the chain, and :func:`_residual_chain_verdict` — so
+    the verdict and its earliest reopening instant are the same computation as
+    the non-pinned path. Returns ``None`` when the request is not pinned, the
+    local route was not refused, or the remote chain is not deterministically
+    blocked (today's refusal then stands, AC-T7b scope).
+    """
+    if not _local_preference_pins_local(request):
+        return None
+    if _local_admission_reject_payload(attempts) is None:
+        return None
+    remotes = [
+        entry
+        for entry in ((model_config or {}).get("providers") or [])
+        if isinstance(entry, dict) and entry.get("type", "remote") != "local"
+    ]
+    if not remotes:
+        return None
+    remote_config = {"providers": remotes}
+    verdict = _residual_chain_verdict(request, remote_config, [], config)
+    if verdict is None:
+        return None
+    return _build_planned_unavailable_response(
+        verdict, config=config, model_config=remote_config
+    )
+
+
 def _log_chain_planned_unavailable(
     path: str,
     verdict: dict,
@@ -13795,6 +13839,14 @@ async def _proxy_with_remote_fallback_cycle(
     planned_unavailable = _build_planned_unavailable_response(
         _fail_fast, config=config, model_config=model_config,
     )
+    if planned_unavailable is None:
+        # AC7 (LP-0MVWC9CZH004OZYN): a pinned request never consults the remote
+        # tiers, but when its local route is refused on a known-until-blocked
+        # remote chain its refusal must still name the reopening instant rather
+        # than a local-capacity timer.
+        planned_unavailable = _pinned_remote_planned_unavailable_response(
+            request, model_config, attempts, config,
+        )
     if planned_unavailable is not None:
         raise ChainExhaustedError(planned_unavailable)
 
@@ -16437,6 +16489,14 @@ async def _proxy_with_fallback_cycle(
     planned_unavailable = _build_planned_unavailable_response(
         _fail_fast, config=config, model_config=model_config,
     )
+    if planned_unavailable is None:
+        # AC7 (LP-0MVWC9CZH004OZYN): a pinned request never consults the remote
+        # tiers, but when its local route is refused on a known-until-blocked
+        # remote chain its refusal must still name the reopening instant rather
+        # than a local-capacity timer.
+        planned_unavailable = _pinned_remote_planned_unavailable_response(
+            request, model_config, attempts, config,
+        )
     if planned_unavailable is not None:
         raise ChainExhaustedError(planned_unavailable)
 

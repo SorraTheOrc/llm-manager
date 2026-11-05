@@ -143,14 +143,6 @@ def _seed_usage_limit_reset(chain: dict, seconds: int) -> str:
 # AC-T7a: the pinned incident is told the 10:00 UTC window edge
 # ======================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Red phase (LP-0MVYVWZDM007F9B3): the pinned path returns the "
-        "local-capacity 429 today; LP-0MVYVX6PC003CSLQ lands the "
-        "planned-unavailable response and removes this marker."
-    ),
-)
 @pytest.mark.asyncio
 async def test_pinned_incident_is_told_the_window_edge():
     """AC7: a pinned request on a known-until-blocked chain gets 10:00Z.
