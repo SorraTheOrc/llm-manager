@@ -411,7 +411,7 @@ carries a 10:00-23:00 UTC `available_times` window (paid dispatches confined
 to business hours); `deepseek-flash` keeps its off-peak windows and carries
 no spend discipline of its own.
 
-### Prepaid-credit balance opt-in (`use_balance`, LP-0MW46PAU4006SK7Z)
+### Prepaid-credit balance opt-in (`use_balance`, LP-0MW46PAU4006SK7Z / LP-0MW46PBD200249WK)
 
 An OpenCode Go account may be configured in the console to fall over onto
 prepaid **balance** once its monthly plan window is spent. Each remote
@@ -420,8 +420,8 @@ which accounts may keep serving on that credit:
 
 | Situation | Behaviour |
 |-----------|-----------|
-| `use_balance: true` on a quota-managed (`opencode-*`) entry | The quota gate treats the plan-exhausted account as still dispatchable onto its prepaid balance (wired by the quota-gate sibling child). |
-| `use_balance: false` (or omitted) — the default | A plan-exhausted account waits for its window reset; routing behaves exactly as before the flag existed. |
+| `use_balance: true` on a quota-managed (`opencode-*`) entry, monthly plan window the **only** blocker | The entry is dispatched and the over-plan spend is billed to prepaid credit — the `dispatch_on_balance` decision (below) replaces the `quota_exhausted` skip. |
+| `use_balance: true` with a spent rolling/weekly window, or with `use_balance: false` (or omitted) — the default | A plan-exhausted account waits for its window reset; routing behaves exactly as before the flag existed (the `quota_exhausted` hard stop stands). |
 | Malformed value (`"yes"`, `2`, a mapping) | Resolves to `false`; one WARN per entry is logged at load (never a startup failure). |
 | Flag on a non-quota-managed entry | Ignored with a debug note — the flag is meaningful only for `opencode-*` accounts. |
 
@@ -431,6 +431,39 @@ The shipped `config.yaml` declares the field on the three `opencode-go-*`
 accounts in the `plan`/`author`/`code` chains; only `opencode-go` opts in
 (`use_balance: true`) — `opencode-go-2` and `opencode-go-3` stay at the
 `false` default.
+
+#### The plan-vs-balance dispatch rule
+
+The quota hard stop (`server.quota_exhaustion_percent`, default 99.5) skips a
+spent account before any upstream request is attempted. `use_balance: true`
+softens exactly one case: the **monthly plan window is the only blocking
+signal** — the monthly window is spent (`status` not `ok`, or its percent at
+or above the threshold) while rolling and weekly still hold real headroom
+(not blocking, and their remaining headroom above `100 - threshold`). Then
+the entry keeps dispatching and `_dispatch_on_balance` logs, once per account
+per process:
+
+```
+dispatch_on_balance (account=OPENCODE_KEY_A, plan_monthly=100.0%, use_balance=true)
+```
+
+Anything else keeps the unchanged hard stop (`reason=quota_exhausted`):
+
+- **rolling or weekly spent** — including a window whose headroom is at or
+  below `100 - threshold` even with an `ok` status (genuine exhaustion is
+  never overridden);
+- **no opt-in** — `false`/absent keeps the skip byte-identical;
+- **quota behaviour disabled or stale-suspended** — the softening is inert, so
+  a stale "plan spent" reading can never bill balance after the plan reset
+  (the money guard's stale-state fail-safe survives).
+
+The softening changes **only** the hard-stop predicate. The surge kill
+switch, dry-run, stale-state suspension, quota ordering, `available_times`
+and the cooldown / usage-limit quarantine gates keep their exact precedence
+— a balance-eligible entry is still constrained by its own `available_times`
+window and the rest of the resolution gates. Balance absence is handled
+reactively (a `GoUsageLimitError` / `[overloaded]` 429) rather than from
+`/v1/usage`.
 
 ### Priority-chain membership (`priorities`, LP-0MVGPZWY0001JD1D)
 
@@ -3745,6 +3778,12 @@ wrong one silently disables the verdict.
 The closed sets live in `DETERMINISTIC_CHAIN_SKIP_REASONS` /
 `DERIVED_CHAIN_SKIP_REASONS` in `proxy/proxy/provider.py`. A **new** skip
 reason defaults to transient — it must be added to the set deliberately.
+
+> **Balance-opted-in entries never appear here.** With `use_balance: true` a
+> plan-exhausted entry whose rolling/weekly windows still hold headroom is
+> **not** skipped at all — it dispatches onto prepaid balance (see
+> [Prepaid-credit balance opt-in](#prepaid-credit-balance-opt-in-use_balance-lp-0mw46pau4006sk7z))
+> — so it produces no skip record and can never make a chain known-until.
 
 A terminal request-scoped refusal (a non-retryable HTTP 4xx, i.e. anything in
 400–499 except 408/425/429) does not defeat the verdict: no wait can change a

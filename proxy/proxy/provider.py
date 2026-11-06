@@ -4119,6 +4119,68 @@ def _quota_ranked_providers(
     return result
 
 
+#: Account -> already-logged dedupe for the balance-dispatch decision
+#: (LP-0MW46PBD200249WK AC4): the INFO line fires once per account per
+#: process, mirroring the dry-run skip-logging discipline.
+_DISPATCH_ON_BALANCE_LOGGED: set[str] = set()
+
+
+def _dispatch_on_balance(
+    provider_cfg: dict, snapshot: quota_state.QuotaSnapshot, config: dict | None
+) -> bool:
+    """True when the quota hard stop may be softened for *provider_cfg*.
+
+    The hard stop (LP-0MVF7KO8C005NB59) exists so a spent account can never
+    spend real pay-as-you-go money. One case is exempted by the operator: the
+    monthly **plan** window is the only blocking signal (rolling and weekly
+    still hold real headroom) and the entry declares ``use_balance: true``
+    (LP-0MW46PAU4006SK7Z) — the account's console configuration allows
+    billing the over-plan spend to prepaid credit, so the entry must keep
+    dispatching instead of waiting out the whole monthly reset horizon
+    (LP-0MW46PBD200249WK).
+
+    Any other blocking signal keeps the current hard stop: a spent rolling or
+    weekly window — including one whose headroom is at or below the threshold
+    margin (``100 - threshold``), which is genuine exhaustion even when the
+    upstream status is still ``ok`` (AC2) — is never overridden, and an entry
+    without the opt-in behaves byte-identically to today (AC11). With quota
+    behaviour disabled (kill switch) or stale-suspended the predicate refuses
+    too (AC3): the money guard stays byte-identical in those regimes, so a
+    stale "plan spent" reading can never bill balance after the plan reset.
+    """
+    if not get_use_balance(provider_cfg):
+        return False
+    behaviour = _quota_behaviour(config)
+    if behaviour.disabled or behaviour.suspended:
+        return False
+    if snapshot.rolling.blocking or snapshot.weekly.blocking:
+        return False
+    threshold = quota_state.quota_exhaustion_percent(config)
+    margin = 100.0 - threshold
+    if snapshot.rolling.headroom <= margin or snapshot.weekly.headroom <= margin:
+        return False
+    return snapshot.monthly.blocking or snapshot.monthly.percent >= threshold
+
+
+def _log_dispatch_on_balance(
+    provider_cfg: dict, snapshot: quota_state.QuotaSnapshot
+) -> None:
+    """INFO once per account that the entry was dispatched onto balance.
+
+    Distinct, greppable reason separating "plan spent, balance permitted"
+    from the applied ``reason=quota_exhausted`` skips (AC4).
+    """
+    if snapshot.account in _DISPATCH_ON_BALANCE_LOGGED:
+        return
+    _DISPATCH_ON_BALANCE_LOGGED.add(snapshot.account)
+    logger.info(
+        "dispatch_on_balance (account=%s, plan_monthly=%.1f%%, use_balance=%s)",
+        snapshot.account,
+        snapshot.monthly.percent,
+        str(get_use_balance(provider_cfg)).lower(),
+    )
+
+
 def _quota_unavailable_reason(
     provider_cfg: dict, config: dict | None
 ) -> str | None:
@@ -4128,7 +4190,12 @@ def _quota_unavailable_reason(
     entry whose snapshot is
     :attr:`~proxy.quota_state.QuotaSnapshot.exhausted` (any window blocking,
     or no effective headroom left) is treated as unavailable — the same
-    conservative stance the snapshot itself takes.
+    conservative stance the snapshot itself takes. The one exception is the
+    :func:`_dispatch_on_balance` override: when the monthly plan window is
+    the **only** blocker and the entry opts into balance billing
+    (``use_balance: true``), the account is not unavailable — it may keep
+    serving on prepaid credit (LP-0MW46PBD200249WK). The hard stop below
+    logs the ``dispatch_on_balance`` decision.
 
     The decision is gated on the central behaviour predicate
     (:func:`proxy.quota_state.quota_behaviour`): it returns ``None`` (fail
@@ -4146,6 +4213,11 @@ def _quota_unavailable_reason(
         return None
     snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
     if snapshot is None or not snapshot.exhausted:
+        return None
+    if _dispatch_on_balance(provider_cfg, snapshot, config):
+        # The monthly plan window is the only blocker and the account opted
+        # into balance billing: not unavailable — the hard stop below
+        # decides, logging dispatch_on_balance (LP-0MW46PBD200249WK).
         return None
     reason = (
         f"quota_exhausted (account={snapshot.account}, "
@@ -4182,6 +4254,19 @@ def _quota_exhausted(
     ``(False, "")`` (fail open) when the entry is not
     quota-managed or no snapshot has been polled yet — the guard only acts on
     authoritative quota state.
+
+    The one softening is the operator's explicit balance opt-in
+    (:func:`_dispatch_on_balance`, LP-0MW46PBD200249WK): when the **only**
+    blocking signal is the monthly plan window (rolling and weekly still hold
+    real headroom) and the entry declares ``use_balance: true``, ``(False,
+    "")`` is returned and the ``dispatch_on_balance`` decision is logged once
+    per account — the over-plan spend is billed to prepaid credit instead of
+    waiting out the monthly reset horizon. Any other blocker (a spent rolling
+    or weekly window, or no opt-in) keeps the unchanged hard stop. The
+    softening is itself honour-able only with fresh quota state and an
+    enabled behaviour predicate — disabled/stale-suspended regimes keep the
+    byte-identical hard stop (AC3), so a stale "plan spent" reading can never
+    bill balance after the plan reset.
     """
     if not quota_state.is_quota_provider(provider_cfg, config):
         return False, ""
@@ -4195,6 +4280,9 @@ def _quota_exhausted(
         monthly_percent < threshold
         and effective_headroom > 100.0 - threshold
     ):
+        return False, ""
+    if _dispatch_on_balance(provider_cfg, snapshot, config):
+        _log_dispatch_on_balance(provider_cfg, snapshot)
         return False, ""
     return True, (
         f"reason=quota_exhausted (account={snapshot.account}, "
@@ -4225,9 +4313,15 @@ def resolve_provider(
       LP-0MSG45LOO007K236)
     - Does not belong to a usage-limit ACCOUNT with a pending usage-limit
       reset (LP-0MSLJPOCC0001ROJ / LP-0MSMBWB23009XYPW)
-    - Is not marked spent by proactive quota state (LP-0MVF7KIKE002DZVD)
+    - Is not marked spent by proactive quota state (LP-0MVF7KIKE002DZVD) —
+      lifted when the **only** spent signal is the monthly plan window and
+      the entry opts into balance billing (``use_balance: true",
+      LP-0MW46PBD200249WK)
     - Is not at or near its monthly quota cap (the cost-guard hard stop —
-      ``server.quota_exhaustion_percent``, LP-0MVF7KO8C005NB59)
+      ``server.quota_exhaustion_percent``, LP-0MVF7KO8C005NB59) — unless the
+      account opted into balance billing, in which case a monthly-plan-only
+      spend dispatches onto prepaid credit (``use_balance: true",
+      LP-0MW46PBD200249WK)
 
     Quota-managed (``opencode-*``) entries are considered in descending
     headroom urgency instead of config order — see
@@ -4671,6 +4765,7 @@ def reset_surge_bypass_state() -> None:
     """Forget per-account transition / dry-run decision log state (tests)."""
     _SURGE_BYPASS_LOGGED.clear()
     _QUOTA_DRY_RUN_LOGGED.clear()
+    _DISPATCH_ON_BALANCE_LOGGED.clear()
 
 
 def _log_quota_skip_decision(
