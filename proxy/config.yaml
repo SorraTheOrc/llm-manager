@@ -1282,6 +1282,26 @@ server:
   # back to the default, with one WARN per process.
   # Default: 99.5.
   quota_exhaustion_percent: 99.5
+  # Transient-overload and balance-exhaustion handling (LP-0MW46PBWL008T317).
+  # Once a `use_balance: true` account may dispatch on credit, two reactive
+  # paths are live and stay distinct:
+  #   - an OpenCode `[overloaded]` 429 (`Retry-After: 2` / `retry-after-ms`)
+  #     is a SHORT retryable cooldown honouring the upstream wait, never a
+  #     failure-domain exclusion and never an account quarantine — the same
+  #     entry is retried on the next chain-hold cycle and the chain falls
+  #     through to the next provider after the bounded holds;
+  #   - a genuine balance-exhaustion response (HTTP 402 / a usage-limit body
+  #     on a non-429 status) quarantines the failing API-key ACCOUNT with the
+  #     reset-aware usage-limit quarantine (real reset timing, cumulative with
+  #     an existing usage-limit quarantine), keyed on api_key_env@endpoint:model
+  #     so same-gateway siblings stay eligible.
+  # overloaded_cooldown_max_seconds caps the `[overloaded]` cooldown above
+  # (default 30 s), so a wildly large Retry-After can never park a
+  # transiently-overloaded entry for a long cooldown. The standard
+  # `Retry-After` / `retry-after-ms` headers are honoured by the overloaded
+  # path directly; the `respect_ratelimit_headers` flag above is NOT required
+  # for them (it remains the opt-in for the custom `x-ratelimit-*` headers).
+  overloaded_cooldown_max_seconds: 30
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
   # provider repeatedly returns an EMPTY response / stalls (no usable content)
   # across retry cycles, the provider is quarantined for an EXTENDED cooldown

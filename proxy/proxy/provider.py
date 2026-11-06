@@ -10477,6 +10477,240 @@ def _is_account_rate_limit_error(response: Response, body_text: str) -> bool:
     return any(marker in lowered_body for marker in _ACCOUNT_QUOTA_MARKERS)
 
 
+# ---------------------------------------------------------------------------
+# Transient upstream overload vs genuine balance exhaustion
+# (LP-0MW46PBWL008T317)
+#
+# Once a ``use_balance: true`` account may dispatch on credit, two reactive
+# paths become live and must be told apart:
+#
+# - **Transient overload** — the upstream answers HTTP 429
+#   ``[overloaded] the server is overloaded; retry shortly`` with
+#   ``Retry-After: 2`` / ``retry-after-ms: 2000`` (live sampling alternated
+#   3 x 429 then 2 x 200). This is a SHORT retryable cooldown honouring the
+#   upstream's own wait (bounded), never a permanent domain failure and never
+#   an account quarantine.
+# - **Balance exhaustion** — the prepaid credit / usage is genuinely spent:
+#   ``/v1/usage`` carries no balance field, so the first signal is the
+#   upstream error itself (HTTP 402 or a usage-limit body). The ACCOUNT is
+#   quarantined with the existing reset-aware usage-limit quarantine (real
+#   reset timing), so the entry is not retried in a loop.
+# ---------------------------------------------------------------------------
+
+#: Default cooldown for an ``[overloaded]`` 429 when the upstream sends no
+#: ``Retry-After`` at all: still a short bounded retryable wait, never a long
+#: quarantine.
+_OVERLOADED_BASE_COOLDOWN_SECONDS = 1.0
+
+#: Upper bound for an ``[overloaded]`` 429 cooldown. The upstream's
+#: ``Retry-After`` is honoured but capped here so a wildly large value cannot
+#: park a transiently-overloaded entry for a long cooldown. Configurable via
+#: ``server.overloaded_cooldown_max_seconds``.
+_OVERLOADED_COOLDOWN_DEFAULT_MAX_SECONDS = 30.0
+
+
+def _overloaded_cooldown_max_seconds(config: dict | None = None) -> float:
+    """Return the cap on an ``[overloaded]`` 429 cooldown (seconds).
+
+    Reads ``server.overloaded_cooldown_max_seconds`` (accepting the flat form
+    for tests), defaulting to :data:`_OVERLOADED_COOLDOWN_DEFAULT_MAX_SECONDS`;
+    a missing, malformed or non-positive value falls through to the default so
+    the cap can never be accidentally disabled.
+    """
+    candidates: list[Any] = []
+    if isinstance(config, dict):
+        server_cfg = config.get("server", config)
+        if isinstance(server_cfg, dict):
+            candidates.append(server_cfg.get("overloaded_cooldown_max_seconds"))
+        candidates.append(config.get("overloaded_cooldown_max_seconds"))
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return float(_OVERLOADED_COOLDOWN_DEFAULT_MAX_SECONDS)
+
+
+def _overloaded_retry_after_seconds(response: Response) -> float | None:
+    """Return the upstream's requested wait for an ``[overloaded]`` 429.
+
+    Honours the standard ``Retry-After`` header first (the observed OpenCode
+    shape ``Retry-After: 2``), then the millisecond variant
+    ``retry-after-ms`` (``retry-after-ms: 2000``). Returns ``None`` when
+    neither header is present/parseable, so the caller falls back to the
+    base cooldown.
+    """
+    seconds = _parse_retry_after(response)
+    if seconds is not None:
+        return seconds
+    raw = response.headers.get("retry-after-ms") if response.headers else None
+    if raw is not None:
+        try:
+            ms = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if ms > 0:
+            return ms / 1000.0
+    return None
+
+
+def _overloaded_cooldown_seconds(
+    response: Response, config: dict | None = None
+) -> float:
+    """A bounded, short cooldown (seconds) for an ``[overloaded]`` 429.
+
+    Floors the upstream's ``Retry-After`` / ``retry-after-ms`` wait at the
+    1-second base (so a missing header cannot spin an instant retry loop) and
+    caps it at :func:`_overloaded_cooldown_max_seconds` (so a transient blip
+    is never parked for a long cooldown). Deliberately NOT exponential and
+    NOT counted by the sibling-fallback breaker: overload is transient and
+    must stay short (LP-0MW46PBWL008T317 AC1/AC5/AC10).
+    """
+    retry_after = _overloaded_retry_after_seconds(response)
+    if retry_after is None:
+        retry_after = _OVERLOADED_BASE_COOLDOWN_SECONDS
+    return min(
+        max(retry_after, _OVERLOADED_BASE_COOLDOWN_SECONDS),
+        _overloaded_cooldown_max_seconds(config),
+    )
+
+
+def _is_overloaded_error(response: Response, body_text: str) -> bool:
+    """Return True when a response is a transient upstream ``[overloaded]``.
+
+    Classifies the OpenCode Go overload shape — an HTTP 429 whose body
+    carries the ``[overloaded]`` marker (observed ``429 ... [overloaded] the
+    server is overloaded; retry shortly``), an ``error.type`` / ``code`` of
+    ``overloaded``, or the combined "server is overloaded" + "retry shortly"
+    wording. It is deliberately distinct from the quota / usage-limit
+    classifiers: the caller applies a SHORT retryable cooldown honouring
+    ``Retry-After`` (bounded), never an account quarantine and never a
+    permanent failure-domain exclusion (LP-0MW46PBWL008T317 AC1/AC10).
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 429:
+        return False
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    err_types: list[str] = []
+    codes: list[str] = []
+    messages: list[str] = []
+    if isinstance(payload, dict):
+        candidates = [payload]
+        error = payload.get("error")
+        if isinstance(error, dict):
+            candidates.append(error)
+        for cand in candidates:
+            err_types.append(str(cand.get("type", "")).strip().lower())
+            codes.append(str(cand.get("code", "")).strip().lower())
+            if isinstance(cand.get("message"), str):
+                messages.append(cand["message"].strip().lower())
+
+    for marker in (*err_types, *codes):
+        if marker in ("overloaded", "[overloaded]"):
+            return True
+
+    lowered_body = (body_text or "").strip().lower()
+    if "[overloaded]" in lowered_body:
+        return True
+    # Conservative wording fallback: the combined "server is overloaded" +
+    # "retry shortly" phrase names the same transient-overload event without
+    # the bracket marker.
+    if any("server is overloaded" in m for m in messages) or (
+        "server is overloaded" in lowered_body
+        and "retry shortly" in lowered_body
+    ):
+        return True
+    return False
+
+
+#: Body markers identifying a genuine balance-exhaustion response (an
+#: out-of-credit / usage-spent account) on a NON-429 error status. Mirrors the
+#: usage-limit vocabulary resolved by ``_usage_limit_reset_info``; a 429 never
+#: reaches this detector because the 429 quota / usage-limit paths own it.
+_BALANCE_EXHAUSTION_BODY_MARKERS = (
+    "insufficient_quota",
+    "free_daily_limit_exceeded",
+    "gousagelimiterror",
+    "freeusagelimiterror",
+    "usage_limit_reached",
+)
+
+
+def _is_balance_exhaustion_error(response: Response, body_text: str) -> bool:
+    """Return True when a response signals genuine credit/balance exhaustion.
+
+    Two shapes (LP-0MW46PBWL008T317 AC3):
+
+    - **HTTP 402 "Payment Required"** — the classic out-of-credit signal;
+      ``/v1/usage`` carries no balance field, so the 402 is the reactive proof
+      the prepaid credit is spent;
+    - **any other non-429 error status** whose body carries the usage-limit
+      markers (``insufficient_quota`` / ``free_daily_limit_exceeded`` /
+      ``GoUsageLimitError`` / ``FreeUsageLimitError`` / ``usage_limit_reached``)
+      — a usage-limit-shaped body on a status the 429 path does not own.
+
+    A 429 is deliberately NOT matched here: 429s route through the quota /
+    usage-limit reset path (``_usage_limit_reset_info``) and the per-account
+    rate-limit handling, never through the balance-quarantine branch.
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status == 429:
+        return False
+    if status == 402:
+        return True
+    if not _is_http_error_status(status):
+        return False
+    lowered_body = (body_text or "").strip().lower()
+    return any(marker in lowered_body for marker in _BALANCE_EXHAUSTION_BODY_MARKERS)
+
+
+def _balance_exhaustion_reset_info(
+    response: Response,
+    body_text: str,
+    config: dict | None = None,
+    provider_cfg: dict | None = None,
+) -> "_UsageLimitReset | None":
+    """Resolve the account quarantine for a balance-exhaustion response.
+
+    Reuses the reset-aware usage-limit resolution (:func:`_usage_limit_reset_info`,
+    now 402-capable) when the body carries usage-limit evidence; otherwise the
+    account's real ``/v1/usage`` snapshot reset is used (the authoritative
+    window reset, LP-0MVPAE77Z002VGIA), and a bounded guessed quarantine is
+    the last resort so an out-of-credit account is never re-probed in a tight
+    loop. Returns ``None`` only when even the guess cannot be computed
+    (defensive: the caller keeps the generic cooldown path then).
+    """
+    info = _usage_limit_reset_info(
+        response, body_text, config, provider_cfg=provider_cfg
+    )
+    if info is not None:
+        return info
+    if provider_cfg is not None:
+        snapshot_seconds = _quota_snapshot_reset_seconds(provider_cfg, config)
+        if snapshot_seconds is not None:
+            return _UsageLimitReset(
+                float(snapshot_seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                True,
+                None,
+                None,
+            )
+    guessed = _usage_limit_guess_cap_seconds(config)
+    if guessed > 0:
+        return _UsageLimitReset(
+            float(guessed) + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, None, None
+        )
+    return None
+
+
 def _parse_resets_in(message: str) -> float | None:
     """Parse a ``Resets in ...`` duration from an upstream error message.
 
@@ -11015,7 +11249,7 @@ def _usage_limit_reset_info(
     An absolute-timestamp reset names no quota *window*, so it is recorded
     without window metadata and revalidated as a legacy entry.
 
-    Returns ``None`` when the response is not a 429 usage-limit error or no
+    Returns ``None`` when the response is not a 429/402 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
     ``FreeUsageLimitError`` 3-hour cooldown / generic rate-limit handling.
 
@@ -11032,9 +11266,15 @@ def _usage_limit_reset_info(
               2026-10-30 00:00 UTC. Add credits to continue now.",
               "type": "insufficient_quota", "code":
               "free_daily_limit_exceeded"}}
+
+    HTTP 402 (``Payment Required``) is accepted as well as 429: a genuinely
+    exhausted prepaid balance surfaces as a 402 / usage-limit body, and the
+    balance-exhaustion path (``_balance_exhaustion_reset_info``) resolves the
+    SAME reset-aware quarantine from it (LP-0MW46PBWL008T317). Any other
+    status is never a usage-limit reset event.
     """
     status = int(getattr(response, "status_code", 0) or 0)
-    if status != 429:
+    if status not in (402, 429):
         return None
 
     try:
@@ -11219,8 +11459,29 @@ def _set_usage_limit_quarantine(
     clear it as soon as that window is reported lifted (LP-0MVPAE77Z002VGIA
     AC7); entries without a window (message durations, x-ratelimit headers,
     legacy state) carry no metadata and are revalidated as legacy entries.
+
+    The quarantine is **cumulative**: an existing quarantine is never cleared
+    or shortened by a later reset (LP-0MW46PBWL008T317 AC4). A fresh
+    balance-exhaustion signal arriving while a longer usage-limit quarantine
+    is already recorded leaves the recorded expiry and metadata untouched; a
+    longer new reset replaces it.
     """
-    _usage_reset_at[account] = time.time() + reset.seconds
+    existing = _usage_reset_at.get(account)
+    now = time.time()
+    if existing is not None and existing - now > reset.seconds:
+        # A longer quarantine is already recorded — never clear or shorten it
+        # (LP-0MW46PBWL008T317 AC4). The existing metadata (window,
+        # guessed/explicit marking) stays too, so the recorded state remains
+        # internally consistent.
+        logger.info(
+            "usage-limit quarantine kept for account=%s: existing longer "
+            "(%ds remaining) than the new reset (%ds)",
+            account,
+            int(existing - now),
+            int(reset.seconds),
+        )
+        return
+    _usage_reset_at[account] = now + reset.seconds
     if reset.explicit:
         _usage_reset_guessed.discard(account)
     else:
@@ -14051,6 +14312,84 @@ async def _proxy_with_remote_fallback_cycle(
                     all_slot_exhaustion = False
                     continue
 
+                # Transient upstream overload (LP-0MW46PBWL008T317): an OpenCode
+                # ``[overloaded]`` 429 is a SHORT retryable cooldown honouring
+                # ``Retry-After`` (bounded), NOT a failure-domain exclusion and
+                # NOT an account quarantine. Deliberately no
+                # ``attempted_domains.add`` and no cooldown on the failure
+                # domain here: a momentary blip on one key must not poison
+                # ``https://opencode.ai/zen/go`` for sibling accounts (AC1,
+                # AC10). The entry is re-tried by the next chain-hold cycle
+                # (AC2); a chain that keeps overloading falls through to the
+                # next provider after the bounded holds instead of exhausting
+                # or hanging (AC5).
+                if _is_overloaded_error(response, body_text):
+                    fallback_reason = "overloaded"
+                    prev_provider = provider_name
+                    _overload_retry = _overloaded_retry_after_seconds(response)
+                    _overload_cooldown = _overloaded_cooldown_seconds(
+                        response, config
+                    )
+                    mark_provider_unavailable(provider_name, _overload_cooldown)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="overloaded",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                        cooldown_seconds=_overload_cooldown,
+                        retry_after_seconds=(
+                            _overload_retry if _overload_retry is not None else 0.0
+                        ),
+                    )
+                    logger.info(
+                        "provider=%s transient overloaded 429 "
+                        "(cooldown=%.1fs retry_after=%ss) reason=overloaded",
+                        provider_name,
+                        _overload_cooldown,
+                        (_overload_retry if _overload_retry is not None else 0.0),
+                    )
+                    all_slot_exhaustion = False
+                    continue
+
+                # Genuine balance exhaustion (LP-0MW46PBWL008T317 AC3): the
+                # prepaid credit / usage is spent — the upstream error itself
+                # (HTTP 402 or a usage-limit body) is the reactive proof. The
+                # ACCOUNT is quarantined with real reset timing via the same
+                # reset-aware usage-limit quarantine, so the entry is NOT
+                # retried in a loop and the quarantine is cumulative with an
+                # existing usage-limit quarantine (AC4). Same-account siblings
+                # on the gateway stay eligible (account-scoped poisoning).
+                if _is_balance_exhaustion_error(response, body_text):
+                    _balance_reset = _balance_exhaustion_reset_info(
+                        response, body_text, config, provider_cfg=provider_cfg
+                    )
+                    if _balance_reset is not None:
+                        _balance_account = _usage_limit_account_key(provider_cfg)
+                        _set_usage_limit_quarantine(_balance_account, _balance_reset)
+                        fallback_reason = "balance_exhaustion"
+                        prev_provider = provider_name
+                        attempted_domains.add(_balance_account)
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="balance_exhaustion",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                            reset_in_seconds=int(_balance_reset.seconds),
+                        )
+                        logger.info(
+                            "provider=%s balance_exhaustion account=%s "
+                            "reset_in=%ds reason=balance_exhaustion",
+                            provider_name,
+                            _balance_account,
+                            int(_balance_reset.seconds),
+                        )
+                        all_slot_exhaustion = False
+                        continue
+
                 # Shared primitive: HTTP error with cooldown
                 _handle_http_error_with_cooldown(
                     response, provider_name, provider_type,
@@ -16614,6 +16953,75 @@ async def _proxy_with_fallback_cycle(
                         )
                         all_slot_exhaustion = False
                         continue
+
+                    # Transient upstream overload (LP-0MW46PBWL008T317): see the
+                    # identically-shaped branch in the remote-only cycle — a
+                    # short bounded retryable cooldown honouring ``Retry-After``,
+                    # never a failure-domain exclusion and never an account
+                    # quarantine (AC1/AC10).
+                    if _is_overloaded_error(response, body_text):
+                        fallback_reason = "overloaded"
+                        prev_provider = provider_name
+                        _overload_retry = _overloaded_retry_after_seconds(response)
+                        _overload_cooldown = _overloaded_cooldown_seconds(
+                            response, config
+                        )
+                        mark_provider_unavailable(provider_name, _overload_cooldown)
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="overloaded",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                            cooldown_seconds=_overload_cooldown,
+                            retry_after_seconds=(
+                                _overload_retry if _overload_retry is not None else 0.0
+                            ),
+                        )
+                        logger.info(
+                            "provider=%s transient overloaded 429 "
+                            "(cooldown=%.1fs retry_after=%ss) reason=overloaded",
+                            provider_name,
+                            _overload_cooldown,
+                            (_overload_retry if _overload_retry is not None else 0.0),
+                        )
+                        all_slot_exhaustion = False
+                        continue
+
+                    # Genuine balance exhaustion (LP-0MW46PBWL008T317 AC3): see
+                    # the identically-shaped branch in the remote-only cycle —
+                    # the ACCOUNT is quarantined with real reset timing via the
+                    # reset-aware usage-limit quarantine, cumulative with an
+                    # existing one (AC4).
+                    if _is_balance_exhaustion_error(response, body_text):
+                        _balance_reset = _balance_exhaustion_reset_info(
+                            response, body_text, config, provider_cfg=provider_cfg
+                        )
+                        if _balance_reset is not None:
+                            _balance_account = _usage_limit_account_key(provider_cfg)
+                            _set_usage_limit_quarantine(_balance_account, _balance_reset)
+                            fallback_reason = "balance_exhaustion"
+                            prev_provider = provider_name
+                            attempted_domains.add(_balance_account)
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="balance_exhaustion",
+                                status_code=int(response.status_code),
+                                body_snippet=(body_text[:512] if body_text else None),
+                                reset_in_seconds=int(_balance_reset.seconds),
+                            )
+                            logger.info(
+                                "provider=%s balance_exhaustion account=%s "
+                                "reset_in=%ds reason=balance_exhaustion",
+                                provider_name,
+                                _balance_account,
+                                int(_balance_reset.seconds),
+                            )
+                            all_slot_exhaustion = False
+                            continue
 
                     # Shared primitive: HTTP error with cooldown
                     _handle_http_error_with_cooldown(

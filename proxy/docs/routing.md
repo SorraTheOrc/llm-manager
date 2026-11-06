@@ -461,9 +461,13 @@ The softening changes **only** the hard-stop predicate. The surge kill
 switch, dry-run, stale-state suspension, quota ordering, `available_times`
 and the cooldown / usage-limit quarantine gates keep their exact precedence
 — a balance-eligible entry is still constrained by its own `available_times`
-window and the rest of the resolution gates. Balance absence is handled
-reactively (a `GoUsageLimitError` / `[overloaded]` 429) rather than from
-`/v1/usage`.
+window and the rest of the resolution gates. Balance absence cannot be seen
+from `/v1/usage` (it carries no balance field), so it is handled reactively
+from the upstream error itself — see
+[Transient overload vs balance exhaustion](#transient-overload-vs-balance-exhaustion-lp-0mw46pbwl008t317):
+a `[overloaded]` 429 is a short retryable cooldown, a genuine
+balance-exhaustion response (HTTP 402 / a usage-limit body) quarantines the
+account with the reset-aware usage-limit quarantine.
 
 ### Priority-chain membership (`priorities`, LP-0MVGPZWY0001JD1D)
 
@@ -3653,6 +3657,67 @@ cooldown (10800s; per-provider overrides were retired with
 `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
 **LP-0MSLJPOCC0001ROJ**; the snapshot-based retirement of the guess is
 **LP-0MVF7MPZN009GOJB**.
+
+## Transient overload vs balance exhaustion (LP-0MW46PBWL008T317)
+
+Once a `use_balance: true` account may dispatch on credit, two reactive paths
+— both invisible to the proactive `/v1/usage` gate, which has no balance
+field — must be told apart when the upstream answers:
+
+- **Transient overload** — an HTTP 429 whose body carries the `[overloaded]`
+  marker (observed `429 ... [overloaded] the server is overloaded; retry
+  shortly`) with `Retry-After: 2` / `retry-after-ms: 2000` (live sampling
+  alternated 3 × 429 then 2 × 200). Classified by `_is_overloaded_error()`
+  **distinctly from every quota / usage-limit classifier**, before
+  `_handle_http_error_with_cooldown()`.
+
+  Behaviour (AC1/AC2/AC5/AC10):
+
+  1. The entry gets a **short retryable cooldown** honouring the upstream's
+     own wait — `Retry-After` (or the `retry-after-ms` millisecond variant),
+     floored at 1 s and capped by `server.overloaded_cooldown_max_seconds`
+     (default 30 s) — so a wild header can never park a transiently
+     overloaded entry for a long cooldown. Logged at INFO with
+     `reason=overloaded`, attempt `status=overloaded`.
+  2. **No failure-domain exclusion, no account quarantine, no
+     sibling-fallback streak**: the entry's failure domain
+     (`https://opencode.ai/zen/go:deepseek-v4-flash`) is never poisoned, so
+     sibling accounts on the same gateway stay eligible (AC1/AC10). The
+     cooldown is deliberately not exponential — repeated overloads stay
+     short.
+  3. The **next chain-hold cycle re-tries the same entry** once the bounded
+     cooldown elapses — a 429-then-200 sequence succeeds with a ~2 s hold
+     (`min(chain_hold_seconds, retry_after)`). A chain whose first entry
+     keeps overloading falls through to the next provider after the bounded
+     holds instead of exhausting or hanging, and the exhaustion response
+     still carries a truthful `retry_after` (the remaining cooldown).
+
+  The standard `Retry-After` / `retry-after-ms` headers are honoured by this
+  path directly; `respect_ratelimit_headers` (the opt-in for the custom
+  `x-ratelimit-*` headers) is **not** required for them.
+
+- **Genuine balance exhaustion** — the prepaid credit / usage is spent. The
+  reactive proof is the upstream error itself: an HTTP 402 "Payment
+  Required", or a usage-limit body (`insufficient_quota` /
+  `free_daily_limit_exceeded` / `GoUsageLimitError` /
+  `FreeUsageLimitError` / `usage_limit_reached`) on a **non-429** status
+  (429s keep routing through the quota / usage-limit reset path above).
+  Classified by `_is_balance_exhaustion_error()` and quarantined via
+  `_balance_exhaustion_reset_info()` (AC3/AC6):
+
+  1. The failing **API-key account** is quarantined with the **reset-aware
+     usage-limit quarantine** — a body `Resets in ...` duration or absolute
+     reset instant, else the account's real `/v1/usage` snapshot reset, else
+     the bounded guess — so the entry is **not retried in a loop**.
+  2. The quarantine is **cumulative**: `_set_usage_limit_quarantine()` only
+     ever extends — a shorter balance signal can never clear or shorten a
+     longer usage-limit quarantine already recorded (AC4).
+  3. Keyed on `api_key_env@endpoint:model` (account-scoped), so paid
+     siblings on the same gateway stay eligible. Logged at INFO with
+     `reason=balance_exhaustion`, attempt `status=balance_exhaustion` (a 402
+     that also carries a resolvable usage-limit body is logged by the
+     usage-limit reset path instead — same quarantine, same real reset
+     timing).
 
 ## Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG)
 
