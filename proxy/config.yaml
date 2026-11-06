@@ -192,6 +192,24 @@
 #                    `server.respect_ratelimit_headers`; default false so
 #                    every existing provider is unchanged (LP-0MVBHDNLB007ALLJ).
 #
+# Prepaid-credit balance opt-in (optional, quota-managed remote providers
+# only; LP-0MW46PAU4006SK7Z):
+#   use_balance - true|false. An OpenCode Go account may be configured in the
+#                    console to fall over onto prepaid **balance** once its
+#                    monthly plan window is spent. When `use_balance: true`
+#                    the quota gate treats a plan-exhausted account as still
+#                    dispatchable onto that credit (wired in the quota-gate
+#                    sibling child); `false` (the default) means a plan-
+#                    exhausted account waits for its window reset. Only a real
+#                    YAML boolean is honoured (fail safe): an omitted key
+#                    defaults to `false` (existing behaviour unchanged) and a
+#                    malformed value is coerced to `false` with one WARN per
+#                    entry — it never fails a load. The flag is meaningful
+#                    only for quota-managed (`opencode-*`) entries; elsewhere
+#                    it is ignored (debug note). The three opencode-go-* entries
+#                    in each chain declare the field; only `opencode-go` opts
+#                    in.
+#
 # Responses-API mode (optional, remote providers only):
 #   api - "openai-completions" (default) or "openai-responses". Some
 #        upstreams (opencode.ai zen/go for the muse model family) expose
@@ -457,6 +475,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -486,6 +505,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -508,6 +528,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
+        use_balance: true  # may spill onto prepaid credit once the plan window is spent (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -693,6 +714,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -715,6 +737,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -737,6 +760,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
+        use_balance: true  # may spill onto prepaid credit once the plan window is spent (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -862,6 +886,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -884,6 +909,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -906,6 +932,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
+        use_balance: true  # may spill onto prepaid credit once the plan window is spent (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #

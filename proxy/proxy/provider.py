@@ -5521,6 +5521,109 @@ def _get_respect_ratelimit_headers(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Per-provider ``use_balance`` opt-in (LP-0MW46PAU4006SK7Z)
+#
+# An OpenCode Go account may be configured in the console to fall over onto
+# prepaid credit once its monthly plan window is spent. The quota gate needs
+# to know which accounts are allowed to do that, so ``use_balance`` is a
+# per-entry ``true|false`` flag with a **false** default: entries that omit it
+# behave exactly as before. Only a real YAML boolean is honoured (fail safe):
+# a malformed value (e.g. ``"yes"``, ``2``, a mapping) is coerced to ``false``
+# and logged **once** with a WARN naming the entry — it never raises at load.
+# The flag is meaningful only for quota-managed (``opencode-*``) entries;
+# elsewhere it is read faithfully but ignored (with a one-time debug note).
+# ---------------------------------------------------------------------------
+
+#: Entry-name -> already-warned dedupe so a malformed ``use_balance`` is
+#: logged exactly once per entry instead of on every routed request.
+_USE_BALANCE_MALFORMED_WARNED: set[str] = set()
+
+#: Entry-name -> already-noted dedupe for the "ignored outside quota-managed
+#: entries" debug note (same per-entry-once discipline as the WARN path).
+_USE_BALANCE_NON_QUOTA_NOTED: set[str] = set()
+
+
+def _warn_malformed_use_balance(provider_cfg: dict) -> None:
+    """Log one WARN for a malformed ``use_balance``, deduplicated per entry."""
+    name = provider_cfg.get("name", "<unnamed>")
+    if name in _USE_BALANCE_MALFORMED_WARNED:
+        return
+    _USE_BALANCE_MALFORMED_WARNED.add(name)
+    raw = provider_cfg.get("use_balance")
+    logger.warning(
+        "use_balance on provider entry %r is not a boolean (got %r); "
+        "treating it as false — only true/false are honoured",
+        name,
+        raw,
+    )
+
+
+def get_use_balance(provider_cfg: dict) -> bool:
+    """Return the per-provider ``use_balance`` opt-in (default ``False``).
+
+    Only a real YAML boolean is honoured (fail safe, LP-0MW46PAU4006SK7Z
+    AC2/AC3): an omitted key, an explicit ``null`` or any non-boolean value
+    resolves to ``False``. A *declared but malformed* value additionally logs
+    one WARN naming the entry (deduplicated) and never raises, so a
+    misconfiguration is visible without changing routing.
+
+    The flag is meaningful only for quota-managed (``opencode-*``) entries
+    (the scope this child introduces); when set on any other entry its value
+    is still returned faithfully but a one-time DEBUG note records that the
+    flag is ignored there.
+    """
+    if not isinstance(provider_cfg, dict):
+        return False
+    raw = provider_cfg.get("use_balance")
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        _warn_malformed_use_balance(provider_cfg)
+        return False
+    if not quota_state.is_quota_provider(provider_cfg):
+        name = provider_cfg.get("name", "<unnamed>")
+        if name not in _USE_BALANCE_NON_QUOTA_NOTED:
+            _USE_BALANCE_NON_QUOTA_NOTED.add(name)
+            logger.debug(
+                "use_balance=%r on provider entry %r is ignored: the flag is "
+                "only meaningful for quota-managed (opencode-*) entries",
+                raw,
+                name,
+            )
+    return raw
+
+
+def validate_use_balance_config(config: dict) -> list[str]:
+    """Scan every provider entry's ``use_balance``; WARN once per malformed value.
+
+    Non-raising by design (LP-0MW46PAU4006SK7Z AC3/AC5): a malformed value is
+    coerced to ``False`` by :func:`get_use_balance`, so this hook only
+    surfaces the misconfiguration as one WARN per entry at load time — never a
+    startup failure. Returns an empty problem list (consistent with the
+    validator convention, nothing here ever blocks a load).
+    """
+    if not isinstance(config, dict):
+        return []
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return []
+    for model_cfg in models.values():
+        if not isinstance(model_cfg, dict):
+            continue
+        providers = model_cfg.get("providers")
+        if not isinstance(providers, list):
+            continue
+        for entry in providers:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("use_balance")
+            if raw is not None and not isinstance(raw, bool):
+                # Shares the runtime dedupe, so load + reads never double-WARN.
+                _warn_malformed_use_balance(entry)
+    return []
+
+
 def _get_ratelimit_cooldown_margin_seconds(config: dict | None) -> float:
     """Read the safety margin added to a header-derived cooldown.
 

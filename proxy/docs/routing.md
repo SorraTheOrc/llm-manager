@@ -411,6 +411,27 @@ carries a 10:00-23:00 UTC `available_times` window (paid dispatches confined
 to business hours); `deepseek-flash` keeps its off-peak windows and carries
 no spend discipline of its own.
 
+### Prepaid-credit balance opt-in (`use_balance`, LP-0MW46PAU4006SK7Z)
+
+An OpenCode Go account may be configured in the console to fall over onto
+prepaid **balance** once its monthly plan window is spent. Each remote
+provider entry may declare `use_balance: true|false` so the quota gate knows
+which accounts may keep serving on that credit:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| `use_balance: true` on a quota-managed (`opencode-*`) entry | The quota gate treats the plan-exhausted account as still dispatchable onto its prepaid balance (wired by the quota-gate sibling child). |
+| `use_balance: false` (or omitted) — the default | A plan-exhausted account waits for its window reset; routing behaves exactly as before the flag existed. |
+| Malformed value (`"yes"`, `2`, a mapping) | Resolves to `false`; one WARN per entry is logged at load (never a startup failure). |
+| Flag on a non-quota-managed entry | Ignored with a debug note — the flag is meaningful only for `opencode-*` accounts. |
+
+Only a real YAML boolean is honoured (fail safe): an omitted key keeps the
+existing behaviour, and a quoted string such as `"true"` is *not* accepted.
+The shipped `config.yaml` declares the field on the three `opencode-go-*`
+accounts in the `plan`/`author`/`code` chains; only `opencode-go` opts in
+(`use_balance: true`) — `opencode-go-2` and `opencode-go-3` stay at the
+`false` default.
+
 ### Priority-chain membership (`priorities`, LP-0MVGPZWY0001JD1D)
 
 Priority routing is declared **once**, on the provider definition the operator
