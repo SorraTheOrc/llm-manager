@@ -228,11 +228,14 @@ Metric definitions, the two file schemas and a worked backfill run:
 When Prometheus is reachable, the **Local model utilization** section adds a
 **GPU busy — power-based (hardware)** row that measures when the GPU actually
 drew compute-level power (≥ 90 W), instead of relying on the proxy's
-stream-lifecycle logs. On this Strix Halo APU `gpu_busy_percent` saturates at
-~20 W (it reads ~100 % for any draw above that) and `amd-smi` reports `N/A`,
+stream-lifecycle logs. On this Strix Halo APU `gpu_busy_percent` is a two-state
+detector whose step sits at **~30 W** — below the idle-with-display band, so it
+reads 99.2 % while idling with a display against 98.7 % while computing and
+cannot separate the two — and `amd-smi` reports `N/A`,
 so power draw is the discriminating signal; `amdtop`/`rocm-smi` show the same
-saturating counter (see [monitoring/README.md](../../../monitoring/README.md),
-*Why not `amd-smi`, `rocm-smi` or `amdtop`?*). The report
+counter (see [monitoring/README.md](../../../monitoring/README.md),
+*Why not `amd-smi`, `rocm-smi` or `amdtop`?*, for the measurement and its
+PromQL recipe; re-measured 2026-11-06 in LP-0MW5K7WKZ005VJXA). The report
 queries `avg_over_time(gpu:computing:bool[Nh])` — evaluated by Prometheus over
 the raw **15-second** hwmon series (`monitoring/gpu_compute_rules.yaml`) —
 plus the 5-minute-smoothed power trace for context. Best-effort: if Prometheus

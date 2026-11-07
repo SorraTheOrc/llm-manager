@@ -39,7 +39,7 @@ Two things this unit is **not**:
 
 | Series | Labels | Type | Meaning |
 |---|---|---|---|
-| `gpu_busy_percent` | `gpu="card0"` | gauge | Driver-reported busy percentage — **saturates at ~20 W on this APU (reads ~100% for any draw above ~20 W), so it is not a utilisation measure** (measured 2026-10-28, LP-0MVSQQO910077LYL) |
+| `gpu_busy_percent` | `gpu="card0"` | gauge | Driver-reported busy percentage — a **two-state detector whose step sits at ~30 W on this APU** (1–10 % below 30 W, 92–99 % above), so it reads 99.2 % while idling with a display against 98.7 % while computing and cannot separate the two. **Not a utilisation measure** (re-measured 2026-11-06 on kernel 7.0.0-38, LP-0MW5K7WKZ005VJXA) |
 | `gpu_vram_used_bytes` | `gpu="card0"` | gauge | Used portion of the VRAM carve-out (`mem_info_vram_used`) |
 | `gpu_vram_total_bytes` | `gpu="card0"` | gauge | Size of the VRAM carve-out (`mem_info_vram_total`, 1 GiB here) |
 | `gpu_gtt_used_bytes` | `gpu="card0"` | gauge | GTT in use (`mem_info_gtt_used`) — the meaningful pool: models map most of their weights here (~36 GiB of a 128 GiB pool in normal operation) |

@@ -1095,10 +1095,15 @@ server:
   # fallback; when neither is available detection is skipped.
   #
   # DISABLED BY DEFAULT (LP-0MS9GA6QL007XTBP): on this Strix Halo APU
-  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent saturates at ~20W - measured
-  # 2026-07-31, 30/30 samples read 100 while power draw showed the
-  # GPU idle at ~54W vs ~115W when computing (quantified 2026-10-28 as a ~20W
-  # latch in LP-0MVSQQO910077LYL). The busy+idle signature
+  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is a two-state detector whose
+  # step sits at ~30W - measured 2026-07-31, 30/30 samples read 100 while power
+  # draw showed the GPU idle at ~54W vs ~115W when computing. Re-measured
+  # 2026-11-06 on kernel 7.0.0-38 (LP-0MW5K7WKZ005VJXA), the step is below the
+  # idle-with-display band (p50 45W), so it reads 99.2% at 40-60W (idle with a
+  # display) against 98.7% at 90-100W (computing) - it inverts, and no threshold
+  # inside the working range rescues it (the retired 20W latch claim was never
+  # the mechanism; see monitoring/README.md, "Why not amd-smi, rocm-smi or amdtop?").
+  # The busy+idle signature
   # therefore false-positives on every idle period, causing constant
   # unload/reload churn (144 unloads in one day, killing in-flight requests).
   # On this hardware class a wedged engine (LP-0MS91D782006XIR6, ~53W idle

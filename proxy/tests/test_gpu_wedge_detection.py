@@ -58,9 +58,13 @@ class TestSlotsAllIdle:
 # _gpu_wedge_discriminate
 #
 # LP-0MS9GA6QL007XTBP: on the Strix Halo APU (Radeon 8060S iGPU, gfx1151)
-# gpu_busy_percent saturates at ~20W - measured 30/30 samples read 100 while
-# power draw showed the GPU idle at ~54W vs ~115W when genuinely computing
-# (quantified 2026-10-28 as a ~20W latch in LP-0MVSQQO910077LYL). The old
+# gpu_busy_percent is a two-state detector, not a percentage - measured 30/30
+# samples read 100 while power draw showed the GPU idle at ~54W vs ~115W when
+# genuinely computing. Re-measured 2026-11-06 on kernel 7.0.0-38
+# (LP-0MW5K7WKZ005VJXA) the step sits at ~30W, below the idle-with-display band,
+# so idle with display reads 99.2% against 98.7% when computing - it inverts and
+# no threshold in the working range rescues it (the retired "~20W latch" was
+# never the mechanism). The old
 # busy+idle signature therefore
 # fired on every idle period, causing constant unload/reload churn.
 #

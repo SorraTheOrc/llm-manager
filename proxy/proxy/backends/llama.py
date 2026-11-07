@@ -45,11 +45,15 @@ def _srv():
 #
 # False-positive guard (LP-0MS9GA6QL007XTBP):
 #
-# On the Strix Halo APU (Radeon 8060S iGPU, gfx1151) gpu_busy_percent
-# saturates at ~20W: measured 2026-07-31, 30/30 samples read 100
-# while power draw showed the GPU idle at ~54W vs ~115W when genuinely
-# computing (quantified 2026-10-28 as a ~20W latch in LP-0MVSQQO910077LYL),
-# so the busy+idle signature fired on every idle period and
+# On the Strix Halo APU (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is a
+# two-state detector, not a percentage: measured 2026-07-31, 30/30 samples read
+# 100 while power draw showed the GPU idle at ~54W vs ~115W when genuinely
+# computing. Re-measured 2026-11-06 on kernel 7.0.0-38 (LP-0MW5K7WKZ005VJXA)
+# the step sits at ~30W - below the idle-with-display band (p50 45W) - so idle
+# with display reads 99.2% against 98.7% when computing: it inverts across the
+# band that matters and no threshold inside the working range rescues it (the
+# retired 20W latch claim was never the mechanism). The busy+idle signature
+# therefore fired on every idle period and
 # caused constant unload/reload churn. Power draw (sysfs power1_average in
 # micro-watts, rocm-smi fallback) is now the discriminating signal:
 #
@@ -994,9 +998,11 @@ async def _router_model_health_loop() -> None:
             )
 
             # GPU-wedge detection configuration (LP-0MS91DHQ9003EGB0 /
-            # LP-0MS9GA6QL007XTBP). Disabled by default: gpu_busy_percent
-            # saturates at ~20W on the Strix Halo APU (LP-0MVSQQO910077LYL), so
-            # the busy+idle signature false-positives on every idle period.
+            # LP-0MS9GA6QL007XTBP). Disabled by default: gpu_busy_percent is a
+            # two-state detector whose step sits at ~30W on the Strix Halo APU
+            # (LP-0MW5K7WKZ005VJXA; monitoring/README.md, "Why not amd-smi,
+            # rocm-smi or amdtop?"), so the busy+idle signature false-positives
+            # on every idle period.
             gpu_wedge_enabled = bool(
                 server_cfg.get("llama_gpu_wedge_detection_enabled", False)
             )

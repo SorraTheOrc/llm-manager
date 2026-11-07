@@ -4,15 +4,21 @@ GPU busy time is measured from power draw via the ``gpu:computing:bool``
 recording rule (1 ≥ 90 W, 0 otherwise), evaluated every 15 s by Prometheus.
 
 The driver's ``gpu_busy_percent`` cannot serve as a utilisation signal on this
-Strix Halo APU: it responds to load within seconds but **saturates at ~20 W**
-(reads ~100 % for any draw above ~20 W), so idle-with-context stretches report
-as busy. Measured 2026-10-28 over 7 days: 94.5 % mean busy against 28.1 % of
-samples at compute power, 45.2 % false-busy (LP-0MS9GA6QL007XTBP, quantified in
-LP-0MVSQQO910077LYL). AMD's own tooling offers no alternative here: ``amd-smi``
+Strix Halo APU: it is a **two-state detector, not a percentage**, whose step
+sits at **~30 W** — it reads 1–10 % below 30 W and 92–99 % from 30 W upward.
+Because the step is below the idle-with-display band (p50 45 W), idle-with-
+context and computing both read ~99 % and the counter *inverts* across the band
+that matters: re-measured 2026-11-06 on kernel 7.0.0-38 it read 99.2 % at
+40–60 W (idle with a display) against 98.7 % at 90–100 W (computing), with
+7.9 % false-busy and 1.7 % false-idle over the whole post-boot window
+(LP-0MW5K7WKZ005VJXA; supersedes the retired 20 W latch claim of
+LP-0MS9GA6QL007XTBP and LP-0MVSQQO910077LYL). AMD's own tooling offers no
+alternative here: ``amd-smi``
 reports ``N/A`` for every metric this module needs on this APU, and
-``amdtop``/``rocm-smi`` merely display the same saturating counter — so this
+``amdtop``/``rocm-smi`` merely display the same counter — so this
 module reads Prometheus and must never shell out to an AMD tool (see
-``monitoring/README.md``, "Why not amd-smi, rocm-smi or amdtop?").
+``monitoring/README.md``, "Why not amd-smi, rocm-smi or amdtop?", for the
+measurement and the PromQL recipe that recomputes every band).
 
 The recording rules live in monitoring/gpu_compute_rules.yaml and are
 evaluated at ``evaluation_interval = 15 s``.  The 15 s cadence is

@@ -16,8 +16,10 @@ Two incidents motivated this module (LP-0MVZ810NG008A3EW, 2026-11-02T12:03:08Z):
   lines, one timestamp, ~10.5 minutes of connection-refused before an operator
   restarted the proxy by hand;
 * nothing recorded the pressure *before* the kill: ``ps`` RSS accounting cannot
-  see GTT, ``gpu_busy_percent`` is useless on this APU, and the only evidence
-  left was a kernel log line.
+  see GTT, ``gpu_busy_percent`` is useless on this APU (a two-state detector
+  whose step sits at ~30 W, below the idle-with-display band — see
+  ``monitoring/README.md``, "Why not amd-smi, rocm-smi or amdtop?"), and the
+  only evidence left was a kernel log line.
 
 The module therefore has two halves:
 

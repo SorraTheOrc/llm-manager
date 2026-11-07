@@ -211,13 +211,17 @@ and evaluates the alert rules in `monitoring/*.yaml`.
 
 > GPU utilisation is derived from **power draw**
 > (`node_hwmon_power_average_watt`), not `gpu_busy_percent`: on this Strix Halo
-> APU that counter **saturates at ~20 W** — it reads ~100 % once the GPU draws
-> more than ~20 W and only falls back below that, so it reports idle-with-
-> context stretches as busy (measured 2026-10-28 over 7 days: 94.5 % mean busy
-> against 28.1 % of samples at compute power; LP-0MS9GA6QL007XTBP,
-> quantified in LP-0MVSQQO910077LYL). `amd-smi`, `rocm-smi` and `amdtop` are
-> not alternatives — see *Why not `amd-smi`, `rocm-smi` or `amdtop`?* in the
-> query cookbook below.
+> APU that counter is a **two-state detector whose step sits at ~30 W**, which
+> makes it **not a utilisation signal**. It reads 1–10 % below 30 W and 92–99 %
+> from 30 W upward; idle-with-models-and-display already draws 33–54 W
+> (p50 45 W), so every working GPU state sits above the step and the counter
+> *inverts* across the band that matters: re-measured 2026-11-06 on kernel
+> 7.0.0-38 it read 99.2 % at 40–60 W (idle with a display) against 98.7 % at
+> 90–100 W (computing). `amd-smi`,
+> `rocm-smi` and `amdtop` are not alternatives — see *Why not `amd-smi`,
+> `rocm-smi` or `amdtop`?* in the query cookbook below for the measurement and
+> its PromQL recipe (LP-0MS9GA6QL007XTBP, LP-0MVSQQO910077LYL,
+> LP-0MW5K7WKZ005VJXA).
 > This power figure is **hardware** activity, never local model utilisation:
 > it counts any GPU draw at compute power, not just the work the proxy served.
 > The usage report's decision figure — the one gates and alerts quote — is the
@@ -323,7 +327,7 @@ systemctl --user enable --now node_exporter.service gpu-metrics.service
 
 Resulting GPU series: `gpu_gtt_used_bytes`, `gpu_vram_used_bytes`,
 `gpu_vram_total_bytes`, `gpu_busy_percent` (scraped for continuity only — it
-saturates at ~20 W on this APU and is not a utilisation signal), plus
+saturates above ~30 W on this APU and is not a utilisation signal), plus
 `node_hwmon_power_average_watt{chip_name="amdgpu"}`.
 
 ## 4. Grafana (optional, not deployed here)
@@ -571,24 +575,143 @@ AMD tooling offers nothing better on this host (measured 2026-10-28,
 | `amdtop` | Linux “GPU usage” is literally `/sys/class/drm/card0/device/gpu_busy_percent` (`linux.go:151`, commit `5e500c3`); power/temp from the same `hwmon` files; VRAM (not GTT). Windows uses ADLX, a Windows-only driver library |
 
 So `amdtop` and `rocm-smi` display **the same counter** this stack samples for
-continuity only, and that counter **saturates at ~20 W**: it responds to load
-within seconds but reads ~100 % for any draw above ~20 W. Measured over 7 days
-of Prometheus history (904 paired 15 s samples, 2026-10-21 → 2026-10-28):
+continuity only. That counter is a **two-state detector, not a percentage**: its
+step sits at ~30 W, so it reads 1–10 % below 30 W and 92–99 % from 30 W upward.
 
-| GPU power band | samples | mean `gpu_busy_percent` | share ≥ 90 % |
-|---|---|---|---|
-| 0–20 W | 44 | 2.3 % | 2 % |
-| 20–40 W | 414 | 98.9 % | 99 % |
-| 40–60 W | 90 | 100.0 % | 100 % |
-| 80–90 W | 96 | 100.0 % | 100 % |
-| 90–100 W | 175 | 99.1 % | 98 % |
-| 100–125 W | 78 | 95.7 % | 95 % |
+Re-measured **2026-11-06** on kernel **7.0.0-38-generic** (host rebooted
+2026-10-31 14:27 UTC), over the whole post-boot window — 2026-10-31 14:28 →
+2026-11-06 14:28 UTC, **25,463** observed 15 s samples. The pre-reboot column
+is the same recipe applied to the preceding five days (2026-10-26 14:28 →
+2026-10-31 14:28 UTC, kernel 7.0.0-34, **28,655** samples), so the two columns
+are like-for-like. Sample counts are *observed* samples, not the grid size: the
+post-boot window holds 73.7 % of its 34,561-point 15 s grid, because the series
+has gaps.
 
-Window summary: mean 94.5 % busy against 28.1 % of samples at compute power
-(≥ 90 W); `r(busy, power) = 0.28`; false-busy (`busy ≥ 90 %` ∧ `power < 40 W`)
-45.2 % of samples, longest continuous run 5.3 h; false-idle
-(`busy < 90 %` ∧ `power ≥ 90 W`) 0.8 %, so it never *under*-reports — which is
-why a live reading looks convincing.
+| GPU power band | pre-reboot (n = 28,655) | post-reboot (n = 25,463) |
+|---|---|---|
+| 0–10 W | 2.0 % | 1.7 % |
+| 10–20 W | 4.7 % | 3.6 % |
+| 20–30 W | 10.2 % | 7.2 % |
+| 30–35 W | 99.4 % | 92.1 % |
+| 35–40 W | 99.8 % | 98.4 % |
+| 40–60 W | 99.5 % | 99.2 % |
+| 60–80 W | 98.6 % | 97.0 % |
+| 80–90 W | 99.6 % | 98.6 % |
+| 90–100 W | 99.4 % | 98.7 % |
+| 100–125 W | 98.4 % | 97.3 % |
+
+| Window summary | pre-reboot | post-reboot |
+|---|---|---|
+| mean `gpu_busy_percent` | 95.6 % | 80.0 % |
+| samples at compute power (≥ 90 W) | 31.5 % | 51.0 % |
+| false-busy (`busy ≥ 90 %` ∧ `power < 40 W`) | 35.1 % | 7.9 % |
+| false-idle (`busy < 90 %` ∧ `power ≥ 90 W`) | 0.5 % | 1.7 % |
+
+**The mechanism, stated once here** (every other document cross-references this
+paragraph): *the step sits at ~30 W — below the idle-with-display band — so the
+counter cannot separate idle-with-context from compute, and it inverts across
+exactly that band.* On the current kernel, 40–60 W (GPU idle with an active
+display) reads **99.2 %** against **98.7 %** at 90–100 W (computing); the
+pre-reboot column inverts the same way (99.5 % against 99.4 %), so this is a
+property of the counter, not of the kernel. Two consequences follow, and both
+have misled readers before:
+
+- *"It latches at 20 W"* invites the conclusion that the counter is fixed when
+  20–30 W starts reporting 7.2 %. The step is not at 20 W; it is at ~30 W, and
+  it was already at ~30 W in the pre-reboot window (20–30 W read 10.2 %).
+- *"It always saturates"* invites the belief that the counter never
+  *under*-reports, which the 1.7 % false-idle share contradicts.
+
+The false-busy share is **band occupancy**, not a counter improvement: it is,
+almost exactly, the share of time spent in the 30–40 W strip just above the step
+(35.1 % of pre-reboot samples against a measured 35.1 %; 7.7 % of post-reboot
+samples against a measured 7.9 %). So the drop from 35.1 % to 7.9 % means the
+host spent less of its window idling at 30–40 W — the compute share rose from
+31.5 % to 51.0 % — not that the counter got better. A live reading still looks
+convincing for that reason: above the step it reads ~99 % whatever the GPU is
+doing.
+
+These figures supersede the pre-reboot measurement quoted here previously
+(2026-10-28, 904 paired samples, a "20 W latch", 94.5 % mean busy,
+45.2 % false-busy); that window also predated the TSDB's creation and could not
+be reproduced from the store. The conclusion is unchanged — the counter is not
+a utilisation signal, and `gpu:computing:bool` stays the definition — only the
+evidence is current (LP-0MW5K7WKZ005VJXA).
+
+#### Re-measuring `gpu_busy_percent` discrimination
+
+This subsection exists so the reason the counter is **not a utilisation signal**
+stays current instead of ageing; it records evidence, it does not change a
+threshold or a rule. The bands above are **recomputed from the Prometheus store
+with the PromQL
+below, never remembered**. Four query shapes cover the whole table. Every one is
+an instant query whose subquery is pinned to a window end with the `@` modifier,
+so a re-run reproduces the published figures instead of drifting with the clock.
+
+```promql
+# 1. Observed samples in the window — the `n` column and the whole-window
+#    denominator. A subquery counts one sample per 15 s step that *has* a
+#    sample, so gaps stay visible instead of being smoothed away.
+count_over_time(gpu_busy_percent[6d:15s] @ 1793984880)
+
+# 2. Mean busy for one power band — the published percentage. `and on ()`
+#    keeps the busy sample only where the power sample is inside the band;
+#    avg_over_time then averages over exactly those steps. Change 40/60 for
+#    each band (the published rows use 0, 10, 20, 30, 35, 40, 60, 80, 90 and
+#    100 as lower bounds).
+avg_over_time(
+  (gpu_busy_percent
+     and on () (gpu:power_watts:amdgpu >= 40)
+     and on () (gpu:power_watts:amdgpu <  60))[6d:15s] @ 1793984880
+)
+
+# 3. Sample count for the same band, when the per-band n matters.
+count_over_time(
+  (gpu_busy_percent
+     and on () (gpu:power_watts:amdgpu >= 40)
+     and on () (gpu:power_watts:amdgpu <  60))[6d:15s] @ 1793984880
+)
+
+# 4. The window-summary shares.
+avg_over_time(gpu:computing:bool[6d:15s] @ 1793984880)
+
+count_over_time(
+  ((gpu_busy_percent >= 90)
+     and on () (gpu:power_watts:amdgpu < 40))[6d:15s] @ 1793984880)
+  / count_over_time(gpu_busy_percent[6d:15s] @ 1793984880)
+
+count_over_time(
+  ((gpu_busy_percent < 90)
+     and on () (gpu:power_watts:amdgpu >= 90))[6d:15s] @ 1793984880)
+  / count_over_time(gpu_busy_percent[6d:15s] @ 1793984880)
+```
+
+The `@` values are the two window ends, as Unix timestamps:
+
+| Window | `@` | subquery range |
+|---|---|---|
+| post-reboot, 2026-10-31 14:28 → 2026-11-06 14:28 UTC | `1793984880` | `[6d:15s]` |
+| pre-reboot, 2026-10-26 14:28 → 2026-10-31 14:28 UTC | `1793456880` | `[5d:15s]` |
+
+Run one expression:
+
+```bash
+curl -s --get http://127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=count_over_time(gpu_busy_percent[6d:15s] @ 1793984880)' \
+  | jq -r '.data.result[0].value[1]'
+```
+
+Notes for whoever re-runs this:
+
+- Take the window from `uptime -s` (`post-boot window`) and record the kernel
+  with `uname -r`; those two facts belong next to the figures, because the
+  previous revision of this section quoted numbers measured on a kernel the
+  host no longer ran.
+- Do not substitute a shorter `[Nh]` lookback for the `@`-pinned subquery: it
+  silently measures a different window, which is how a quoted figure stops
+  being reproducible.
+- A band with few samples is not evidence. Quote `n` alongside the mean, as the
+  table does.
 
 Two structural points apply even if a tool did expose a usable number:
 `amd-smi` and friends are **instantaneous** (no history, so a 24 h window would
@@ -824,6 +947,13 @@ a sample is far more likely to be computing than idling. A machine whose
 *idle* band reached 90 W would make the rule fire on an idle GPU, so re-measure
 after a hardware, driver or kernel change before trusting the figure.
 
+> This section calibrates the **90 W compute threshold**. The same store also
+> answers the separate question *why the discarded `gpu_busy_percent` counter
+> stays discarded* — it is not a utilisation signal, and that measurement has
+> its own recipe — see
+> [Re-measuring `gpu_busy_percent`
+> discrimination](#re-measuring-gpu_busy_percent-discrimination).
+
 ### Re-measuring
 
 `power1_average` is the sensor this stack already uses
@@ -977,12 +1107,19 @@ counter is only a liveness check here, never a utilisation signal; see
 
 ### `gpu_busy_percent` reads 100% while the machine is idle
 
-Expected on this APU: the counter latches to ~100 % as soon as the GPU draws
-more than ~20 W and only falls back below that, so an idle GPU holding a
-residual context still reads as busy. It is **not** a utilisation measure. Use
+Expected on this APU: it is a two-state detector whose step sits at **~30 W** —
+below the idle-with-display band (p50 45 W) — so an idle GPU holding a residual
+context above ~30 W reads ~99 % busy. Re-measured 2026-11-06 on kernel
+7.0.0-38 it read 99.2 % at 40–60 W (idle with an active display) against 98.7 %
+at 90–100 W (computing): it inverts across exactly that band, so no threshold
+inside the working range can rescue it. See
+[Why not `amd-smi`, `rocm-smi` or `amdtop`?](#why-not-amd-smi-rocm-smi-or-amdtop)
+for the measurement and its PromQL recipe. Use
 the power-derived series (`gpu:computing:bool`, `gpu:power_watts:avg5m`)
-instead. No rule in this repository may select `gpu_busy_percent`
-(LP-0MS9GA6QL007XTBP, quantified in LP-0MVSQQO910077LYL).
+instead. It is **not** a utilisation signal: no rule in this repository may
+select `gpu_busy_percent`
+(LP-0MS9GA6QL007XTBP, quantified in LP-0MVSQQO910077LYL and re-measured in
+LP-0MW5K7WKZ005VJXA).
 
 ## Security notes
 
@@ -1012,6 +1149,9 @@ instead. No rule in this repository may select `gpu_busy_percent`
 - LP-0MVSQQO910077LYL — why the GPU-utilisation source stays power draw
   (`amd-smi` returns `N/A`; `amdtop`/`rocm-smi` surface the saturating
   `gpu_busy_percent`; 7-day quantification).
+- LP-0MW5K7WKZ005VJXA — re-measured that quantification on kernel 7.0.0-38 and
+  replaced the retired 20 W latch claim with the ~30 W step and the
+  40–60 W / 90–100 W inversion.
 - LP-0MVNWUEY8008XM6W — slot-occupancy telemetry epic (this documentation
   change is its AC7/AC8 slice).
 - LP-0MVT1O0VG00905EL — the proxy publishes the slot-occupancy series this

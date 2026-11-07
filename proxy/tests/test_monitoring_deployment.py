@@ -66,10 +66,12 @@ REQUIRED_RULE_FILES = {
 #   The dashboard is covered separately by TestGrafanaDashboardVramPanel, which
 #   rejects any series the documented sampler does not publish
 #   (LP-0MVOHRLPB0086Q5T).
-# - gpu_busy_percent: saturates at ~20 W on this Strix Halo APU (it reads
-#   ~100% for any draw above ~20 W, so idle-with-context stretches report as
-#   busy), i.e. it is not a utilisation signal (LP-0MS9GA6QL007XTBP, quantified
-#   in LP-0MVSQQO910077LYL).
+# - gpu_busy_percent: a two-state detector whose step sits at ~30 W on this
+#   Strix Halo APU (1-10 % below 30 W, 92-99 % from 30 W upward), which is below
+#   the idle-with-display band (p50 45 W), so idle-with-context and computing
+#   both read ~99 % and the counter inverts across 40-60 W / 90-100 W, i.e. it
+#   is not a utilisation signal (LP-0MS9GA6QL007XTBP, quantified in
+#   LP-0MVSQQO910077LYL and re-measured in LP-0MW5K7WKZ005VJXA).
 # llama_process_rss_bytes is deliberately NOT forbidden: LP-0MVO9F877008ZCP7
 # fixed the always-0 publication (llama-server runs in a podman container, so
 # the proxy now resolves RSS via the container process tree / cgroup
@@ -1674,10 +1676,319 @@ USAGE_ANALYSIS_SKILL_DIR = PROJECT_ROOT / ".pi" / "skills" / "proxy-usage-analys
 # The stale premise: "pinned at 100% regardless of GPU state".  Kernel 7.0.0-34
 # responds to load within seconds, so the claimed mechanism was wrong even
 # though the conclusion (not a utilisation measure) holds — the counter
-# saturates at ~20 W.  See LP-0MVSQQO910077LYL.
+# saturates above ~30 W.  See LP-0MVSQQO910077LYL, LP-0MW5K7WKZ005VJXA.
 STALE_PINNED_CLAIM = "pinned at 100% regardless"
 
 AMD_SHELLOUT_TOOLS = ("amd-smi", "amdsmi", "rocm-smi", "amdtop")
+
+# ---------------------------------------------------------------------------
+# The re-measured `gpu_busy_percent` discrimination evidence (LP-0MW5K7WKZ005VJXA)
+#
+# The retirement of the counter used to be justified with a pre-2026-10-31
+# measurement (2026-10-28, kernel 7.0.0-34: 94.5 % mean busy, 45.2 % false-busy,
+# "saturates at ~20 W").  That figure no longer describes the host, so it was
+# re-measured on the kernel the host actually runs and every quote replaced.
+# These constants pin the published evidence: a re-quote that drifts from the
+# capture (or an ageing claim nobody re-ran) fails the suite instead of ageing
+# silently.
+# ---------------------------------------------------------------------------
+
+#: Capture date and kernel of the published re-measurement.
+GPU_BUSY_CAPTURE_DATE = "2026-11-06"
+GPU_BUSY_CAPTURE_KERNEL = "7.0.0-38"
+
+#: Observed 15 s samples per window (not the grid size: the series has gaps).
+GPU_BUSY_POST_SAMPLES = "25,463"
+GPU_BUSY_PRE_SAMPLES = "28,655"
+
+#: (published band label, pre-reboot mean busy %, post-reboot mean busy %).
+#: Kernel 7.0.0-38 post-reboot, kernel 7.0.0-34 pre-reboot, same recipe both
+#: ways so the two columns are like-for-like.
+GPU_BUSY_BANDS = (
+    ("0\u201310 W", "2.0 %", "1.7 %"),
+    ("10\u201320 W", "4.7 %", "3.6 %"),
+    ("20\u201330 W", "10.2 %", "7.2 %"),
+    ("30\u201335 W", "99.4 %", "92.1 %"),
+    ("35\u201340 W", "99.8 %", "98.4 %"),
+    ("40\u201360 W", "99.5 %", "99.2 %"),
+    ("60\u201380 W", "98.6 %", "97.0 %"),
+    ("80\u201390 W", "99.6 %", "98.6 %"),
+    ("90\u2013100 W", "99.4 %", "98.7 %"),
+    ("100\u2013125 W", "98.4 %", "97.3 %"),
+)
+
+#: Window-summary shares: (label, pre-reboot %, post-reboot %).
+GPU_BUSY_WINDOW_SUMMARY = (
+    ("mean `gpu_busy_percent`", "95.6 %", "80.0 %"),
+    ("samples at compute power (\u2265 90 W)", "31.5 %", "51.0 %"),
+    ("false-busy (`busy \u2265 90 %` \u2227 `power < 40 W`)", "35.1 %", "7.9 %"),
+    ("false-idle (`busy < 90 %` \u2227 `power \u2265 90 W`)", "0.5 %", "1.7 %"),
+)
+
+#: The mechanism, stated once in the canonical place.  The step moved: it is a
+#: two-state detector whose transition sits at ~30 W, which is *below* the
+#: idle-with-display band (p50 45 W), so idle and computing both read ~99 %.
+GPU_BUSY_CANONICAL_MECHANISM = "two-state detector"
+GPU_BUSY_STEP_WATTS = "~30 W"
+
+#: The failure mode the fresh evidence actually shows: it inverts across the
+#: band that matters (40-60 W idle-with-display reads *higher* than 90-100 W
+#: computing), so no threshold inside the working range can rescue it.
+GPU_BUSY_INVERSION_PHRASE = "inverts"
+
+#: Source files that quote the counter's mechanism (AC 3 of
+#: LP-0MW5K7WKZ005VJXA enumerates them).  The retired mechanism must be gone
+#: from every one, and every one must point at the canonical measurement.
+GPU_BUSY_QUOTE_SOURCES = (
+    MONITORING_DIR / "README.md",
+    MONITORING_DIR / "gpu_compute_rules.yaml",
+    PROJECT_ROOT / "proxy" / "config.yaml",
+    PROJECT_ROOT / "proxy" / "proxy" / "backends" / "llama.py",
+    PROJECT_ROOT / "proxy" / "proxy" / "host_pressure.py",
+    USAGE_ANALYSIS_SCRIPTS / "gpu_busy.py",
+    USAGE_ANALYSIS_SKILL_DIR / "REFERENCE.md",
+    USAGE_ANALYSIS_SKILL_DIR / "SKILL.md",
+    DOCS_SYSTEMD_DIR / "gpu-metrics.service",
+    DOCS_SYSTEMD_DIR / "node_exporter.service",
+    DOCS_SYSTEMD_DIR / "rocm-exporter.service",
+)
+
+#: The retired "~20 W latch" claims.  Normalised (whitespace collapsed,
+#: lowercased) before matching, so wrapping and spacing do not hide a survivor.
+STALE_GPU_BUSY_CLAIMS = (
+    "saturates at ~20 w",
+    "saturates at ~20w",
+    "~20w latch",
+    "~20 w latch",
+    "latches to ~100 %",
+    "reads ~100 % once the gpu draws more than ~20 w",
+    "reads ~100% for any draw above ~20 w",
+    "90 % whenever the gpu draws more than ~20 w",
+)
+
+
+def _promql_recipe(readme: str) -> str:
+    """Return the published re-measurement recipe block from the README."""
+    marker = "re-measuring `gpu_busy_percent` discrimination"
+    lowered = readme.lower()
+    assert marker in lowered, (
+        "monitoring/README.md must carry a 'Re-measuring `gpu_busy_percent` "
+        "discrimination' subsection: the bands have to be recomputed from the "
+        "Prometheus store with exact PromQL, not from remembered numbers"
+    )
+    section = readme[lowered.index(marker) :]
+    blocks = [
+        body
+        for lang, body in _fenced_blocks_text(section)
+        if lang in ("promql", "text", "bash")
+    ]
+    assert blocks, (
+        "the re-measurement subsection must publish its PromQL in a fenced "
+        "block so an operator can re-run it"
+    )
+    return "\n".join(blocks)
+
+
+def _fenced_blocks_text(text: str) -> list[tuple[str, str]]:
+    """(language, body) for every fenced code block in a markdown *text*."""
+    blocks: list[tuple[str, list[str]]] = []
+    current: list[str] | None = None
+    lang = ""
+    for line in text.splitlines():
+        if line.startswith(FENCE):
+            if current is None:
+                lang = line[len(FENCE) :].strip()
+                current = []
+            else:
+                blocks.append((lang, "\n".join(current)))
+                current = None
+            continue
+        if current is not None:
+            current.append(line)
+    return blocks
+
+
+class TestGpuBusyDiscriminationRemeasurement:
+    """The `gpu_busy_percent` verdict is quoted from a fresh measurement.
+
+    LP-0MW5K7WKZ005VJXA: the conclusion (not a utilisation signal) survives, but
+    the stated reason was measured before the 2026-10-31 reboot on kernel
+    7.0.0-34.  The counter's step moved and the observed failure mode on kernel
+    7.0.0-38 is a *inversion* across 40-60 W (idle with display) against
+    90-100 W (computing) — not a "~20 W latch".  These guards pin the capture
+    (date, kernel, window, sample counts) alongside the figures, so a stale
+    quote fails the suite rather than ageing silently.
+    """
+
+    def _readme(self) -> str:
+        return (MONITORING_DIR / "README.md").read_text()
+
+    def test_capture_is_dated_and_kernel_pinned(self):
+        """AC 1: the published evidence names its date, kernel and window."""
+        content = _norm(self._readme())
+        assert GPU_BUSY_CAPTURE_DATE in content, (
+            "monitoring/README.md must state the re-measurement capture date "
+            f"({GPU_BUSY_CAPTURE_DATE}) next to the figures it quotes"
+        )
+        assert GPU_BUSY_CAPTURE_KERNEL in content, (
+            "monitoring/README.md must state the kernel the re-measurement ran "
+            f"on ({GPU_BUSY_CAPTURE_KERNEL}); a figure without its kernel is "
+            "exactly what made the old claim age silently"
+        )
+        assert GPU_BUSY_POST_SAMPLES.lower() in content, (
+            f"monitoring/README.md must publish the post-reboot sample count "
+            f"({GPU_BUSY_POST_SAMPLES})"
+        )
+        assert GPU_BUSY_PRE_SAMPLES.lower() in content, (
+            f"monitoring/README.md must publish the pre-reboot sample count "
+            f"({GPU_BUSY_PRE_SAMPLES}) it compares against"
+        )
+        # The window must be the whole post-boot window (or longer), and it must
+        # say so: a shorter window would be a different measurement.
+        assert "post-boot window" in content, (
+            "monitoring/README.md must name the post-boot window as the "
+            "measurement window"
+        )
+
+    def test_banded_table_matches_the_published_measurement(self):
+        """AC 1: every band's pre/post mean busy is the measured value."""
+        content = _norm(self._readme())
+        for label, pre, post in GPU_BUSY_BANDS:
+            row_prefix = _norm(label)
+            assert row_prefix in content, (
+                f"monitoring/README.md has no row for the {label} power band"
+            )
+            for value in (pre, post):
+                assert _norm(value) in content, (
+                    f"monitoring/README.md does not quote {value} for the "
+                    f"{label} band; the table must hold the measured figure"
+                )
+            # The two figures must sit on the *same* table row as the band, so
+            # a copy-paste slip between columns is caught, not just a stray
+            # number somewhere in the file.
+            rows = [
+                line
+                for line in self._readme().splitlines()
+                if _norm(line).startswith(f"| {row_prefix}")
+            ]
+            assert len(rows) == 1, (
+                f"expected exactly one table row for {label}, found {len(rows)}"
+            )
+            row = _norm(rows[0])
+            assert _norm(pre) in row and _norm(post) in row, (
+                f"the {label} row must carry both the pre-reboot ({pre}) and "
+                f"post-reboot ({post}) mean busy; got {rows[0]!r}"
+            )
+
+    def test_window_summary_matches_the_published_measurement(self):
+        """AC 1: the false-busy share and the rest of the summary are quoted."""
+        content = _norm(self._readme())
+        for label, pre, post in GPU_BUSY_WINDOW_SUMMARY:
+            assert _norm(label) in content, (
+                f"monitoring/README.md must publish the '{label}' summary figure"
+            )
+            assert _norm(pre) in content, (
+                f"monitoring/README.md must quote the pre-reboot {label} ({pre})"
+            )
+            assert _norm(post) in content, (
+                f"monitoring/README.md must quote the post-reboot {label} ({post})"
+            )
+
+    def test_mechanism_is_the_thirty_watt_step_and_the_inversion(self):
+        """AC 2: the mechanism is the observed step + inversion, stated once.
+
+        The old text said the counter "saturates at ~20 W".  The fresh numbers
+        put the step at ~30 W *and* show the failure that actually matters: it
+        cannot separate idle-with-context from compute, because 40-60 W (idle
+        with a display) reads higher than 90-100 W (computing).
+        """
+        content = _norm(self._readme())
+        assert GPU_BUSY_CANONICAL_MECHANISM in content, (
+            "monitoring/README.md must state that the counter is a \"two-state "
+            "detector\", not a percentage"
+        )
+        assert GPU_BUSY_STEP_WATTS.lower() in content, (
+            f"monitoring/README.md must state the measured step ({GPU_BUSY_STEP_WATTS})"
+        )
+        assert GPU_BUSY_INVERSION_PHRASE in content, (
+            "monitoring/README.md must name the observed failure mode: the "
+            "counter inverts across the 40-60 W / 90-100 W bands"
+        )
+
+    def test_false_busy_share_is_explained_as_band_occupancy(self):
+        """AC 2: the 35.1 % -> 7.9 % drop is occupancy, not a counter change.
+
+        Without this the fresh numbers invite the opposite error — someone
+        reads "7.9 % false-busy" as "the counter got better" and re-adopts it.
+        The drop tracks the share of time spent in the 30-40 W band exactly.
+        """
+        content = _norm(self._readme())
+        assert "band occupancy" in content, (
+            "monitoring/README.md must explain that the false-busy share tracks "
+            "how long the host sat in the 30-40 W band, not a change in the counter"
+        )
+        assert "7.7 %" in content, (
+            "the 30-40 W occupancy that explains the post-reboot false-busy "
+            "share (7.7 %) must be published"
+        )
+
+    def test_recipe_is_published_as_exact_promql(self):
+        """AC 4: the bands are reproducible from the store, not remembered."""
+        recipe = _promql_recipe(self._readme())
+        for fragment in (
+            "gpu_busy_percent",
+            "gpu:power_watts:amdgpu",
+            "avg_over_time",
+            "count_over_time",
+            "and on ()",
+        ):
+            assert fragment in recipe, (
+                f"the published recipe is missing {fragment!r}; the bands must "
+                "be recomputed from the Prometheus store with exact PromQL"
+            )
+        # The window must be anchored, otherwise the recipe silently measures a
+        # different window every time it is run and can never reproduce a number.
+        assert "@ " in recipe, (
+            "the recipe must pin its evaluation instant with a PromQL `@` "
+            "modifier, so re-running it reproduces the published figures"
+        )
+
+    def test_no_source_restates_the_twenty_watt_latch(self):
+        """AC 3: every stale quote of the retired mechanism is gone."""
+        survivors: list[str] = []
+        for path in GPU_BUSY_QUOTE_SOURCES:
+            assert path.exists(), f"expected {path} to exist"
+            content = _norm(path.read_text())
+            for claim in STALE_GPU_BUSY_CLAIMS:
+                if claim in content:
+                    survivors.append(f"{path.relative_to(PROJECT_ROOT)}: {claim!r}")
+        assert not survivors, (
+            "the retired ~20 W latch mechanism is still quoted; replace it with "
+            "the measured ~30 W step and the 40-60 W / 90-100 W inversion "
+            "(LP-0MW5K7WKZ005VJXA):\n" + "\n".join(survivors)
+        )
+
+    def test_every_source_points_at_the_canonical_measurement(self):
+        """AC 2: the mechanism is stated once and cross-referenced elsewhere.
+
+        Each source that quotes the counter's behaviour must either carry the
+        canonical ~30 W step itself or point at monitoring/README.md, so a
+        reader never lands on an unqualified version of the claim.
+        """
+        stale: list[str] = []
+        for path in GPU_BUSY_QUOTE_SOURCES:
+            content = _norm(path.read_text())
+            if "gpu_busy" not in content:
+                continue
+            cross_referenced = "monitoring/readme.md" in content
+            states_the_step = GPU_BUSY_STEP_WATTS.lower() in content
+            if not (cross_referenced or states_the_step):
+                stale.append(str(path.relative_to(PROJECT_ROOT)))
+        assert not stale, (
+            "these sources quote gpu_busy_percent without either the measured "
+            "~30 W step or a pointer to monitoring/README.md:\n"
+            + "\n".join(stale)
+        )
 
 
 class TestGpuUtilisationSourceDecision:
@@ -1710,16 +2021,19 @@ class TestGpuUtilisationSourceDecision:
             "monitoring/README.md must describe the measured saturating "
             "behaviour of gpu_busy_percent"
         )
-        assert "20 w" in content, (
-            "monitoring/README.md must record the ~20 W saturation threshold"
+        assert "~30 w" in content, (
+            "monitoring/README.md must record the measured ~30 W step "
+            "(re-measured 2026-11-06, LP-0MW5K7WKZ005VJXA); the retired claim "
+            "said ~20 W"
         )
 
     def test_node_exporter_unit_forbids_selecting_the_busy_counter(self):
         """AC 3: the unit file carries the explicit rule-level prohibition.
 
-        `gpu_busy_percent` saturates at ~20 W on this APU, so a rule selecting
-        it fires while the GPU is idle. The prohibition has to sit next to the
-        series table a rule author copies from, not only in the README.
+        `gpu_busy_percent` saturates above ~30 W on this APU, so a rule
+        selecting it fires while the GPU is idle. The prohibition has to sit
+        next to the series table a rule author copies from, not only in the
+        README.
         """
         content = _norm((DOCS_SYSTEMD_DIR / "node_exporter.service").read_text())
         assert "gpu_busy_percent" in content
@@ -1727,8 +2041,9 @@ class TestGpuUtilisationSourceDecision:
             "node_exporter.service must explicitly forbid selecting "
             "gpu_busy_percent in a rule, next to the series it describes"
         )
-        assert "saturates at ~20 w" in content, (
-            "node_exporter.service must state the measured saturation threshold"
+        assert "saturates above ~30 w" in content, (
+            "node_exporter.service must state the measured saturation threshold "
+            "(~30 W, re-measured 2026-11-06 in LP-0MW5K7WKZ005VJXA)"
         )
 
     def test_docs_replace_the_stale_pinned_claim_with_a_measurement(self):
@@ -1741,8 +2056,8 @@ class TestGpuUtilisationSourceDecision:
             content = _norm(path.read_text())
             assert STALE_PINNED_CLAIM not in content, (
                 f"{path.name} still asserts gpu_busy_percent is 'pinned at 100% "
-                "regardless' of GPU state; record the measured saturation "
-                "(measured 2026-10-28) instead"
+                "regardless' of GPU state; record the measured step instead "
+                "(re-measured 2026-11-06 in LP-0MW5K7WKZ005VJXA)"
             )
 
     def test_usage_analysis_docs_name_the_retained_power_source(self):

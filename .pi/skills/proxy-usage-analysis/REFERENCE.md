@@ -1461,15 +1461,20 @@ utilisation figure: decisions use the log-derived `local_busy` (see
 [Which busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
 
 Why power rather than `gpu_busy_percent`: on this Strix Halo APU that counter
-**saturates at ~20 W** — it responds to load within seconds but reads ~100 % for
-any draw above ~20 W, so it reports idle-with-context stretches as busy
-(LP-0MS9GA6QL007XTBP; measured 2026-10-28 over 7 days: 94.5 % mean busy against
-28.1 % of samples at compute power, 45.2 % false-busy; LP-0MVSQQO910077LYL). It
+is a **two-state detector, not a percentage** — its step sits at **~30 W** (it
+reads 1–10 % below 30 W and 92–99 % from 30 W upward). That step is *below* the
+idle-with-display band (p50 45 W), so idle-with-context and computing both read
+~99 % and the counter **inverts** across exactly the band that matters:
+re-measured 2026-11-06 on kernel 7.0.0-38 it read 99.2 % at 40–60 W (idle with a
+display) against 98.7 % at 90–100 W (computing) (LP-0MW5K7WKZ005VJXA; supersedes
+the retired 20 W latch claim of LP-0MS9GA6QL007XTBP and LP-0MVSQQO910077LYL). It
 is not a utilisation signal. AMD's own tooling is not an alternative either:
 `amd-smi` reports `N/A` for usage/power/clocks/energy on this APU, and
-`amdtop`/`rocm-smi` display the very same saturating counter (see
+`amdtop`/`rocm-smi` display the very same counter (see
 [monitoring/README.md](../../../monitoring/README.md), *Why not `amd-smi`,
-`rocm-smi` or `amdtop`?*). Power draw discriminates
+`rocm-smi` or `amdtop`?*, which carries the measurement, the pre/post-reboot
+comparison and the PromQL recipe that recomputes every band). Power draw
+discriminates
 cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing:bool`
 recording rule (`gpu:power_watts:amdgpu >= bool 90`) is evaluated by Prometheus
 every **15 s** from the node_exporter hwmon series. The report queries
