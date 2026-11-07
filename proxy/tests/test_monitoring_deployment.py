@@ -275,6 +275,133 @@ def _consumer_guard_offenders(path: Path) -> list[str]:
     return _forbidden_series_offenders(expressions, source_label=path.name)
 
 
+# ---------------------------------------------------------------------------
+# One-producer guard for the attributable GPU-activity share (LP-0MW5K90EQ001W0R1)
+# ---------------------------------------------------------------------------
+
+#: The window share of ``gpu:computing_workload:bool`` (power >= 90 W **and** a
+#: busy slot) is the single reported GPU-activity figure. It has exactly one
+#: producer: the CLI, which queries the rule series itself and does grid-honest
+#: share arithmetic locally. Any other surface that *aggregates* the series in
+#: PromQL (a rule, a report, a dashboard) is a second producer and must fail a
+#: test — the six-figures-for-one-window failure mode the epic exists to kill.
+ATTRIBUTABLE_SHARE_SERIES = "gpu:computing_workload:bool"
+ATTRIBUTABLE_SHARE_PRODUCER = PROJECT_ROOT / "scripts" / "gpu_utilisation.py"
+
+#: PromQL aggregation functions that turn the attributable rule into a
+#: share/percentage over a window. Applying any of them to the rule re-derives
+#: the figure — exactly what the one-producer doctrine forbids outside the CLI.
+SHARE_AGGREGATIONS = (
+    "avg_over_time",
+    "sum_over_time",
+    "count_over_time",
+    "avg",
+    "sum",
+    "rate",
+    "increase",
+)
+
+
+def _share_derivation_functions(expression: str) -> list[str]:
+    """Return the aggregation functions in *expression* that re-derive the share."""
+    found: list[str] = []
+    for function in SHARE_AGGREGATIONS:
+        if re.search(
+            rf"\b{re.escape(function)}\s*\(\s*{re.escape(ATTRIBUTABLE_SHARE_SERIES)}\b",
+            expression,
+        ):
+            found.append(function)
+    return found
+
+
+def _configured_rule_files() -> list[Path]:
+    """Every rule file the deployed Prometheus loads (recording + alerting)."""
+    config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
+    return [MONITORING_DIR / rf for rf in config.get("rule_files", [])]
+
+
+def _dashboard_expressions(path: Path) -> list[str]:
+    """Every ``expr`` string in a Grafana dashboard JSON file."""
+    import json
+
+    data = json.loads(path.read_text())
+    found: list[str] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "expr" and isinstance(value, str):
+                    found.append(value)
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(data)
+    return found
+
+
+def _promql_machine_sources() -> list[tuple[Path, str, list[str]]]:
+    """Every machine-consumed PromQL surface: rules, CLI and report, dashboards.
+
+    Each item is ``(path, source_label, expressions)`` so the one-producer
+    guard can exempt the named producer path and report the rest by name.
+    """
+    sources: list[tuple[Path, str, list[str]]] = []
+    for path in _configured_rule_files():
+        sources.append((path, path.name, _rule_expressions(path)))
+    for path in CLI_QUERY_SOURCES:
+        if path.exists():
+            sources.append(
+                (
+                    path,
+                    path.name,
+                    _promql_expressions_in_python(path.read_text(), filename=str(path)),
+                )
+            )
+    report_script = (
+        PROJECT_ROOT
+        / ".pi"
+        / "skills"
+        / "proxy-usage-analysis"
+        / "scripts"
+        / "gpu_busy.py"
+    )
+    if report_script.exists():
+        sources.append(
+            (
+                report_script,
+                report_script.name,
+                _promql_expressions_in_python(
+                    report_script.read_text(), filename=str(report_script)
+                ),
+            )
+        )
+    for path in (DASHBOARD_PATH, PROVISIONED_DASHBOARD_PATH):
+        if path.exists():
+            sources.append((path, path.name, _dashboard_expressions(path)))
+    return sources
+
+
+def _share_producer_offenders(
+    sources: list[tuple[Path, str, list[str]]],
+) -> list[str]:
+    """Return ``<source>: <expr>`` for every non-producer surface aggregating
+    the attributable share. The allowlist is the producer's own path; anything
+    else that derives the share is a second producer.
+    """
+    producers = {ATTRIBUTABLE_SHARE_PRODUCER.resolve()}
+    offenders: list[str] = []
+    for path, source_label, expressions in sources:
+        if path.resolve() in producers:
+            continue
+        for expression in expressions:
+            if _share_derivation_functions(expression):
+                offenders.append(f"{source_label}: {' '.join(expression.split())}")
+    return offenders
+
+
 def _find_key(node, key: str):
     """Recursively find *key* in a nested config mapping (config.yaml blocks)."""
     if isinstance(node, dict):
@@ -930,6 +1057,103 @@ class TestForbiddenSeriesGuard:
         )
         assert len(offenders) == 1
         assert "gpu_busy_percent" in offenders[0]
+
+
+class TestAttributableShareSingleProducer:
+    """C6 / epic AC2 (LP-0MW5K90EQ001W0R1): the attributable GPU-activity share
+    has exactly one producer.
+
+    ``scripts/gpu_utilisation.py`` is the only surface allowed to turn
+    ``gpu:computing_workload:bool`` into a busy figure. A second producer would
+    mean two different percentages for the same question — exactly the
+    six-figures-for-one-window failure mode this epic eliminates. The guard is
+    FORBIDDEN_RULE_SERIES-style: it scans every machine-consumed PromQL
+    surface (rule files, Python query/report consumers, dashboards) for an
+    aggregation over the attributable rule and allows only the named producer.
+    """
+
+    def test_exactly_one_producer_across_every_machine_promql_surface(self):
+        """AC2: no rule, report or dashboard re-derives the share."""
+        sources = _promql_machine_sources()
+        assert sources, "no PromQL surface was scanned by the one-producer guard"
+        offenders = _share_producer_offenders(sources)
+        assert not offenders, (
+            "a non-producer surface re-derives the attributable GPU-activity "
+            "share (gpu:computing_workload:bool); scripts/gpu_utilisation.py "
+            "is the only producer:\n" + "\n".join(offenders)
+        )
+
+    def test_the_cli_is_the_named_producer_and_queries_the_rule_series(self):
+        """The allowlist is not vacuous: the producer exists, selects the
+        attributable rule itself, and does its arithmetic locally — its own
+        queries contain no PromQL aggregation over the series."""
+        assert ATTRIBUTABLE_SHARE_PRODUCER.exists(), (
+            f"{ATTRIBUTABLE_SHARE_PRODUCER} is the named producer but is gone"
+        )
+        expressions = _promql_expressions_in_python(
+            ATTRIBUTABLE_SHARE_PRODUCER.read_text(),
+            filename=str(ATTRIBUTABLE_SHARE_PRODUCER),
+        )
+        assert expressions, "the producer's QUERIES mapping must exist"
+        assert any(
+            ATTRIBUTABLE_SHARE_SERIES in expression for expression in expressions
+        ), (
+            "the producer must read the attributable rule series itself"
+        )
+        assert not any(
+            _share_derivation_functions(expression) for expression in expressions
+        ), (
+            "the producer must do the share arithmetic locally; a PromQL "
+            "aggregation over gpu:computing_workload:bool would be a second "
+            "derivation definition"
+        )
+
+    def test_one_producer_guard_flags_a_second_producer(self, tmp_path):
+        """Non-vacuous: a report-module aggregation is reported, not missed."""
+        source = (
+            "QUERIES = {\n"
+            f'  "busy": "avg_over_time({ATTRIBUTABLE_SHARE_SERIES}[2h])",\n'
+            "}\n"
+        )
+        path = tmp_path / "report.py"
+        path.write_text(source)
+        offenders = _share_producer_offenders(
+            [
+                (
+                    path,
+                    path.name,
+                    _promql_expressions_in_python(
+                        source, filename=str(path)
+                    ),
+                )
+            ]
+        )
+        assert len(offenders) == 1
+        assert ATTRIBUTABLE_SHARE_SERIES in offenders[0]
+
+    def test_one_producer_guard_flags_a_rule_file_expression(self, tmp_path):
+        """A recording rule that averages the share is a second producer."""
+        rule = tmp_path / "rules.yaml"
+        rule.write_text(
+            "groups:\n"
+            "  - name: g\n"
+            "    rules:\n"
+            f"      - record: naughty\n"
+            f"        expr: sum_over_time({ATTRIBUTABLE_SHARE_SERIES}[24h:15s]) * 15\n"
+        )
+        offenders = _share_producer_offenders(
+            [(rule, rule.name, _rule_expressions(rule))]
+        )
+        assert len(offenders) == 1
+        assert ATTRIBUTABLE_SHARE_SERIES in offenders[0]
+
+    def test_guard_does_not_flag_a_bare_read_of_the_rule_series(self):
+        """Selecting the series without aggregating it is not a derivation."""
+        fake = PROJECT_ROOT / "query.py"
+        offenders = _share_producer_offenders(
+            [(fake, "query.py", [ATTRIBUTABLE_SHARE_SERIES])]
+        )
+        assert offenders == []
 
 
 # ---------------------------------------------------------------------------
@@ -2581,12 +2805,42 @@ class TestMonitoringReadmeCookbook:
     """The cookbook must answer the four operational questions asked of it."""
 
     def test_covers_gpu_computing_fraction_from_power(self):
+        """AC3 (LP-0MW5K90EQ001W0R1): a busy percentage is never a bare
+        `avg_over_time(...)`; the cookbook points at the CLI (grid-honest,
+        unknown explicit) or at a coverage-honest query that divides by
+        in-window seconds."""
         content = _readme()
-        assert "avg_over_time(gpu:computing:bool" in content, (
-            "the cookbook must show how to get the GPU computing fraction from "
-            "the power-derived recording rule"
+        assert "scripts/gpu_utilisation.py" in content, (
+            "the cookbook must route the busy percentage through the CLI"
         )
         assert "gpu:power_watts:avg5m" in content
+        assert "sum_over_time(gpu:computing_workload:bool[24h:15s]) * 15 / 86400" in content, (
+            "the cookbook must show the coverage-honest form that divides by "
+            "in-window seconds"
+        )
+        # A bare over-time average is coverage-blind. The only permitted
+        # occurrences are the prose that forbids the idiom and a window *pinned*
+        # with `@` (a reproduction recipe, not a live percentage).
+        cookbook = content.split("## Query cookbook", 1)[1].split("\n## ", 1)[0]
+        offenders: list[str] = []
+        for line in cookbook.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            for series in (
+                "gpu:computing:bool",
+                "gpu:computing_workload:bool",
+            ):
+                if f"avg_over_time({series}" not in stripped:
+                    continue
+                if "@" in stripped or "not a busy percentage" in stripped.replace("**", ""):
+                    continue
+                offenders.append(stripped)
+        assert not offenders, (
+            "the cookbook recommends a bare avg_over_time(...) as a busy "
+            "percentage; it renormalises over the samples that happen to be "
+            "present, so a gap inflates the figure: " + " | ".join(offenders)
+        )
 
     def test_covers_gpu_memory_gtt_and_vram(self):
         content = _readme()
@@ -2627,10 +2881,13 @@ class TestMonitoringReadmeCookbook:
         File names such as `gpu_memory_alerts.yaml` are excluded by the negative
         lookahead on `.`, so only bare series identifiers are compared.
         """
-        # `gpu_utilisation:` is the CLI's stderr program tag, not a series.
+        # Two non-series `gpu_*` tokens are excluded: `gpu_utilisation` is the
+        # CLI's program name and `gpu_metrics` is the sysfs metrics interface
+        # (the decision record's falsifier candidate, LP-0MVSQT7YC0045HFW) —
+        # neither is a Prometheus series the sampler publishes.
         mentioned = {
             token.rstrip(":") for token in re.findall(r"\bgpu_[a-z_]+\b(?!\.)", _readme())
-        } - {"gpu_utilisation"}
+        } - {"gpu_utilisation", "gpu_metrics"}
         assert mentioned, "the cookbook mentions no gpu_* series"
         # A retired series may be documented as historical, never as published.
         published = _sampler_series_names()
@@ -2868,6 +3125,202 @@ class TestAuthoritativeBusyFigureIsDocumented:
         assert not unresolved, (
             f"anchor links that resolve to no heading: {unresolved}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: one reported GPU-activity measure (C6, LP-0MW5K90EQ001W0R1)
+#
+# The README section that used to present three busy figures is now one measure
+# plus scoped derivations, with an explicit scope-naming rule; the skills docs
+# agree; the `> 60 %` local-busy capacity gate keeps quoting `local_busy`; and
+# the source decision records its falsifier so a future verdict revisits it on
+# evidence rather than by re-argument.
+# ---------------------------------------------------------------------------
+
+ONE_MEASURE_HEADING = "## One reported GPU-activity measure"
+OLD_BUSY_FIGURES_HEADING = '## Three "busy" figures — what each answers'
+
+#: The scope statements for the two `--json` keys, one sentence each; the docs
+#: must state each key's scope in a single sentence so a consumer can tell what
+#: it measures (AC5).
+JSON_SCOPE_STATEMENTS = (
+    (
+        "`local_busy` — the log-derived `dispatch → finish` slot-union share "
+        "measuring local capacity/contention (the figure gates and alerts "
+        "quote), not a GPU measurement."
+    ),
+    (
+        "`gpu_busy` — the power-derived `gpu:computing:bool` share measuring "
+        "hardware activity for any GPU consumer, not local model utilisation."
+    ),
+)
+
+
+class TestSingleReportedGpuActivityMeasure:
+    """The README reports one measure; every other figure is scoped."""
+
+    def test_the_busy_figures_section_is_now_one_measure_plus_derivations(self):
+        """AC1: the section is one measure plus scoped derivations."""
+        content = _readme()
+        assert ONE_MEASURE_HEADING in content, (
+            f"the README must present exactly one reported GPU-activity measure "
+            f"(heading {ONE_MEASURE_HEADING!r})"
+        )
+        assert OLD_BUSY_FIGURES_HEADING not in content, (
+            "the old three-figures framing must be gone: one measure plus scoped "
+            "derivations"
+        )
+
+    def test_the_measure_and_its_scoped_derivations_are_named(self):
+        """AC1: the measure is the attributable share from the CLI; the
+        derivations carry their scope (any consumer / rule input / local
+        capacity-contention)."""
+        text = _norm(_readme())
+        section = next(
+            body
+            for heading, body in _markdown_sections(_readme())
+            if heading == ONE_MEASURE_HEADING
+        )
+        normalised = _norm(section)
+        assert "scripts/gpu_utilisation.py" in normalised, (
+            "the section must name the CLI as the only producer of the measure"
+        )
+        assert "scoped derivation" in normalised
+        for phrase in (
+            "gpu:computing:bool",  # any consumer
+            "llama_slots_busy",  # the rule's input
+            "local_busy.busy_pct",  # local capacity/contention
+            "any consumer",
+            "local capacity/contention",
+            "power-only",
+        ):
+            assert phrase in normalised, f"the derivations table must name {phrase!r}"
+        assert text.count("none replaces another") >= 1, (
+            "the section must keep the 'none replaces another' doctrine"
+        )
+
+    def test_the_scope_naming_rule_is_stated(self):
+        """AC1: a figure's name must state its scope."""
+        text = _norm(_readme())
+        for phrase in ("must state its scope", "never interchangeable"):
+            assert phrase in text, f"README must state {phrase!r}"
+
+    def test_the_attributable_share_is_reported_only_by_the_cli(self):
+        """AC2's doc side: the measure names its single producer, so a reader
+        cannot conclude that any other surface produces the figure."""
+        normalised = _norm(_readme())
+        assert "produced **only** by `scripts/gpu_utilisation.py`" in normalised, (
+            "the measure's producer must be named as the *only* producer"
+        )
+
+
+class TestBusyCapacityGateQuotesLocalBusyOnly:
+    """AC4: the `> 60 %` local-busy capacity gate keeps quoting `local_busy` and
+    never quotes a GPU figure — the two are never interchangeable."""
+
+    FORBIDDEN_GPU_FIGURES = (
+        "gpu_busy",
+        "gpu:computing_workload",
+        "gpu:computing:bool",
+    )
+
+    def _gate_sentences(self, doc: Path) -> list[str]:
+        """Every *prose* sentence of *doc* that names the > 60 % threshold.
+
+        Table rows are skipped: a scope-table row cross-references the whole
+        derivation set, so a sentence there would be the wrong unit to judge the
+        gate wording by.
+        """
+        sentences: list[str] = []
+        for block in re.split(r"\n\s*\n", doc.read_text()):
+            lines = [line for line in block.splitlines() if line.strip()]
+            if not lines or all(line.lstrip().startswith("|") for line in lines):
+                continue
+            text = _norm(" ".join(lines))
+            sentences.extend(
+                sentence.strip()
+                for sentence in re.split(r"(?<=\.)\s+", text)
+                if "> 60 %" in sentence
+            )
+        return sentences
+
+    def test_the_gate_quotes_local_busy_and_no_gpu_figure(self):
+        for doc in (REFERENCE_DOC, MONITORING_DIR / "README.md"):
+            sentences = self._gate_sentences(doc)
+            assert sentences, f"{doc.name} never names the > 60 % gate"
+            for sentence in sentences:
+                assert "local_busy" in sentence or "local-busy" in sentence, (
+                    f"{doc.name}: the > 60 % gate sentence does not quote "
+                    f"local_busy: {sentence}"
+                )
+                for gpu_figure in self.FORBIDDEN_GPU_FIGURES:
+                    assert gpu_figure not in sentence, (
+                        f"{doc.name}: a GPU figure leaks into the > 60 % gate "
+                        f"sentence: {sentence}"
+                    )
+
+
+class TestGpuActivityDecisionRecord:
+    """AC6: the decision record states the falsifier so a future verdict
+    revisits the power-derived measure on evidence, never by re-argument."""
+
+    def test_the_source_decision_names_its_falsifier(self):
+        sections = _markdown_sections(_readme())
+        section = next(
+            body
+            for heading, body in sections
+            if heading.startswith("### Why not")
+        )
+        text = _norm(section)
+        assert "falsifier" in text
+        assert "gpu_metrics" in text
+        # `_norm` lowercases, so the work-item id is matched case-insensitively
+        # through the normalised text.
+        assert "lp-0mvsqt7yc0045hfw" in text
+        assert "revisit" in text or "re-argument" in text, (
+            "the falsifier must be a revisiting channel on evidence, not a "
+            "second measure"
+        )
+
+
+class TestJsonBusyKeyScopeDescriptions:
+    """AC5: the `--json` `local_busy`/`gpu_busy` descriptions state scope in
+    one sentence each, in both skill docs."""
+
+    def test_skill_docs_state_each_json_key_scope_in_one_sentence(self):
+        for doc in (REFERENCE_DOC, SKILL_DOC):
+            content = doc.read_text()
+            lines = [
+                line.strip()
+                for line in content.splitlines()
+                if line.lstrip().startswith(("- `local_busy`", "- `gpu_busy`"))
+            ]
+            missing: list[str] = []
+            for expected in JSON_SCOPE_STATEMENTS:
+                compact = " ".join(expected.split())
+                if not any(compact in " ".join(line.split()) for line in lines):
+                    missing.append(expected)
+            assert not missing, (
+                f"{doc.name} must carry these one-sentence `--json` scope "
+                f"statements: {missing}"
+            )
+            for line in lines:
+                assert line.count(".") == 1, (
+                    f"{doc.name}: each --json scope statement must be exactly "
+                    f"one sentence: {line}"
+                )
+
+    def test_skill_docs_agree_with_the_readme_wording(self):
+        """AC5: both skill docs name the single producer and the attributable
+        measure, agreeing with monitoring/README.md."""
+        for doc in (REFERENCE_DOC, SKILL_DOC):
+            content = _norm(doc.read_text())
+            assert "scripts/gpu_utilisation.py" in content, (
+                f"{doc.name} must name the single producer of the attributable "
+                "share like the README does"
+            )
+            assert "attributable" in content
+            assert "scoped derivation" in content
 
 
 # ---------------------------------------------------------------------------

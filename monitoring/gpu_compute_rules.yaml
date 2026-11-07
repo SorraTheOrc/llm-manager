@@ -81,12 +81,15 @@
 #
 # QUERIES THESE RULES ENABLE
 # --------------------------
-#   avg_over_time(gpu:computing:bool[2h])      computing-time fraction (0..1)
+# The busy percentage is produced ONLY by scripts/gpu_utilisation.py (grid-
+# honest: computing + idle + unknown = 100 %, unknown explicit). It reads the
+# attributable rule below and does the share arithmetic locally. A bare
+# avg_over_time(<series>[Nh]) is coverage-blind — it renormalises over the
+# samples that happen to be present, so a gap inflates the figure — and must
+# not be quoted as a busy percentage.
 #   gpu:power_watts:avg5m                      smoothed power for dashboards
-#   sum_over_time(gpu:computing:bool[24h:15s]) * 15   computing seconds
-#   avg_over_time(gpu:computing_workload:bool[2h])    share of time the GPU was
-#                                                     doing OUR work (0..1, and
-#                                                     absent => unknown)
+#   gpu:computing:bool                         live power-only check (any consumer)
+#   gpu:computing_workload:bool                live attributable check (our work)
 #
 # Validation: `promtool check rules monitoring/gpu_compute_rules.yaml` and the
 # behavioural unit tests in monitoring/tests/gpu_rules_test.yml

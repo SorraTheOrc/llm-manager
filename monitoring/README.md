@@ -209,6 +209,15 @@ copy. It scrapes:
 
 and evaluates the alert rules in `monitoring/*.yaml`.
 
+> **One reported GPU-activity figure.** The attributable workload share —
+> `gpu:computing_workload:bool` (power ≥ 90 W **and** ≥ 1 busy llama slot)
+> averaged over the window — is the figure this stack reports when asked "how
+> busy was the GPU?", and it is produced **only** by
+> `scripts/gpu_utilisation.py` (grid-honest: computing + idle + unknown = 100 %,
+> missing data is `unknown`, never renormalised away). Every other number is a
+> **scoped derivation whose name states its scope** — see
+> [One reported GPU-activity measure](#one-reported-gpu-activity-measure).
+>
 > GPU utilisation is derived from **power draw**
 > (`node_hwmon_power_average_watt`), not `gpu_busy_percent`: on this Strix Halo
 > APU that counter is a **two-state detector whose step sits at ~30 W**, which
@@ -421,19 +430,36 @@ curl -s --get http://127.0.0.1:9090/api/v1/query --data-urlencode 'query=<PROMQL
 
 ### GPU computing fraction (from power)
 
-GPU utilisation is a **power** measurement on this hardware. `gpu:computing:bool`
-is a recording rule that is 1 while the GPU draws at or above the 90 W compute
-threshold and 0 otherwise (`bool` is essential: without it idle samples are
-filtered out and averages overstate utilisation).
+GPU utilisation is a **power** measurement on this hardware. The one figure
+this stack reports for "how busy was the GPU?" is the **attributable workload
+share** — `gpu:computing_workload:bool` (power ≥ 90 W **and** ≥ 1 busy llama
+slot) averaged over the window — produced **only** by
+`scripts/gpu_utilisation.py`. Query it through the CLI, which is grid-honest:
+every expected 15 s instant is classified `computing`, `idle` or `unknown`
+against the window's full grid, so missing data is `unknown` instead of being
+silently renormalised away.
+
+```bash
+# Busy percentage over the last 2 hours / the last 24 hours
+python3 scripts/gpu_utilisation.py --window 2h
+python3 scripts/gpu_utilisation.py --window 24h --json | jq '.shares_pct'
+```
+
+A bare `avg_over_time(gpu:computing:bool[24h])` is **not** a busy percentage:
+it renormalises over the samples that happen to be present, so a monitoring gap
+inflates the figure (the CLI exists precisely because of that
+coverage-blindness). The same applies to the attributable series — do not
+average it by hand. If you need raw PromQL, divide by in-window seconds so
+missing samples contribute zero instead of shrinking the denominator (the
+documented line is conservative: `unknown` folds into the zero term, it can
+never inflate the share):
 
 ```promql
-# Computing fraction over the last 2 hours (0..1)
-avg_over_time(gpu:computing:bool[2h])
+# Attributable share, coverage-honest (computing-seconds / window-seconds)
+sum_over_time(gpu:computing_workload:bool[24h:15s]) * 15 / 86400
 
-# Computing fraction over the last 24 hours
-avg_over_time(gpu:computing:bool[24h])
-
-# Total computing seconds in the last 24 hours
+# Power-only computing seconds in the last 24 hours (power-only: any GPU
+# consumer — a scoped derivation, not the reported measure)
 sum_over_time(gpu:computing:bool[24h:15s]) * 15
 
 # Smoothed power draw for trend graphs (idle ≈ 40-54 W, computing ≈ 115 W)
@@ -444,8 +470,9 @@ gpu:power_watts:amdgpu
 ```
 
 Sanity note: the sample values depend on the machine's state. Verified
-2026-10-25 on this host: `avg_over_time(gpu:computing:bool[2h])` → 0.5,
-`sum_over_time(...[24h:15s]) * 15` → 4605 s, `gpu:power_watts:avg5m` → 67.7 W.
+2026-10-25 on this host: power-only computing seconds
+`sum_over_time(...[24h:15s]) * 15` → 4605 s and `gpu:power_watts:avg5m` →
+67.7 W.
 
 ### GPU workload fraction (power **and** a busy llama slot)
 
@@ -453,18 +480,17 @@ Sanity note: the sample values depend on the machine's state. Verified
 work another process is doing. `gpu:computing_workload:bool` is the one shared
 definition of "the GPU is doing **our** local model's work": 1 while power is
 at or above the 90 W compute threshold **and** at least one llama-server slot is
-processing, 0 otherwise. The CLI, the alert rules and ad-hoc queries all read
-this series instead of re-deriving the condition.
+processing, 0 otherwise.
+
+It is the **input** of the attributable share, and the CLI is the only consumer
+that turns it into one: the CLI queries this series and does the grid-honest
+share arithmetic locally, and a regression test fails if any rule, report or
+dashboard aggregates it into a second figure. The raw series is still the right
+thing to read for a live yes/no:
 
 ```promql
-# Share of the last 2h the GPU spent on OUR work (0..1)
-avg_over_time(gpu:computing_workload:bool[2h])
-
-# Our computing seconds in the last 24h
-sum_over_time(gpu:computing_workload:bool[24h:15s]) * 15
-
-# How much compute power we owned (power-only), for comparison
-gpu:computing:bool
+# Is the GPU doing OUR work right now? (0/1, absent => unknown)
+gpu:computing_workload:bool
 ```
 
 Three properties matter when querying it:
@@ -642,8 +668,15 @@ These figures supersede the pre-reboot measurement quoted here previously
 (2026-10-28, 904 paired samples, a "20 W latch", 94.5 % mean busy,
 45.2 % false-busy); that window also predated the TSDB's creation and could not
 be reproduced from the store. The conclusion is unchanged — the counter is not
-a utilisation signal, and `gpu:computing:bool` stays the definition — only the
-evidence is current (LP-0MW5K7WKZ005VJXA).
+a utilisation signal, and `gpu:computing:bool` stays the derivation behind the
+attributable share — only the evidence is current (LP-0MW5K7WKZ005VJXA).
+
+**The falsifier.** `gpu_metrics` (`/sys/class/drm/card0/device/gpu_metrics`,
+the `amd_gpu_metrics_v3_0` blob `amdgpu_top` reads) is the only candidate that
+could replace power draw with a direct percentage. Its verdict belongs to
+LP-0MVSQT7YC0045HFW: if a graded field passes the discrimination bar recorded
+there, power becomes the corroborator and this power-derived measure is
+revisited *on that evidence*, never by re-argument (LP-0MVSQT7YC0045HFW).
 
 #### Re-measuring `gpu_busy_percent` discrimination
 
@@ -776,11 +809,12 @@ drift with the clock:
 avg_over_time(gpu_busy_percent[24h] @ 1794067200)
 ```
 
-Do not use it as a utilisation figure. The maintained measures are
-`avg_over_time(gpu:computing:bool[2h])` (hardware activity, any consumer) and
-the usage report's log-derived `local_busy.busy_pct` (the work the proxy
-served); `gpu:computing_workload:bool` combines them for the attributable
-share.
+Do not use it as a utilisation figure. The one reported GPU-activity figure is
+the attributable `gpu:computing_workload:bool` share produced by
+`scripts/gpu_utilisation.py`; the maintained derivations are
+`gpu:computing:bool` (power-only hardware activity, any consumer) and the usage
+report's log-derived `local_busy.busy_pct` (the work the proxy served — local
+capacity/contention).
 
 ### Host metrics
 
@@ -859,16 +893,29 @@ coarsen it, and a finer `--step` is rejected as a usage error:
   resolution: step 15s (scrape floor 15s); 481 expected samples, 0 observed, 481 unknown
 ```
 
-## Three "busy" figures — what each answers
+## One reported GPU-activity measure
 
-The stack publishes three different measures that all look like "GPU usage".
-They answer different questions, and none replaces another.
+The stack reports **one** GPU-activity figure: the attributable workload
+share — `gpu:computing_workload:bool` (power ≥ 90 W **and** ≥ 1 busy llama
+slot) averaged over the window — produced **only** by
+`scripts/gpu_utilisation.py` (grid-honest: computing + idle + unknown = 100 %,
+missing data is `unknown`, never folded into the denominator; a regression test
+fails if any other rule, report, dashboard or doc re-derives it). Every other
+number is a **scoped derivation**, named by its scope — never an alternative
+measure, and none replaces another:
 
-| Figure | Source | Answers | Does not answer |
+| Figure | Scope | Answers | Does not answer |
 |---|---|---|---|
-| `gpu:computing:bool` (`avg_over_time(...)` = computing fraction) | `node_hwmon_power_average_watt` ≥ 90 W — hardware only | "was the GPU drawing compute power?" (any consumer: us, another process, a batch job) | whether the work was *ours* |
-| `gpu:computing_workload:bool` (the CLI's `computing` share) | power ≥ 90 W **and** ≥ 1 busy llama slot | "did the GPU draw compute power while one of our slots was processing?" — hardware attributed to our slots | wall-clock slot occupancy: a single short task inside one 15 s scrape still counts as a computing instant |
-| `local_busy.busy_pct` (the usage report's decision figure) | proxy log, `dispatch → finish` slot union — **proxy-inferred**, no hardware | "how much wall-clock time did our slots spend on tasks?" — the figure gates and alerts quote | how much GPU power that work drew, or any GPU work outside the proxy |
+| `gpu:computing_workload:bool` share (**the measure**) | power ≥ 90 W **and** ≥ 1 busy llama slot; produced only by `scripts/gpu_utilisation.py` | "how much of the window was the GPU doing **our** local model's work?" | wall-clock slot occupancy: a single short task inside one 15 s sample still fills the whole instant |
+| `gpu:computing:bool` (power-only, any consumer) | `node_hwmon_power_average_watt` ≥ 90 W — hardware only | "was the GPU drawing compute power, whoever asked?" (us, another process, a batch job) | whether the work was *ours* |
+| `llama_slots_busy` (the rule's input) | slot occupancy published by the proxy | "how many of our slots are processing right now?" — a count, not a % | anything about power draw |
+| `local_busy.busy_pct` (local capacity/contention) | proxy log, `dispatch → finish` slot union — **proxy-inferred**, no hardware | "how contended was local capacity?" — the `> 60 %` local-busy capacity gate quotes **this** figure | how much GPU power that work drew, or any GPU work outside the proxy |
+
+**A figure's name must state its scope.** No number may be quoted as a bare
+"GPU busy %", and the derivations are **never interchangeable** with the
+measure or with each other. The `> 60 %` local-busy capacity gate quotes the
+log-derived `local_busy` — never a power-derived GPU figure — and the
+attributable share is produced only by `scripts/gpu_utilisation.py`.
 
 The log-derived and power-based figures end up on different scales and
 legitimately diverge. Measured
@@ -884,8 +931,8 @@ Read them as answers to different questions:
 - **Is local capacity contended?** → `local_busy.busy_pct`. This is the
   decision figure; see
   [which busy figure is authoritative](../.pi/skills/proxy-usage-analysis/REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
-- **Did our slots actually keep the GPU computing?** →
-  `gpu:computing_workload:bool` (or `scripts/gpu_utilisation.py`).
+- **Did our slots actually keep the GPU computing?** → the attributable share
+  (`gpu:computing_workload:bool`), via `scripts/gpu_utilisation.py`.
 - **Is the GPU busy at all, whoever asked?** → `gpu:computing:bool`.
 
 ## GPU utilisation CLI (`scripts/gpu_utilisation.py`)
@@ -893,9 +940,9 @@ Read them as answers to different questions:
 `scripts/gpu_utilisation.py` answers "how busy was the GPU between 17:00 and
 19:00?" from the deployed Prometheus store — never from `proxy.log` — so the
 figure survives log rotation and needs no log parsing. It reports the
-`gpu:computing_workload:bool` share (our work), the power-only share (any
-consumer) and an explicit `unknown` share, and it fails loudly rather than
-reporting missing data as idle.
+attributable share (the one reported GPU-activity figure), the power-only share
+(a scoped derivation: any GPU consumer) and an explicit `unknown` share, and it
+fails loudly rather than reporting missing data as idle.
 
 ```bash
 cd /path/to/llm
@@ -1239,3 +1286,7 @@ LP-0MW5K7WKZ005VJXA).
 - LP-0MVT1O52G000LMC6 — `scripts/gpu_utilisation.py`, the CLI documented here.
 - LP-0MVSPWLLP008AQXZ — the log-derived `local_busy` is the decision figure;
   the ~27-point divergence from the power figure.
+- LP-0MW5K90EQ001W0R1 — `gpu:computing_workload:bool` is the single reported
+  GPU-activity figure: one producer, every other figure scoped by its name.
+- LP-0MVSQT7YC0045HFW — the `gpu_metrics` falsifier verdict; if a graded field
+  passes there, the power-derived measure is revisited on that evidence.

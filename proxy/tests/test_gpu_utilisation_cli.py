@@ -821,6 +821,38 @@ def test_cli_issues_exactly_the_documented_queries(capsys):
     assert "gpu_busy_percent" not in " ".join(calls)
 
 
+def test_the_cli_is_the_single_producer_of_the_attributable_share():
+    """C6 / epic AC2 (LP-0MW5K90EQ001W0R1): the CLI *is* the producer.
+
+    It queries the attributable rule series itself and does the grid-honest
+    share arithmetic locally, so no PromQL aggregation over
+    ``gpu:computing_workload:bool`` may appear in its query mapping — that is
+    what a second derivation definition would look like. The one-producer guard
+    in ``test_monitoring_deployment.py`` enforces the other side (no rule,
+    report or dashboard may aggregate it).
+    """
+    assert gu.QUERIES["computing_workload_bool"] == "gpu:computing_workload:bool"
+    for key, expression in gu.QUERIES.items():
+        assert "(" not in expression, (
+            f"QUERIES[{key!r}] = {expression!r} is a PromQL expression, not a "
+            "bare series selector; the CLI computes the share from the raw "
+            "series locally"
+        )
+
+
+def test_human_output_names_the_scope_of_the_power_only_derivation(capsys):
+    """AC1: a figure's name states its scope — the human output keeps the
+    'any GPU consumer, not just ours' label on the power-only derivation."""
+    code, out, _err = run_cli(
+        ["--since", str(START), "--until", str(END)],
+        getter=bundle_getter(),
+        capsys=capsys,
+    )
+
+    assert code == gu.EXIT_OK
+    assert "(gpu:computing:bool: any GPU consumer, not just ours)" in out
+
+
 def test_json_output_carries_the_documented_schema(capsys):
     code, out, _err = run_cli(
         ["--since", str(START), "--until", str(END), "--json"],

@@ -263,6 +263,19 @@ thermals, power draw). The decision rule, the preference rule and the causes
 of the gap:
 [REFERENCE.md § Which busy figure is authoritative for decisions](REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
 
+**The one reported GPU-activity measure.**
+[monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure)
+defines exactly one reported GPU-activity figure: the attributable
+`gpu:computing_workload:bool` share produced **only** by
+`scripts/gpu_utilisation.py`. `gpu_busy` here is a **scoped derivation** of
+that doctrine — the power-only `gpu:computing:bool` share (any GPU consumer) —
+and `llama_slots_busy` is the rule's input; `local_busy` is local
+capacity/contention (a proxy-accounting question, the figure gates quote). The
+`--json` key scope, one sentence each:
+
+- `local_busy` — the log-derived `dispatch → finish` slot-union share measuring local capacity/contention (the figure gates and alerts quote), not a GPU measurement.
+- `gpu_busy` — the power-derived `gpu:computing:bool` share measuring hardware activity for any GPU consumer, not local model utilisation.
+
 ## Engine cross-check (slot-time vs llama-server eval timings)
 
 The **Engine cross-check** section (LP-0MVNWULLI006ZYXX) independently

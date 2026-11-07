@@ -1458,8 +1458,13 @@ large-context sessions permanently onto remote providers.
 The **Local model utilization** table's primary busy figures are derived from
 proxy logs (the dispatch → finish slot union). Alongside them, when Prometheus
 is reachable, the report adds a **GPU busy — power-based (hardware)** row and
-exposes the same data under `--json`'s `gpu_busy` key. This is the
-**authoritative hardware-side** busy fraction and does **not** depend on the
+exposes the same data under `--json`'s `gpu_busy` key. It is a **scoped
+derivation** of the one-measure doctrine in
+[monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure):
+the single reported GPU-activity figure is the attributable
+`gpu:computing_workload:bool` share produced **only** by
+`scripts/gpu_utilisation.py`, while this row is the power-only
+`gpu:computing:bool` share (any GPU consumer). It does **not** depend on the
 proxy's stream-lifecycle logging — but it is **not** the local model
 utilisation figure: decisions use the log-derived `local_busy` (see
 [Which busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
@@ -1522,6 +1527,17 @@ comparisons quote *that* number: it is the only figure measuring
 **proxy-served** local work (slot occupancy, queued time included), so it is
 what "how busy was the local model?" means when deciding whether local
 capacity is contended (e.g. the `> 60 %` local-busy gate).
+
+The one reported GPU-activity measure is the attributable
+`gpu:computing_workload:bool` share produced **only** by
+`scripts/gpu_utilisation.py` (the doctrine in
+[monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure));
+the report's `gpu_busy` row is a **scoped derivation** of it — the power-only
+`gpu:computing:bool` share (any GPU consumer) — and `llama_slots_busy` is the
+rule's input. The two `--json` keys state their scope in one sentence each:
+
+- `local_busy` — the log-derived `dispatch → finish` slot-union share measuring local capacity/contention (the figure gates and alerts quote), not a GPU measurement.
+- `gpu_busy` — the power-derived `gpu:computing:bool` share measuring hardware activity for any GPU consumer, not local model utilisation.
 
 **Prefer `gpu_busy` for hardware questions only** — was the GPU computing at
 all, is another workload using it, is it power/thermally limited. The row is
