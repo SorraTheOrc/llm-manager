@@ -409,6 +409,9 @@ def _sampler_emitted_series(out_dir: Path) -> dict[str, str]:
 
 #: Fixture readings for a fully readable amdgpu device: every documented series
 #: is published, so the returned set is the sampler's whole output surface.
+#: ``gpu_busy_percent`` stays in the fixture on purpose: the device still exposes
+#: the attribute, so the sampler's output proves it ignores a readable one
+#: (retired by LP-0MW5K8ZDZ007YSIX).
 FULL_GPU_SYSFS = {
     "gpu_busy_percent": "100",
     "mem_info_vram_used": "309604352",
@@ -785,11 +788,13 @@ class TestAlertRuleFiles:
 class TestForbiddenSeriesGuard:
     """The forbidden-series guard must fail on violations, not be vacuously green.
 
-    The contract is enforced on two source kinds: Prometheus rule files (YAML,
-    scanned in ``TestAlertRuleFiles``) and the GPU utilisation CLI (Python, whose
-    PromQL lives in a ``QUERIES`` mapping). These tests prove the guard would
-    have caught a ``gpu_busy_percent`` query while still allowing the
-    documentation that explains the caveat (LP-0MVT1NVAJ007KUGO AC3/AC4).
+    The contract is enforced on three source kinds: Prometheus rule files (YAML,
+    scanned in ``TestAlertRuleFiles``), the GPU utilisation CLI (Python, whose
+    PromQL lives in a ``QUERIES`` mapping) and the sysfs sampler script (bash,
+    documented inside ``docs/systemd/gpu-metrics.service``). These tests prove
+    the guard would have caught a ``gpu_busy_percent`` query while still
+    allowing the documentation that explains the caveat
+    (LP-0MVT1NVAJ007KUGO AC3/AC4, sampler coverage LP-0MW5K8ZDZ007YSIX).
     """
 
     def test_gpu_utilisation_cli_uses_no_forbidden_series(self):
@@ -894,6 +899,37 @@ class TestForbiddenSeriesGuard:
         expressions = _promql_expressions_in_python(path.read_text())
         assert expressions == ["avg_over_time(gpu:computing:bool[2h])"]
         assert _consumer_guard_offenders(path) == []
+
+    def test_sampler_script_is_guarded_against_the_retired_series(self):
+        """AC 3: re-adding the attribute to the sampler fails a test.
+
+        Retiring the series removed its only publisher, but the guard that kept
+        it out of rules was a lint of the rule files — a sampler that started
+        reading the attribute again would publish a plausible-looking series
+        with no consumer and no failure. The sampler script is now its own
+        source kind under the same ``FORBIDDEN_RULE_SERIES`` contract.
+        """
+        offenders = _forbidden_series_offenders(
+            [_sampler_script()], source_label="gpu-metrics-textfile.sh"
+        )
+        assert not offenders, (
+            "the documented sampler script reads a forbidden series; the "
+            "retirement (LP-0MW5K8ZDZ007YSIX) is not a rule-file lint only:\n"
+            + "\n".join(offenders)
+        )
+
+    def test_sampler_guard_flags_a_re_added_attribute(self):
+        """Non-vacuous: a re-added read/emit line must be reported."""
+        restored = (
+            _sampler_script()
+            + 'busy=$(read_attr gpu_busy_percent)\n'
+            + 'echo "gpu_busy_percent{gpu=\\"card0\\"} $busy"\n'
+        )
+        offenders = _forbidden_series_offenders(
+            [restored], source_label="gpu-metrics-textfile.sh"
+        )
+        assert len(offenders) == 1
+        assert "gpu_busy_percent" in offenders[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1991,13 +2027,124 @@ class TestGpuBusyDiscriminationRemeasurement:
         )
 
 
+class TestGpuBusyPercentSeriesRetirement:
+    """C4 (LP-0MW5K8ZDZ007YSIX): the counter is no longer a published series.
+
+    The guard keeping the counter out of rules was a lint of the rule files
+    while the sampler kept publishing it — a plausible-looking series with a
+    real reader nowhere. These tests pin the retirement: the sampler no longer
+    reads the attribute, the metric tables no longer advertise the series, the
+    decision carries its evidence, and the cookbook says the samples in the
+    store are historical only.
+    """
+
+    SERIES = "gpu_busy_percent"
+
+    def _unit_doc(self) -> str:
+        return (DOCS_SYSTEMD_DIR / "gpu-metrics.service").read_text()
+
+    def test_unit_doc_records_the_retirement_and_its_evidence(self):
+        """AC 1: the decision and the measurement it cites live with the sampler."""
+        content = _norm(self._unit_doc())
+        assert "retire" in content, (
+            "gpu-metrics.service must record that the series was retired, not "
+            "just quietly stop emitting it"
+        )
+        assert "no longer published" in content or "not published" in content, (
+            "gpu-metrics.service must say the series is no longer published"
+        )
+        for fact in (
+            GPU_BUSY_CAPTURE_DATE,
+            GPU_BUSY_CAPTURE_KERNEL,
+            GPU_BUSY_STEP_WATTS.lower(),
+            GPU_BUSY_INVERSION_PHRASE,
+        ):
+            assert fact in content, (
+                f"the retirement decision must cite the current measurement; "
+                f"missing {fact!r}"
+            )
+
+    def test_metric_tables_no_longer_advertise_the_series(self):
+        """AC 4: a metric-table row reads as \"this is published\"; it must go."""
+        for path in (
+            DOCS_SYSTEMD_DIR / "gpu-metrics.service",
+            DOCS_SYSTEMD_DIR / "node_exporter.service",
+        ):
+            metric_sections = [
+                body
+                for heading, body in _markdown_sections(path.read_text())
+                if "metric names" in heading.lower()
+            ]
+            assert metric_sections, f"{path.name} must keep its metric-names table"
+            table = "\n".join(metric_sections)
+            assert f"| `{self.SERIES}`" not in table, (
+                f"{path.name} still lists {self.SERIES} in its metric table; "
+                "record the retirement in prose instead of a metric-table row"
+            )
+            assert self.SERIES in path.read_text(), (
+                f"{path.name} must still name the retired series so a reader "
+                "who greps for it learns why it stopped"
+            )
+
+    def test_sampler_script_no_longer_reads_the_attribute(self):
+        """AC 3: the retirement lives in the executable sampler, not in prose."""
+        assert self.SERIES not in _sampler_script(), (
+            "the documented sampler still mentions the retired counter; the "
+            "script must neither read nor emit it (LP-0MW5K8ZDZ007YSIX)"
+        )
+
+    def test_sampler_publishes_only_the_memory_series(self, tmp_path):
+        """AC 2: GTT/VRAM survive the retirement exactly as before.
+
+        The fixture device exposes a fully readable `gpu_busy_percent`, so this
+        asserts behaviour against a device that still has the attribute.
+        """
+        device = _fake_gpu_sysfs(tmp_path, **FULL_GPU_SYSFS)
+        published = _sampler_emitted_series(_run_documented_sampler(tmp_path, device))
+        assert set(published) == {
+            "gpu_gtt_used_bytes",
+            "gpu_vram_used_bytes",
+            "gpu_vram_total_bytes",
+        }
+        assert published["gpu_gtt_used_bytes"] == FULL_GPU_SYSFS["mem_info_gtt_used"]
+
+    def test_readme_documents_the_samples_as_historical_only(self):
+        """AC 5: the cookbook must explain a series that stops."""
+        sections = [
+            (heading, body)
+            for heading, body in _markdown_sections(_readme())
+            if self.SERIES in body and "historical only" in _norm(body)
+        ]
+        assert sections, (
+            "monitoring/README.md must document the retired series as historical "
+            "only, in the query cookbook a reader lands on"
+        )
+        heading, body = sections[0]
+        text = _norm(body)
+        for fact in ("90 d", "no longer", "queryable"):
+            assert fact in text, (
+                f"the {heading!r} section must say the samples are historical "
+                f"only; missing {fact!r}"
+            )
+
+    def test_readme_does_not_present_the_retired_series_as_live(self):
+        """AC 4: the install-time series list must not promise the series."""
+        content = _norm(_readme())
+        assert "no longer published" in content, (
+            "monitoring/README.md must say the series is no longer published "
+            "where it lists the GPU series the sampler serves"
+        )
+
+
 class TestGpuUtilisationSourceDecision:
     """The GPU-utilisation source decision is documented and not shelled out.
 
     LP-0MVSQQO910077LYL: keep the power-derived `gpu:computing:bool` measure and
     record, with measurement dates, that `amd-smi` returns N/A on this APU and
     that `amdtop`/`rocm-smi` surface the same saturating `gpu_busy_percent`
-    counter the monitoring stack already samples for continuity only.
+    counter the monitoring stack used to sample for continuity only. That series
+    is retired (LP-0MW5K8ZDZ007YSIX), so the prohibition below now documents a
+    series that must not come back either.
     """
 
     def _readme(self) -> str:
@@ -2037,6 +2184,10 @@ class TestGpuUtilisationSourceDecision:
         """
         content = _norm((DOCS_SYSTEMD_DIR / "node_exporter.service").read_text())
         assert "gpu_busy_percent" in content
+        assert "no longer published" in content, (
+            "node_exporter.service must state that gpu_busy_percent is no "
+            "longer published (retired by LP-0MW5K8ZDZ007YSIX)"
+        )
         assert "must not be used in any rule" in content, (
             "node_exporter.service must explicitly forbid selecting "
             "gpu_busy_percent in a rule, next to the series it describes"
@@ -2173,7 +2324,11 @@ class TestGpuMetricsSamplerAndUnit:
         assert result.returncode == 0, f"documented sampler is not valid bash:\n{result.stderr}"
 
     def test_sampler_publishes_the_documented_series(self, tmp_path):
-        """Behaviour: run the documented script against fixture sysfs attributes."""
+        """Behaviour: run the documented script against fixture sysfs attributes.
+
+        The fixture device still exposes `gpu_busy_percent`; the sampler must not
+        publish it (retired by LP-0MW5K8ZDZ007YSIX).
+        """
         device = self._fake_sysfs(
             tmp_path,
             gpu_busy_percent="100",
@@ -2183,7 +2338,6 @@ class TestGpuMetricsSamplerAndUnit:
         )
         out_dir = self._run_sampler(tmp_path, device)
         assert self._emitted_series(out_dir) == {
-            "gpu_busy_percent": "100",
             "gpu_vram_used_bytes": "309604352",
             "gpu_vram_total_bytes": "1073741824",
             "gpu_gtt_used_bytes": "36573331456",
@@ -2211,12 +2365,23 @@ class TestGpuMetricsSamplerAndUnit:
                 f"{doc} does not document the series the sampler publishes: {missing}"
             )
 
-    def test_sampler_writes_nothing_when_busy_percent_is_unreadable(self, tmp_path):
-        """Publishing zeros for an unreadable sensor would look like an idle GPU."""
+    def test_sampler_publishes_memory_when_the_busy_counter_is_unreadable(self, tmp_path):
+        """The retired counter must not gate the memory series.
+
+        Before LP-0MW5K8ZDZ007YSIX the sampler exited without writing whenever
+        `gpu_busy_percent` was unreadable, so a counter nobody consumed decided
+        whether GTT telemetry existed at all.
+        """
         device = self._fake_sysfs(tmp_path, mem_info_gtt_used="42")
         out_dir = self._run_sampler(tmp_path, device)
+        assert self._emitted_series(out_dir) == {"gpu_gtt_used_bytes": "42"}
+
+    def test_sampler_writes_nothing_when_no_memory_attribute_is_readable(self, tmp_path):
+        """A readable retired attribute alone must not keep a file alive."""
+        device = self._fake_sysfs(tmp_path, gpu_busy_percent="100")
+        out_dir = self._run_sampler(tmp_path, device)
         assert not (out_dir / "gpu.prom").exists(), (
-            "the sampler must not publish fabricated values when the driver "
+            "the sampler must not publish fabricated values when the memory "
             "attributes are unreadable"
         )
 
@@ -2230,14 +2395,13 @@ class TestGpuMetricsSamplerAndUnit:
         )
         out_dir = self._run_sampler(tmp_path, device)
         assert self._emitted_series(out_dir) == {
-            "gpu_busy_percent": "100",
             "gpu_vram_used_bytes": "10",
             "gpu_vram_total_bytes": "20",
         }
 
     def test_output_is_written_atomically(self, tmp_path):
         """node_exporter must never read a half-written textfile."""
-        device = self._fake_sysfs(tmp_path, gpu_busy_percent="7")
+        device = self._fake_sysfs(tmp_path, mem_info_gtt_used="7")
         out_dir = self._run_sampler(tmp_path, device)
         leftovers = sorted(p.name for p in out_dir.iterdir() if p.name != "gpu.prom")
         assert not leftovers, f"sampler left temporary files behind: {leftovers}"
@@ -2404,6 +2568,15 @@ def _sampler_series_names() -> set[str]:
     )
 
 
+#: Series that once were published and are now retired (LP-0MW5K8ZDZ007YSIX).
+#: The cookbook still names them so a reader who queries one is not surprised
+#: when it stops: the samples in the store are historical only, no longer
+#: advanced. The anti-drift check below has to subtract this set explicitly —
+#: and proves the sampler does not publish it any more — so keeping the mention
+#: can never be mistaken for the series still being emitted.
+HISTORICAL_GPU_SERIES = {"gpu_busy_percent"}
+
+
 class TestMonitoringReadmeCookbook:
     """The cookbook must answer the four operational questions asked of it."""
 
@@ -2459,10 +2632,18 @@ class TestMonitoringReadmeCookbook:
             token.rstrip(":") for token in re.findall(r"\bgpu_[a-z_]+\b(?!\.)", _readme())
         } - {"gpu_utilisation"}
         assert mentioned, "the cookbook mentions no gpu_* series"
-        unpublished = sorted(mentioned - _sampler_series_names())
+        # A retired series may be documented as historical, never as published.
+        published = _sampler_series_names()
+        still_published = sorted(published & HISTORICAL_GPU_SERIES)
+        assert not still_published, (
+            "these series are documented as no longer published, so the sampler "
+            f"must not emit them: {still_published}"
+        )
+        unpublished = sorted(mentioned - published - HISTORICAL_GPU_SERIES)
         assert not unpublished, (
             f"monitoring/README.md references gpu series that no exporter "
-            f"publishes: {unpublished} (published: {sorted(_sampler_series_names())})"
+            f"publishes: {unpublished} (published: {sorted(published)}; "
+            f"historical: {sorted(HISTORICAL_GPU_SERIES)})"
         )
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ node_exporter is the **only** exporter this stack runs. It provides:
   | Collector | Series | Source |
   |---|---|---|
   | `--collector.hwmon` | `node_hwmon_power_average_watt`, `node_hwmon_chip_names`, `node_hwmon_temp_celsius`, … | `/sys/class/hwmon` — the `amdgpu` chip's `power1` sensor is GPU package power |
-  | `--collector.textfile.directory` | `gpu_gtt_used_bytes`, `gpu_vram_used_bytes`, `gpu_vram_total_bytes`, `gpu_busy_percent` | `*.prom` files written by the 10 s sysfs sampler in [gpu-metrics.service](gpu-metrics.service) |
+  | `--collector.textfile.directory` | `gpu_gtt_used_bytes`, `gpu_vram_used_bytes`, `gpu_vram_total_bytes` | `*.prom` files written by the 10 s sysfs sampler in [gpu-metrics.service](gpu-metrics.service) |
 
 node_exporter has **no amdgpu collector**, which is why GPU memory comes
 through the textfile collector rather than being read directly. The
@@ -104,7 +104,18 @@ value is sampled and refreshed every 10 s):
 | `gpu_gtt_used_bytes` | gauge | GTT (system RAM mapped for the GPU) in use — **the meaningful memory pool on this APU** |
 | `gpu_vram_used_bytes` | gauge | Used portion of the small BIOS VRAM carve-out (1 GiB here) |
 | `gpu_vram_total_bytes` | gauge | Size of the VRAM carve-out |
-| `gpu_busy_percent` | gauge | Driver-reported busy percentage. **Saturates above ~30 W on this APU — it is a two-state detector (1–10 % below 30 W, 92–99 % above), so it reads 99.2 % while idling with a display against 98.7 % while computing and is not a utilisation signal** (re-measured 2026-11-06 on kernel 7.0.0-38, LP-0MW5K7WKZ005VJXA; see [monitoring/README.md](../../monitoring/README.md), *Why not `amd-smi`, `rocm-smi` or `amdtop`?*); scraped for continuity only and **must not be used in any rule** — select the power-derived `gpu:computing:bool` instead |
+
+**Retired series: `gpu_busy_percent`.** The sampler no longer reads the driver
+attribute, so `gpu_busy_percent` is **no longer published** (retired
+2026-11-07, LP-0MW5K8ZDZ007YSIX; decision and evidence in
+[gpu-metrics.service](gpu-metrics.service#decision-gpu_busy_percent-is-retired)).
+It was **not a utilisation signal** and **must not be used in any rule** either:
+it saturates above ~30 W on this APU as a two-state detector (1–10 % below
+30 W, 92–99 % above), so it read 99.2 % while idling with a display against
+98.7 % while computing (re-measured 2026-11-06 on kernel 7.0.0-38,
+LP-0MW5K7WKZ005VJXA). Select the power-derived `gpu:computing:bool` instead;
+for the historical data, see
+[monitoring/README.md](../../monitoring/README.md#retired-series-gpu_busy_percent-historical-only).
 
 GPU power (from the hwmon collector):
 
@@ -135,8 +146,8 @@ curl -s http://127.0.0.1:9100/metrics | grep 'node_hwmon_power_average_watt' | g
 #   node_hwmon_power_average_watt{chip="0000:00:08_1_0000:c5:00_0",chip_name="amdgpu",sensor="power1"} 49.076
 
 # GPU memory is visible through the textfile collector (needs gpu-metrics.service)
-curl -s http://127.0.0.1:9100/metrics | grep -E '^gpu_(gtt_used|vram_used|vram_total|busy_percent)'
-# expected: four series, all with gpu="card0"
+curl -s http://127.0.0.1:9100/metrics | grep -E '^gpu_(gtt_used|vram_used|vram_total)'
+# expected: three series, all with gpu="card0" (gpu_busy_percent is retired)
 
 # Prometheus sees the exporter as up
 curl -s http://127.0.0.1:9090/api/v1/query?query=up \

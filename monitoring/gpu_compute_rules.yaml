@@ -26,7 +26,10 @@
 # idle (~54 W) and computing (~115 W); the measured step explains that same
 # symptom with a threshold rather than a stuck counter. gpu_busy_percent is NOT
 # a utilisation signal here and must not be used in any rule; the proxy's own
-# wedge detector had to be disabled because of it. `amd-smi` is not an
+# wedge detector had to be disabled because of it. It is also no longer
+# published: the 10 s sysfs sampler stopped reading the attribute on 2026-11-07
+# (LP-0MW5K8ZDZ007YSIX), so the series exists only as history inside the
+# retention window. `amd-smi` is not an
 # alternative either: it reports N/A for usage/power/clocks/energy on this APU,
 # and `amdtop`/`rocm-smi` surface this same counter (LP-0MVSQQO910077LYL,
 # LP-0MW5K7WKZ005VJXA).

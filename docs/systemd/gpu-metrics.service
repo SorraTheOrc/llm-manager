@@ -16,11 +16,16 @@ costs one `cat` per attribute every 10 s.
 
 Two things this unit is **not**:
 
-- It is not a utilisation signal. `gpu_busy_percent` is published for
-  continuity only: on this Strix Halo APU it reads 100% whether the GPU is idle
-  or computing. Utilisation is derived from **power draw**
+- It is not a utilisation signal. `gpu_busy_percent` is **not sampled at all**
+  (retired 2026-11-07, LP-0MW5K8ZDZ007YSIX): on this Strix Halo APU the driver
+  attribute is a **two-state busy counter, not a percentage**, whose step sits
+  at ~30 W, so it reads 1–10 % below 30 W and 92–99 % above and *inverts*
+  across the band that matters (99.2 % at 40–60 W idle-with-display against
+  98.7 % at 90–100 W computing). Utilisation is derived from **power draw**
   (`node_hwmon_power_average_watt`, from node_exporter's hwmon collector) — see
   [monitoring/gpu_compute_rules.yaml](../../monitoring/gpu_compute_rules.yaml).
+  The decision and its evidence are recorded under
+  [Decision: `gpu_busy_percent` is retired](#decision-gpu_busy_percent-is-retired).
 - It is not the workload signal either. Slot occupancy — how many llama-server
   slots exist, how many are processing a task, the per-slot 0/1 state, the
   in-flight task count and a last-successful-sample heartbeat — is published by
@@ -39,19 +44,65 @@ Two things this unit is **not**:
 
 | Series | Labels | Type | Meaning |
 |---|---|---|---|
-| `gpu_busy_percent` | `gpu="card0"` | gauge | Driver-reported busy percentage — a **two-state detector whose step sits at ~30 W on this APU** (1–10 % below 30 W, 92–99 % above), so it reads 99.2 % while idling with a display against 98.7 % while computing and cannot separate the two. **Not a utilisation measure** (re-measured 2026-11-06 on kernel 7.0.0-38, LP-0MW5K7WKZ005VJXA) |
 | `gpu_vram_used_bytes` | `gpu="card0"` | gauge | Used portion of the VRAM carve-out (`mem_info_vram_used`) |
 | `gpu_vram_total_bytes` | `gpu="card0"` | gauge | Size of the VRAM carve-out (`mem_info_vram_total`, 1 GiB here) |
 | `gpu_gtt_used_bytes` | `gpu="card0"` | gauge | GTT in use (`mem_info_gtt_used`) — the meaningful pool: models map most of their weights here (~36 GiB of a 128 GiB pool in normal operation) |
 
 **Sampling interval: 10 s** (`sleep 10` in the unit's `ExecStart`). Prometheus
 scrapes at 15 s, so consecutive scrapes see alternating samples; that is fine
-for a gauge that changes slowly and is averaged in the rules.
+for gauges that change slowly and are averaged in the rules.
 
-If `gpu_busy_percent` is unreadable the sampler exits **without writing** a
-file rather than publishing zeros — a zero would silently look like an idle
-GPU. `gpu_vram_*` is written only when both VRAM attributes are readable, and
-`gpu_gtt_used_bytes` only when the GTT attribute is.
+The sampler writes a textfile only when it can read at least one of the memory
+attributes above: it publishes `gpu_vram_*` when both VRAM attributes are
+readable and `gpu_gtt_used_bytes` when the GTT attribute is. When none is
+readable it exits **without writing** rather than publishing zeros — a zero
+would silently look like an idle GPU.
+
+`gpu_busy_percent` is **no longer published** by this unit (retired
+2026-11-07, LP-0MW5K8ZDZ007YSIX). See the decision below.
+
+## Decision: `gpu_busy_percent` is retired
+
+**Status:** retired 2026-11-07. The sampler no longer reads
+`/sys/class/drm/card0/device/gpu_busy_percent`, so the series is no longer
+published by this unit. Samples already in the Prometheus store remain
+queryable until they fall out of the 90 d retention window, but they are
+**historical only** — nothing advances the series any more.
+
+**Why, recorded as evidence rather than as a prohibition.** The counter was
+published "for continuity only" and no rule or dashboard ever selected it; a
+published series with a plausible name and no consumer is an invitation, and
+the only thing stopping a future rule was a lint of the rule files. On this
+APU the counter cannot answer the question its name suggests: it is a
+**two-state detector**, not a percentage, whose step sits at **~30 W**, i.e.
+below the idle-with-display band (p50 45 W), so idle-with-context and computing
+both read ~99 % and it **inverts** across the band that matters.
+
+| GPU power band | mean busy, kernel 7.0.0-38 (n = 25,463) | mean busy, kernel 7.0.0-34 (n = 28,655) |
+|---|---|---|
+| 20–30 W | 10.2 % | 7.2 % |
+| 30–35 W | 99.4 % | 92.1 % |
+| 40–60 W (idle with display) | 99.5 % | 99.2 % |
+| 90–100 W (computing) | 99.4 % | 98.7 % |
+
+Capture: **2026-11-06** on kernel **7.0.0-38**, the whole post-boot window
+(2026-10-31 14:28 → 2026-11-06 14:28 UTC, 15 s samples), compared with the
+preceding five days on kernel 7.0.0-34 using the same recipe; the full banded
+table and its PromQL recipe are in
+[monitoring/README.md](../../monitoring/README.md#re-measuring-gpu_busy_percent-discrimination)
+(LP-0MW5K7WKZ005VJXA). Note the inversion: 40–60 W reads *higher* than
+90–100 W, so no threshold inside the working range rescues the counter.
+
+**What to use instead.** GPU activity is the power-derived recording rule
+`gpu:computing:bool` (`node_hwmon_power_average_watt{chip_name="amdgpu"} >=
+bool 90`); the attributable workload share is
+`gpu:computing_workload:bool`. Neither is produced by this unit.
+
+**The guard moved from the rules to the publisher.** `gpu_busy_percent` stays
+in `FORBIDDEN_RULE_SERIES`, and the documented sampler script below is now
+scanned by the same guard, so re-adding the attribute to the sampler fails
+`proxy/tests/test_monitoring_deployment.py` instead of silently republishing a
+counter nobody reads.
 
 ## The sampler script
 
@@ -59,8 +110,11 @@ GPU. `gpu_vram_*` is written only when both VRAM attributes are readable, and
 
 ```bash
 #!/usr/bin/env bash
-# Emit AMD GPU utilisation/memory metrics for node_exporter's textfile collector.
+# Emit AMD GPU memory metrics for node_exporter's textfile collector.
 # Source: amdgpu sysfs attributes on /sys/class/drm/card0/device. No root needed.
+# The driver's busy counter is deliberately NOT sampled: it is a two-state
+# counter, not a utilisation measure on this APU (retired 2026-11-07,
+# LP-0MW5K8ZDZ007YSIX; see the decision record in the unit document).
 set -u
 OUT_DIR="${1:-$HOME/.local/share/node_exporter/textfile}"
 DEV="${GPU_SYSFS:-/sys/class/drm/card0/device}"
@@ -68,18 +122,16 @@ TMP="$OUT_DIR/.gpu.prom.$$"
 
 read_attr() { [ -r "$DEV/$1" ] && cat "$DEV/$1" 2>/dev/null || echo ""; }
 
-busy=$(read_attr gpu_busy_percent)
 vram_used=$(read_attr mem_info_vram_used)
 vram_total=$(read_attr mem_info_vram_total)
 gtt_used=$(read_attr mem_info_gtt_used)
 
-[ -n "$busy" ] || exit 0
+have_vram=""; [ -n "$vram_used" ] && [ -n "$vram_total" ] && have_vram=1
+have_gtt=""; [ -n "$gtt_used" ] && have_gtt=1
+if [ -z "$have_vram" ] && [ -z "$have_gtt" ]; then exit 0; fi
 
 {
-  echo '# HELP gpu_busy_percent GPU utilisation as reported by the amdgpu driver (0-100).'
-  echo '# TYPE gpu_busy_percent gauge'
-  echo "gpu_busy_percent{gpu=\"card0\"} $busy"
-  if [ -n "$vram_used" ] && [ -n "$vram_total" ]; then
+  if [ -n "$have_vram" ]; then
     echo '# HELP gpu_vram_used_bytes VRAM currently allocated (sysfs mem_info_vram_used).'
     echo '# TYPE gpu_vram_used_bytes gauge'
     echo "gpu_vram_used_bytes{gpu=\"card0\"} $vram_used"
@@ -87,7 +139,7 @@ gtt_used=$(read_attr mem_info_gtt_used)
     echo '# TYPE gpu_vram_total_bytes gauge'
     echo "gpu_vram_total_bytes{gpu=\"card0\"} $vram_total"
   fi
-  if [ -n "$gtt_used" ]; then
+  if [ -n "$have_gtt" ]; then
     echo '# HELP gpu_gtt_used_bytes GTT (system RAM mapped for the GPU) in use — the meaningful memory pool on this APU.'
     echo '# TYPE gpu_gtt_used_bytes gauge'
     echo "gpu_gtt_used_bytes{gpu=\"card0\"} $gtt_used"
@@ -136,8 +188,8 @@ chmod +x ~/.local/bin/gpu-metrics-textfile.sh
 # 2. Run it once by hand and check the output before wiring up systemd
 ~/.local/bin/gpu-metrics-textfile.sh
 cat ~/.local/share/node_exporter/textfile/gpu.prom
-# expected: gpu_busy_percent, gpu_vram_used_bytes, gpu_vram_total_bytes and
-#           gpu_gtt_used_bytes, each with gpu="card0"
+# expected: gpu_vram_used_bytes, gpu_vram_total_bytes and gpu_gtt_used_bytes,
+#           each with gpu="card0" (gpu_busy_percent is retired and not written)
 
 # 3. Install the unit. docs/systemd/*.service are documents that wrap the unit
 #    in an `ini` block, so the block is extracted — `cp` would install markdown.
@@ -168,6 +220,9 @@ date +%s; stat -c %Y ~/.local/share/node_exporter/textfile/gpu.prom
 
 # The series reach Prometheus through node_exporter
 curl -s http://127.0.0.1:9100/metrics | grep -E '^gpu_'
+# expected: three series (gpu_gtt_used_bytes, gpu_vram_used_bytes,
+#           gpu_vram_total_bytes) — gpu_busy_percent is retired, so it stops
+#           appearing after the sampler is restarted on this version
 curl -s --get http://127.0.0.1:9090/api/v1/query \
   --data-urlencode 'query=gpu_gtt_used_bytes'
 # expected: a single series, job="node-exporter", instance="localhost:9100",
@@ -182,7 +237,8 @@ rocm-smi --showmeminfo vram
 
 | Symptom | Cause / fix |
 |---|---|
-| `gpu.prom` never appears | `gpu_busy_percent` is unreadable: `cat /sys/class/drm/card0/device/gpu_busy_percent`. On a host without an AMD GPU there is nothing to sample and the script exits 0 by design |
+| `gpu.prom` never appears | none of the memory attributes is readable: `cat /sys/class/drm/card0/device/mem_info_gtt_used`. On a host without an AMD GPU there is nothing to sample and the script exits 0 by design |
+| `gpu_busy_percent` disappeared from Prometheus | Expected: the series was retired on 2026-11-07 (LP-0MW5K8ZDZ007YSIX). History up to that instant is still queryable for as long as it falls inside the 90 d retention window; nothing advances the series |
 | File appears but `gpu_*` series are missing in Prometheus | The textfile directory in the script's `OUT_DIR` differs from node_exporter's `--collector.textfile.directory`; compare `systemctl --user cat node_exporter.service` with the unit above |
 | `gpu.prom` stops updating | `systemctl --user status gpu-metrics.service`; the log is at `~/.local/state/node_exporter/logs/gpu-metrics.log` |
 | `gpu_gtt_used_bytes` is far above installed RAM | GTT is capped by the driver/BIOS carve-out and can exceed physical RAM; the alert thresholds assume a 128 GiB pool — update `monitoring/gpu_memory_alerts.yaml` if that changes |

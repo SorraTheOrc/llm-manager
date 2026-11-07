@@ -302,7 +302,7 @@ Both units are needed for full GPU coverage, and both are loopback-only:
   power through `--collector.hwmon`, and serves the GPU memory textfile through
   `--collector.textfile.directory`.
 - **gpu-metrics.service** is a 10 s bash loop that samples
-  `/sys/class/drm/card0/device/mem_info_*` and `gpu_busy_percent` into
+  `/sys/class/drm/card0/device/mem_info_*` into
   `~/.local/share/node_exporter/textfile/gpu.prom`.
 
 Full install steps, metric names and troubleshooting:
@@ -326,9 +326,14 @@ systemctl --user enable --now node_exporter.service gpu-metrics.service
 ```
 
 Resulting GPU series: `gpu_gtt_used_bytes`, `gpu_vram_used_bytes`,
-`gpu_vram_total_bytes`, `gpu_busy_percent` (scraped for continuity only — it
-saturates above ~30 W on this APU and is not a utilisation signal), plus
-`node_hwmon_power_average_watt{chip_name="amdgpu"}`.
+`gpu_vram_total_bytes`, plus
+`node_hwmon_power_average_watt{chip_name="amdgpu"}`. `gpu_busy_percent` is
+**no longer published** — it was retired on 2026-11-07
+(LP-0MW5K8ZDZ007YSIX) because it is **not a utilisation signal**: a two-state
+detector whose ~30 W step sits below the idle-with-display band. The samples
+already in the store are **historical only** — still queryable inside the 90 d
+retention window and no longer maintained; see
+[Retired series: `gpu_busy_percent` (historical only)](#retired-series-gpu_busy_percent-historical-only).
 
 ## 4. Grafana (optional, not deployed here)
 
@@ -574,8 +579,10 @@ AMD tooling offers nothing better on this host (measured 2026-10-28,
 | `rocm-smi` | power (the same `hwmon` `power1_average` node this stack scrapes) and `GPU use 100%` from `gpu_busy_percent` |
 | `amdtop` | Linux “GPU usage” is literally `/sys/class/drm/card0/device/gpu_busy_percent` (`linux.go:151`, commit `5e500c3`); power/temp from the same `hwmon` files; VRAM (not GTT). Windows uses ADLX, a Windows-only driver library |
 
-So `amdtop` and `rocm-smi` display **the same counter** this stack samples for
-continuity only. That counter is a **two-state detector, not a percentage**: its
+So `amdtop` and `rocm-smi` display **the same counter** this stack used to
+sample (it is retired as a published series — see
+[Retired series: `gpu_busy_percent` (historical only)](#retired-series-gpu_busy_percent-historical-only)).
+That counter is a **two-state detector, not a percentage**: its
 step sits at ~30 W, so it reads 1–10 % below 30 W and 92–99 % from 30 W upward.
 
 Re-measured **2026-11-06** on kernel **7.0.0-38-generic** (host rebooted
@@ -642,7 +649,11 @@ evidence is current (LP-0MW5K7WKZ005VJXA).
 
 This subsection exists so the reason the counter is **not a utilisation signal**
 stays current instead of ageing; it records evidence, it does not change a
-threshold or a rule. The bands above are **recomputed from the Prometheus store
+threshold or a rule. The series itself stopped being sampled on **2026-11-07**
+(LP-0MW5K8ZDZ007YSIX), so the recipe below now reproduces the published figures
+from the samples the store already holds; re-running it once those samples age
+out of the retention window returns no data, which is the expected result, not
+a broken recipe. The bands above are **recomputed from the Prometheus store
 with the PromQL
 below, never remembered**. Four query shapes cover the whole table. Every one is
 an instant query whose subquery is pinned to a window end with the `@` modifier,
@@ -743,6 +754,33 @@ gpu_vram_total_bytes / 1024^3
 max_over_time(gpu_gtt_used_bytes[24h])
 delta(gpu_gtt_used_bytes[1h])
 ```
+
+### Retired series: `gpu_busy_percent` (historical only)
+
+`gpu_busy_percent` stopped being published on **2026-11-07**
+(LP-0MW5K8ZDZ007YSIX): the 10 s sysfs sampler no longer reads the driver
+attribute, because on this APU it is a two-state busy counter, not a
+utilisation measure (see
+[Why not `amd-smi`, `rocm-smi` or `amdtop`?](#why-not-amd-smi-rocm-smi-or-amdtop)).
+The samples already in the store are **historical only**: still queryable for
+as long as they fall inside the 90 d `storage.tsdb.retention.time`, and no
+longer maintained or advanced. The series stops existing once the retirement
+instant passes out of that window, so a panel, rule or report built on it today
+will silently go empty later.
+
+Read the history deliberately, with the window pinned, so the answer does not
+drift with the clock:
+
+```promql
+# Driver busy over the last full day before the retirement
+avg_over_time(gpu_busy_percent[24h] @ 1794067200)
+```
+
+Do not use it as a utilisation figure. The maintained measures are
+`avg_over_time(gpu:computing:bool[2h])` (hardware activity, any consumer) and
+the usage report's log-derived `local_busy.busy_pct` (the work the proxy
+served); `gpu:computing_workload:bool` combines them for the attributable
+share.
 
 ### Host metrics
 
@@ -1130,12 +1168,14 @@ ls -l --time-style=+%s ~/.local/share/node_exporter/textfile/gpu.prom   # mtime 
 curl -s http://127.0.0.1:9100/metrics | grep '^gpu_'
 ```
 
-If `gpu.prom` is missing, the sampler cannot read `gpu_busy_percent` (no AMD
-GPU, or the driver is not loaded) and exits without writing, by design — the
-counter is only a liveness check here, never a utilisation signal; see
+If `gpu.prom` is missing, the sampler cannot read any GPU memory attribute (no
+AMD GPU, or the driver is not loaded) and exits without writing, by design; see
 [docs/systemd/gpu-metrics.service](../docs/systemd/gpu-metrics.service).
+`gpu_busy_percent` is not involved: it was retired as a published series on
+2026-11-07 (LP-0MW5K8ZDZ007YSIX), it was never a utilisation signal, so its
+absence from `/metrics` is expected, not a fault.
 
-### `gpu_busy_percent` reads 100% while the machine is idle
+### `gpu_busy_percent` (historical) read 100% while the machine was idle
 
 Expected on this APU: it is a two-state detector whose step sits at **~30 W** —
 below the idle-with-display band (p50 45 W) — so an idle GPU holding a residual
