@@ -1785,9 +1785,6 @@ async def health_check():
         )
     self_healing = srv._is_self_healing_active()
     gpu_wedge_detected = bool(getattr(srv, "gpu_wedge_detected", False))
-    gpu_wedge_detection_disabled = bool(
-        getattr(srv, "gpu_wedge_detection_disabled", False)
-    )
     ready = bool(
         llama_running
         and srv.backend_ready
@@ -1865,7 +1862,8 @@ async def health_check():
         "llama_server_managed": bool(llama_server_managed),
         "self_healing_in_progress": self_healing,
         "gpu_wedge_detected": gpu_wedge_detected,
-        "gpu_wedge_detection_disabled": gpu_wedge_detection_disabled,
+        # LP-0MW5K8ZW3005SEA8: the PINNED auto-disable state was removed with
+        # the busy counter, so no gpu_wedge_detection_disabled field exists.
         "gpu_wedge_signal_count": int(
             srv.backend_signal_counts.get("gpu_wedge", 0) or 0
         ),

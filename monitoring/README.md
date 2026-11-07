@@ -996,6 +996,14 @@ detector reads `server.llama_gpu_wedge_power_low_threshold_watts: 90` from
 changed together**, or the alerting layer and the proxy disagree about what
 "computing" means.
 
+The proxy's wedge detector (LP-0MW5K8ZW3005SEA8) is power-and-slot-state
+only; the removed keys `llama_gpu_wedge_busy_threshold_percent` and
+`llama_gpu_wedge_pinned_checks_required` no longer exist in
+`proxy/config.yaml` (the busy counter they tuned is not read at all). The
+remaining wedge keys are `llama_gpu_wedge_detection_enabled`,
+`llama_gpu_wedge_idle_checks_required` and
+`llama_gpu_wedge_power_low_threshold_watts`.
+
 Measured bands on this host (Strix Halo APU, Radeon 8060S iGPU, `gfx1151`),
 over 7 days of 15 s samples (2026-10-25 21:00 → 2026-10-31 22:00 UTC):
 
