@@ -623,7 +623,7 @@ the renderer.
 
 | Metric | Baseline | Target | Actual | Result |
 |---|---|---|---|---|
-| GPU busy / local utilisation | 18.4 % (2026-11-03) | n/a | 18.4 % | Insufficient history |
+| GPU activity — power-based, any consumer | 18.4 % (2026-11-03) | n/a | 18.4 % | Insufficient history |
 | Fallback rate | 87.9 % of requests (2026-11-03) | n/a | 87.9 % of requests | Insufficient history |
 | Decode speed | 32.1 tok/s (2026-11-03) | n/a | 32.1 tok/s | Insufficient history |
 …one row per registered metric, in registry order…
@@ -675,7 +675,7 @@ key, the `--json` key and the detail-subsection prefix.
 
 | id | Label | Unit | Direction | Data source |
 |---|---|---|---|---|
-| `gpu_busy` | GPU busy / local utilisation | % | higher is better | GPU telemetry sampler power samples |
+| `gpu_busy` | GPU activity — power-based, any consumer | % | higher is better | GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer) |
 | `fallback_rate` | Fallback rate | % of requests | lower is better | `Fallback triggered` log events |
 | `decode_speed` | Decode speed | tok/s | higher is better | `Stream finished` token counts |
 | `prompt_eval_speed` | Prompt eval speed | tok/s | higher is better | llama-server prompt eval timing |
@@ -689,14 +689,18 @@ key, the `--json` key and the detail-subsection prefix.
 How each value is calculated (`aggregation.performance_metric_inputs` is the
 single roll-up that produces exactly these keys):
 
-- **`gpu_busy`** — power-based busy time from the GPU telemetry sampler
-  (`avg_over_time(gpu:computing:bool[Nh])` over the 15-second hwmon series),
-  corroborated by log-derived local busy time for the same window. This is the
-  **hardware** figure the **Local model utilization** section renders, **not**
-  a local-utilisation signal: decisions still use the log-derived
-  `local_busy` (see [Which busy figure is authoritative for
-decisions](#which-busy-figure-is-authoritative-for-decisions)). `n/a` when
-  Prometheus was unreachable.
+- **`gpu_busy`** — coverage-honest power-based computing share from the GPU
+  telemetry sampler. Every expected 15-second instant across the window is
+  classified `computing`, `idle` or `unknown` from the `gpu:computing:bool`
+  recording rule, with the unobserved share reported as `unknown` (never
+  renormalised away, never counted as `idle`, and never added to the
+  numerator); corroborated by log-derived local busy time for the same window.
+  This is the **hardware** figure the **Local model utilization** section
+  renders, and it counts **any GPU consumer** — **not** a local-utilisation
+  signal: decisions still use the log-derived `local_busy` (see [Which busy
+figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
+  `n/a` when Prometheus was unreachable or the window had no observed
+  instants.
 - **`fallback_rate`** — share of the window's requests that produced
   `Fallback triggered` events, as a percentage; the dominant fallback reason
   is rendered in the **Fallback reasons** section rather than in the table.
@@ -1477,21 +1481,36 @@ comparison and the PromQL recipe that recomputes every band). Power draw
 discriminates
 cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing:bool`
 recording rule (`gpu:power_watts:amdgpu >= bool 90`) is evaluated by Prometheus
-every **15 s** from the node_exporter hwmon series. The report queries
-`avg_over_time(gpu:computing:bool[Nh])` for the window, so the busy fraction is
-computed over the raw 15 s samples (see
-[monitoring/README.md](../../../monitoring/README.md) for the full pipeline).
+every **15 s** from the node_exporter hwmon series. Over the window the report
+classifies **every expected instant on a 15 s grid** as `computing`, `idle` or
+`unknown`: an instant is observed only when a sentinel proves the sampling
+pipeline was alive there (`up{job="llama-proxy"}`, `up{job="node-exporter"}`
+or a fresh `llama_slots_sample_timestamp_seconds` heartbeat) **and** the rule
+has a sample; the remainder is `unknown`. Absence is never folded into `idle`
+and never into the numerator, so a monitoring gap cannot inflate the figure
+(a rolling average over only the present samples would). The three shares
+therefore cover the window exactly — `computing_seconds + idle_seconds +
+unknown_seconds == window_seconds` and the percentages sum to 100 %.
 
+- The figure measures **hardware activity for any GPU consumer**
+  (`gpu:computing:bool`), not only the local model's work; that scope is named
+  in the scorecard label and the row's note.
 - The 15 s cadence is comfortably finer than the workload timescales (median
 decode 2.4 s, worst prefill 108 s), so sub-15-second sampling would add no
 accuracy.
 - The row is **best-effort**: if Prometheus is unreachable the query returns
   `None`, the row is omitted from the report, and `--json`'s `gpu_busy` is
-  `null`. A report run never fails because monitoring is down.
+  `null`. A report run never fails because monitoring is down. A window with
+  **no observed instants at all** keeps that same "no row" behaviour rather
+  than reporting a fabricated `0 %`; a partially observed window keeps the row
+  and names its `unknown` share.
 - The `gpu_busy` block carries `computing_fraction` (0–1), `busy_pct`,
-  `busy_seconds`, `idle_seconds`, `total_seconds`, and `smoothed_power` — the
-  `gpu:power_watts:avg5m` trace at 1-minute resolution, derived from the 15 s
-  raw series by a 5-minute rolling average, for warm-up/cooldown context.
+  `busy_seconds`, `idle_pct`, `idle_seconds`, `unknown_pct`, `unknown_seconds`,
+  `total_seconds`, a `coverage` block (`expected_samples`, `observed_samples`,
+  `computing_samples`, `idle_samples`, `unknown_samples`), the three
+  `shares_pct` values, and `smoothed_power` — the `gpu:power_watts:avg5m` trace
+  at 1-minute resolution, derived from the 15 s raw series by a 5-minute
+  rolling average, for warm-up/cooldown context.
 
 #### Which busy figure is authoritative for decisions
 

@@ -19,8 +19,8 @@
 metrics:
   gpu_busy:
     measurements: []
-    why: "GPU utilisation is the clearest single measure of whether the local model earns its keep: a busy GPU absorbs demand locally instead of paying for remote tokens."
-    calculation: "Power-based busy time from GPU telemetry sampler power samples, corroborated by log-derived local busy time for the same window."
+    why: "GPU activity shows whether the hardware is actually computing, so a quiet GPU is the first sign that local capacity is going unused — but the figure counts any GPU consumer, not only the local model, so it is read as hardware activity rather than local utilisation."
+    calculation: "Coverage-honest power-based computing share from GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer): every 15-second instant across the window is classified computing / idle / unknown, with the unobserved share reported as unknown instead of being renormalised away; corroborated by log-derived local busy time for the same window."
     levers: "Slot pool size and context geometry, the local admission policy, prompt-cache retention and the routing thresholds that decide when a request is served locally."
     trade_offs: "Pushing utilisation higher by admitting more work per slot raises queueing delay and time to first token; widening context per slot reduces the number of concurrent slots."
     data_section_anchor: "## Local model utilization"

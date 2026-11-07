@@ -1,4 +1,11 @@
-"""Tests for gpu_busy module — Prometheus-based GPU busy-time measurement."""
+"""Tests for gpu_busy module — coverage-honest GPU busy-time measurement.
+
+The module classifies every expected instant on a 15 s grid across the window
+as ``computing`` / ``idle`` / ``unknown`` (LP-0MW5K8YE9001QO39). These tests
+pin the coverage arithmetic against the authored gapped-window fixture and the
+small synthetic cases, and guard against the renormalising rolling-average
+query returning.
+"""
 
 from __future__ import annotations
 
@@ -20,104 +27,251 @@ import reporting
 
 from tests import fixtures
 
-# A mock Prometheus response for avg_over_time(gpu:computing:bool[1h]).
-_MOCK_BOOL_RESPONSE = {
-    "status": "success",
-    "data": {
-        "result": [
-            {
-                "metric": {"__name__": "gpu:computing:bool"},
-                "value": [1698766800, "0.50"],  # ts, value
-            }
-        ]
-    },
-}
-
-# A mock Prometheus response for gpu:power_watts:avg5m range query.
-_MOCK_POWER_RESPONSE = {
-    "status": "success",
-    "data": {
-        "result": [
-            {
-                "metric": {
-                    "__name__": "gpu:power_watts:avg5m",
-                    "chip_name": "amdgpu",
-                },
-                "values": [
-                    [1698766200, "93.20"],
-                    [1698766260, "10.80"],
-                    [1698766320, "95.50"],
-                ],
-            }
-        ]
-    },
-}
+#: The authored two-hour store bundle with its deliberate 10-minute hole.
+#: ``monitoring/tests/fixtures/window_with_gap.json`` is shared with the
+#: ``gpu_utilisation`` CLI tests, so both readers measure the same store.
+WINDOW_WITH_GAP = (
+    Path(__file__).resolve().parents[4]
+    / "monitoring"
+    / "tests"
+    / "fixtures"
+    / "window_with_gap.json"
+)
+#: The fixture's own documented arithmetic: 481 expected grid instants, 441
+#: observed, 40 missing (8.316 % unknown), of which 68 computing and 373 idle.
+EXPECTED_SAMPLES = 481
+OBSERVED_SAMPLES = 441
+COMPUTING_SAMPLES = 68
+IDLE_SAMPLES = 373
+UNKNOWN_SAMPLES = 40
 
 
-class TestComputeGpuBusy:
-    """compute_gpu_busy with mocked Prometheus responses."""
+def _matrix(points: dict[int, float]) -> dict:
+    """A Prometheus ``query_range`` matrix payload for one series."""
+    return {
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": {},
+                    "values": [[ts, str(value)] for ts, value in sorted(points.items())],
+                }
+            ],
+        },
+    }
 
-    def test_returns_gpubusyresult_on_success(self):
-        ws = datetime(2024, 10, 31, 14, 0, 0).timestamp()
-        we = datetime(2024, 10, 31, 15, 0, 0).timestamp()  # 1 h window
-        with patch("gpu_busy.urllib.request.urlopen") as mock_urlopen:
-            mock_resp = type("MockResp", (), {
-                "read": lambda: json.dumps(_MOCK_BOOL_RESPONSE).encode(),
-                "__enter__": lambda self: self,
-                "__exit__": lambda self, *a: None,
-            })()
-            mock_urlopen.return_value = mock_resp
-            with patch("gpu_busy.query_prometheus") as mock_q:
-                # First call is the bool query (step=None, end-only)
-                # Second call is the power trace
-                mock_q.side_effect = [_MOCK_BOOL_RESPONSE, _MOCK_POWER_RESPONSE]
-                result = gpu_busy.compute_gpu_busy(ws, we)
+
+def _stub_series(
+    *,
+    computing_bool: dict[int, float],
+    up_llama: dict[int, float] | None = None,
+    up_node: dict[int, float] | None = None,
+    heartbeat: dict[int, float] | None = None,
+    power: dict[int, float] | None = None,
+):
+    """A ``query_prometheus`` stand-in answering from explicit series."""
+
+    def _query(query: str, start: int, end: int, step: str = "60") -> dict:
+        if query == gpu_busy.BOOL_QUERY:
+            return _matrix(computing_bool)
+        if query == gpu_busy.UP_LLAMA_PROXY_QUERY:
+            return _matrix(up_llama or {})
+        if query == gpu_busy.UP_NODE_EXPORTER_QUERY:
+            return _matrix(up_node or {})
+        if query == gpu_busy.HEARTBEAT_QUERY:
+            return _matrix(heartbeat or {})
+        if query == gpu_busy.POWER_QUERY:
+            return _matrix(power or {})
+        raise AssertionError(f"unexpected query: {query}")
+
+    return _query
+
+
+def _fixture_bundle() -> dict:
+    return json.loads(WINDOW_WITH_GAP.read_text())
+
+
+def _fixture_query(query: str, start: int, end: int, step: str = "60") -> dict | None:
+    """Answer from the recorded bundle (the bundle predates the power alias)."""
+    responses = _fixture_bundle()["responses"]
+    if query == gpu_busy.POWER_QUERY:
+        return responses["gpu:power_watts:amdgpu"]
+    return responses.get(query)
+
+
+class TestGappedWindowFixture:
+    """The authored 2 h store bundle: three shares + the seconds identity."""
+
+    START = _fixture_bundle()["capture"]["window"]["start_unix"]
+    END = _fixture_bundle()["capture"]["window"]["end_unix"]
+
+    def _result(self) -> gpu_busy.GpuBusyResult:
+        with patch("gpu_busy.query_prometheus", side_effect=_fixture_query):
+            result = gpu_busy.compute_gpu_busy(self.START, self.END)
         assert result is not None
-        assert result.computing_fraction == 0.5
-        assert result.busy_seconds == pytest.approx(1800.0)
-        assert result.idle_seconds == pytest.approx(1800.0)
-        assert result.busy_pct == pytest.approx(50.0)
-        assert len(result.smoothed_power_values) == 3
+        return result
 
-    def test_returns_none_on_prometheus_failure(self):
-        ws = datetime(2024, 10, 31, 14, 0, 0).timestamp()
-        we = datetime(2024, 10, 31, 15, 0, 0).timestamp()
+    def test_reports_the_documented_three_shares(self):
+        result = self._result()
+
+        assert result.expected_samples == EXPECTED_SAMPLES
+        assert result.observed_samples == OBSERVED_SAMPLES
+        assert result.computing_samples == COMPUTING_SAMPLES
+        assert result.idle_samples == IDLE_SAMPLES
+        assert result.unknown_samples == UNKNOWN_SAMPLES
+
+        assert result.shares_pct["computing"] == pytest.approx(
+            100.0 * COMPUTING_SAMPLES / EXPECTED_SAMPLES
+        )
+        assert result.shares_pct["idle"] == pytest.approx(
+            100.0 * IDLE_SAMPLES / EXPECTED_SAMPLES
+        )
+        assert result.shares_pct["unknown"] == pytest.approx(8.316, abs=1e-3)
+        assert sum(result.shares_pct.values()) == pytest.approx(100.0)
+
+    def test_seconds_cover_the_window_exactly(self):
+        result = self._result()
+
+        assert result.busy_seconds + result.idle_seconds + result.unknown_seconds == (
+            pytest.approx(result.total_seconds)
+        )
+        assert result.unknown_seconds == pytest.approx(
+            UNKNOWN_SAMPLES / EXPECTED_SAMPLES * result.total_seconds
+        )
+
+    def test_the_gap_is_never_counted_as_idle_or_in_the_numerator(self):
+        result = self._result()
+
+        # Absence is not idle: the two observed shares exclude the 40 missing
+        # instants, and computing cannot include what nobody measured.
+        assert result.idle_samples == IDLE_SAMPLES
+        assert result.idle_samples != EXPECTED_SAMPLES - COMPUTING_SAMPLES
+        assert result.computing_fraction == pytest.approx(
+            COMPUTING_SAMPLES / EXPECTED_SAMPLES
+        )
+
+    def test_smoothed_power_trace_is_carried(self):
+        result = self._result()
+        assert len(result.smoothed_power_values) == OBSERVED_SAMPLES
+
+
+class TestAbsenceIsUnknown:
+    """Small synthetic grids pin the three-way classification."""
+
+    def test_absent_samples_are_unknown_not_idle_or_numerator(self):
+        # Four instants (0, 15, 30, 45): one idle, one computing, two absent.
+        stub = _stub_series(
+            computing_bool={0: 0.0, 15: 1.0},
+            up_llama={0: 1.0, 15: 1.0},
+        )
+        with patch("gpu_busy.query_prometheus", side_effect=stub):
+            result = gpu_busy.compute_gpu_busy(0, 45)
+
+        assert result is not None
+        assert (result.computing_samples, result.idle_samples, result.unknown_samples) == (
+            1,
+            1,
+            2,
+        )
+        assert result.shares_pct == pytest.approx(
+            {"computing": 25.0, "idle": 25.0, "unknown": 50.0}
+        )
+
+    def test_a_missing_sentinel_makes_only_that_instant_unknown(self):
+        # The rule reports at all four instants, but the pipeline proves itself
+        # alive at only three of them.
+        stub = _stub_series(
+            computing_bool={0: 1.0, 15: 0.0, 30: 0.0, 45: 0.0},
+            up_llama={0: 1.0, 15: 1.0, 30: 1.0},
+        )
+        with patch("gpu_busy.query_prometheus", side_effect=stub):
+            result = gpu_busy.compute_gpu_busy(0, 45)
+
+        assert result is not None
+        assert (result.computing_samples, result.idle_samples, result.unknown_samples) == (
+            1,
+            2,
+            1,
+        )
+
+    def test_a_stale_heartbeat_does_not_prove_the_instant_was_observed(self):
+        # Instant 0 has a heartbeat 100 s old (stale); instant 15 is fresh.
+        stub = _stub_series(
+            computing_bool={0: 1.0, 15: 0.0},
+            heartbeat={0: -100.0, 15: 15.0},
+        )
+        with patch("gpu_busy.query_prometheus", side_effect=stub):
+            result = gpu_busy.compute_gpu_busy(0, 15)
+
+        assert result is not None
+        assert (result.computing_samples, result.idle_samples, result.unknown_samples) == (
+            0,
+            1,
+            1,
+        )
+
+    def test_a_fully_absent_window_keeps_the_no_row_behaviour(self):
+        # Documented choice (module docstring): no observed instants -> None,
+        # the report omits the row, and nothing is reported as a fabricated 0 %.
+        stub = _stub_series(computing_bool={})
+        with patch("gpu_busy.query_prometheus", side_effect=stub):
+            assert gpu_busy.compute_gpu_busy(0, 45) is None
+
+    def test_unreachable_prometheus_returns_none(self):
         with patch("gpu_busy.query_prometheus", return_value=None):
-            result = gpu_busy.compute_gpu_busy(ws, we)
-        assert result is None
+            assert gpu_busy.compute_gpu_busy(0, 45) is None
 
-    def test_returns_none_on_empty_result(self):
-        ws = datetime(2024, 10, 31, 14, 0, 0).timestamp()
-        we = datetime(2024, 10, 31, 15, 0, 0).timestamp()
-        with patch("gpu_busy.query_prometheus", return_value={"data": {"result": []}}):
-            result = gpu_busy.compute_gpu_busy(ws, we)
-        assert result is None
-
-    def test_returns_none_on_invalid_value(self):
-        ws = datetime(2024, 10, 31, 14, 0, 0).timestamp()
-        we = datetime(2024, 10, 31, 15, 0, 0).timestamp()
-        bad_response = {
-            "status": "success",
-            "data": {"result": [{"value": [0, "not-a-number"]}]},
-        }
-        with patch("gpu_busy.query_prometheus", return_value=bad_response):
-            result = gpu_busy.compute_gpu_busy(ws, we)
-        assert result is None
-
-    def test_returns_none_on_zero_or_negative_window(self):
-        ws = datetime(2024, 10, 31, 15, 0, 0).timestamp()
-        we = datetime(2024, 10, 31, 14, 0, 0).timestamp()  # negative
-        with patch("gpu_busy.query_prometheus", return_value=_MOCK_BOOL_RESPONSE):
-            result = gpu_busy.compute_gpu_busy(ws, we)
-        assert result is None
-        result2 = gpu_busy.compute_gpu_busy(ws, ws)  # zero
-        assert result2 is None
+    def test_zero_or_negative_window_returns_none(self):
+        with patch("gpu_busy.query_prometheus", return_value=_matrix({0: 1.0})):
+            assert gpu_busy.compute_gpu_busy(45, 0) is None
+            assert gpu_busy.compute_gpu_busy(0, 0) is None
 
 
-class TestGpuBusyResult:
-    """GpuBusyResult dataclass convenience properties."""
+class TestNoRenormalisingQuery:
+    """The renormalising rolling average must not come back (AC3/AC6)."""
 
-    def test_busy_and_idle_pct_sum_to_100(self):
+    def test_the_module_issues_a_plain_selector(self):
+        seen: list[str] = []
+
+        def _capturing(query, start, end, step="60"):
+            seen.append(query)
+            return _stub_series(
+                computing_bool={0: 1.0}, up_llama={0: 1.0}
+            )(query, start, end, step)
+
+        with patch("gpu_busy.query_prometheus", side_effect=_capturing):
+            gpu_busy.compute_gpu_busy(0, 15)
+
+        assert gpu_busy.BOOL_QUERY == "gpu:computing:bool"
+        assert seen, "the module must query Prometheus"
+        assert all("avg_over_time" not in query for query in seen)
+
+    def test_the_module_source_holds_no_renormalising_average(self):
+        # Explicit regression pin required by the work item: the renormalised
+        # form must fail loudly if it is reintroduced.
+        source = Path(gpu_busy.__file__).read_text(encoding="utf-8")
+        assert "avg_over_time" not in source
+
+
+class TestGridHelpers:
+    """Grid alignment: jitter is snapped, out-of-window samples are dropped."""
+
+    def test_align_to_grid_snaps_jitter_and_drops_out_of_window_samples(self):
+        aligned = gpu_busy._align_to_grid(
+            {7: 1.0, 22: 2.0, 300: 9.0}, start=0, step=15, expected=2
+        )
+        assert aligned == {0: 1.0, 15: 2.0}
+
+    def test_expected_sample_count_covers_both_window_ends(self):
+        assert gpu_busy._expected_sample_count(0, 7200, 15) == 481
+        assert gpu_busy._expected_sample_count(0, 0, 15) == 1
+
+
+class TestGpuBusyResultShares:
+    """GpuBusyResult convenience properties stay coverage-consistent."""
+
+    def test_busy_and_idle_pct_sum_to_100_without_unknown(self):
         result = gpu_busy.GpuBusyResult(
             computing_fraction=0.35,
             total_seconds=3600,
@@ -127,17 +281,22 @@ class TestGpuBusyResult:
         )
         assert result.busy_pct == pytest.approx(35.0)
         assert result.idle_pct == pytest.approx(65.0)
+        assert result.unknown_pct == pytest.approx(0.0)
+        assert sum(result.shares_pct.values()) == pytest.approx(100.0)
 
-    def test_busy_seconds_equals_fraction_times_total(self):
+    def test_unknown_share_is_carried_alongside_computing_and_idle(self):
         result = gpu_busy.GpuBusyResult(
-            computing_fraction=0.75,
-            total_seconds=7200,
-            busy_seconds=5400.0,
-            idle_seconds=1800.0,
+            computing_fraction=0.5,
+            total_seconds=100.0,
+            busy_seconds=50.0,
+            idle_seconds=40.0,
+            unknown_seconds=10.0,
             smoothed_power_values=[],
         )
-        assert result.busy_seconds == pytest.approx(5400.0)
-        assert result.idle_seconds == pytest.approx(1800.0)
+        assert result.busy_pct == pytest.approx(50.0)
+        assert result.idle_pct == pytest.approx(40.0)
+        assert result.unknown_pct == pytest.approx(10.0)
+        assert sum(result.shares_pct.values()) == pytest.approx(100.0)
 
 
 class TestQueryPrometheus:
@@ -151,7 +310,7 @@ class TestQueryPrometheus:
                 "__exit__": lambda self, *a: None,
             })()
             mock_urlopen.return_value = mock_resp
-            result = gpu_busy.query_prometheus("avg_over_time(test[1h])", 0, 3600)
+            result = gpu_busy.query_prometheus("test", 0, 3600)
         assert result == {"status": "success"}
 
     def test_returns_none_on_exception(self):
@@ -163,82 +322,44 @@ class TestQueryPrometheus:
 class TestGpuBusyJson:
     """_gpu_busy_json rendering in reporting.py."""
 
-    def test_gpu_busy_json_from_result(self):
-        import reporting
-
+    def test_gpu_busy_json_carries_coverage_and_the_three_shares(self):
         gpu = gpu_busy.GpuBusyResult(
-            computing_fraction=0.492,
+            computing_fraction=0.5,
             total_seconds=21600,
-            busy_seconds=10627.2,
-            idle_seconds=10972.8,
+            busy_seconds=10800.0,
+            idle_seconds=7200.0,
+            unknown_seconds=3600.0,
             smoothed_power_values=[(1698766200, 93.2), (1698766260, 10.8)],
+            expected_samples=60,
+            observed_samples=50,
+            computing_samples=30,
+            idle_samples=20,
+            unknown_samples=10,
         )
         data = reporting._gpu_busy_json(gpu)
-        assert data["computing_fraction"] == 0.492
-        assert data["busy_pct"] == 49.2
-        assert data["idle_pct"] == 50.8
-        assert data["total_seconds"] == 21600
-        assert data["busy_seconds"] == 10627.2
+        assert data["computing_fraction"] == 0.5
+        assert data["busy_pct"] == 50.0
+        assert data["idle_pct"] == pytest.approx(33.3, abs=0.1)
+        assert data["unknown_pct"] == pytest.approx(16.7, abs=0.1)
+        assert data["unknown_seconds"] == 3600.0
+        assert data["total_seconds"] == 21600.0
+        assert data["coverage"] == {
+            "expected_samples": 60,
+            "observed_samples": 50,
+            "computing_samples": 30,
+            "idle_samples": 20,
+            "unknown_samples": 10,
+        }
+        assert data["shares_pct"] == {
+            "computing": 50.0,
+            "idle": pytest.approx(33.3, abs=0.1),
+            "unknown": pytest.approx(16.7, abs=0.1),
+        }
         assert len(data["smoothed_power"]) == 2
         assert data["smoothed_power"][0] == {"timestamp": 1698766200, "power_watts": 93.2}
 
     def test_gpu_busy_json_returns_none_for_none(self):
-        import reporting
-
         assert reporting._gpu_busy_json(None) is None
-
-
-class TestComputeGpuBusyMatrixFormat:
-    """Regression: the bool fraction may arrive in matrix (values[]) form.
-
-    Guards against the bug where the range endpoint returned ``values`` but
-    the code read ``value`` — silently yielding ``None``.
-    """
-
-    def test_reads_matrix_values_format(self):
-        matrix_response = {
-            "status": "success",
-            "data": {
-                "resultType": "matrix",
-                "result": [
-                    {
-                        "metric": {"chip_name": "amdgpu"},
-                        "values": [
-                            [1698766200, "0.40"],
-                            [1698766800, "0.60"],
-                        ],
-                    }
-                ],
-            },
-        }
-        ws = datetime(2024, 10, 31, 14, 0, 0).timestamp()
-        we = datetime(2024, 10, 31, 15, 0, 0).timestamp()
-        with patch("gpu_busy.query_prometheus") as mock_q:
-            mock_q.side_effect = [matrix_response, _MOCK_POWER_RESPONSE]
-            result = gpu_busy.compute_gpu_busy(ws, we)
-        assert result is not None
-        # Uses the LAST value of the matrix series.
-        assert result.computing_fraction == 0.60
-
-    def test_busy_plus_idle_equals_window(self):
-        ws = datetime(2024, 10, 31, 14, 0, 0).timestamp()
-        we = datetime(2024, 10, 31, 15, 0, 0).timestamp()
-        with patch("gpu_busy.query_prometheus") as mock_q:
-            mock_q.side_effect = [_MOCK_BOOL_RESPONSE, _MOCK_POWER_RESPONSE]
-            result = gpu_busy.compute_gpu_busy(ws, we)
-        assert result.busy_seconds + result.idle_seconds == pytest.approx(result.total_seconds)
-        assert result.busy_pct + result.idle_pct == pytest.approx(100.0)
-
-    def test_rejects_out_of_range_fraction(self):
-        bad = {
-            "status": "success",
-            "data": {"result": [{"value": [0, "1.5"]}]},
-        }
-        ws = datetime(2024, 10, 31, 14, 0, 0).timestamp()
-        we = datetime(2024, 10, 31, 15, 0, 0).timestamp()
-        with patch("gpu_busy.query_prometheus", return_value=bad):
-            result = gpu_busy.compute_gpu_busy(ws, we)
-        assert result is None
 
 
 class TestLocalBusyIsDecisionFigure:
@@ -269,13 +390,14 @@ class TestLocalBusyIsDecisionFigure:
         )
 
     @staticmethod
-    def _stub_gpu_busy() -> gpu_busy.GpuBusyResult:
+    def _stub_gpu_busy(unknown_seconds: float = 0.0) -> gpu_busy.GpuBusyResult:
         """A deterministic hardware figure that diverges from the log data."""
         return gpu_busy.GpuBusyResult(
             computing_fraction=0.50,
             total_seconds=3600.0,
             busy_seconds=1800.0,
-            idle_seconds=1800.0,
+            idle_seconds=1800.0 - unknown_seconds,
+            unknown_seconds=unknown_seconds,
             smoothed_power_values=[],
         )
 
@@ -323,3 +445,12 @@ class TestLocalBusyIsDecisionFigure:
         assert "GPU busy — power-based (hardware)" in section
         assert "not local model utilisation" in section
         assert "local_busy" in section
+        assert "any GPU consumer" in section
+
+    def test_report_row_names_the_unknown_share(self):
+        """A partially observed window states its unobserved share in the row."""
+        summary = self._summary()
+        summary.gpu_busy = self._stub_gpu_busy(unknown_seconds=360.0)
+        report = reporting.build_report(summary, None)
+        section = report.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "unknown 10.0%" in section

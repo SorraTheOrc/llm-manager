@@ -66,6 +66,17 @@ def test_each_calculation_copy_names_the_registered_data_source():
         )
 
 
+def test_gpu_busy_detail_copy_describes_coverage_and_hardware_scope():
+    """AC4/AC5 (LP-0MW5K8YE9001QO39): the why/calculation copy states the
+    coverage-honest grid and that the figure counts any GPU consumer."""
+    copy = pm.detail_copy("gpu_busy", pm.load_defaults())
+    text = _norm(f"{copy['why']} {copy['calculation']}")
+
+    assert "any gpu consumer" in text
+    assert "15-second instant" in text
+    assert "unknown" in text
+
+
 def test_each_detail_copy_anchors_an_existing_report_section_heading():
     defaults = pm.load_defaults()
 

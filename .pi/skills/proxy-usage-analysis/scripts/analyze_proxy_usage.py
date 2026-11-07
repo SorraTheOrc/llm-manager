@@ -459,7 +459,13 @@ def _run(args: argparse.Namespace) -> int:
                 busy_summary += (
                     f", GPU busy — power-based (hardware, not local model "
                     f"utilisation) {gpu['busy_pct']:.1f}% "
-                    f"({gpu['busy_seconds']:.0f}s)"
+                    f"({gpu['busy_seconds']:.0f}s"
+                    + (
+                        f", unknown {gpu['unknown_pct']:.1f}%"
+                        if gpu.get('unknown_pct', 0) > 0
+                        else ""
+                    )
+                    + ")"
                 )
         print(
             f"Analyzed {len(run.files)} log file(s) from {args.log_dir}: "

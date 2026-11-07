@@ -3143,8 +3143,11 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     # GPU-based busy time from Prometheus power consumption (hardware-side).
     gpu = summary.gpu_busy
     if gpu is not None:
-        ap(f"| GPU busy — power-based (hardware) | "
-           f"{_busy_cell(gpu.busy_seconds, gpu.total_seconds)} | - | - |")
+        gpu_cell = _busy_cell(gpu.busy_seconds, gpu.total_seconds)
+        unknown_pct = getattr(gpu, "unknown_pct", 0.0)
+        if unknown_pct > 0:
+            gpu_cell += f", unknown {unknown_pct:.1f}%"
+        ap(f"| GPU busy — power-based (hardware) | {gpu_cell} | - | - |")
     ap("")
     ap(f"_Bounds: lower = {aggregation.BUSY_LOWER_BOUND_LABEL}; upper = "
        f"{aggregation.BUSY_UPPER_BOUND_LABEL}. {b.prefill_extended_streams} of "
@@ -3180,16 +3183,18 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     if gpu is not None:
         ap("")
         ap("_The **GPU busy** row uses Prometheus power-consumption data "
-           "(`avg_over_time(gpu:computing:bool[Nh])`, evaluated every 15 s): "
-           "1 while the GPU draws ≥ 90 W (the recording-rule threshold), 0 "
-           "otherwise. It is **hardware activity, not local model "
-           "utilisation**: it counts GPU work outside the proxy's slot "
-           "accounting (other workloads, non-local requests) and misses "
-           "proxy-served work during log gaps. The decision figure for local "
-           "model utilisation is the log-derived `local_busy` "
-           "(`dispatch → finish`) above; this row is supplementary hardware "
-           "telemetry and does not depend on the proxy's stream lifecycle "
-           "logs._")
+           "(`gpu:computing:bool`, evaluated every 15 s): 1 while the GPU "
+           "draws ≥ 90 W (the recording-rule threshold), 0 otherwise. Each "
+           "15 s instant across the window is counted as computing, idle or "
+           "**unknown**, so a monitoring gap cannot inflate the figure; the "
+           "row names the unknown share whenever the window is not fully "
+           "observed. It is **hardware activity, not local model "
+           "utilisation**: `gpu:computing:bool` counts any GPU consumer "
+           "(other workloads, non-local requests) and misses proxy-served "
+           "work during log gaps. The decision figure for local model "
+           "utilisation is the log-derived `local_busy` (`dispatch → "
+           "finish`) above; this row is supplementary hardware telemetry and "
+           "does not depend on the proxy's stream lifecycle logs._")
 
 
 def _phase_cell(value: float | None) -> str:
@@ -4965,11 +4970,15 @@ def _gpu_busy_json(gpu: object | None) -> dict | None:
     """JSON-friendly GPU busy-time from Prometheus power consumption.
 
     Supplementary hardware telemetry, **not** a local-utilisation signal:
-    measures when the GPU drew compute-level power (``gpu:computing:bool``),
-    independent of proxy log events, so it counts GPU work outside the
-    proxy's slot accounting. Decisions use the log-derived ``local_busy``
-    (``dispatch → finish``); this block is its hardware-side complement.
-    Returns ``None`` when the query fails.
+    measures when the GPU drew compute-level power (``gpu:computing:bool`` —
+    any GPU consumer), independent of proxy log events, so it counts GPU work
+    outside the proxy's slot accounting. Coverage is grid-honest: the
+    ``coverage`` block names the expected/observed/computing/idle/unknown
+    sample counts and the ``unknown_*`` fields carry the unobserved share, so
+    a monitoring gap can never read as idle or inflate the busy figure.
+    Decisions use the log-derived ``local_busy`` (``dispatch → finish``); this
+    block is its hardware-side complement. Returns ``None`` when the query
+    fails or the window has no observed instants.
     """
     if gpu is None:
         return None
@@ -4977,9 +4986,24 @@ def _gpu_busy_json(gpu: object | None) -> dict | None:
         "computing_fraction": round(gpu.computing_fraction, 4),
         "busy_seconds": round(gpu.busy_seconds, 1),
         "idle_seconds": round(gpu.idle_seconds, 1),
+        "unknown_seconds": round(gpu.unknown_seconds, 1),
         "busy_pct": round(gpu.busy_pct, 1),
         "idle_pct": round(gpu.idle_pct, 1),
+        "unknown_pct": round(gpu.unknown_pct, 1),
         "total_seconds": round(gpu.total_seconds, 1),
+        # Coverage the shares are computed on (grid-honest, LP-0MW5K8YE9001QO39).
+        "coverage": {
+            "expected_samples": gpu.expected_samples,
+            "observed_samples": gpu.observed_samples,
+            "computing_samples": gpu.computing_samples,
+            "idle_samples": gpu.idle_samples,
+            "unknown_samples": gpu.unknown_samples,
+        },
+        "shares_pct": {
+            "computing": round(gpu.busy_pct, 1),
+            "idle": round(gpu.idle_pct, 1),
+            "unknown": round(gpu.unknown_pct, 1),
+        },
         # Smoothed power trace (1-min samples, derived from 15-s raw).
         "smoothed_power": [
             {"timestamp": int(ts), "power_watts": round(w, 2)}

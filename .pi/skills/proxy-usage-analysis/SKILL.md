@@ -66,7 +66,7 @@ Options:
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
 | `--stale-rate-target` | `0.05` | Target share of status polls allowed to report `slots_stale=true`; drives the **Local capacity signals** section's met/unmet outcome and `--json`'s `capacity_signals.slots_stale.passed`. Mirrors `scripts/capacity_signal_verification.py --stale-rate-target` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings — plus `performance_metrics` — the scorecard block keyed by metric id and its `performance_metrics_counts` totals, and `wasted_compute` — the wasted-GPU-compute block, `null` when the analysis was not produced) |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `idle_pct`, `unknown_pct`, the three `shares_pct` values, a `coverage` sample block and `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings — plus `performance_metrics` — the scorecard block keyed by metric id and its `performance_metrics_counts` totals, and `wasted_compute` — the wasted-GPU-compute block, `null` when the analysis was not produced) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 | `--metrics-config` | `metrics/performance_metrics.yaml` | Path to the committed performance-metric defaults (metric detail copy and any seeded history); read-only at runtime, never written |
 | `--metrics-state` | `<output-dir>/performance_metrics_state.yaml` | Path to the live performance-metric history file this run records its window in |
@@ -235,23 +235,32 @@ cannot separate the two — and `amd-smi` reports `N/A`,
 so power draw is the discriminating signal; `amdtop`/`rocm-smi` show the same
 counter (see [monitoring/README.md](../../../monitoring/README.md),
 *Why not `amd-smi`, `rocm-smi` or `amdtop`?*, for the measurement and its
-PromQL recipe; re-measured 2026-11-06 in LP-0MW5K7WKZ005VJXA). The report
-queries `avg_over_time(gpu:computing:bool[Nh])` — evaluated by Prometheus over
-the raw **15-second** hwmon series (`monitoring/gpu_compute_rules.yaml`) —
-plus the 5-minute-smoothed power trace for context. Best-effort: if Prometheus
+PromQL recipe; re-measured 2026-11-06 in LP-0MW5K7WKZ005VJXA). The figure is
+computed over the raw **15-second** hwmon series (`monitoring/gpu_compute_rules.yaml`)
+by classifying **every expected 15 s instant** across the window as
+`computing`, `idle` or `unknown`: an instant is observed only when a sentinel
+proves the sampling pipeline was alive there (`up{job="llama-proxy"}`,
+`up{job="node-exporter"}` or a fresh `llama_slots_sample_timestamp_seconds`
+heartbeat) and the rule has a sample. Absence is never counted as `idle` and
+never added to the numerator, so a monitoring gap cannot inflate the figure;
+the `computing` + `idle` + `unknown` shares cover the window exactly and sum
+to 100 %. A window with no observed instants at all keeps the best-effort
+"no row" behaviour rather than reporting a fabricated 0 %. The report also
+adds the 5-minute-smoothed power trace for context. Best-effort: if Prometheus
 is down the row is omitted and `--json`'s `gpu_busy` is `null` — the report
 never fails. Full pipeline and rationale:
 [monitoring/README.md](../../../monitoring/README.md) and
 [REFERENCE.md](REFERENCE.md#gpu-busy-time-from-power-prometheus).
 
 **This row is hardware activity, not local model utilisation.** It counts any
-GPU draw ≥ 90 W — including work the proxy never served — and misses
-proxy-served work during log gaps, so it must never be read (or quoted) as the
-local model utilisation figure. **Decisions use the log-derived `local_busy`**
-(the `dispatch → finish` slot union: the report's `Busy time — upper bound
-(dispatch → finish)` row and `--json`'s `local_busy` key); quote `gpu_busy`
-only for hardware questions (was the GPU computing at all, thermals, power
-draw). The decision rule, the preference rule and the causes of the gap:
+GPU consumer (`gpu:computing:bool`) — including work the proxy never served —
+and misses proxy-served work during log gaps, so it must never be read (or
+quoted) as the local model utilisation figure. **Decisions use the log-derived
+`local_busy`** (the `dispatch → finish` slot union: the report's `Busy time —
+upper bound (dispatch → finish)` row and `--json`'s `local_busy` key); quote
+`gpu_busy` only for hardware questions (was the GPU computing at all,
+thermals, power draw). The decision rule, the preference rule and the causes
+of the gap:
 [REFERENCE.md § Which busy figure is authoritative for decisions](REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
 
 ## Engine cross-check (slot-time vs llama-server eval timings)
