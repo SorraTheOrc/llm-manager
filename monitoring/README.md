@@ -901,13 +901,43 @@ python3 scripts/gpu_utilisation.py \
 
 `--json` carries `window`, `resolution`, `coverage` (expected / observed /
 computing / idle / unknown sample counts), `shares_pct`, `power_watts`,
-`slots.peak_busy`, `rule_cross_check` (the CLI recomputes the rule and reports
+`slots.peak_busy`, `rule_cross_check` (the CLI recomputes the rules and reports
 mismatches) and `warnings`. Percentages are rounded to four decimal places and
 the sample counts are exact, so nothing is lost:
 
 ```bash
 python3 scripts/gpu_utilisation.py --window 2h --json | jq '.shares_pct, .resolution'
 ```
+
+### The rule cross-check, and why it tolerates one sample of jitter
+
+`rule_cross_check` compares the recorded `gpu:computing:bool` and
+`gpu:computing_workload:bool` against a local recomputation, so a drifted
+threshold or expression surfaces as a `warnings` entry instead of a silently
+different definition. It is the only signal that would catch such a drift, so
+it has to be trustworthy — a warning that names the wrong cause is worse than
+no warning.
+
+Recording rules are evaluated on Prometheus' own schedule, against the last
+sample at or before their evaluation instant, which is not necessarily the grid
+instant the CLI queries. At a power step or a slot-state change the recorded
+value can therefore sit one grid sample behind the raw series for reasons that
+have nothing to do with the definition. Measured on 2026-11-02 (the worst case
+the audit found): a same-instant comparison called **321 of 2,897 instants** a
+divergence, and **303 of those 321 (94 %) sat within ±30 s of a slot-state
+change** — pure timestamp jitter. The cross-check therefore recomputes over a
+**±1-sample** staleness window (earlier sample first, the direction a recording
+rule looks) and skips instants whose inputs are all frozen (a dead sampler,
+where comparing one frozen sample set with another invents a drift).
+
+A genuine definition change diverges at *every* instant, so this tolerance does
+not weaken it: a rule recorded for a 100 W threshold against the CLI's 90 W
+still fails at every compared instant. The warning names the half that actually
+diverged — `gpu:computing:bool` (check `THRESHOLD_WATTS` and the threshold in
+`gpu_compute_rules.yaml`) or `gpu:computing_workload:bool` (check the
+power-and-slot expression; the warning states that the threshold is not the
+cause). `rule_cross_check` itself keeps its stable `compared_samples` /
+`mismatches` keys either way.
 
 Exit codes: `0` success, `1` unexpected error, `2` invalid arguments,
 `3` Prometheus unreachable or answering with an error, `4` no observed samples

@@ -41,6 +41,7 @@ issues for a single window from one file.
 | `llama_slots_sample_timestamp_seconds.json` | `llama_slots_sample_timestamp_seconds` | authored |
 | `gpu_computing_workload_bool.json` | `gpu:computing_workload:bool` | authored |
 | `window_with_gap.json` | all of the above | mixed |
+| `window_rules_jitter.json` | all of the above | captured live |
 
 ## How the live captures were made
 
@@ -83,6 +84,23 @@ Do not over-fit tests to these values: they exist to pin the *shape* and the
 gap semantics, not to be a golden readout of real hardware behaviour. When the
 sibling children land, re-capture the real series with the command above and
 replace the authored files.
+
+## The jitter bundle
+
+`window_rules_jitter.json` is a second full bundle (same shape: `capture` plus
+`responses`), captured live over **2026-11-02T05:25:00Z .. 05:45:00Z** — a
+20-minute slice of the worst-case window measured on 2026-11-06
+(LP-0MW5K8YWG0069ZD8). Fifteen of its 81 instants break a naive same-instant
+equality between the recorded rules and a local recomputation, because the
+rules were evaluated a sample earlier than the raw series the CLI queries.
+
+That is the point of the file: it pins the staleness-aware rule cross-check
+(`scripts/gpu_utilisation.py` § `staleness_candidates`), which must report zero
+mismatches over it. Do **not** "fix" the values to satisfy
+`test_bundle_slot_occupancy_matches_the_workload_definition` — that equality
+holds only for the authored `window_with_gap.json`, where the workload stream
+was derived from the same timestamps; real recordings do not have it, and the
+cross-check exists precisely because they do not.
 
 ## The deliberate gap
 
