@@ -70,7 +70,12 @@ from proxy.local_route_starvation import (
     LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN,
     record_local_route_arm,
 )
-from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
+
+# ``_coerce_enabled`` is reused deliberately (LP-0MW81DJZ60049X5W): it is the
+# *single* enable-switch vocabulary (bool / 0-1 / "true"|"false"|"yes"|"no"|"on"|
+# "off") shared by the operator-facing rollback switches, so a second copy in
+# this module could drift from it.
+from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON, _coerce_enabled
 from proxy.observability import (
     _arm_local_backend_unreachable,
     _is_connection_refused,
@@ -2555,6 +2560,20 @@ class _RoutingEstimateCache:
 #: resident in the session's slot. ``0`` disables the gate entirely.
 RESIDENT_PREFIX_MIN_RATIO_DEFAULT: float = 0.5
 
+#: Single rollback switch for the unmeasured-cold enforcement
+#: (LP-0MW81DFML006O5KL → rollback added by LP-0MW81DJZ60049X5W):
+#: ``server.local_unmeasured_residency_cold_enabled``. Unset/``true`` (the
+#: shipped default, matching the intended post-rollout behaviour) keeps an
+#: *unmeasured* prefix residency cold, so a prompt above the cold threshold
+#: falls through to the remote chain. ``false`` (or ``0``) restores the
+#: pre-change behaviour byte-for-byte: an unmeasured basis degrades to the
+#: predicted sidecar ratio, logging ``admit_predicted`` / ``skip_predicted``,
+#: exactly as before LP-0MW81DFML006O5KL. One value, no code revert.
+UNMEASURED_RESIDENCY_COLD_ENABLED_KEY: str = (
+    "local_unmeasured_residency_cold_enabled"
+)
+UNMEASURED_RESIDENCY_COLD_ENABLED_DEFAULT: bool = True
+
 #: Skip reason emitted when a large prompt's measured reusable prefix is below
 #: `local_resident_prefix_min_ratio`.
 SKIP_REASON_RESIDENT_PREFIX: str = "resident_prefix_insufficient"
@@ -2797,6 +2816,39 @@ def _effective_resident_prefix_min_ratio(config: dict | None) -> float:
     if value <= 0.0:
         return 0.0
     return min(1.0, value)
+
+
+def _unmeasured_residency_cold_enabled(config: dict | None) -> bool:
+    """Resolve ``local_unmeasured_residency_cold_enabled`` (default ``True``).
+
+    The single rollback for the *unmeasured is cold* enforcement
+    (LP-0MW81DFML006O5KL, rollback LP-0MW81DJZ60049X5W). ``True`` (the shipped
+    default, i.e. the intended post-rollout behaviour) denies local admission
+    to a prompt above the cold threshold whose prefix residency could not be
+    measured; ``False`` restores the pre-change behaviour byte-for-byte — the
+    predicted sidecar ratio decides, and the decision logs
+    ``admit_predicted`` / ``skip_predicted`` again.
+
+    Accepts both the nested (``server:``) and flat forms, like the other
+    routing readers, and shares the enable-switch vocabulary with the other
+    operator rollbacks (``_coerce_enabled``). A missing value keeps the
+    default; an unusable (malformed) value also keeps the default — the
+    enforcement is the intended behaviour, so a typo must not silently
+    disable it.
+    """
+    candidates: list[Any] = []
+    if isinstance(config, dict):
+        server_cfg = config.get("server", config)
+        if isinstance(server_cfg, dict):
+            candidates.append(server_cfg.get(UNMEASURED_RESIDENCY_COLD_ENABLED_KEY))
+        candidates.append(config.get(UNMEASURED_RESIDENCY_COLD_ENABLED_KEY))
+    for value in candidates:
+        if value is None:
+            continue
+        coerced = _coerce_enabled(value)
+        if coerced is not None:
+            return coerced
+    return UNMEASURED_RESIDENCY_COLD_ENABLED_DEFAULT
 
 
 def _session_owns_slot(session_id: str | None, endpoint: str | None = None) -> int | None:
@@ -3193,6 +3245,7 @@ def _should_skip_local(
     endpoint: str | None = None,
     session_tenants: int | None = None,
     tenancy_idle_seconds: float | None = None,
+    unmeasured_cold_enabled: bool = True,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -3244,7 +3297,12 @@ def _should_skip_local(
        snapshot and no ownership, or a probe that raised), the prediction may
        not make the prompt cheap: skip with
        :data:`SKIP_REASON_UNMEASURED_COLD` and let the remote chain serve it
-       (LP-0MW81DFML006O5KL);
+       (LP-0MW81DFML006O5KL). The single rollback switch
+       *unmeasured_cold_enabled* (``server
+       .local_unmeasured_residency_cold_enabled``, default ``True``) restores
+       the pre-change behaviour: an unmeasured basis degrades to the predicted
+       sidecar ratio and logs ``admit_predicted`` / ``skip_predicted`` again
+       (LP-0MW81DJZ60049X5W);
     3. **resident-prefix gate** — admit only when the session's *measured*
        reusable prefix (live `/slots` `context_tokens`, else the session's last
        measured dispatch — see `resolve_resident_prefix`) is at least
@@ -3275,6 +3333,13 @@ def _should_skip_local(
         residency_view: Pre-built residency view (``proxy.residency``); built
             on demand when omitted.
         endpoint: Local llama-server endpoint scope.
+        unmeasured_cold_enabled: The single rollback for the *unmeasured is
+            cold* enforcement (``server
+            .local_unmeasured_residency_cold_enabled``, default ``True``).
+            ``False`` restores the pre-change predicted-ratio decision and its
+            ``admit_predicted`` / ``skip_predicted`` log lines, byte-for-byte
+            (LP-0MW81DJZ60049X5W). Only consulted when
+            ``resident_prefix_min_ratio`` > 0.
 
     Returns:
         A tuple ``(skip, reason)`` where:
@@ -3308,6 +3373,13 @@ def _should_skip_local(
     # tenancy rung then still applies with its own knob, since tenancy is an
     # independent bound on how many distinct sessions may hold the pool.
     facts = None
+    # Set when the residency view could not measure anything (no fresh
+    # snapshot and no ownership) *and* the unmeasured-cold enforcement has been
+    # rolled back. The ladder then fails open to the predicted ratio, but the
+    # *decision* must still be logged with an explicit ``n_past_actual=none``
+    # so residency-blind admissions are visible in the usage report instead of
+    # vanishing (AC5 — LP-0MVN4LANP0069QQM).
+    unmeasured_facts = None
 
     # Every rung logs through the same decision line, carrying both token
     # thresholds so the *applied* one is auditable (LP-0MW81DHPH00650NY AC1):
@@ -3336,23 +3408,30 @@ def _should_skip_local(
             model_name=model_name,
         )
         if facts.source == RESIDENCY_SOURCE_UNKNOWN:
-            # Unmeasured is COLD (LP-0MW81DFML006O5KL). With no measurement of
-            # the session's reusable prefix the predicted sidecar ratio cannot
-            # make this prompt cheap: on 2026-11-07 20:48:51 a 55 492-token
-            # prompt was priced ``cached_ratio=1.00 / new_tokens=172``,
-            # admitted at ``eta_prefill_s=130.8`` and evicted at 180.1 s —
-            # immediately after the probe measured nothing
-            # (``residency_source=non_resident``/``unknown``,
-            # ``measurement=unavailable:*``). The cold threshold therefore
-            # governs, so the prompt falls through to the remote chain with an
-            # explicit reason rather than being admitted locally on a guess.
-            # The denial is logged through the same decision line as every
-            # other rung, so an unmeasured 55k skip is attributable.
-            _log_decision(
-                SKIP_REASON_UNMEASURED_COLD, facts, resident_prefix_min_ratio
-            )
-            return (True, SKIP_REASON_UNMEASURED_COLD)
-        if not facts.resident:
+            if unmeasured_cold_enabled:
+                # Unmeasured is COLD (LP-0MW81DFML006O5KL). With no
+                # measurement of the session's reusable prefix the predicted
+                # sidecar ratio cannot make this prompt cheap: on 2026-11-07
+                # 20:48:51 a 55 492-token prompt was priced ``cached_ratio=1.00
+                # / new_tokens=172``, admitted at ``eta_prefill_s=130.8`` and
+                # evicted at 180.1 s — immediately after the probe measured
+                # nothing (``residency_source=non_resident``/``unknown``,
+                # ``measurement=unavailable:*``). The cold threshold therefore
+                # governs, so the prompt falls through to the remote chain with
+                # an explicit reason rather than being admitted on a guess.
+                # The denial is logged through the same decision line as every
+                # other rung, so an unmeasured 55k skip is attributable.
+                _log_decision(
+                    SKIP_REASON_UNMEASURED_COLD, facts, resident_prefix_min_ratio
+                )
+                return (True, SKIP_REASON_UNMEASURED_COLD)
+            # ROLLBACK (LP-0MW81DJZ60049X5W): one config value restores the
+            # pre-change behaviour byte-for-byte — no fresh measurement and no
+            # ownership degrade to the predicted-ratio decision, logged as
+            # ``admit_predicted`` / ``skip_predicted`` below.
+            unmeasured_facts = facts
+            facts = None
+        elif not facts.resident:
             # Fresh view, no slot of its own: the resident prefix is measured
             # at zero, so no prediction can make this prompt cheap.
             _log_decision(
@@ -3413,6 +3492,10 @@ def _should_skip_local(
     )
     new_tokens = int(estimated_tokens * (1 - ratio))
     if new_tokens <= cold_cache_threshold:
+        if unmeasured_facts is not None:
+            _log_decision(
+                DECISION_ADMIT_PREDICTED, unmeasured_facts, resident_prefix_min_ratio
+            )
         return (False, None)
 
     # Economic cold-cache bypass (large_context_bypass)
@@ -3420,8 +3503,16 @@ def _should_skip_local(
         # Active mode profile recovers economic bypasses locally. The
         # contention queue (if enabled) will wait for a slot when all are
         # busy.
+        if unmeasured_facts is not None:
+            _log_decision(
+                DECISION_ADMIT_PREDICTED, unmeasured_facts, resident_prefix_min_ratio
+            )
         return (False, None)
 
+    if unmeasured_facts is not None:
+        _log_decision(
+            DECISION_SKIP_PREDICTED, unmeasured_facts, resident_prefix_min_ratio
+        )
     return (True, "large_context_bypass")
 
 
@@ -7446,6 +7537,7 @@ async def _queue_context_bypass(
         warm_cache_threshold=_warm_threshold,
         economic_bypass_serves_local=_recover_economic,
         resident_prefix_min_ratio=_effective_resident_prefix_min_ratio(config),
+        unmeasured_cold_enabled=_unmeasured_residency_cold_enabled(config),
         endpoint=endpoint,
         session_tenants=_resolve_tenants(config),
         tenancy_idle_seconds=_resolve_tenancy_idle(config),
@@ -15569,6 +15661,12 @@ async def _proxy_with_fallback_cycle(
                 # medium uses the merged base config flag (absent — false).
                 _recover_economic = _economic_bypass_serves_local(config, _priority)
                 _resident_min_ratio = _effective_resident_prefix_min_ratio(config)
+                # The single unmeasured-cold rollback (LP-0MW81DJZ60049X5W),
+                # resolved once next to the ratio it modifies; the compaction
+                # re-check below reuses the same value.
+                _unmeasured_cold_enabled = _unmeasured_residency_cold_enabled(
+                    config
+                )
                 _session_tenants = _resolve_tenants(config)
                 _tenancy_idle = _resolve_tenancy_idle(config)
                 _skip_local, _skip_reason = _should_skip_local(
@@ -15580,6 +15678,7 @@ async def _proxy_with_fallback_cycle(
                     warm_cache_threshold=_warm_threshold,
                     economic_bypass_serves_local=_recover_economic,
                     resident_prefix_min_ratio=_resident_min_ratio,
+                    unmeasured_cold_enabled=_unmeasured_cold_enabled,
                     endpoint=local_endpoint,
                     session_tenants=_session_tenants,
                     tenancy_idle_seconds=_tenancy_idle,
@@ -15872,6 +15971,7 @@ async def _proxy_with_fallback_cycle(
                             warm_cache_threshold=_warm_threshold,
                             economic_bypass_serves_local=_recover_economic,
                             resident_prefix_min_ratio=_resident_min_ratio,
+                            unmeasured_cold_enabled=_unmeasured_cold_enabled,
                             endpoint=local_endpoint,
                             session_tenants=_session_tenants,
                             tenancy_idle_seconds=_tenancy_idle,

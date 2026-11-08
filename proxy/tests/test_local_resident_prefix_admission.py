@@ -170,6 +170,7 @@ def _gate(
     view=None,
     cold_threshold: int = COLD_THRESHOLD,
     warm_threshold: int = 0,
+    unmeasured_cold_enabled: bool = True,
     monkeypatch: pytest.MonkeyPatch | None = None,
 ):
     """Run the local admission ladder as the router does for a large prompt."""
@@ -185,6 +186,7 @@ def _gate(
         estimated_tokens=estimated_tokens,
         warm_cache_threshold=warm_threshold,
         resident_prefix_min_ratio=min_ratio,
+        unmeasured_cold_enabled=unmeasured_cold_enabled,
         residency_view=view,
     )
 
@@ -342,6 +344,112 @@ def test_unknown_state_denies_cold_work(monkeypatch):
     assert (skip_cold, reason_cold) == (
         True, provider.SKIP_REASON_UNMEASURED_COLD
     )
+
+
+# ---------------------------------------------------------------------------
+# AC5 rollback — one config flag restores the pre-change decision
+# (LP-0MW81DJZ60049X5W)
+# ---------------------------------------------------------------------------
+
+#: The single rollback switch for the unmeasured-cold enforcement.
+UNMEASURED_COLD_FLAG = "local_unmeasured_residency_cold_enabled"
+
+
+def _unmeasured_view(monkeypatch):
+    """A stale snapshot with no ownership ⇒ prefix residency is ``unknown``."""
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+    return _view(
+        slots=[_slot(0, None)],
+        owners={},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+        monkeypatch=monkeypatch,
+    )
+
+
+def test_unmeasured_cold_rollback_flag_restores_the_predicted_decision(monkeypatch):
+    """A 55k unmeasured prompt: cold by default, predicted with the rollback.
+
+    AC2 of LP-0MW81DJZ60049X5W pins both halves: unset (the shipped default)
+    keeps the LP-0MW81DFML006O5KL enforcement, and the single rollback flag
+    restores the *pre-change* decision byte-for-byte — the 55 492-token /
+    ``new_tokens=172`` case that motivated the change is admitted again on the
+    predicted ratio.
+    """
+    view = _unmeasured_view(monkeypatch)
+
+    # Shipped default: nothing was measured, so the cold threshold governs and
+    # the predicted sidecar ratio cannot make the prompt cheap.
+    assert _gate(
+        view=view,
+        estimated_tokens=55_000,
+        predicted_ratio=1.0,
+        monkeypatch=monkeypatch,
+    ) == (True, provider.SKIP_REASON_UNMEASURED_COLD)
+
+    # Rollback: one value restores the pre-change predicted-ratio decision,
+    # with both of its verdicts (predicted-warm admit / predicted-cold bypass).
+    rollback = provider._unmeasured_residency_cold_enabled(
+        {"server": {UNMEASURED_COLD_FLAG: False}}
+    )
+    assert rollback is False
+    assert _gate(
+        view=view,
+        estimated_tokens=55_000,
+        predicted_ratio=1.0,
+        unmeasured_cold_enabled=rollback,
+        monkeypatch=monkeypatch,
+    ) == (False, None)
+    assert _gate(
+        view=view,
+        estimated_tokens=55_000,
+        predicted_ratio=0.0,
+        unmeasured_cold_enabled=rollback,
+        monkeypatch=monkeypatch,
+    ) == (True, "large_context_bypass")
+
+
+def test_unmeasured_cold_rollback_restores_the_predicted_log_line(caplog, monkeypatch):
+    """The rollback also restores the pre-change decision *line* (``admit_predicted``)."""
+    import logging
+
+    view = _unmeasured_view(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, _ = _gate(
+            view=view,
+            estimated_tokens=55_000,
+            predicted_ratio=1.0,
+            unmeasured_cold_enabled=False,
+            monkeypatch=monkeypatch,
+        )
+
+    assert skip is False
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == provider.DECISION_ADMIT_PREDICTED
+    assert event.n_past_actual is None
+    assert event.residency_source == provider.RESIDENCY_SOURCE_UNKNOWN
+
+
+def test_unmeasured_cold_flag_config_resolution():
+    """The rollback flag defaults on and reads both nested and flat forms."""
+    resolve = provider._unmeasured_residency_cold_enabled
+
+    # Default = the intended post-rollout behaviour: enforcement ON.
+    assert resolve(None) is True
+    assert resolve({}) is True
+    assert resolve({"server": {}}) is True
+
+    # Shipped (nested ``server:``) form, as a YAML bool and as 0/1.
+    assert resolve({"server": {UNMEASURED_COLD_FLAG: False}}) is False
+    assert resolve({"server": {UNMEASURED_COLD_FLAG: 0}}) is False
+    assert resolve({"server": {UNMEASURED_COLD_FLAG: True}}) is True
+
+    # Flat form (single-level configs and tests).
+    assert resolve({UNMEASURED_COLD_FLAG: False}) is False
+    assert resolve({UNMEASURED_COLD_FLAG: "false"}) is False
+
+    # A malformed value keeps the default rather than silently rolling back.
+    assert resolve({"server": {UNMEASURED_COLD_FLAG: "nonsense"}}) is True
 
 
 def test_stale_snapshot_is_unknown(monkeypatch):

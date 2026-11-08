@@ -40,6 +40,7 @@ from proxy.provider import (
     RESIDENCY_SOURCE_UNKNOWN,
     THRESHOLD_APPLIED_VOCABULARY,
     _effective_resident_prefix_min_ratio,
+    _unmeasured_residency_cold_enabled,
 )
 from proxy.router_helpers import (
     DEFAULT_TENANCY_IDLE_SECONDS,
@@ -58,6 +59,10 @@ NEW_KNOBS = (
     "local_session_tenants",
     "local_session_tenancy_idle_seconds",
 )
+
+#: Single rollback switch for the unmeasured-cold enforcement
+#: (LP-0MW81DJZ60049X5W), documented beside the residency knobs above.
+UNMEASURED_COLD_KEY = "local_unmeasured_residency_cold_enabled"
 
 DOC_PATHS = (ROUTING_DOC, CACHED_RATIO_DOC, SLOT_DESIGN_DOC)
 
@@ -93,6 +98,34 @@ def test_ratio_zero_disables_the_gate_in_the_reader():
     assert _effective_resident_prefix_min_ratio(
         {"server": {"local_resident_prefix_min_ratio": 0}}
     ) == 0.0
+
+
+def test_unmeasured_cold_rollback_is_documented_and_shipped_enabled():
+    """AC1/AC3 (LP-0MW81DJZ60049X5W): the rollback ships documented and ON.
+
+    The unmeasured-cold enforcement's single rollback switch must be visible in
+    the shipped config (an operator reads ``proxy/config.yaml``, not the
+    source), its documented default must be the intended post-rollout
+    behaviour, and the reader must agree with the shipped value.
+    """
+    server = _server_config()
+    text = CONFIG_PATH.read_text()
+
+    assert server[UNMEASURED_COLD_KEY] is True
+    assert _unmeasured_residency_cold_enabled({"server": server}) is True
+    # The documented rollback is the reader's behaviour, not just a comment.
+    assert (
+        _unmeasured_residency_cold_enabled(
+            {"server": {UNMEASURED_COLD_KEY: False}}
+        )
+        is False
+    )
+    # The rollback statement sits in the knob's own comment block, so an
+    # operator looking at the key sees how to undo it (AC1).
+    index = text.index(f"{UNMEASURED_COLD_KEY}:")
+    block = text[max(0, index - 4000):index].lower()
+    assert "rollback" in block
+    assert "predicted" in block
 
 
 def test_tenancy_default_is_the_shipped_slot_count():

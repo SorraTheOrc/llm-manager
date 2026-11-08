@@ -1534,7 +1534,10 @@ server:
   # - Fail-open: a missing/stale snapshot, a session that owns no slot, or a
   #   build that does not report `context_tokens` (llama.cpp b8782 dropped
   #   `n_past`) degrades to the session-owns-slot check and then to the
-  #   predicted ratio — never to a hard local outage.
+  #   predicted ratio — never to a hard local outage. An *unmeasured* basis is
+  #   now COLD (LP-0MW81DFML006O5KL, see
+  #   `local_unmeasured_residency_cold_enabled` below); that one key restores
+  #   the predicted-ratio rung documented here.
   # - Live-prefix pricing (AC3): when the measurement is available, the
   #   cold-token cap (`local_large_context_cold_cache_threshold`, 25k from
   #   LP-0MVN3KMGI009BZ0D once shipped) is evaluated against the *measured*
@@ -1542,6 +1545,31 @@ server:
   #
   # Default: 0.5 (50 % of the prompt must still be resident).
   local_resident_prefix_min_ratio: 0.5
+
+  # Unmeasured is COLD (LP-0MW81DFML006O5KL) and its SINGLE rollback
+  # (LP-0MW81DJZ60049X5W). When no measurement of the session's reusable prefix
+  # exists (`residency_source=unknown`: no fresh `/slots` snapshot *and* no slot
+  # ownership, or a probe that raised), the predicted cache ratio is NOT
+  # trusted: a prompt above `local_large_context_cold_cache_threshold` skips
+  # local with reason `unmeasured_residency_cold` and follows the normal remote
+  # chain. The 2026-11-07 20:48:51 case — a 55 492-token prompt priced
+  # `cached_ratio=1.00 / new_tokens=172`, admitted at `eta_prefill_s=130.8` and
+  # evicted at 180.1 s — was admitted precisely because nothing had been
+  # measured. The denial is deliberately NOT idle-overridable (it reports a
+  # missing measurement, not a price an idle GPU can beat); `local_last_resort_*`
+  # stays the final local override when no remote can serve the request.
+  #
+  # ROLLBACK — one value, byte-for-byte: set
+  # `local_unmeasured_residency_cold_enabled: false`. The pre-change behaviour
+  # returns exactly: an unmeasured basis degrades to the predicted sidecar
+  # ratio and logs `decision=admit_predicted` / `decision=skip_predicted` with
+  # `n_past_actual=none`, as before LP-0MW81DFML006O5KL. No code revert and no
+  # extra restart-ordering constraint beyond the usual process restart.
+  # `false` / `0` / `off` are all accepted; a missing or malformed value keeps
+  # the default (a typo never silently disables the enforcement).
+  #
+  # Default: true — the intended post-rollout behaviour (unmeasured is cold).
+  local_unmeasured_residency_cold_enabled: true
 
   # Session tenancy bound (LP-0MVN1IQTF0037WTG AC2). Per-request dispatch
   # leases bound *in-flight* requests but not *which* sessions occupy the
