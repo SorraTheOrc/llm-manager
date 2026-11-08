@@ -471,6 +471,14 @@ async def test_cheap_mode_economic_bypass_serves_local(mixed_model_config, caplo
     cfg = _queue_cfg(
         local_large_context_cold_cache_threshold=100,
         local_large_context_warm_cache_threshold=100_000,
+        # Isolate the economic band. The synthetic request has no residency
+        # measurement, which the residency ladder now treats as cold
+        # (``unmeasured_residency_cold``, LP-0MW81DFML006O5KL) and would deny
+        # before the economic rung is reached; ``0`` is the documented rollback
+        # that restores the predicted-ratio decision this test pins
+        # (``proxy/tests/test_local_resident_prefix_admission.py`` covers the
+        # ladder and its interplay with the queue).
+        local_resident_prefix_min_ratio=0,
         local_large_context_economic_bypass_serves_local=True,
     )
 
@@ -513,6 +521,14 @@ async def test_cheap_mode_economic_bypass_queues_when_busy(mixed_model_config):
     cfg = _queue_cfg(
         local_large_context_cold_cache_threshold=100,
         local_large_context_warm_cache_threshold=100_000,
+        # Isolate the economic band. The synthetic request has no residency
+        # measurement, which the residency ladder now treats as cold
+        # (``unmeasured_residency_cold``, LP-0MW81DFML006O5KL) and would deny
+        # before the economic rung is reached; ``0`` is the documented rollback
+        # that restores the predicted-ratio decision this test pins
+        # (``proxy/tests/test_local_resident_prefix_admission.py`` covers the
+        # ladder and its interplay with the queue).
+        local_resident_prefix_min_ratio=0,
         local_large_context_economic_bypass_serves_local=True,
     )
 
@@ -570,6 +586,9 @@ async def test_fast_mode_economic_bypass_falls_back_remote(
     cfg = _queue_cfg(
         local_large_context_cold_cache_threshold=100,
         local_large_context_warm_cache_threshold=100_000,
+        # See ``test_cheap_mode_economic_bypass_serves_local``: the residency
+        # ladder is disabled so the economic rung is the one under test.
+        local_resident_prefix_min_ratio=0,
     )
 
     with (

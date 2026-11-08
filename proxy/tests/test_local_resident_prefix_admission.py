@@ -311,11 +311,14 @@ def test_unknown_context_tokens_without_ownership_with_fresh_view_rejects(monkey
     assert reason_cached == SKIP_RESIDENT_PREFIX
 
 
-def test_unknown_state_falls_back_to_prediction(monkeypatch):
-    """No fresh view and no ownership ⇒ today's predicted-ratio decision.
+def test_unknown_state_denies_cold_work(monkeypatch):
+    """No fresh view and no ownership ⇒ the prompt is *unmeasured*, hence cold.
 
-    Fail-open: a stale/missing snapshot must never become a hard local
-    outage for a session the ownership registry knows nothing about.
+    LP-0MW81DFML006O5KL retired the fail-open fallback here: a stale/missing
+    snapshot with no ownership used to be decided by the predicted sidecar
+    ratio (the 2026-11-07 55 492-token / ``new_tokens=172`` admission). The
+    prediction is now irrelevant — the cold threshold governs and the prompt
+    follows the remote chain with an explicit reason.
     """
     from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
 
@@ -333,9 +336,12 @@ def test_unknown_state_falls_back_to_prediction(monkeypatch):
         view=view, predicted_ratio=0.0, monkeypatch=monkeypatch
     )
 
-    assert (skip_cached, reason_cached) == (False, None)
-    assert skip_cold is True
-    assert reason_cold == "large_context_bypass"
+    assert (skip_cached, reason_cached) == (
+        True, provider.SKIP_REASON_UNMEASURED_COLD
+    )
+    assert (skip_cold, reason_cold) == (
+        True, provider.SKIP_REASON_UNMEASURED_COLD
+    )
 
 
 def test_stale_snapshot_is_unknown(monkeypatch):
@@ -941,11 +947,19 @@ def _gate_with_tenancy(*, session_id, tenants=2, idle_seconds=30.0, view=None,
 def test_ladder_denies_a_third_session_with_tenant_limit(monkeypatch):
     """Two live tenants hold the pool ⇒ a third session's prompt falls through.
 
-    The residency view is unknown here (the case the gate fails open on), so
-    tenancy is the rung that keeps a newcomer from evicting a resident.
+    The newcomer owns a slot with a measured resident prefix, so it passes the
+    residency gate and reaches the tenancy rung — the rung that keeps it from
+    evicting a resident. A genuinely *unmeasured* newcomer never gets this far:
+    it is denied earlier with ``unmeasured_residency_cold``
+    (LP-0MW81DFML006O5KL). The newcomer's slot is not ``is_processing``, so it
+    is not one of the occupants the bound counts.
     """
     _install_tenancy(["sess-a", "sess-b"])
-    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+    view = _view(
+        slots=[_slot(0, EST_TOKENS, processing=False)],
+        owners={("", 0): "sess-c"},
+        monkeypatch=monkeypatch,
+    )
 
     skip, reason = _gate_with_tenancy(
         session_id="sess-c", view=view, monkeypatch=monkeypatch
@@ -976,7 +990,11 @@ def test_ladder_admits_when_tenant_idle_lapsed(monkeypatch):
     # Live leases (unexpired) whose last activity is 5 s old: they lapse on a
     # 1 s idle bound but not on the default 30 s one.
     _install_tenancy(["sess-a", "sess-b"], age=5.0)
-    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+    view = _view(
+        slots=[_slot(0, EST_TOKENS, processing=False)],
+        owners={("", 0): "sess-c"},
+        monkeypatch=monkeypatch,
+    )
 
     skip, reason = _gate_with_tenancy(
         session_id="sess-c",
@@ -985,17 +1003,19 @@ def test_ladder_admits_when_tenant_idle_lapsed(monkeypatch):
         monkeypatch=monkeypatch,
     )
 
-    # The tenancy rung released the pool; what remains is the (separately
-    # covered) cold-pricing decision, never a `tenant_limit` denial.
-    assert reason != SKIP_TENANT_LIMIT
-    assert reason == "large_context_bypass"
+    # The tenancy rung released the pool and the newcomer's own prefix is
+    # measured resident, so the prompt is served locally.
+    assert (skip, reason) == (False, None)
 
 
 def test_tenancy_bound_disabled_with_zero(monkeypatch):
     """``local_session_tenants: 0`` disables the bound in the ladder."""
     _install_tenancy(["sess-a", "sess-b", "sess-c"])
-    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
-    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.99)
+    view = _view(
+        slots=[_slot(0, EST_TOKENS, processing=False)],
+        owners={("", 0): "sess-d"},
+        monkeypatch=monkeypatch,
+    )
 
     skip, reason = _gate_with_tenancy(
         session_id="sess-d", tenants=0, view=view, monkeypatch=monkeypatch
@@ -1315,7 +1335,11 @@ def test_tenant_denial_logging_is_parseable(caplog, monkeypatch):
     import logging
 
     _install_tenancy(["sess-a", "sess-b"])
-    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+    view = _view(
+        slots=[_slot(0, EST_TOKENS, processing=False)],
+        owners={("", 0): "sess-c"},
+        monkeypatch=monkeypatch,
+    )
 
     with caplog.at_level(logging.INFO, logger="llama-proxy"):
         skip, reason = _gate_with_tenancy(
@@ -1361,14 +1385,17 @@ def test_non_resident_denial_logs_no_ratio(caplog, monkeypatch):
     assert event.reuse_ratio is None, "a non-measurement must not be logged as 0.0"
 
 
-def test_unknown_state_logs_no_ratio(caplog, monkeypatch):
-    """Genuinely unknown state (stale view, no ownership) also logs ``none``.
+def test_unknown_state_denial_logs_its_basis(caplog, monkeypatch):
+    """Genuinely unknown state logs ``none`` for the ratio and *why* it is unknown.
 
-    LP-0MVN4LANP0069QQM closed the gap this test used to document: the
-    fail-open path (no fresh snapshot, no ownership) *does* emit the decision
-    line — with ``n_past_actual=none`` and ``reuse_ratio=none`` — so a
-    residency-blind admission is visible in the usage report instead of
-    vanishing. Asserted through the ladder, not through a direct call.
+    LP-0MVN4LANP0069QQM made residency-blind decisions observable;
+    LP-0MW81DFML006O5KL changed their verdict from an admit to an explicit
+    ``unmeasured_residency_cold`` denial. The line therefore records the basis
+    (``residency_source=unknown`` / ``measurement=unavailable:stale_view``)
+    and the decision, so any unmeasured 55k skip is explainable from the log,
+    and no ``reuse_ratio`` is fabricated for a non-measurement
+    (LP-0MVNPZY22008B536). Asserted through the ladder, not through a direct
+    call.
     """
     import logging
 
@@ -1384,49 +1411,19 @@ def test_unknown_state_logs_no_ratio(caplog, monkeypatch):
     with caplog.at_level(logging.INFO, logger="llama-proxy"):
         skip, reason = _gate(view=view, predicted_ratio=0.99, monkeypatch=monkeypatch)
 
-    assert (skip, reason) == (False, None)
+    assert (skip, reason) == (True, provider.SKIP_REASON_UNMEASURED_COLD)
     event = _parse_logged_caught(caplog, "routing_resident_prefix")
     assert event.residency_source == "unknown"
-    assert event.decision == provider.DECISION_ADMIT_PREDICTED
+    assert event.decision == provider.SKIP_REASON_UNMEASURED_COLD
     assert event.n_past_actual is None
     assert event.reuse_ratio is None, "a non-measurement must not be logged as 0.0"
-
-
-def test_unknown_state_denial_logs_the_predicted_decision(caplog, monkeypatch):
-    """A fail-open *denial* is logged too, at INFO with ``n_past_actual=none``.
-
-    AC5 requires every admission/denial decision to be observable; before
-    LP-0MVN4LANP0069QQM the residency-blind denial was invisible, so the
-    usage report could not distinguish "no residency measurement" from "no
-    large prompts at all".
-    """
-    import logging
-
-    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
-
-    view = _view(
-        slots=[_slot(0, None)],
-        owners={},
-        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
-        monkeypatch=monkeypatch,
-    )
-
-    with caplog.at_level(logging.INFO, logger="llama-proxy"):
-        skip, reason = _gate(view=view, predicted_ratio=0.0, monkeypatch=monkeypatch)
-
-    assert skip is True
-    assert reason == "large_context_bypass"
-    event = _parse_logged_caught(caplog, "routing_resident_prefix")
-    assert event.residency_source == "unknown"
-    assert event.decision == provider.DECISION_SKIP_PREDICTED
-    assert event.n_past_actual is None
-    assert event.reuse_ratio is None
 
 
 def test_decision_line_is_logged_at_info(caplog, monkeypatch):
     """The decision line rides INFO — the level the usage report parses.
 
-    Asserted on the fail-open path, which had emitted no line at all.
+    Asserted on the unmeasured-cold denial, the path whose verdict changed in
+    LP-0MW81DFML006O5KL.
     """
     import logging
 
@@ -1440,17 +1437,17 @@ def test_decision_line_is_logged_at_info(caplog, monkeypatch):
     )
 
     with caplog.at_level(logging.INFO, logger="llama-proxy"):
-        _gate(view=view, predicted_ratio=0.0, monkeypatch=monkeypatch)
+        _gate(view=view, predicted_ratio=0.99, monkeypatch=monkeypatch)
 
     records = [
         r for r in caplog.records if "routing_resident_prefix" in r.getMessage()
     ]
-    assert records, "the fail-open decision must be logged"
+    assert records, "the unmeasured-cold decision must be logged"
     assert all(r.levelno == logging.INFO for r in records)
 
 
 def test_measured_path_still_emits_one_line(caplog, monkeypatch):
-    """The fail-open logging never doubles up on the measured path."""
+    """The unmeasured-cold logging never doubles up on the measured path."""
     import logging
 
     view = _view(
@@ -1725,7 +1722,11 @@ def test_tenancy_denial_leaves_the_contention_queue_budget_alone(monkeypatch):
         raise AssertionError("the admission ladder must not consult the queue")
 
     _install_tenancy(["sess-a", "sess-b"])
-    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+    view = _view(
+        slots=[_slot(0, EST_TOKENS, processing=False)],
+        owners={("", 0): "sess-c"},
+        monkeypatch=monkeypatch,
+    )
     monkeypatch.setattr(provider, "evaluate_admission", _boom, raising=False)
     monkeypatch.setattr("proxy.prefill_eta.evaluate_admission", _boom)
 

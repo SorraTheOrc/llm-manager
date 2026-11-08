@@ -45,21 +45,11 @@ snapshot (``observability._last_slot_details_cache`` /
 ``proxy.measured_prefill`` store. The autouse fixtures reset all three, so
 every cell runs in isolation and in any order.
 
-Red-first encoding (repository convention): the cells that pin behaviour the
-implementation item (child 2) has not landed yet carry
-``pytest.mark.xfail(strict=True)``. They are genuinely red today — run them
-without the marker to see the unmeasured 55k admission — and ``strict=True``
-means child 2 **must** remove the marker once the enforcement lands: an xfail
-that starts passing is a suite failure, never a silent pass. The remaining
-cells already hold and are unmarked, so they guard against over-denial (an
-unmeasured 30k prompt, the 38 000 boundary, every measured-resident source and
-the 120 000 warm cap) while the pinned cells await child 2.
-
-Note for child 2: ``test_unknown_state_falls_back_to_prediction`` in
-``test_local_resident_prefix_admission.py`` pins the **retired** fail-open
-behaviour this matrix replaces; it is the one existing test expected to change
-when the enforcement lands (the warm-path and large-context tests are not
-affected).
+Red-first encoding (repository convention): these cells were written
+``pytest.mark.xfail(strict=True)`` while the enforcement was still pending in
+child 2. The enforcement has landed (LP-0MW81DFML006O5KL), so every marker has
+been removed: the whole matrix now asserts the shipped behaviour, and an
+``xfail`` here would mean the rule regressed.
 """
 
 from __future__ import annotations
@@ -72,12 +62,6 @@ from proxy.measured_prefill import MeasuredPrefill
 from proxy import measured_prefill, observability, provider
 from proxy import residency as residency_module
 from proxy import session as session_registry
-
-#: Reason carried by every red-first cell; child 2 removes the markers.
-PENDING_ENFORCEMENT = (
-    "pending LP-0MW81DFML006O5KL (unmeasured residency applies the 38k cold "
-    "threshold); remove this xfail marker when the enforcement lands"
-)
 
 #: Shipped thresholds (``proxy/config.yaml`` server block). The enforcement
 #: must not move them; it only decides which one governs a given basis.
@@ -217,10 +201,10 @@ def _route(
     ),
     [
         pytest.param(
-            "unmeasured", LARGE_PROMPT, WARM_LOOKING_PREDICTION, True, None,
+            "unmeasured", LARGE_PROMPT, WARM_LOOKING_PREDICTION, True,
+            provider.SKIP_REASON_UNMEASURED_COLD,
             provider.RESIDENCY_SOURCE_UNKNOWN,
             id="unmeasured-55k-not-local",
-            marks=pytest.mark.xfail(strict=True, reason=PENDING_ENFORCEMENT),
         ),
         pytest.param(
             "unmeasured", 30_000, WARM_LOOKING_PREDICTION, False, None,
@@ -323,18 +307,10 @@ def test_exactly_the_cold_threshold_still_routes_local(monkeypatch):
         # Predicted cold: the ladder already refuses this today, and must keep
         # refusing it after the enforcement lands (the unmarked control).
         pytest.param(0.0, id="predicted-cold"),
-        pytest.param(
-            WARM_LOOKING_PREDICTION,
-            id="predicted-warm",
-            marks=pytest.mark.xfail(strict=True, reason=PENDING_ENFORCEMENT),
-        ),
+        pytest.param(WARM_LOOKING_PREDICTION, id="predicted-warm"),
         # The "fully cached" extreme the 2026-11-07 incident logged
         # (``cached_ratio=1.00 new_tokens=172``).
-        pytest.param(
-            1.0,
-            id="predicted-fully-cached",
-            marks=pytest.mark.xfail(strict=True, reason=PENDING_ENFORCEMENT),
-        ),
+        pytest.param(1.0, id="predicted-fully-cached"),
     ],
 )
 def test_one_token_above_the_cold_threshold_is_denied_when_unmeasured(
@@ -355,15 +331,62 @@ def test_one_token_above_the_cold_threshold_is_denied_when_unmeasured(
         residency_view=residency_module.get_residency_view(),
     )
 
+    assert (skip, reason) == (True, provider.SKIP_REASON_UNMEASURED_COLD)
+
+
+def test_unmeasured_cold_is_its_own_reason_and_not_economic():
+    """The new denial names a *missing measurement*, not an expensive one.
+
+    A measured-zero denial is an economic miss an idle GPU may still serve
+    (``IDLE_OVERRIDABLE_SKIP_REASONS``); the unmeasured denial is not, because
+    nothing measured the prefix — admitting it locally is exactly the
+    2026-11-07 behaviour this rule removes. The two tokens stay distinct so the
+    log and the usage report can separate the causes.
+    """
+    assert (
+        provider.SKIP_REASON_UNMEASURED_COLD
+        != provider.SKIP_REASON_RESIDENT_PREFIX
+    )
+    assert (
+        provider.SKIP_REASON_UNMEASURED_COLD
+        not in provider.IDLE_OVERRIDABLE_SKIP_REASONS
+    )
+
+
+def test_unmeasured_denial_is_logged_with_its_basis(caplog, monkeypatch):
+    """The denial records why: unknown source, stale view, no measurement."""
+    import logging
+
+    _arrange("unmeasured")
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, _reason = _route(
+            monkeypatch,
+            estimated_tokens=LARGE_PROMPT,
+            predicted_ratio=WARM_LOOKING_PREDICTION,
+            residency_view=residency_module.get_residency_view(),
+        )
+
     assert skip is True
-    assert isinstance(reason, str) and reason
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "routing_resident_prefix" in record.getMessage()
+    ]
+    assert lines, "the unmeasured-cold denial must be logged"
+    line = lines[-1]
+    assert f"decision={provider.SKIP_REASON_UNMEASURED_COLD}" in line
+    assert "residency_source=unknown" in line
+    assert "measurement=unavailable:stale_view" in line
+    assert "n_past_actual=none" in line
+    # No measurement ⇒ no fabricated ratio (LP-0MVNPZY22008B536).
+    assert "reuse_ratio=none" in line
 
 
 # ---------------------------------------------------------------------------
 # AC2 — a probe that cannot answer fails to the cold threshold
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=PENDING_ENFORCEMENT)
 def test_probe_error_fails_to_the_cold_threshold(monkeypatch):
     """A raising residency probe is *unmeasured*, never silently warm.
 
