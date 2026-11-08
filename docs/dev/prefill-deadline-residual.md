@@ -324,3 +324,23 @@ evidence supporting a re-scope:
 - `slot_id` is `unknown` on every post-F4 eviction line, so slot-level
   occupancy (which of the two slots was occupied) cannot be attributed; pool
   level (`local_in_flight_requests`, other-session leases) is used instead.
+
+## 9. Post-change window (same baseline, re-measured after the abandoned-drain fix)
+
+The window above is the **pre-change** baseline. It has now been re-measured
+against a restart-free post-change window on a build containing the
+abandoned-drain starvation fix (`9f3b9c06`, `eac04d96`):
+
+[prefill-deadline-residual-postchange.md](prefill-deadline-residual-postchange.md)
+(`2026-11-06 14:15:56` → `2026-11-07 14:15:56` and the whole 44.73 h
+restart-free span; datasets `prefill-deadline-residual-postchange-*-2026-11-06.json`).
+
+Headline, stated here only as a pointer so that the two windows are never
+confused: user-class `prefill_deadline` + `measured_cache_deficit` falls from
+**5.875/h** to **2.500/h** (24 h) / **1.833/h** (44.73 h) — still 3.7–5× the
+agreed ≤ 0.5/h gate — the measured-basis abandoned-window share falls from
+**3.3 %** to **2.8 % / 1.5 %**, and the pre-change figures in this document
+remain the pre-change column, unchanged and still visible. One confounder
+travels with the comparison: `local_prefill_deadline_seconds` moved 120 → 180
+on 2026-11-04 (`31c842157`), so `elapsed_s` is not comparable across the change.
+
