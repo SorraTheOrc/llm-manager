@@ -203,26 +203,26 @@ class TestCitationsStillResolve:
     CITATIONS: tuple[tuple[str, int, str], ...] = (
         # 1 — pool size exported as --parallel
         ("proxy/config.yaml", 1925, "session_slot_pool_size: 2"),
-        ("proxy/proxy/lifecycle.py", 1918, "LLAMA_PARALLEL"),
+        ("proxy/proxy/lifecycle.py", 1991, "LLAMA_PARALLEL"),
         ("start-llama.sh", 239, "LLAMA_PARALLEL:=1"),
         ("start-llama.sh", 252, "--parallel"),
         ("start-llama.sh", 501, "LLAMA_PARALLEL:=1"),
         ("start-llama.sh", 511, "-np"),
         ("start-llama.sh", 514, "--parallel"),
         # 2/3 — per-slot context + routing clamp
-        ("proxy/proxy/provider.py", 1999, "_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096"),
-        ("proxy/proxy/provider.py", 2008, "def effective_per_slot_threshold"),
-        ("proxy/proxy/provider.py", 2120, "def _effective_large_context_thresholds"),
-        ("proxy/proxy/provider.py", 2163, "effective_per_slot_threshold"),
-        ("proxy/proxy/provider.py", 2329, "effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 2428, "_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096"),
+        ("proxy/proxy/provider.py", 2437, "def effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 2549, "def _effective_large_context_thresholds"),
+        ("proxy/proxy/provider.py", 2592, "effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 2758, "effective_per_slot_threshold"),
         # 4 — persistence cap derived from the same clamp
-        ("proxy/proxy/provider.py", 2286, "def compute_hard_routing_cap"),
+        ("proxy/proxy/provider.py", 2715, "def compute_hard_routing_cap"),
         ("proxy/proxy/session.py", 1377, "effective_per_slot_threshold"),
         # 5 — dispatch-lease cap
         ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
         ("proxy/proxy/router.py", 1611, "_try_acquire_local_dispatch"),
         ("proxy/proxy/router_helpers.py", 4354, "async def _try_acquire_local_dispatch"),
-        ("proxy/proxy/provider.py", 7279, "def _get_local_concurrency_info"),
+        ("proxy/proxy/provider.py", 7708, "def _get_local_concurrency_info"),
         # 6 — slot-ID space
         ("proxy/proxy/session.py", 1126, "def _slot_id_for_session"),
         # 7 — persistence on/off gate + eviction planner
