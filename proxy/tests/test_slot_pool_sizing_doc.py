@@ -210,19 +210,19 @@ class TestCitationsStillResolve:
         ("start-llama.sh", 511, "-np"),
         ("start-llama.sh", 514, "--parallel"),
         # 2/3 — per-slot context + routing clamp
-        ("proxy/proxy/provider.py", 1881, "_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096"),
-        ("proxy/proxy/provider.py", 1890, "def effective_per_slot_threshold"),
-        ("proxy/proxy/provider.py", 2002, "def _effective_large_context_thresholds"),
-        ("proxy/proxy/provider.py", 2045, "effective_per_slot_threshold"),
-        ("proxy/proxy/provider.py", 2209, "effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 1999, "_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096"),
+        ("proxy/proxy/provider.py", 2008, "def effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 2120, "def _effective_large_context_thresholds"),
+        ("proxy/proxy/provider.py", 2163, "effective_per_slot_threshold"),
+        ("proxy/proxy/provider.py", 2329, "effective_per_slot_threshold"),
         # 4 — persistence cap derived from the same clamp
-        ("proxy/proxy/provider.py", 2166, "def compute_hard_routing_cap"),
+        ("proxy/proxy/provider.py", 2286, "def compute_hard_routing_cap"),
         ("proxy/proxy/session.py", 1377, "effective_per_slot_threshold"),
         # 5 — dispatch-lease cap
         ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
         ("proxy/proxy/router.py", 1611, "_try_acquire_local_dispatch"),
         ("proxy/proxy/router_helpers.py", 4354, "async def _try_acquire_local_dispatch"),
-        ("proxy/proxy/provider.py", 7170, "def _get_local_concurrency_info"),
+        ("proxy/proxy/provider.py", 7279, "def _get_local_concurrency_info"),
         # 6 — slot-ID space
         ("proxy/proxy/session.py", 1126, "def _slot_id_for_session"),
         # 7 — persistence on/off gate + eviction planner
