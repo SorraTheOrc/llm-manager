@@ -116,6 +116,19 @@ grep -o 'residency_source=[a-z_]* measurement=[a-z:_]*' proxy.log | sort | uniq 
   says why: `unavailable:no_prior_measurement` or
   `unavailable:capture_disabled`.
 
+**Which threshold decided it.** Each line also carries the additive
+`threshold_applied=<cold|warm|none>` and `threshold_value=<n|none>` fields
+(`LP-0MW81DHPH00650NY`), so an admission above the cold cap is attributable
+without reconstructing the ladder: `threshold_applied=cold` is a prompt with
+no measured residency (cold-priced, or denied for that reason), while
+`threshold_applied=warm` is a measured-resident prompt served under the
+120 000 warm cap. Grep them together with the basis:
+
+```bash
+grep -o 'residency_source=[a-z_]* measurement=[a-z:_]* threshold_applied=[a-z]*' \
+  proxy.log | sort | uniq -c
+```
+
 **Two expected unmeasured cases — neither is a regression.**
 
 1. **Buffered (non-streaming) dispatches.** `return_progress` is injected only

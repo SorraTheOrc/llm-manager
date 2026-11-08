@@ -2637,6 +2637,66 @@ MEASUREMENT_VOCABULARY: tuple[str, ...] = (
     MEASUREMENT_UNAVAILABLE_STALE_VIEW,
 )
 
+#: ``threshold_applied=`` vocabulary (LP-0MW81DHPH00650NY AC1): which token
+#: threshold governed one admission decision. Recorded together with the
+#: residency basis (``residency_source`` / ``measurement``), so a local
+#: admission of a prompt above the cold threshold is explainable from the line
+#: alone instead of needing the ladder reconstructed by hand:
+#:
+#: - ``cold`` — the cold-cache threshold (38 000) governs, because **no**
+#:   measured residency backs the prompt: the unmeasured-cold denial
+#:   (``unmeasured_residency_cold``) and the measured-zero denial
+#:   (``non_resident``) both fall here;
+#: - ``warm`` — the warm hard cap (120 000) governs, because the session's
+#:   reusable prefix *is* measured-resident (``measured`` /
+#:   ``measured_last_dispatch`` / ``session_slot``);
+#: - ``none`` — the decision has no residency basis at all (the ladder is
+#:   disabled: ``facts`` is ``None``), so no token threshold is attributed.
+THRESHOLD_APPLIED_COLD: str = "cold"
+THRESHOLD_APPLIED_WARM: str = "warm"
+THRESHOLD_APPLIED_NONE: str = "none"
+
+#: The whole closed vocabulary: ``threshold_applied=`` is exactly one of these.
+THRESHOLD_APPLIED_VOCABULARY: tuple[str, ...] = (
+    THRESHOLD_APPLIED_COLD,
+    THRESHOLD_APPLIED_WARM,
+    THRESHOLD_APPLIED_NONE,
+)
+
+
+def applied_threshold(
+    facts,
+    *,
+    cold_cache_threshold: int | None,
+    warm_cache_threshold: int | None,
+) -> tuple[str, int | None]:
+    """Return ``(threshold_applied, threshold_value)`` for one decision.
+
+    The *basis* selects the threshold, never the predicted cache ratio
+    (LP-0MW81DHPH00650NY AC1):
+
+    - measured-resident facts (``measured`` / ``measured_last_dispatch`` /
+      ``session_slot``) keep the warm hard cap — the prompt may be served
+      locally above the cold threshold precisely because its prefix is known
+      to be resident;
+    - a facts object that is *not* resident (the unmeasured ``unknown`` basis
+      and the measured-zero ``non_resident`` basis) falls to the cold
+      threshold, because the warm threshold has no measurement to stand on;
+    - no facts at all (residency ladder disabled) records ``none``: the
+      decision was not made against a token threshold, so attributing one
+      would fabricate a basis.
+
+    ``threshold_value`` is the configured value of that threshold, read from
+    the caller's arguments so a retune is visible on the line; ``None`` (logged
+    as ``none``) when no value was supplied or the threshold is ``0``
+    (disabled).
+    """
+    if facts is None:
+        return THRESHOLD_APPLIED_NONE, None
+    if getattr(facts, "resident", False):
+        return THRESHOLD_APPLIED_WARM, warm_cache_threshold or None
+    return THRESHOLD_APPLIED_COLD, cold_cache_threshold or None
+
 
 @dataclass(frozen=True)
 class ResidentPrefixFacts:
@@ -3036,6 +3096,8 @@ def _log_residency_decision(
     facts=None,
     min_ratio: float | None = None,
     tenancy=None,
+    cold_cache_threshold: int | None = None,
+    warm_cache_threshold: int | None = None,
 ) -> None:
     """Emit the residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5).
 
@@ -3045,6 +3107,13 @@ def _log_residency_decision(
     session owned the slot — residency regressions become visible without
     forensics. Consumed by ``proxy-usage-analysis`` (resident-vs-evicted reuse
     split and per-session slot-owner churn).
+
+    The line records the *basis* of the decision (``residency_source`` and the
+    additive ``measurement``) and, since LP-0MW81DHPH00650NY, *which threshold*
+    the verdict was held to: ``threshold_applied`` (``cold`` / ``warm`` /
+    ``none``) with its configured ``threshold_value``. The two threshold fields
+    are appended after ``session=`` so every pre-existing key keeps its
+    relative order and deployed parsers are unaffected.
 
     Never raises: logging must not become an admission failure mode.
     """
@@ -3074,12 +3143,24 @@ def _log_residency_decision(
         # Exactly one value per line: a line logged without residency facts
         # (the gate is disabled) still reports ``unavailable:stale_view``.
         # Existing keys keep their relative order so deployed parsers are
-        # unaffected; ``measurement=`` is the only addition.
+        # unaffected; ``measurement=`` was the only in-place addition.
+        # Additive suffix, after ``session=`` (LP-0MW81DHPH00650NY AC1): the
+        # basis above says *whether* residency was measured, these two say
+        # *which threshold* the verdict was held to, so a >38k local admission
+        # (cold-priced or measured-resident/warm) is attributable from the
+        # line. Appended — never interleaved — so positional consumers keep
+        # working (parent AC3).
+        threshold_applied, threshold_value = applied_threshold(
+            facts,
+            cold_cache_threshold=cold_cache_threshold,
+            warm_cache_threshold=warm_cache_threshold,
+        )
         logger.info(
             "routing_resident_prefix provider=local model=%s decision=%s "
             "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
             "slot_owner_session=%s residency_source=%s measurement=%s min_ratio=%s "
-            "tenants=%s occupants=%d session=%s",
+            "tenants=%s occupants=%d session=%s "
+            "threshold_applied=%s threshold_value=%s",
             model_name or "unknown",
             decision,
             n_past if n_past is not None else "none",
@@ -3092,6 +3173,8 @@ def _log_residency_decision(
             tenant_limit if tenant_limit is not None else "none",
             occupants,
             session_id or "unknown",
+            threshold_applied,
+            threshold_value if threshold_value is not None else "none",
         )
     except Exception:
         pass
@@ -3225,6 +3308,25 @@ def _should_skip_local(
     # tenancy rung then still applies with its own knob, since tenancy is an
     # independent bound on how many distinct sessions may hold the pool.
     facts = None
+
+    # Every rung logs through the same decision line, carrying both token
+    # thresholds so the *applied* one is auditable (LP-0MW81DHPH00650NY AC1):
+    # a cold-priced admission, a measured-resident (warm) admission and an
+    # unmeasured-cold denial are distinguishable from the line alone. One
+    # helper here means a future rung cannot forget to pass them.
+    def _log_decision(decision: str, facts, min_ratio, tenancy=None) -> None:
+        _log_residency_decision(
+            session_id=session_id,
+            estimated_tokens=estimated_tokens,
+            decision=decision,
+            model_name=model_name,
+            facts=facts,
+            min_ratio=min_ratio,
+            tenancy=tenancy,
+            cold_cache_threshold=cold_cache_threshold,
+            warm_cache_threshold=warm_cache_threshold,
+        )
+
     if resident_prefix_min_ratio > 0.0:
         facts = resolve_resident_prefix(
             session_id,
@@ -3246,35 +3348,20 @@ def _should_skip_local(
             # explicit reason rather than being admitted locally on a guess.
             # The denial is logged through the same decision line as every
             # other rung, so an unmeasured 55k skip is attributable.
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=SKIP_REASON_UNMEASURED_COLD,
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
+            _log_decision(
+                SKIP_REASON_UNMEASURED_COLD, facts, resident_prefix_min_ratio
             )
             return (True, SKIP_REASON_UNMEASURED_COLD)
         if not facts.resident:
             # Fresh view, no slot of its own: the resident prefix is measured
             # at zero, so no prediction can make this prompt cheap.
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=SKIP_REASON_RESIDENT_PREFIX,
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
+            _log_decision(
+                SKIP_REASON_RESIDENT_PREFIX, facts, resident_prefix_min_ratio
             )
             return (True, SKIP_REASON_RESIDENT_PREFIX)
         elif facts.reuse_ratio < resident_prefix_min_ratio:
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=SKIP_REASON_RESIDENT_PREFIX,
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
+            _log_decision(
+                SKIP_REASON_RESIDENT_PREFIX, facts, resident_prefix_min_ratio
             )
             return (True, SKIP_REASON_RESIDENT_PREFIX)
 
@@ -3291,13 +3378,10 @@ def _should_skip_local(
             idle_seconds=tenancy_idle_seconds,
         )
         if tenancy is not None and not tenancy.admitted:
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=SKIP_REASON_TENANT_LIMIT,
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio or None,
+            _log_decision(
+                SKIP_REASON_TENANT_LIMIT,
+                facts,
+                resident_prefix_min_ratio or None,
                 tenancy=tenancy,
             )
             return (True, SKIP_REASON_TENANT_LIMIT)
@@ -3310,35 +3394,14 @@ def _should_skip_local(
             else estimated_tokens
         )
         if max(0, estimated_tokens - reusable) <= cold_cache_threshold:
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision="admit",
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
-            )
+            _log_decision("admit", facts, resident_prefix_min_ratio)
             return (False, None)
         if economic_bypass_serves_local:
             # Cheap mode still recovers the *economic* miss locally; the
             # contention queue (if enabled) waits for a slot.
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision="admit",
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
-            )
+            _log_decision("admit", facts, resident_prefix_min_ratio)
             return (False, None)
-        _log_residency_decision(
-            session_id=session_id,
-            estimated_tokens=estimated_tokens,
-            decision="large_context_bypass",
-            model_name=model_name,
-            facts=facts,
-            min_ratio=resident_prefix_min_ratio,
-        )
+        _log_decision("large_context_bypass", facts, resident_prefix_min_ratio)
         return (True, "large_context_bypass")
 
     # Check 5: Dynamic new-token calculation (predicted ratio).

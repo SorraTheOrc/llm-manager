@@ -1265,7 +1265,7 @@ client restores warm instead of prefilling cold, and the shared
 ### Observability
 
 Every decision logs
-`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=…`.
+`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass|unmeasured_residency_cold> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=… threshold_applied=<cold|warm|none> threshold_value=<n|none>`.
 
 `measurement=` is the additive provenance field (immediately after
 `residency_source=`, before `min_ratio=`) that distinguishes a real measurement
@@ -1293,6 +1293,26 @@ reported as `stale_view`, never as a measured zero.
 every non-measurement (the internal `0.0`/`1.0` gate sentinels are never
 surfaced — `LP-0MVNPZY22008B536`), `residency_source` values are unchanged, and
 a pre-change line (no `measurement=` field) parses unchanged.
+
+**Which threshold decided it (`LP-0MW81DHPH00650NY`).** The basis says
+*whether* residency was measured; `threshold_applied=` says *which token
+threshold* the verdict was held to, and `threshold_value=` is that threshold's
+configured value (`local_large_context_cold_cache_threshold` cells default
+38 000, `local_large_context_warm_cache_threshold` default 120 000). Both are
+**appended after `session=`**, so every pre-existing key keeps its relative
+order and the `proxy-usage-analysis` parser reads a new line unchanged (the
+values are a closed vocabulary, `provider.THRESHOLD_APPLIED_VOCABULARY`):
+
+| `threshold_applied=` | `threshold_value=` | Emitted when |
+|---|---|---|
+| `cold` | the cold cap (38 000) | no measured residency backs the prompt — the unmeasured-cold denial (`unmeasured_residency_cold`, `residency_source=unknown`) and the measured-zero denial (`resident_prefix_insufficient` with `residency_source=non_resident`) both fall here, because the warm cap has no measurement to stand on |
+| `warm` | the warm cap (120 000) | the decision is measured-resident (`measured` / `measured_last_dispatch` / `session_slot`), so the warm cap governs and the prompt may be served locally above the cold threshold |
+| `none` | `none` | the decision has no residency basis at all (the ladder is disabled: `local_resident_prefix_min_ratio: 0`), so no token threshold is attributed |
+
+So a local admission of a >38 000-token prompt is attributable from the line
+alone: `threshold_applied=cold` with a small `n_past_actual` is a cold-priced
+admission, while `threshold_applied=warm` is a measured-resident prompt that
+would otherwise have been refused by the cold cap.
 
 **Measurement sources** (rung order): `measured` is the live `/slots`
 `context_tokens`; when the deployed build does not report it (llama.cpp b8782

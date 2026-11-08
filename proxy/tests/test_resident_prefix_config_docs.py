@@ -38,6 +38,7 @@ from proxy.provider import (
     RESIDENCY_SOURCE_NON_RESIDENT,
     RESIDENCY_SOURCE_SESSION_SLOT,
     RESIDENCY_SOURCE_UNKNOWN,
+    THRESHOLD_APPLIED_VOCABULARY,
     _effective_resident_prefix_min_ratio,
 )
 from proxy.router_helpers import (
@@ -330,6 +331,27 @@ def test_measurement_vocabulary_is_documented_where_operators_look():
         text = path.read_text(encoding="utf-8")
         missing = [value for value in MEASUREMENT_VOCABULARY if value not in text]
         assert missing == [], f"{path.name} does not document {missing}"
+
+
+def test_threshold_applied_fields_are_documented_as_an_additive_suffix():
+    """``threshold_applied``/``threshold_value`` (LP-0MW81DHPH00650NY).
+
+    The fields explain *which* threshold decided a >38k admission, so the
+    operator-facing grammar must show them — and must show them **after**
+    ``session=``, because appending is what keeps the existing positional
+    consumers of the line working (parent AC3).
+    """
+    line = _observability_grammar_line()
+
+    assert "threshold_applied=" in line
+    assert "threshold_value=" in line
+    assert (
+        line.index(" session=")
+        < line.index("threshold_applied=")
+        < line.index("threshold_value=")
+    )
+    for value in THRESHOLD_APPLIED_VOCABULARY:
+        assert value in line, f"threshold_applied={value} missing from the grammar"
 
 
 def test_rollout_doc_explains_what_to_read_and_the_residual_gap():
