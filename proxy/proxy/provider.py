@@ -30,7 +30,7 @@ import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -977,6 +977,412 @@ def large_append_bytes_threshold(config: dict | None) -> int:
     return DEFAULT_LARGE_APPEND_BYTES_THRESHOLD
 
 
+# ---------------------------------------------------------------------------
+# Divergence feedback into the session pricing model (LP-0MW81DS4W008DKDV)
+# ---------------------------------------------------------------------------
+#
+# The predicted ratio above is a *prediction*. When the measured dispatch
+# proves it wrong — ``proxy.measured_cache_abort`` records ``deficit_ratio`` =
+# ``(total - cache) / total`` from llama-server's ``prompt_progress`` — nothing
+# wrote that truth back, so the next turn inherited the same under-estimate:
+# on 2026-11-03 08:41:54 a 19,628-token prompt was priced
+# ``cached_ratio=0.99 new_tokens=173`` and then prefilled 13,002 tokens
+# (``measured_new_tokens=12936 priced_new_tokens=173 deficit_ratio=0.659``,
+# 53.2 s to first byte); the following turn was priced optimistically again.
+# The 2026-11-07 20:48:51 shape was the same at 55,492 tokens
+# (``cached_ratio=1.00 new_tokens=172``, evicted at 180.1 s).
+#
+# The feedback is the minimum that makes the next price honest:
+#
+# 1. the measured reuse ratio ``cache / total`` becomes the session's measured
+#    ratio — the authoritative reuse of the turn just measured, written ahead
+#    of the usage block so an aborted (unmeasured-by-usage) dispatch is
+#    corrected too;
+# 2. the next turn's prefix credit is capped at the ``cache`` tokens proven
+#    resident — both when ``expected_cached_ratio`` reads the credit (the next
+#    routing decision happens before that dispatch completes) and when the
+#    next dispatch records its own prompt prefix, so no later price can credit
+#    more of that prefix than was actually reused (the slot-snapshot sidecar
+#    records the same truthful lower bound).
+#
+# Bounded by construction: at most ``local_divergence_feedback_max_turns``
+# recorded dispatches are corrected (default 1) and the correction expires
+# after ``local_divergence_feedback_max_age_seconds`` (default 900 s), so a
+# session can never be poisoned permanently — the following dispatch rewrites
+# the basis and a genuinely warm turn restores the credit. It is cleared with
+# the model state it corrects: session invalidation
+# (``clear_cached_ratio_for_session``), slot reassignment and model switch
+# (``clear_divergence_feedback`` call sites).
+
+DIVERGENCE_FEEDBACK_ENABLED_KEY = "local_divergence_feedback_enabled"
+DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO_KEY = (
+    "local_divergence_feedback_min_deficit_ratio"
+)
+DIVERGENCE_FEEDBACK_MAX_TURNS_KEY = "local_divergence_feedback_max_turns"
+DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS_KEY = (
+    "local_divergence_feedback_max_age_seconds"
+)
+
+DEFAULT_DIVERGENCE_FEEDBACK_ENABLED: bool = True
+DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO: float = 0.25
+DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS: int = 1
+DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS: float = 900.0
+
+
+@dataclass(frozen=True)
+class DivergenceCorrection:
+    """One session's post-measurement correction to its pricing model.
+
+    ``reusable_tokens`` is the measured ``cache`` (absolute tokens proven
+    resident by llama-server), which is what the next dispatch's recorded
+    prefix credit is capped at. ``turns_remaining`` / ``expires_at`` make the
+    correction bounded; ``deficit_ratio`` / ``priced_new_tokens`` keep it
+    attributable in the log line.
+    """
+
+    reusable_tokens: int
+    total_tokens: int
+    deficit_ratio: float
+    priced_new_tokens: float | None
+    turns_remaining: int
+    recorded_at: float
+    expires_at: float
+
+
+_divergence_feedback: dict[tuple[str, str], DivergenceCorrection] = {}
+
+
+def _divergence_number(value: Any, default: float) -> float:
+    """Coerce *value* to a finite float, falling back to *default*.
+
+    A malformed numeric knob keeps its shipped default rather than
+    silently disabling (or unbinding) the correction.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return number
+
+
+def divergence_feedback_settings(
+    server_config: dict | None,
+) -> tuple[bool, float, int, float]:
+    """Resolve ``(enabled, min_deficit_ratio, max_turns, max_age_seconds)``.
+
+    Reads the ``server`` section (a flat dict is accepted too, like the other
+    routing readers). Fail-open: a missing config keeps the documented
+    defaults; an *unreadable* config or an unusable ``enabled`` switch
+    disables the feedback (pre-change pricing); a malformed numeric knob
+    falls back to its shipped default, so a typo can neither silently disable
+    the correction nor unbind it.
+    """
+    defaults = (
+        DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO,
+        DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS,
+        DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS,
+    )
+    if server_config is None:
+        return (DEFAULT_DIVERGENCE_FEEDBACK_ENABLED, *defaults)
+    if not isinstance(server_config, dict):
+        return (False, *defaults)
+    server_cfg = server_config.get("server", server_config)
+    if not isinstance(server_cfg, dict):
+        return (False, *defaults)
+    enabled = _coerce_enabled(
+        server_cfg.get(
+            DIVERGENCE_FEEDBACK_ENABLED_KEY, DEFAULT_DIVERGENCE_FEEDBACK_ENABLED
+        )
+    )
+    if not enabled:
+        return (False, *defaults)
+
+    ratio = _divergence_number(
+        server_cfg.get(
+            DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO_KEY,
+            DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO,
+        ),
+        DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO,
+    )
+    if not 0.0 <= ratio <= 1.0:
+        ratio = DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO
+
+    turns = int(
+        _divergence_number(
+            server_cfg.get(
+                DIVERGENCE_FEEDBACK_MAX_TURNS_KEY,
+                DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS,
+            ),
+            float(DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS),
+        )
+    )
+    if turns < 1:
+        turns = DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS
+
+    max_age = _divergence_number(
+        server_cfg.get(
+            DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS_KEY,
+            DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS,
+        ),
+        DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS,
+    )
+    if max_age <= 0.0:
+        max_age = DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS
+
+    return (True, ratio, turns, max_age)
+
+
+def _divergence_token_count(value: Any) -> int | None:
+    """Coerce a measured token count, or ``None`` when it is not usable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return int(number)
+
+
+def record_measured_divergence(
+    model_name: str | None,
+    session_id: str | None,
+    total: Any,
+    cache: Any,
+    server_config: dict | None = None,
+    *,
+    priced_new_tokens: float | None = None,
+) -> DivergenceCorrection | None:
+    """Feed a post-measurement divergence back into the session pricing model.
+
+    Called from the local dispatch's measured ``prompt_progress`` capture
+    (``router._observe_prompt_progress`` and the early-abort branch) with the
+    dispatch's measured ``total`` / ``cache`` tokens. When the measured
+    deficit ``(total - cache) / total`` is at or above
+    ``local_divergence_feedback_min_deficit_ratio`` (default ``0.25``), the
+    session's measured ratio becomes the measured ``cache / total`` and the
+    next turn's prefix credit is capped at the ``cache`` tokens proven
+    resident (both on the read path and in the prefix record the next
+    dispatch writes), so the turn cannot be priced with an optimistic credit
+    the measurement just disproved.
+
+    Returns the stored :class:`DivergenceCorrection`, or ``None`` when nothing
+    was recorded (a warm/at-or-below-threshold measurement, a disabled
+    feature, an unusable measurement or a blank identity). Never raises: a
+    metric path must not break a stream.
+    """
+    try:
+        if not model_name or not session_id:
+            return None
+        enabled, min_ratio, max_turns, max_age = divergence_feedback_settings(
+            server_config
+        )
+        if not enabled:
+            return None
+        total_tokens = _divergence_token_count(total)
+        cache_tokens = _divergence_token_count(cache)
+        if total_tokens is None or cache_tokens is None:
+            return None
+        if total_tokens <= 0 or cache_tokens > total_tokens:
+            return None
+        deficit_ratio = (total_tokens - cache_tokens) / total_tokens
+        if deficit_ratio < min_ratio:
+            return None
+
+        now = time.monotonic()
+        correction = DivergenceCorrection(
+            reusable_tokens=cache_tokens,
+            total_tokens=total_tokens,
+            deficit_ratio=deficit_ratio,
+            priced_new_tokens=_divergence_number(priced_new_tokens, 0.0)
+            if priced_new_tokens is not None
+            else None,
+            turns_remaining=max_turns,
+            recorded_at=now,
+            expires_at=now + max_age,
+        )
+        key = (model_name, session_id)
+        if (
+            key not in _divergence_feedback
+            and len(_divergence_feedback) >= _MAX_CACHED_RATIO_ENTRIES
+        ):
+            try:
+                oldest = next(iter(_divergence_feedback))
+                _divergence_feedback.pop(oldest, None)
+            except (StopIteration, KeyError):
+                pass
+        # Measured truth first: the progress measurement is the authoritative
+        # reuse of the turn being measured, so it replaces the (possibly
+        # optimistic) predicted ratio even when the usage block never arrives
+        # (an early-released dispatch).
+        set_cached_ratio(model_name, session_id, cache_tokens / total_tokens)
+        _divergence_feedback[key] = correction
+        logger.info(
+            "routing_divergence_feedback model=%s session=%s deficit_ratio=%.4f "
+            "measured_reusable_tokens=%d measured_new_tokens=%d "
+            "priced_new_tokens=%s turns=%d max_age_s=%.0f",
+            model_name,
+            session_id,
+            deficit_ratio,
+            cache_tokens,
+            total_tokens - cache_tokens,
+            "unknown"
+            if correction.priced_new_tokens is None
+            else f"{correction.priced_new_tokens:.0f}",
+            max_turns,
+            max_age,
+        )
+        return correction
+    except Exception:
+        logger.debug("record_measured_divergence failed", exc_info=True)
+        return None
+
+
+def _live_divergence_correction(
+    model_name: str, session_id: str
+) -> DivergenceCorrection | None:
+    """The stored correction for a pair while it is still live.
+
+    Drops (and reports ``None`` for) an expired correction, so a quiet session
+    cannot carry a stale correction indefinitely.
+    """
+    key = (model_name, session_id)
+    correction = _divergence_feedback.get(key)
+    if correction is None:
+        return None
+    try:
+        if time.monotonic() >= correction.expires_at:
+            _divergence_feedback.pop(key, None)
+            return None
+    except Exception:
+        return None
+    return correction
+
+
+def _divergence_credit_ceiling(
+    model_name: str, session_id: str, tokens: int
+) -> int:
+    """Cap a prefix *credit* at the measured reusable tokens (read path).
+
+    The routing decision happens *before* the next dispatch completes, so the
+    ceiling must be applied to the credit read here, not only to the record
+    the next dispatch will write. Never raises (this is the pricing hot path).
+    """
+    try:
+        correction = _live_divergence_correction(model_name, session_id)
+    except Exception:
+        return tokens
+    if correction is None:
+        return tokens
+    return min(int(tokens), correction.reusable_tokens)
+
+
+def _apply_divergence_ceiling(
+    model_name: str, session_id: str, tokens: int
+) -> int:
+    """Cap a recorded prompt prefix at the measured reusable tokens.
+
+    Consumes one turn of the stored correction (the default bound is one
+    dispatch) and drops it when spent or expired, so the model can never be
+    poisoned permanently. Never raises: this runs inside the usage path.
+    """
+    key = (model_name, session_id)
+    correction = _live_divergence_correction(model_name, session_id)
+    if correction is None:
+        return tokens
+    try:
+        corrected = min(int(tokens), correction.reusable_tokens)
+        remaining = correction.turns_remaining - 1
+        if remaining <= 0:
+            _divergence_feedback.pop(key, None)
+        else:
+            _divergence_feedback[key] = replace(
+                correction, turns_remaining=remaining
+            )
+        if corrected < tokens:
+            logger.info(
+                "routing_divergence_feedback_applied model=%s session=%s "
+                "recorded_tokens=%d corrected_tokens=%d deficit_ratio=%.4f",
+                model_name,
+                session_id,
+                tokens,
+                corrected,
+                correction.deficit_ratio,
+            )
+        return corrected
+    except Exception:
+        logger.debug("divergence feedback ceiling failed", exc_info=True)
+        return tokens
+
+
+def clear_divergence_feedback(
+    model_name: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Forget divergence corrections matching the identity known.
+
+    Dimensioned like ``proxy.measured_prefill.clear_measured_prefill`` because
+    the invalidation call sites know different halves of the key:
+
+    - ``(model, session)`` — forget exactly that pair;
+    - ``(None, session)`` — forget **every** model for that session (session
+      invalidation and slot reassignment know the session, not the routed
+      model name);
+    - ``(model, None)`` — forget **every** session for that model (model
+      switch: the departing model's slots are torn down);
+    - ``(None, None)`` / blank keys — a no-op.
+
+    Never raises: every caller is an invalidation path.
+    """
+    try:
+        if session_id:
+            if model_name:
+                _divergence_feedback.pop((model_name, session_id), None)
+                return
+            for key in [k for k in _divergence_feedback if k[1] == session_id]:
+                _divergence_feedback.pop(key, None)
+            return
+        if model_name:
+            for key in [k for k in _divergence_feedback if k[0] == model_name]:
+                _divergence_feedback.pop(key, None)
+    except Exception:
+        pass
+
+
+def clear_divergence_feedback_for_other_models(
+    *keep_model_names: str | None,
+) -> None:
+    """Forget every correction except those recorded under a *keep* name.
+
+    The model-switch path (``lifecycle._forget_switched_model_measurements``)
+    observes a switch between local models. Enumerating a departing model's
+    aliases is not possible (aliases may be wildcards), so the switch keeps
+    only the names it can prove belong to the target model and forgets
+    everything else — over-clearing is the safe direction (it degrades to the
+    measured-ratio price, never to a fabricated credit). With no usable *keep*
+    name nothing is cleared (no evidence of what the target is).
+    Never raises.
+    """
+    try:
+        keep = {name for name in keep_model_names if name}
+        if not keep:
+            return
+        for key in [k for k in _divergence_feedback if k[0] not in keep]:
+            _divergence_feedback.pop(key, None)
+    except Exception:
+        pass
+
+
+def reset_divergence_feedback() -> None:
+    """Clear the whole store (test isolation; also usable on model switch)."""
+    _divergence_feedback.clear()
+
+
 def record_prompt_prefix(
     model_name: str,
     session_id: str | None,
@@ -988,8 +1394,12 @@ def record_prompt_prefix(
     Called from the local streaming loop alongside ``update_cached_ratio``
     (usage path).  *prompt_tokens* is the measured prompt size of the request
     the KV slot now holds, so a later request whose message list extends this
-    one can be credited for them.  Never raises: a metric path must not break
-    a stream.  Also re-caps the dict like ``set_cached_ratio``.
+    one can be credited for them.  A post-measurement divergence caps that
+    record at the tokens llama-server actually reused
+    (``_apply_divergence_ceiling``), so the next turn cannot be credited for a
+    prefix the measurement just disproved (LP-0MW81DS4W008DKDV).  Never
+    raises: a metric path must not break a stream.  Also re-caps the dict like
+    ``set_cached_ratio``.
     """
     if not model_name or not session_id:
         return
@@ -1006,6 +1416,7 @@ def record_prompt_prefix(
         logger.debug("record_prompt_prefix failed", exc_info=True)
         return
     key = (model_name, session_id)
+    tokens = _apply_divergence_ceiling(model_name, session_id, tokens)
     if key not in _last_prompt_prefix and len(_last_prompt_prefix) >= _MAX_CACHED_RATIO_ENTRIES:
         try:
             oldest = next(iter(_last_prompt_prefix))
@@ -1040,6 +1451,14 @@ def expected_cached_ratio(
       With no recorded prefix the append boundary is unknown (a ratio restored
       from the slot-snapshot sidecar), so the measured ratio is returned
       unchanged rather than treating the whole prompt as an append.
+
+    A post-measurement divergence (``record_measured_divergence``) caps the
+    prefix credit at the tokens the measured dispatch proved resident, so the
+    next turn is priced from the corrected model instead of the optimistic
+    credit the measurement just disproved (LP-0MW81DS4W008DKDV). The cap is
+    bounded (``local_divergence_feedback_max_turns`` /
+    ``..._max_age_seconds``) and cleared with the session/model state it
+    derives from.
     """
     measured = _get_cached_ratio(model_name, session_id)
     if not model_name or not session_id:
@@ -1099,7 +1518,14 @@ def expected_cached_ratio(
                 return 0.0
     except Exception:
         logger.debug("large-append check failed", exc_info=True)
-    credit = min(1.0, margin * min(prev_tokens, estimate) / estimate)
+    credit_tokens = min(prev_tokens, estimate)
+    # A post-measurement divergence caps the credit at the tokens llama-server
+    # actually reused, so the next turn cannot be priced with the same
+    # under-estimate the measurement just disproved (LP-0MW81DS4W008DKDV).
+    credit_tokens = _divergence_credit_ceiling(
+        model_name, session_id, credit_tokens
+    )
+    credit = min(1.0, margin * credit_tokens / estimate)
     return max(measured, credit)
 
 
@@ -1121,6 +1547,9 @@ def clear_cached_ratio_for_session(session_id: str | None) -> None:
     # sidecar are being discarded, so no credit may survive (LP-0MVI2XOTY008Q4UV).
     for key in [k for k in _last_prompt_prefix if k[1] == session_id]:
         _last_prompt_prefix.pop(key, None)
+    # A divergence correction derived from that prefix's measurement is
+    # invalid for the same reason (LP-0MW81DS4W008DKDV AC3).
+    clear_divergence_feedback(None, session_id)
     # A discarded session starts a fresh hop count (LP-0MVI2VRT2000V1AP).
     for key in [k for k in _last_routing_hop if k[1] == session_id]:
         _last_routing_hop.pop(key, None)

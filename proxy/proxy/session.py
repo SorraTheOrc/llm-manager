@@ -1180,6 +1180,14 @@ def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> None:
         clear_measured_prefill(None, session_id)
     except Exception:
         pass
+    # A divergence correction derived from that measurement is equally invalid
+    # once the slot changes hands (LP-0MW81DS4W008DKDV AC3).
+    try:
+        from proxy.provider import clear_divergence_feedback
+
+        clear_divergence_feedback(None, session_id)
+    except Exception:
+        pass
     ep = endpoint or ""
     for key, owner in list(_slot_owners.items()):
         if owner == session_id and (

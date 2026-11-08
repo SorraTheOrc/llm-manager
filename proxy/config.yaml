@@ -2876,6 +2876,53 @@ server:
   local_large_append_bytes_threshold: 32768
 
   # -----------------------------------------------------------------------
+  # Divergence feedback into the session pricing model (LP-0MW81DS4W008DKDV)
+  # -----------------------------------------------------------------------
+  # The routing ``cached_ratio`` is a prediction. When llama-server's measured
+  # ``prompt_progress`` proves it wrong (``measured_cache_abort`` records
+  # ``deficit_ratio = (total - cache) / total``), the measured truth is fed back
+  # into the session's pricing model instead of the next turn inheriting the
+  # same under-estimate. 2026-11-03 08:41:54: priced ``cached_ratio=0.99
+  # new_tokens=173``, measured ``measured_new_tokens=12936 priced_new_tokens=173
+  # deficit_ratio=0.659`` (53.2 s to first byte). 2026-11-07 20:48:51: the same
+  # shape at 55,492 tokens, evicted at 180.1 s.
+  #
+  # Feedback applied on a divergence (measured deficit at or above the ratio
+  # below):
+  #   * the session's measured ratio becomes the measured ``cache / total``;
+  #   * the next turn's prefix credit is capped at the ``cache`` tokens the
+  #     dispatch proved resident, so the corrected price is the measured work
+  #     (a 55k prompt with 200 resident tokens is priced at ≈55k new tokens and
+  #     therefore falls under the 38k cold threshold / the unmeasured-cold
+  #     rule), not the optimistic 172-token price.
+  #
+  # BOUNDED — never a permanent poisoning: the correction applies to at most
+  # ``local_divergence_feedback_max_turns`` recorded dispatches (default 1) and
+  # expires after ``..._max_age_seconds`` (default 900), so the following
+  # dispatch rewrites the pricing basis and a genuinely warm turn restores the
+  # credit. It is cleared with the model state it corrects: session
+  # invalidation, slot reassignment and model switch.
+  #
+  # ROLLBACK — one value, byte-for-byte: set
+  # ``local_divergence_feedback_enabled: false`` (``0`` / ``off`` also work).
+  # No correction is recorded and the previous pricing behaviour returns
+  # exactly. A missing or malformed switch keeps the enabled default; a
+  # malformed numeric knob keeps its shipped default (a typo can neither
+  # disable the correction nor unbind it).
+  local_divergence_feedback_enabled: true
+  # Minimum measured ``(total - cache) / total`` for a correction. Default 0.25
+  # (the same floor the early abort uses): a genuinely warm dispatch measures
+  # <= 0.01, so it is never treated as a divergence.
+  local_divergence_feedback_min_deficit_ratio: 0.25
+  # How many recorded dispatches the correction applies to. Default 1: exactly
+  # the next turn is priced from the corrected model.
+  local_divergence_feedback_max_turns: 1
+  # Wall-clock expiry for a correction whose dispatch never records a prefix
+  # (e.g. an aborted turn). Default 900 s. A quiet session cannot carry a stale
+  # correction indefinitely.
+  local_divergence_feedback_max_age_seconds: 900
+
+  # -----------------------------------------------------------------------
   # Priority routing cheap window (LP-0MVDT94F0003VHUA AC1)
   # -----------------------------------------------------------------------
   # During this local-time window EVERY request is routed as ``low`` priority

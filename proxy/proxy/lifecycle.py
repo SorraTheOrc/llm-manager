@@ -574,8 +574,23 @@ def _forget_switched_model_measurements(
 
         if backend_restarted:
             reset_measured_prefill()
+            try:
+                from proxy.provider import reset_divergence_feedback
+
+                reset_divergence_feedback()
+            except Exception:
+                pass
             return
         clear_measured_prefill_for_other_models(requested_model, target_model)
+        # LP-0MW81DS4W008DKDV AC3 (model switch): a divergence correction is
+        # only meaningful while the model whose slots measured it is loaded, so
+        # it is forgotten by the same keep-only-the-target rule.
+        try:
+            from proxy.provider import clear_divergence_feedback_for_other_models
+
+            clear_divergence_feedback_for_other_models(requested_model, target_model)
+        except Exception:
+            pass
     except Exception:
         pass
 

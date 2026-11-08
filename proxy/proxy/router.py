@@ -2288,6 +2288,27 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         await _stamp_measured_prefill_record(
                             srv, endpoint, session_id, _abort_measured
                         )
+                        # LP-0MW81DS4W008DKDV: the aborted dispatch never
+                        # reaches the stream loop's capture, so its measured
+                        # divergence is fed back here — the same measurement
+                        # corrects the session's pricing model for the next
+                        # turn.
+                        try:
+                            if _abort_measured is not None:
+                                from proxy.provider import (
+                                    record_measured_divergence,
+                                )
+
+                                record_measured_divergence(
+                                    model_name,
+                                    session_id,
+                                    _abort_measured.total,
+                                    _abort_measured.cache,
+                                    server_config,
+                                    priced_new_tokens=_priced_new_tokens,
+                                )
+                        except Exception:
+                            pass
                         try:
                             srv.logger.warning(
                                 "measured_cache_abort session=%s model=%s "
@@ -2731,6 +2752,30 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 )
                                 if _prompt_progress.events_seen == 1:
                                     # AC6: one attributable line per dispatch.
+                                    # LP-0MW81DS4W008DKDV: the same (first)
+                                    # measurement is the post-measurement
+                                    # divergence that corrects the session's
+                                    # pricing model, so the next turn is not
+                                    # priced with the under-estimate this
+                                    # dispatch just disproved. Only the first
+                                    # event decides (its ``cache`` is the final
+                                    # reused prefix), so the correction is
+                                    # recorded once per dispatch. Fail-open.
+                                    try:
+                                        from proxy.provider import (
+                                            record_measured_divergence,
+                                        )
+
+                                        record_measured_divergence(
+                                            model_name,
+                                            session_id,
+                                            _progress.total,
+                                            _progress.cache,
+                                            server_config,
+                                            priced_new_tokens=_priced_new_tokens,
+                                        )
+                                    except Exception:
+                                        pass
                                     _log_measured_prefill(
                                         srv, session_id, model_name, _measured
                                     )

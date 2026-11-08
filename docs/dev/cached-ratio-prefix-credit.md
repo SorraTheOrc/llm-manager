@@ -140,6 +140,77 @@ append keeps the measured ratio, a resident prefix is not counted as an append,
 threshold configurability (flat and nested), the `0`/negative sentinel, the
 malformed-value fallback and the size helper's prefix arithmetic.
 
+## Divergence feedback — correcting the model from measurement
+
+**Work item:** LP-0MW81DS4W008DKDV (AC10 merged from LP-0MW0KZUUS002LICZ).
+
+Everything above is still a *prediction*: the measured ratio describes the
+previous response, and the prefix credit assumes the previous prompt is still
+resident. When the dispatch it admitted proves the prediction wrong — the
+measured `prompt_progress` deficit — nothing used to write that truth back, so
+the next turn inherited the same under-estimate.
+
+Measured 2026-11-03 08:41:54: `routing_check estimated_tokens=18516
+new_tokens=173 cached_ratio=0.99`, then llama-server prefilled 13,002 tokens;
+`measured_cache_abort measured_new_tokens=12936 priced_new_tokens=173
+deficit_ratio=0.659` and the turn took **53.2 s** to first byte. Repeated at
+08:43–08:44 (`deficit_ratio=0.285`, 72.0 s), and again on 2026-11-07 20:48:51
+at 55,492 tokens (`cached_ratio=1.00 new_tokens=172`, evicted at 180.1 s).
+
+**The feedback.** `provider.record_measured_divergence()` is called from the
+local dispatch's measured capture (`router._observe_prompt_progress`, plus the
+early-abort branch so an aborted dispatch still corrects the model) with the
+dispatch's measured `total` / `cache`. When the deficit is at or above
+`server.local_divergence_feedback_min_deficit_ratio` (default `0.25`, the same
+floor the early abort uses):
+
+1. the session's measured ratio becomes the measured `cache / total` (written
+   ahead of the usage block, so an aborted turn is corrected too);
+2. the next turn's prefix credit is capped at the `cache` tokens the dispatch
+   proved resident — applied both when `expected_cached_ratio` reads the credit
+   (the next routing decision happens before that dispatch completes) and when
+   `record_prompt_prefix` writes the next recorded prefix.
+
+The corrected price is therefore the measured work: the 55,492-token incident
+is priced at ≈55,400 new tokens instead of 172, exceeding the 38,000 cold
+threshold, so the turn is refused locally (the unmeasured-cold rule denies it,
+and the corrected price alone lands on `large_context_bypass` when that rule is
+rolled back).
+
+**Bounded, never permanent.** The correction applies to at most
+`local_divergence_feedback_max_turns` recorded dispatches (default `1`) and
+expires after `local_divergence_feedback_max_age_seconds` (default `900`, the
+bound for a correction whose dispatch never records a prefix). The following
+dispatch rewrites the pricing basis, and a genuinely warm turn restores the
+credit — only a renewed divergence re-applies the correction.
+
+**Cleared with the state it derives from.** Session invalidation
+(`clear_cached_ratio_for_session`), slot reassignment
+(`session._free_slot_assignment`) and model switch
+(`lifecycle._forget_switched_model_measurements`, including a backend restart)
+all drop the correction, exactly like the measurement store it comes from.
+
+**Observability.** `routing_divergence_feedback model=… session=…
+deficit_ratio=… measured_reusable_tokens=… measured_new_tokens=…
+priced_new_tokens=… turns=… max_age_s=…` is emitted once when the correction
+is recorded, and `routing_divergence_feedback_applied model=… session=…
+recorded_tokens=… corrected_tokens=… deficit_ratio=…` when a corrected
+dispatch records its own prefix. The `routing_check` line then shows the
+corrected `cached_ratio`.
+
+**Rollback.** `server.local_divergence_feedback_enabled: false` (`0` / `off`
+also work) restores the previous pricing byte-for-byte. A missing or malformed
+switch keeps the enabled default; a malformed numeric knob keeps its shipped
+default, so a typo can neither disable the correction nor unbind it.
+
+Tests: `proxy/tests/test_divergence_feedback_pricing.py` — the incident is
+corrected, the second turn is priced cold and routed cold (with and without the
+unmeasured-cold rule), a warm measurement is not a divergence, the threshold is
+inclusive and configurable (flat and nested), the one-turn/TTL bounds hold, the
+`max_turns` bound is configurable, every invalidation path clears it, both log
+lines are attributable, and an unusable measurement or malformed config fails
+open.
+
 ## Rollback
 
 Set `server.cached_prefix_credit_margin: 0.0` in `proxy/config.yaml`. No

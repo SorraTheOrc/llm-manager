@@ -1249,6 +1249,39 @@ missing or malformed value keeps the 32 KiB default. Every forced price logs
 threshold=… estimated_tokens=…`, so a session that is suddenly priced cold is
 explainable from the log instead of looking like a measurement change.
 
+**Divergence feedback (`LP-0MW81DS4W008DKDV`).** A prediction is sometimes
+*disproved* by the dispatch it admitted: llama-server's measured
+`prompt_progress` reports `total` / `cache`, and
+`proxy.measured_cache_abort` records `deficit_ratio = (total - cache) / total`.
+When that deficit is at or above `local_divergence_feedback_min_deficit_ratio`
+(default `0.25`, the same floor the early abort uses), the measured truth is
+fed back into the session's pricing model rather than left for the next turn
+to re-inherit:
+
+- the session's measured ratio becomes the measured `cache / total`;
+- the next turn's prefix credit is capped at the `cache` tokens the dispatch
+  proved resident, so `expected_cached_ratio` prices the measured work — a
+  55,492-token prompt with 200 resident tokens is priced at ≈55k new tokens,
+  not the `new_tokens=172` the model had predicted, and so falls under the
+  38,000 cold threshold (and under the unmeasured-cold rule);
+- the correction is **bounded**: at most
+  `local_divergence_feedback_max_turns` recorded dispatches (default `1`) and
+  at most `local_divergence_feedback_max_age_seconds` (default `900`), so a
+  session can never be poisoned permanently — the following dispatch rewrites
+  the basis and a genuinely warm turn restores the credit;
+- it is **cleared** with the state it derives from: session invalidation, slot
+  reassignment (`session._free_slot_assignment`) and model switch
+  (`lifecycle._forget_switched_model_measurements`).
+
+Two log lines make it attributable: `routing_divergence_feedback model=…
+session=… deficit_ratio=… measured_reusable_tokens=… measured_new_tokens=…
+priced_new_tokens=… turns=…` when the correction is recorded, and
+`routing_divergence_feedback_applied model=… session=… recorded_tokens=…
+corrected_tokens=… deficit_ratio=…` when a corrected dispatch records its own
+prefix. `local_divergence_feedback_enabled: false` restores the previous
+pricing byte-for-byte; a missing or malformed numeric knob keeps its shipped
+default.
+
 ### What to read, what never to call
 
 Admission reads the **cached** slot snapshot only
