@@ -202,7 +202,7 @@ class TestCitationsStillResolve:
     #: (relative path, 1-based line, needle that must be present on that line)
     CITATIONS: tuple[tuple[str, int, str], ...] = (
         # 1 — pool size exported as --parallel
-        ("proxy/config.yaml", 1846, "session_slot_pool_size: 2"),
+        ("proxy/config.yaml", 1925, "session_slot_pool_size: 2"),
         ("proxy/proxy/lifecycle.py", 1918, "LLAMA_PARALLEL"),
         ("start-llama.sh", 239, "LLAMA_PARALLEL:=1"),
         ("start-llama.sh", 252, "--parallel"),
@@ -222,7 +222,7 @@ class TestCitationsStillResolve:
         ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
         ("proxy/proxy/router.py", 1611, "_try_acquire_local_dispatch"),
         ("proxy/proxy/router_helpers.py", 4354, "async def _try_acquire_local_dispatch"),
-        ("proxy/proxy/provider.py", 7079, "def _get_local_concurrency_info"),
+        ("proxy/proxy/provider.py", 7170, "def _get_local_concurrency_info"),
         # 6 — slot-ID space
         ("proxy/proxy/session.py", 1126, "def _slot_id_for_session"),
         # 7 — persistence on/off gate + eviction planner
@@ -231,8 +231,8 @@ class TestCitationsStillResolve:
         ("proxy/proxy/session.py", 848, "def plan_eviction_snapshot"),
         # 8 — tenancy default
         ("proxy/proxy/router_helpers.py", 3990, "def _default_tenants"),
-        ("proxy/config.yaml", 1504, "session_slot_pool_size"),
-        ("proxy/config.yaml", 1512, "local_session_tenants: 2"),
+        ("proxy/config.yaml", 1583, "session_slot_pool_size"),
+        ("proxy/config.yaml", 1591, "local_session_tenants: 2"),
         # 9 — capacity admission + status fail-open
         ("proxy/proxy/capacity_admission.py", 124, "def _slots"),
         ("proxy/proxy/handlers.py", 482, "session_slot_pool_size"),
