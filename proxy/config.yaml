@@ -2848,6 +2848,34 @@ server:
   cached_prefix_credit_margin: 0.9
 
   # -----------------------------------------------------------------------
+  # Large-append rule (LP-0MW81DLWY003XOZ2)
+  # -----------------------------------------------------------------------
+  # The measured ``cached_ratio`` describes the PREVIOUS local response's hit
+  # fraction, so it cannot see a single message that appends a large block of
+  # genuinely new work. On 2026-11-03 08:41:54 one 51,945-byte tool-role
+  # message (a whole SKILL.md pasted into history) was appended; the price came
+  # out as ``cached_ratio=0.99 new_tokens=173`` and llama-server then prefilled
+  # 13,002 tokens (53.2 s to first byte, ``measured_cache_abort
+  # deficit_ratio=0.659``).
+  #
+  # When the content appended AFTER the session's recorded prompt prefix
+  # (``provider.record_prompt_prefix``) exceeds this many BYTES, the
+  # pre-dispatch price forces a full prefill (``cached_ratio = 0``), so the
+  # cold threshold is evaluated against the real prefill work. Only the append
+  # counts: a large *resident* prefix plus a small new turn keeps the measured
+  # ratio. With no recorded prefix (e.g. a ratio restored from the slot-snapshot
+  # sidecar) the append boundary is unknown and the measured ratio is used
+  # unchanged — the rule never treats a whole prompt as an append.
+  #
+  # Default 32768 (32 KiB, ≈8k tokens). ``0`` is the disable sentinel: the rule
+  # is off and the price is byte-for-byte the previous behaviour. A missing or
+  # malformed value keeps the default (a typo must not disable the rule).
+  # Sizing: a lower value is more conservative (more prompts priced cold, more
+  # remote fallbacks above the cold threshold); a higher value trusts the
+  # measured ratio for larger appends.
+  local_large_append_bytes_threshold: 32768
+
+  # -----------------------------------------------------------------------
   # Priority routing cheap window (LP-0MVDT94F0003VHUA AC1)
   # -----------------------------------------------------------------------
   # During this local-time window EVERY request is routed as ``low`` priority

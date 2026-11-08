@@ -193,6 +193,43 @@ def message_fingerprints(messages: Any) -> list[str]:
     return fingerprints
 
 
+def message_bytes(message: Any) -> int:
+    """Return the UTF-8 byte size of one message's ``role`` + ``content``.
+
+    The same fields, in the same order, that :func:`message_fingerprints`
+    digests, so the size measured here covers exactly the content whose
+    reuse the fingerprint prefix proves.  A non-dict message (or one with no
+    content) measures its role only.
+    """
+    role = ""
+    if isinstance(message, dict):
+        role = str(message.get("role") or "")
+    return len(role.encode("utf-8")) + 1 + len(_content_text(message).encode("utf-8"))
+
+
+def appended_content_bytes(messages: Any, stored_fingerprints: Any) -> int:
+    """Return the byte size of the content appended after a known prefix.
+
+    *stored_fingerprints* is the recorded prefix's fingerprint list (see
+    :func:`message_fingerprints`).  Every incoming message past the overlap
+    with that prefix is *appended* content: it cannot be served from the KV
+    prefix the previous dispatch measured, so it is real prefill work.
+
+    * ``stored_fingerprints`` empty/absent → the whole prompt is appended
+      (there is no known prefix boundary);
+    * incoming shorter than the stored prefix (truncated history) → nothing is
+      appended;
+    * a non-list ``messages`` → ``0`` (fail-open, never a raise: this is a
+      metric path).
+    """
+    if not isinstance(messages, (list, tuple)):
+        return 0
+    overlap = 0
+    if isinstance(stored_fingerprints, (list, tuple)) and stored_fingerprints:
+        overlap = min(len(stored_fingerprints), len(messages))
+    return sum(message_bytes(message) for message in messages[overlap:])
+
+
 def prefix_matches(stored: Any, incoming: Any) -> bool:
     """True when *stored* fingerprints cover a prefix of *incoming*.
 

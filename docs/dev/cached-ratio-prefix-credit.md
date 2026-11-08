@@ -80,6 +80,66 @@ label flips on turn 3 once turn 2's full prompt is resident. The number that
 matters for routing and the ETA guard — `new_tokens` — is correct
 immediately.
 
+## Large-append rule
+
+**Work item:** LP-0MW81DLWY003XOZ2 (merged from LP-0MW0KZUUS002LICZ AC9).
+
+The prefix credit above is only as good as its assumption: that the prompt grew
+by a small turn on top of the recorded prefix. A single message can append a
+large block of genuinely new work, which the measured ratio cannot see — it
+describes the **previous** response's hit fraction.
+
+Measured 2026-11-03 08:41:54: `routing_check estimated_tokens=18516
+new_tokens=173 cached_ratio=0.99 cache_state=warm`, then llama-server prefilled
+13,002 tokens; `measured_cache_abort` recorded `measured_new_tokens=12936
+priced_new_tokens=173 deficit_ratio=0.659` and the turn took **53.2 s** to first
+byte. The append that broke the estimate was a single tool-role message of
+**51,945 bytes** (a whole `SKILL.md` pasted into history).
+
+`provider.expected_cached_ratio()` now measures the content appended after the
+recorded prefix (`slot_cache_ratio.appended_content_bytes`, the same role +
+content fields the fingerprint digests) and, when it exceeds
+`server.local_large_append_bytes_threshold` bytes, returns `0.0`:
+
+```
+if recorded prefix matches incoming:
+    if appended_content_bytes(messages, fingerprints) > threshold:
+        return 0.0                                  # full prefill
+    credit = min(1.0, margin × min(prev_prompt_tokens, estimate) / estimate)
+    return max(measured, credit)
+return measured                                     # unchanged
+```
+
+Consequences and limits, all deliberate:
+
+- **The cold threshold then governs.** With `cached_ratio = 0`, `new_tokens` is
+  the whole estimate, so a prompt above
+  `local_large_context_cold_cache_threshold` (38,000) falls through the chain as
+  `large_context_bypass` instead of being admitted on a ratio that was never
+  about the appended content.
+- **Only the append counts.** A large *resident* prefix plus a small new turn
+  keeps the measured ratio; the threshold is not a prompt-size cap.
+- **No recorded prefix → unchanged.** A ratio restored from the slot-snapshot
+  sidecar has no known append boundary, so the measured ratio is used as before
+  rather than treating the whole prompt as an append (that would re-price every
+  large prompt of a restarted warm session cold — a behaviour change this rule
+  does not make).
+- **Default 32 KiB** (≈8k tokens): the incident's 51,945-byte append is caught,
+  an ordinary turn's few-hundred-byte append is not.
+- **Sentinel `0` disables the rule** and restores the previous price
+  byte-for-byte; a missing or malformed value keeps the default (a typo must
+  not silently disable the rule).
+- **Threaded through the router.** `_should_skip_local` takes `server_config`
+  and passes it to `expected_cached_ratio`, so the predicted-ratio price and the
+  prefix-credit margin read the same `server:` section as the rest of the
+  routing pipeline.
+
+Tests: `proxy/tests/test_large_append_full_prefill.py` — the 51,945-byte tool
+append prices `cached_ratio = 0` and falls under the cold threshold, a small
+append keeps the measured ratio, a resident prefix is not counted as an append,
+threshold configurability (flat and nested), the `0`/negative sentinel, the
+malformed-value fallback and the size helper's prefix arithmetic.
+
 ## Rollback
 
 Set `server.cached_prefix_credit_margin: 0.0` in `proxy/config.yaml`. No

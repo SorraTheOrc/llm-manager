@@ -1226,7 +1226,28 @@ server:
   local_resident_prefix_min_ratio: 0.5   # 0 disables the residency gate
   local_session_tenants: 2               # default: the slot count; 0 disables
   local_session_tenancy_idle_seconds: 30 # default: the adaptive dispatch lease
+  local_large_append_bytes_threshold: 32768  # 0 disables the large-append rule
 ```
+
+**Large-append pricing (`LP-0MW81DLWY003XOZ2`).** Where the ladder does *not*
+measure (rung 5, the predicted-ratio price), the ratio still comes from the
+previous local response — it cannot see a single message that appends a large
+block of new work. On 2026-11-03 08:41:54 a **51,945-byte** tool-role message
+(a whole `SKILL.md` pasted into history) was appended, the price came out as
+`cached_ratio=0.99 new_tokens=173`, and llama-server then prefilled 13,002
+tokens: 53.2 s to first byte, `measured_cache_abort deficit_ratio=0.659`. When
+the content appended after the session's recorded prompt prefix exceeds
+`local_large_append_bytes_threshold` **bytes**, the pre-dispatch price forces a
+full prefill (`cached_ratio = 0`), so the cold threshold is evaluated against
+the real prefill work instead of a ratio that was never about this content.
+Only the append counts (a large resident prefix plus a small turn keeps the
+measured ratio), and with no recorded prefix — a ratio restored from the
+slot-snapshot sidecar — the boundary is unknown and the measured ratio is used
+unchanged. `0` disables the rule and restores the previous price exactly; a
+missing or malformed value keeps the 32 KiB default. Every forced price logs
+`routing_large_append_full_prefill model=… session=… appended_bytes=…
+threshold=… estimated_tokens=…`, so a session that is suddenly priced cold is
+explainable from the log instead of looking like a measurement change.
 
 ### What to read, what never to call
 

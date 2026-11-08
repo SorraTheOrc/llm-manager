@@ -924,6 +924,58 @@ _last_prompt_prefix: dict[tuple[str, str], tuple[int, list[str]]] = {}
 #: sidecar's safety margin; llama.cpp may invalidate its own checkpoints).
 _DEFAULT_PREFIX_CREDIT_MARGIN = 0.9
 
+#: Large-append rule (LP-0MW81DLWY003XOZ2): when the content appended after
+#: the recorded prompt prefix exceeds this many bytes, the pre-dispatch price
+#: forces a full prefill (``cached_ratio = 0``) instead of trusting the
+#: in-memory residency ratio. The ratio describes the *previous* response's hit
+#: fraction and cannot see that a single new message added a large block of
+#: genuinely new work: on 2026-11-03 08:41:54 a **51,945-byte** tool-role
+#: message was appended, the price came out as ``cached_ratio=0.99
+#: new_tokens=173``, and llama-server prefilled 13,002 tokens (53.2 s to first
+#: byte, ``measured_cache_abort deficit_ratio=0.659``). Forcing the full-prefill
+#: price holds the prompt to the cold threshold on its real prefill work.
+LARGE_APPEND_BYTES_THRESHOLD_KEY: str = "local_large_append_bytes_threshold"
+
+#: Shipped threshold for the large-append rule: 32 KiB (≈8k tokens) of
+#: appended content. Above it the append alone is a material prefill, so the
+#: measured ratio is not a safe basis for the price. The incident's 51,945-byte
+#: append is caught; an ordinary turn's few-hundred-byte append is not.
+DEFAULT_LARGE_APPEND_BYTES_THRESHOLD: int = 32768
+
+#: Sentinel that disables the large-append rule (``0``, matching the other
+#: threshold knobs in this module): the price is exactly today's.
+DISABLED_LARGE_APPEND_BYTES_THRESHOLD: int = 0
+
+
+def large_append_bytes_threshold(config: dict | None) -> int:
+    """Resolve ``local_large_append_bytes_threshold`` (default 32 768 bytes).
+
+    ``0`` (or any non-positive value) is the disable sentinel
+    (:data:`DISABLED_LARGE_APPEND_BYTES_THRESHOLD`): the large-append rule is
+    off and the pre-dispatch price is byte-for-byte the previous behaviour.
+    A missing value keeps the shipped default; an unusable (malformed) value
+    also keeps the default — a typo must not silently disable the rule.
+    Accepts both the nested (``server:``) and flat forms, like the other
+    routing readers.
+    """
+    candidates: list[Any] = []
+    if isinstance(config, dict):
+        server_cfg = config.get("server", config)
+        if isinstance(server_cfg, dict):
+            candidates.append(server_cfg.get(LARGE_APPEND_BYTES_THRESHOLD_KEY))
+        candidates.append(config.get(LARGE_APPEND_BYTES_THRESHOLD_KEY))
+    for value in candidates:
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            threshold = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        if threshold <= 0:
+            return DISABLED_LARGE_APPEND_BYTES_THRESHOLD
+        return threshold
+    return DEFAULT_LARGE_APPEND_BYTES_THRESHOLD
+
 
 def record_prompt_prefix(
     model_name: str,
@@ -979,7 +1031,15 @@ def expected_cached_ratio(
       (today's behaviour — cold 0.0 for a fresh session);
     - a matching recorded prefix → ``max(measured, min(1.0, margin *
       prev_prompt / estimate))`` so the credit is proportionate to the
-      incoming prompt and never over-credits.
+      incoming prompt and never over-credits;
+    - a matching recorded prefix whose **appended** content (every message
+      past the recorded prefix) exceeds ``server
+      .local_large_append_bytes_threshold`` bytes → ``0.0``: the append is
+      real prefill work the measured ratio knows nothing about, so the price
+      is a full prefill (LP-0MW81DLWY003XOZ2). ``0`` disables the rule.
+      With no recorded prefix the append boundary is unknown (a ratio restored
+      from the slot-snapshot sidecar), so the measured ratio is returned
+      unchanged rather than treating the whole prompt as an append.
     """
     measured = _get_cached_ratio(model_name, session_id)
     if not model_name or not session_id:
@@ -1005,11 +1065,40 @@ def expected_cached_ratio(
     try:
         from proxy.slot_cache_ratio import message_fingerprints, prefix_matches
 
-        if not prefix_matches(fingerprints, message_fingerprints(messages)):
+        incoming_fingerprints = message_fingerprints(messages)
+        if not prefix_matches(fingerprints, incoming_fingerprints):
             return measured
     except Exception:
         logger.debug("prefix credit check failed", exc_info=True)
         return measured
+    # Large-append rule (LP-0MW81DLWY003XOZ2): a single message can append a
+    # large block of genuinely new work, which the previous response's measured
+    # ratio cannot see — it describes how much of the *previous* prompt was
+    # cached. Above the configured append size the price is forced to a full
+    # prefill (``cached_ratio = 0``), so the cold threshold is evaluated on the
+    # real prefill work instead of a ratio that was never about this content.
+    # ``0`` disables the rule (sentinel) and restores the previous price.
+    try:
+        from proxy.slot_cache_ratio import appended_content_bytes
+
+        threshold = large_append_bytes_threshold(server_config)
+        if threshold > 0:
+            appended = appended_content_bytes(messages, fingerprints)
+            if appended > threshold:
+                # One stable line so a session that is suddenly priced cold is
+                # explainable (the price, not the measurement, changed).
+                logger.info(
+                    "routing_large_append_full_prefill model=%s session=%s "
+                    "appended_bytes=%d threshold=%d estimated_tokens=%d",
+                    model_name,
+                    session_id or "unknown",
+                    appended,
+                    threshold,
+                    estimate,
+                )
+                return 0.0
+    except Exception:
+        logger.debug("large-append check failed", exc_info=True)
     credit = min(1.0, margin * min(prev_tokens, estimate) / estimate)
     return max(measured, credit)
 
@@ -2798,6 +2887,19 @@ def _closed_measurement_value(measurement: str | None) -> str:
     return MEASUREMENT_UNAVAILABLE_STALE_VIEW
 
 
+def _server_section(config: dict | None) -> dict | None:
+    """Return the ``server:`` mapping of *config* (flat configs pass through).
+
+    The pricing helpers (:func:`expected_cached_ratio`,
+    :func:`large_append_bytes_threshold`) read the ``server`` keys, so the
+    routing pipeline threads this mapping down to them (LP-0MW81DLWY003XOZ2).
+    """
+    if not isinstance(config, dict):
+        return None
+    section = config.get("server", config)
+    return section if isinstance(section, dict) else None
+
+
 def _effective_resident_prefix_min_ratio(config: dict | None) -> float:
     """Resolve `server.local_resident_prefix_min_ratio` (default 0.5).
 
@@ -3246,6 +3348,7 @@ def _should_skip_local(
     session_tenants: int | None = None,
     tenancy_idle_seconds: float | None = None,
     unmeasured_cold_enabled: bool = True,
+    server_config: dict | None = None,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -3340,6 +3443,11 @@ def _should_skip_local(
             ``admit_predicted`` / ``skip_predicted`` log lines, byte-for-byte
             (LP-0MW81DJZ60049X5W). Only consulted when
             ``resident_prefix_min_ratio`` > 0.
+        server_config: The ``server:`` section of the config (flat configs
+            pass through), threaded to :func:`expected_cached_ratio` so the
+            predicted-ratio price honours the large-append rule
+            (``local_large_append_bytes_threshold``, LP-0MW81DLWY003XOZ2) and
+            the prefix-credit margin. ``None`` keeps both shipped defaults.
 
     Returns:
         A tuple ``(skip, reason)`` where:
@@ -3489,6 +3597,7 @@ def _should_skip_local(
         session_id,
         estimated_tokens,
         (body_json or {}).get("messages") if isinstance(body_json, dict) else None,
+        server_config=server_config,
     )
     new_tokens = int(estimated_tokens * (1 - ratio))
     if new_tokens <= cold_cache_threshold:
@@ -7541,6 +7650,7 @@ async def _queue_context_bypass(
         endpoint=endpoint,
         session_tenants=_resolve_tenants(config),
         tenancy_idle_seconds=_resolve_tenancy_idle(config),
+        server_config=_server_section(config),
     )
     return _skip_local, _skip_reason
 
@@ -15682,6 +15792,7 @@ async def _proxy_with_fallback_cycle(
                     endpoint=local_endpoint,
                     session_tenants=_session_tenants,
                     tenancy_idle_seconds=_tenancy_idle,
+                    server_config=_server_section(config),
                 )
                 # LP-0MVODJ3P6000AIUM: initialised here so the admission-evidence
                 # stamp below can consult the idle-admit verdict even on the
@@ -15975,6 +16086,7 @@ async def _proxy_with_fallback_cycle(
                             endpoint=local_endpoint,
                             session_tenants=_session_tenants,
                             tenancy_idle_seconds=_tenancy_idle,
+                            server_config=_server_section(config),
                         )
                         if _skip_after:
                             logger.info(
