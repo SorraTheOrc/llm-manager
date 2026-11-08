@@ -361,15 +361,20 @@ ROUTING_IDLE_ADMIT = "routing_idle_admit"
 # Residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5): the proxy emits
 # ``routing_resident_prefix provider=local model=... decision=<verdict>
 # n_past_actual=<n|none> estimated_tokens=<n> reuse_ratio=<f|none>
-# slot_owner_session=<id|none> residency_source=<measured|session_slot|
-# non_resident|unknown> measurement=<measured|unavailable:<reason>>
-# min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
+# slot_owner_session=<id|none> residency_source=<measured|measured_last_dispatch|
+# session_slot|non_resident|unknown> measurement=<measured|unavailable:<reason>>
+# min_ratio=<f> tenants=<n> occupants=<n> session=<id>
+# threshold_applied=<cold|warm|none> threshold_value=<n|none>``
 # once per admission decision. ``decision`` is one of ``admit``,
-# ``resident_prefix_insufficient``, ``tenant_limit`` (plus
-# ``large_context_bypass`` for a live-priced cold miss). The fail-open path
-# (unmeasured view — no fresh snapshot, no ownership) logs
-# ``admit_predicted`` / ``skip_predicted`` with ``n_past_actual=none`` so
-# residency-blind decisions stay observable (LP-0MVN4LANP0069QQM AC5).
+# ``resident_prefix_insufficient``, ``tenant_limit``, ``large_context_bypass``
+# (a live-priced cold miss) or ``unmeasured_residency_cold`` (an unmeasured
+# basis held to the cold threshold). Since LP-0MW81DFML006O5KL an unmeasured
+# basis above the cold threshold is DENIED as ``unmeasured_residency_cold``;
+# the retired fail-open path logged ``admit_predicted`` / ``skip_predicted``
+# with ``n_past_actual=none`` (LP-0MVN4LANP0069QQM AC5). Those two values are
+# kept in the vocabulary so historical lines and their parses keep their
+# meaning, and they reappear verbatim when the documented rollback
+# (``local_unmeasured_residency_cold_enabled: false``) is in force.
 ROUTING_RESIDENT_PREFIX = "routing_resident_prefix"
 # Shared post-acceptance eviction event (LP-0MVN1IQTF0037WTG AC6,
 # LP-0MVN3KMGI009BZ0D AC7): ``local_eviction session=... reason=<vocab>

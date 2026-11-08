@@ -245,20 +245,31 @@ the divergence case decidable at all (task 92383: predicted 0.99, measured
 
 The prediction is still used, deliberately, in two places:
 
-1. **Fail-open fallback.** When there is no fresh snapshot *and* the session owns
-   no slot (`residency_source=unknown`), admission degrades to the predicted
-   ratio rather than denying local on absent data.
-2. **Everything below the budget.** Prompts at or under
+1. **Below the budget.** Prompts at or under
    `local_large_context_cold_cache_threshold` (and small contexts generally) are
    routed local as before, as is the cheap-mode economic recovery, the
    capacity-admission path and the prefill-ETA guard's ETA input.
+2. **Under the rollback.** `server.local_unmeasured_residency_cold_enabled:
+   false` (`false` / `0` / `off`; a missing or malformed value keeps the shipped
+   `true`) restores the pre-change fail-open to the predicted ratio
+   byte-for-byte, logging `decision=admit_predicted` /
+   `decision=skip_predicted` with `n_past_actual=none`.
+
+With the shipped default (`true`) the prediction is **not** used above the cold
+threshold: an unmeasured basis (`residency_source=unknown`) is treated as
+**cold** (`LP-0MW81DFML006O5KL`), so the turn is refused locally
+(`unmeasured_residency_cold`) rather than admitted on a ratio nothing measured.
 
 So the prefix-credit machinery documented above remains the mechanism that
 keeps *sub-threshold* multi-turn sessions cheap, while the residency gate
-decides the large-prompt band from measurement. The knob that disables the new
-gate (`server.local_resident_prefix_min_ratio: 0`) restores the predicted-ratio
-decision everywhere — the documented rollback for the residency work, exactly
-as `cached_prefix_credit_margin: 0.0` is the rollback for the credit itself.
+decides the large-prompt band from measurement — and, when nothing has been
+measured, refuses it. Two switches undo this, at different scopes: the
+**narrow** one is `server.local_unmeasured_residency_cold_enabled: false`
+(restores only the unmeasured → predicted fallback), the **broad** one is
+`server.local_resident_prefix_min_ratio: 0` (disables the whole residency
+ladder, restoring the predicted-ratio decision everywhere — the documented
+rollback for the residency work, exactly as `cached_prefix_credit_margin: 0.0`
+is the rollback for the credit itself).
 
 **Do not add a synchronous `/slots` call to make the prediction "more accurate".**
 `/slots` is held for >15 s during prompt processing

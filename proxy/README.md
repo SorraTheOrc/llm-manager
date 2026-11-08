@@ -3011,6 +3011,32 @@ Cache-warm marking is tied to **slot-save success** (not just any HTTP response
 success). A response that does not save the slot (e.g., slot persistence
 disabled, non-streaming proxy-only mode) does **not** warm the cache.
 
+#### Measured residency: unmeasured is cold (`LP-0MW81DFML006O5KL`)
+
+For prompts above the cold threshold the threshold is chosen from the session's
+**measured** reusable prefix (the cached `/slots` snapshot plus the in-process
+slot-ownership registry), not from the predicted `cached_ratio` alone:
+
+| Basis at admission | Threshold applied |
+|---|---|
+| measured-resident (`residency_source` = `measured`, `measured_last_dispatch` or `session_slot`) | warm cap (`local_large_context_warm_cache_threshold`, 120 000) |
+| unmeasured (`residency_source=unknown`: no fresh snapshot *and* no slot ownership, or a probe that raised) | cold cap (`local_large_context_cold_cache_threshold`, 38 000 base/fast, 42 000 cheap) — above it the request skips local with reason `unmeasured_residency_cold` |
+
+Unmeasured used to fail open to the predicted ratio; that admitted a 55 492-token
+prompt priced `cached_ratio=1.00` on 2026-11-07 20:48:51, evicted 180.1 s later.
+The denial is not idle-overridable — it reports a missing measurement, not a
+price an idle GPU can beat; `local_last_resort_*` stays the final local
+override when no remote provider can serve the request. Design, rung order and
+the log grammar: `proxy/docs/routing.md` → *Residency-aware admission ladder*.
+
+**Rollback: one value, byte-for-byte.**
+`local_unmeasured_residency_cold_enabled: false` (`false` / `0` / `off`;
+missing or malformed keeps the shipped `true`) restores the pre-change
+behaviour exactly: an unmeasured basis degrades to the predicted ratio and logs
+`decision=admit_predicted` / `decision=skip_predicted` with
+`n_past_actual=none`. `local_resident_prefix_min_ratio: 0` is the broader
+switch that disables the whole residency ladder.
+
 #### Configuration
 
 ```yaml

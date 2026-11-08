@@ -1206,7 +1206,10 @@ now walks a **five-rung ladder**, in this order:
 2. **Resident-prefix gate** — admit only when the session's *measured* reusable
    prefix is at least `local_resident_prefix_min_ratio` of the prompt;
    otherwise skip local with `resident_prefix_insufficient` and fall through the
-   chain as `large_context_bypass` does today. `0` disables this rung.
+   chain as `large_context_bypass` does today. A prompt above the cold threshold
+   with **no** measurement at all (`residency_source=unknown`) is treated as
+   *cold* and skipped with `unmeasured_residency_cold` (see *Unmeasured is cold*
+   below). `0` disables this rung.
 3. **Session tenancy** — at most `local_session_tenants` distinct sessions hold a
    local reservation at once (`tenant_limit` otherwise); same-session re-entry is
    always permitted and a tenancy idle-lapses after
@@ -1224,6 +1227,7 @@ now walks a **five-rung ladder**, in this order:
 ```yaml
 server:
   local_resident_prefix_min_ratio: 0.5   # 0 disables the residency gate
+  local_unmeasured_residency_cold_enabled: true  # false restores the predicted-ratio fallback
   local_session_tenants: 2               # default: the slot count; 0 disables
   local_session_tenancy_idle_seconds: 30 # default: the adaptive dispatch lease
   local_large_append_bytes_threshold: 32768  # 0 disables the large-append rule
@@ -1297,11 +1301,33 @@ synchronous call would stall every routing decision. `proxy.residency` is
 dependency-free for exactly this reason: no poller, no new task, no upstream
 call.
 
-**Fail-open on unknown state.** A missing or stale snapshot (> 5 s), a session
-that owns no slot, or a build that no longer reports `context_tokens` (llama.cpp
-b8782 dropped `n_past`) degrades one rung at a time: measured ratio → session
-owns the slot (restore path) → today's predicted-ratio decision. Admission never
-turns absent data into a hard local outage.
+**Unmeasured is cold (`LP-0MW81DFML006O5KL`).** A missing or stale snapshot
+(> 5 s), a session that owns no slot, or a build that no longer reports
+`context_tokens` (llama.cpp b8782 dropped `n_past`) degrades one rung at a
+time: measured ratio → session owns the slot (restore path) → **unmeasured**. An
+unmeasured basis is treated as **cold**: the prompt is held to
+`local_large_context_cold_cache_threshold` (38 000) and, above it, skipped with
+`unmeasured_residency_cold` into the normal remote chain. It no longer
+fail-opens to the predicted sidecar ratio — that relaxation is exactly what
+admitted the 2026-11-07 20:48:51 55 492-token prompt on
+`cached_ratio=1.00 new_tokens=172` and evicted it at 180.1 s. Only a
+*measured-resident* basis (`measured` / `measured_last_dispatch` /
+`session_slot`) keeps the 120 000 warm threshold. The denial is deliberately
+**not** idle-overridable (`IDLE_OVERRIDABLE_SKIP_REASONS`): it reports a missing
+measurement, not a price an idle GPU can beat — `local_last_resort_*` stays the
+final local override when no remote can serve the request. Absent data never
+becomes a hard local outage for prompts *below* the cold threshold: those route
+local exactly as before.
+
+**Rollback (one value, byte-for-byte).**
+`server.local_unmeasured_residency_cold_enabled: false` — `false` / `0` / `off`
+are all accepted, and a missing or malformed value keeps the `true` default, so
+a typo can never silently disable the enforcement — restores the pre-change
+fail-open behaviour exactly: an unmeasured basis degrades to the predicted
+sidecar ratio and logs `decision=admit_predicted` / `decision=skip_predicted`
+with `n_past_actual=none`. `local_resident_prefix_min_ratio: 0` remains the
+broader switch that disables the whole residency ladder (and therefore this rule
+with it).
 
 ### Tenancy is a lease, not a lock
 
@@ -2471,6 +2497,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap — the prompt can never fit local, however long it waits | `context_too_large` | promoting | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
 | Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | refusing | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
+| Router skip: prompt above the cold threshold with **no** measured residency (`residency_source=unknown`, i.e. no fresh `/slots` view and no slot ownership) — unmeasured is cold (`LP-0MW81DFML006O5KL`), and unlike `resident_prefix_insufficient` this denial is **not** idle-overridable, because it reports a missing measurement rather than a price | `unmeasured_residency_cold` | refusing | `routing_skip_local ... reason=unmeasured_residency_cold ...` |
 | Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | refusing | `routing_skip_local ... reason=tenant_limit ...` |
 | Router skip: (session, prompt) in post-deadline prefill-thrash cooldown — enforced at provider.py's chain entry **and** at the local dispatch choke points (`proxy_to_local` and `_try_acquire_local_dispatch`). The choke point's refusal is a **deferral**, not a fault: its 503 carries the `prefill_thrash_cooldown` dispatch-reason marker, so the entry is **not** quarantined and other sessions keep their local route (LP-0MVXSSYTN001TBW5) | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` (`entry=router_dispatch` / `entry=lease_acquire` at the choke points) and `Fallback triggered ... reason=prefill_thrash_cooldown` (attempt record `status=local_dispatch_deferral`, no `local_provider_cooldown` arm) |
 | Router skip: this request already had a local dispatch cancelled post-deadline (the request-scoped terminal marker), so local is terminal for it. Enforced at the same choke points as the cooldown row. Request-scoped by construction, so a concurrent request from the same session is unaffected. The refusal is a **deferral** carrying the `post_deadline_terminal` dispatch-reason marker, so the entry is **not** quarantined (LP-0MVXSSYTN001TBW5) | `post_deadline_terminal` | refusing | `routing_skip_local ... reason=post_deadline_terminal ...` (`entry=router_dispatch` / `entry=lease_acquire`) and `Fallback triggered ... reason=post_deadline_terminal` (attempt record `status=local_dispatch_deferral`, no `local_provider_cooldown` arm) |

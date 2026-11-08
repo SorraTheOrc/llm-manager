@@ -497,6 +497,47 @@ local is bypassed whenever new tokens exceed the threshold. A ratio of `1.0`
 (full warm cache) yields `new_tokens = 0`, so local is always used unless the
 warm-cache hard cap applies. A threshold of `0` disables the bypass entirely.
 
+### Measured residency: unmeasured is cold (`LP-0MW81DFML006O5KL`)
+
+For prompts above the cold threshold the cold/warm decision is taken from the
+session's **measured** reusable prefix, not from the predicted `cached_ratio`
+alone. The router reads the cached `/slots` snapshot
+(`proxy.residency.get_residency_view()`) joined with the in-process slot
+ownership registry, and picks the threshold from that basis:
+
+| Measured basis | Threshold that governs |
+|---|---|
+| **measured-resident** — `residency_source` is `measured`, `measured_last_dispatch` or `session_slot` | the **warm** cap (`local_large_context_warm_cache_threshold`, 120 000): a measured-warm 55 000-token prompt is still served locally |
+| **unmeasured** — `residency_source=unknown` (no fresh snapshot *and* no slot ownership, or a probe that raised) | the **cold** cap (`local_large_context_cold_cache_threshold`, 38 000): above it the prompt skips local with reason `unmeasured_residency_cold` and follows the normal remote chain |
+
+Rationale: on 2026-11-07 20:48:51 a 55 492-token prompt was priced
+`cached_ratio=1.00 new_tokens=172` — nothing had been measured — and the
+dispatch was charged `eta_prefill_s=130.8` before being evicted at 180.1 s. Over
+the certified 2026-11-06 window (33.7 h) 55 of 60 `prefill_deadline` events were
+prompts above 38 000 tokens and **none** exceeded 120 000, i.e. the failures
+lived entirely in the band only the predicted-warm path admitted.
+
+The denial is deliberately **not** idle-overridable (it reports a missing
+measurement, not a price an idle GPU can beat); `local_last_resort_*` remains
+the final local override when no remote provider can serve the request. Each
+decision records its basis and the threshold it applied, so a >38 000-token
+local admission is explainable from the log line alone:
+
+```
+routing_resident_prefix provider=… model=… decision=… residency_source=… measurement=… threshold_applied=<cold|warm|none> threshold_value=<n|none>
+```
+
+**Rollback (single flag).** Set
+`server.local_unmeasured_residency_cold_enabled: false` — `false` / `0` / `off`
+are accepted, and a missing or malformed value keeps the `true` default — to
+restore the pre-change behaviour byte-for-byte: an unmeasured basis degrades to
+the predicted sidecar ratio and logs `decision=admit_predicted` /
+`decision=skip_predicted` with `n_past_actual=none`. No code revert is needed,
+and no restart-ordering constraint applies beyond the usual process restart.
+`local_resident_prefix_min_ratio: 0` remains the broader switch that disables the
+whole residency ladder, and the unmeasured-cold rule lives inside that ladder
+(so `0` disables this rule with it).
+
 Config keys (both nested under `server:` and flat forms are supported):
 
 ```yaml
