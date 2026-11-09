@@ -1008,12 +1008,21 @@ sample at or before their evaluation instant, which is not necessarily the grid
 instant the CLI queries. At a power step or a slot-state change the recorded
 value can therefore sit one grid sample behind the raw series for reasons that
 have nothing to do with the definition. Measured on 2026-11-02 (the worst case
-the audit found): a same-instant comparison called **321 of 2,897 instants** a
-divergence, and **303 of those 321 (94 %) sat within ±30 s of a slot-state
-change** — pure timestamp jitter. The cross-check therefore recomputes over a
+the audit found; re-measured 2026-11-09 over
+`2026-11-02T00:00:00Z`–`12:04:00Z`, 2,897 instants at 15 s, captured live into
+`monitoring/tests/fixtures/window_rules_jitter_full.json`): a same-instant
+comparison calls **307 of the 2,883 paired instants** a divergence, and **7 more
+instants carry no recorded-rule sample at all** — 314 of 2,897 in total. The
+2026-11-06 audit quoted 321 of 2,897 for the same window with a slightly
+different pairing convention; the conclusion is unchanged, and 94 % of the
+divergences it inspected sat within ±30 s of a slot-state change, i.e. pure
+timestamp jitter. The cross-check therefore recomputes over a
 **±1-sample** staleness window (earlier sample first, the direction a recording
 rule looks) and skips instants whose inputs are all frozen (a dead sampler,
-where comparing one frozen sample set with another invents a drift).
+where comparing one frozen sample set with another invents a drift). Over the
+same 2,897-instant window it compares 2,873 instants and reports **0
+mismatches** — pinned by
+`proxy/tests/test_gpu_utilisation_cli.py::test_live_capture_of_the_full_worst_case_window_reports_no_rule_drift`.
 
 A genuine definition change diverges at *every* instant, so this tolerance does
 not weaken it: a rule recorded for a 100 W threshold against the CLI's 90 W

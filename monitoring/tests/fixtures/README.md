@@ -42,6 +42,7 @@ issues for a single window from one file.
 | `gpu_computing_workload_bool.json` | `gpu:computing_workload:bool` | authored |
 | `window_with_gap.json` | all of the above | mixed |
 | `window_rules_jitter.json` | all of the above | captured live |
+| `window_rules_jitter_full.json` | all of the above | captured live |
 
 ## How the live captures were made
 
@@ -101,6 +102,19 @@ mismatches over it. Do **not** "fix" the values to satisfy
 holds only for the authored `window_with_gap.json`, where the workload stream
 was derived from the same timestamps; real recordings do not have it, and the
 cross-check exists precisely because they do not.
+
+## The full worst-case window
+
+`window_rules_jitter_full.json` is the **whole** measured worst-case window,
+not a slice: `2026-11-02T00:00:00Z .. 12:04:00Z`, 2,897 instants at 15 s,
+captured live on 2026-11-09 with the recipe above. 307 of its 2,883 paired
+instants break a naive same-instant rule comparison and 7 instants carry no
+recorded-rule sample at all (314 of 2,897 in total), while the staleness-aware
+cross-check compares 2,873 instants and reports zero mismatches. It is ~1.1 MB
+because it is a full 12-hour 15 s matrix — that size is the point: it is the
+only fixture that proves the tolerance at the window scale the audit measured,
+rather than on a 20-minute slice. Regenerate it with the recipe above; do not
+hand-edit values.
 
 ## The deliberate gap
 

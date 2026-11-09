@@ -43,6 +43,13 @@ BUNDLE = json.loads((FIXTURES / "window_with_gap.json").read_text())
 #: Live capture of the 2026-11-02 05:25-05:45 slice of the measured worst-case
 #: window: 15 of its 81 instants break a naive same-instant rule comparison.
 JITTER_BUNDLE = json.loads((FIXTURES / "window_rules_jitter.json").read_text())
+#: Live capture of the WHOLE measured worst-case window (2026-11-02
+#: 00:00-12:04 UTC, 2,897 instants at 15 s): 307 of its 2,883 paired instants
+#: break a naive same-instant rule comparison, and 7 instants carry no
+#: recorded-rule sample at all (314 of 2,897 divergent in total).
+FULL_JITTER_BUNDLE = json.loads(
+    (FIXTURES / "window_rules_jitter_full.json").read_text()
+)
 START = BUNDLE["capture"]["window"]["start_unix"]
 END = BUNDLE["capture"]["window"]["end_unix"]
 STEP = 15
@@ -789,6 +796,69 @@ def test_live_capture_of_the_worst_case_window_reports_no_rule_drift():
     # The slice must actually exercise the staleness path, or it proves nothing.
     assert len(naive_divergences) == 15
     assert result.cross_check_samples == expected == 81
+    assert result.cross_check_mismatches == 0
+    assert result.warnings == ()
+
+
+def test_live_capture_of_the_full_worst_case_window_reports_no_rule_drift():
+    """AC2: the whole 2026-11-02 window, not a 20-minute slice of it.
+
+    The audit that motivated this item measured the jitter hotspot over
+    2026-11-02 and quoted 321 of 2,897 instants flagged by a same-instant
+    comparison. Re-measured over the whole window (2026-11-02T00:00:00Z ..
+    12:04:00Z, 2,897 instants at 15 s, captured live into
+    ``window_rules_jitter_full.json``): 307 of the 2,883 paired instants
+    diverge, and 7 instants carry no recorded-rule sample at all, so 314 of
+    the 2,897 instants disagree under a naive comparison. The staleness-aware
+    cross-check must report none of them — over the whole window, not just
+    over the slice pinned by the test above.
+    """
+    capture = FULL_JITTER_BUNDLE["capture"]
+    window = gu.Window(
+        start=capture["window"]["start_unix"], end=capture["window"]["end_unix"]
+    )
+    step = capture["step_seconds"]
+    expected = gu.expected_sample_count(window.start, window.end, step)
+    series = gu.load_series(
+        getter=bundle_getter(FULL_JITTER_BUNDLE["responses"]),
+        prometheus_url=gu.DEFAULT_PROMETHEUS_URL,
+        window=window,
+        step_seconds=step,
+        expected_samples=expected,
+    )
+
+    grid = [window.start + index * step for index in range(expected)]
+    naive_divergences = [
+        timestamp
+        for timestamp in grid
+        if timestamp in series["computing_workload_bool"]
+        and timestamp in series["power_watts"]
+        and timestamp in series["slots_busy"]
+        and gu.classify_instant(
+            series["power_watts"][timestamp], series["slots_busy"][timestamp]
+        )
+        != (series["computing_workload_bool"][timestamp] >= 0.5)
+    ]
+    unmeasured = [
+        timestamp
+        for timestamp in grid
+        if timestamp not in series["computing_workload_bool"]
+    ]
+
+    result = gu.compute_utilisation(
+        series,
+        window=window,
+        step_seconds=step,
+        scrape_interval_seconds=STEP,
+    )
+
+    # The window must actually be the measured worst case, or the zero below
+    # proves nothing.
+    assert expected == 2897
+    assert len(naive_divergences) == 307
+    assert len(unmeasured) == 7
+    # ... and the cross-check must clear every instant it can compare.
+    assert result.cross_check_samples == 2873
     assert result.cross_check_mismatches == 0
     assert result.warnings == ()
 
