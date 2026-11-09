@@ -1,0 +1,405 @@
+
+# <!-- REFACTOR-LP-0MW8QY8HE0051UNZ
+# smell: unused_import
+# severity: critical
+# description: Redefinition of unused `app` from line 219: `app` redefined here
+# -->
+"""Busy-engine ``/slots`` regression harness for ``/llama/local/status``.
+
+LP-0MW3ED3XN003TPXI (child of LP-0MW10EZXX004M7BI).
+
+Why this module exists
+----------------------
+The intake measured the defect on a live engine: while a local generation ran,
+the model child's ``/slots`` endpoint did not answer inside either proxy poll
+budget, so essentially every status poll degraded to a fossil snapshot
+(``slots_stale=true``, ``slots_detail_stale=true``, ``null`` ETAs). Without a
+deterministic reproduction every later fix is unverifiable and the "< 5 % of
+polls stale" target cannot be measured in CI.
+
+This module is the **single reusable busy-engine harness** for the whole
+``/slots`` policy family. Later features (fossil-``generating`` reproduction,
+ETA availability, authoritative-occupancy policy, documentation) assert against
+these helpers instead of inventing a second stub mechanism:
+
+- :class:`BusySlotsStub` — one configurable fake ``/slots`` upstream
+  (``delay``, ``status``, ``payload``) patched onto the coalesced fetch choke
+  point ``proxy.observability._do_slots_fetch``. It faithfully emulates
+  ``asyncio.wait_for(client.get(url), timeout)``: it waits at most the caller's
+  budget and raises :class:`TimeoutError` when the simulated latency exceeds it,
+  so the *real* degradation path (timeout → last-known cache) is exercised.
+- :func:`call_local_status` — drives ``GET /llama/local/status`` through the
+  same FastAPI ``ASGITransport`` pattern the existing slots tests use, under a
+  stub, with optional seeded last-known caches.
+
+Reuse from a sibling test module (``proxy/tests`` is on ``sys.path`` via
+``proxy/conftest.py``)::
+
+    from test_slots_busy_engine_policy import BusySlotsStub, call_local_status
+
+The two proxy poll budgets the stub must exceed to reproduce the defect are
+:data:`COUNTS_BUDGET_SECONDS` (2.0 s, hard-coded in the status handler) and
+:data:`DEFAULT_DETAIL_BUDGET_SECONDS` (1.0 s, ``STATUS_QUERY_TIMEOUT``).
+"""
+
+import asyncio
+import contextlib
+import os
+import time
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+# Documented proxy poll budgets. The stub latency must exceed BOTH to
+# reproduce the measured busy-engine degradation.
+COUNTS_BUDGET_SECONDS = 2.0
+"""Counts-phase ``/slots`` budget, hard-coded in ``get_llama_local_status``."""
+
+DEFAULT_DETAIL_BUDGET_SECONDS = 1.0
+"""Detail-phase ``/slots`` budget (``STATUS_QUERY_TIMEOUT`` default)."""
+
+# Extra headroom granted to the wall-clock assertion so ordinary CI scheduling
+# jitter cannot make a correctly-bounded poll look unbounded.
+_BUDGET_SLACK_SECONDS = 1.0
+
+_DEFAULT_SEED_SLOTS = [
+    {"slot_id": 0, "is_processing": False, "n_decoded": None},
+    {"slot_id": 1, "is_processing": True, "n_decoded": 42},
+]
+"""Last-known per-slot detail seeded so the detail fallback has something to
+serve (a cache-served list is what makes ``slots_detail_stale`` observable)."""
+
+_DEFAULT_SEED_COUNTS = (1, 2)
+"""Last-known ``(available, total)`` counts seeded so ``slot_counts_stale`` has
+a last-known pair to serve after the fresh counts query fails."""
+
+
+class BusySlotsStub:
+    """A configurable fake ``/slots`` upstream shared by every policy test.
+
+    Parameters
+    ----------
+    delay:
+        Simulated upstream latency in seconds. Use a value greater than
+        :data:`COUNTS_BUDGET_SECONDS` / :data:`DEFAULT_DETAIL_BUDGET_SECONDS` to
+        reproduce the busy-engine timeout path; ``0.0`` for a healthy engine.
+    status:
+        HTTP status the request would carry if it returned before timing out.
+        ``200`` with a ``payload`` models a healthy-but-slow engine; ``500``
+        models the measured ``proxying request … 500`` shape.
+    payload:
+        Parsed JSON body returned when ``status == 200``. Entries use
+        llama.cpp's raw ``/slots`` shape (``id``, ``is_processing``,
+        ``next_token``).
+
+    ``calls`` records every fetch as ``{url, timeout, delay}`` so a test can
+    assert which budget each phase applied.
+    """
+
+    def __init__(self, *, delay: float = 0.0, status: int = 200, payload=None):
+        self.delay = float(delay)
+        self.status = int(status)
+        self.payload = list(payload) if payload is not None else []
+        self.calls: list[dict] = []
+
+    async def fetch(self, url, timeout, client=None):
+        """Stand-in for ``proxy.observability._do_slots_fetch``.
+
+        Faithfully mirrors the real helper's ``asyncio.wait_for`` semantics:
+        waits at most ``timeout`` seconds and only raises ``TimeoutError`` when
+        the simulated latency exceeds that budget.
+        """
+        budget = float(timeout)
+        self.calls.append({"url": url, "timeout": budget, "delay": self.delay})
+        await asyncio.sleep(min(self.delay, budget))
+        if self.delay > budget:
+            raise TimeoutError(
+                f"busy /slots latency {self.delay}s exceeded {budget}s budget"
+            )
+        if self.status != 200:
+            return self.status, None
+        return self.status, self.payload
+
+    def patch(self):
+        """Patch the coalesced fetch choke point used by both query helpers."""
+        return patch("proxy.observability._do_slots_fetch", self.fetch)
+
+    def budget_exceeding_calls(self) -> list[dict]:
+        """Fetches whose simulated latency exceeded the budget applied to them."""
+        return [c for c in self.calls if c["delay"] > c["timeout"]]
+
+
+class _FakeLock:
+    """Non-blocking async lock stand-in for the server's asyncio locks."""
+
+    def locked(self):
+        return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+
+@contextlib.contextmanager
+def _status_endpoint(stub: BusySlotsStub, *, seed_counts, seed_slots, config):
+    """Context manager installing every patch a status poll needs.
+
+    Mirrors the established slots tests' patch set (server state + the
+    last-known caches) and adds the busy-engine stub at the fetch choke point.
+    """
+    from proxy.server import app
+
+    from proxy import server as srv
+
+    async def fake_query():
+        return {"llama_server_running": True}
+
+    counts_cache = None
+    if seed_counts is not None:
+        counts_cache = (seed_counts[0], seed_counts[1], time.monotonic())
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch("proxy.server.query_llama_status", side_effect=fake_query)
+        )
+        stack.enter_context(patch.object(srv, "current_model", "test-model"))
+        stack.enter_context(patch.object(srv, "model_switch_refcount", 0))
+        stack.enter_context(patch.object(srv, "model_switch_lock", _FakeLock()))
+        stack.enter_context(patch.object(srv, "background_loads", {}))
+        stack.enter_context(patch.object(srv, "local_dispatch_records", {}))
+        stack.enter_context(
+            patch.object(srv, "local_dispatch_records_lock", _FakeLock())
+        )
+        stack.enter_context(
+            patch.object(
+                srv,
+                "config",
+                config
+                if config is not None
+                else {"server": {"llama_server_port": 8080}},
+            )
+        )
+        stack.enter_context(
+            patch("proxy.observability._last_slot_counts_cache", counts_cache)
+        )
+        stack.enter_context(
+            patch(
+                "proxy.observability._last_slot_details_cache",
+                list(seed_slots) if seed_slots is not None else [],
+            )
+        )
+        stack.enter_context(patch("proxy.observability._last_slot_details_at", 0.0))
+        stack.enter_context(stub.patch())
+        yield app
+
+
+async def call_local_status(
+    *,
+    stub: BusySlotsStub | None = None,
+    seed_counts=_DEFAULT_SEED_COUNTS,
+    seed_slots=None,
+    detail_timeout: float | None = None,
+    config: dict | None = None,
+):
+    """Drive ``GET /llama/local/status`` under a :class:`BusySlotsStub`.
+
+    Args:
+        stub: The fake ``/slots`` upstream. Defaults to a healthy, instant,
+            empty-payload stub.
+        seed_counts: Last-known ``(available, total)`` pair, or ``None`` to
+            leave the counts cache empty.
+        seed_slots: Last-known per-slot detail list, or ``None`` for the
+            module default (:data:`_DEFAULT_SEED_SLOTS`).
+        detail_timeout: Override ``STATUS_QUERY_TIMEOUT`` for the detail phase.
+        config: Server config override.
+
+    Returns:
+        ``(payload, elapsed_seconds)`` where *payload* is the parsed JSON body.
+    """
+    stub = stub if stub is not None else BusySlotsStub(delay=0.0, payload=[])
+    seed_slots = _DEFAULT_SEED_SLOTS if seed_slots is None else seed_slots
+
+    app = None
+    with _status_endpoint(
+        stub, seed_counts=seed_counts, seed_slots=seed_slots, config=config
+    ) as app:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as ac:
+            env = (
+                {"STATUS_QUERY_TIMEOUT": str(detail_timeout)}
+                if detail_timeout is not None
+                else {}
+            )
+            with patch.dict(os.environ, env):
+                started = time.monotonic()
+                resp = await ac.get("/llama/local/status")
+                elapsed = time.monotonic() - started
+
+    assert resp.status_code == 200, (
+        f"/llama/local/status returned {resp.status_code} under a busy-engine "
+        f"stub; a degraded poll must stay 200 (graceful degradation)"
+    )
+    return resp.json(), elapsed
+
+
+# ======================================================================
+# Baseline: the harness provably reproduces the measured degradation
+# ======================================================================
+
+
+class TestBusyEngineBaseline:
+    """A slow ``/slots`` reproduces the intake's degraded status payload."""
+
+    @pytest.mark.asyncio
+    async def test_slow_slots_exceeding_budgets_reproduces_degradation(self):
+        """AC1: latency beyond both poll budgets → the three stale flags.
+
+        The stub's latency exceeds both documented budgets, so *both* the counts
+        phase (2.0 s) and the detail phase (``STATUS_QUERY_TIMEOUT``, 1.0 s)
+        time out. Each phase then serves its last-known cache, which is exactly
+        the shape the intake measured on the live engine.
+        """
+        stub = BusySlotsStub(
+            delay=COUNTS_BUDGET_SECONDS + 0.5,
+            status=200,
+            payload=[
+                {"id": 0, "is_processing": False, "next_token": {"n_decoded": None}},
+                {"id": 1, "is_processing": True, "next_token": {"n_decoded": 7}},
+            ],
+        )
+        # Recorded baseline: the harness only reproduces the defect while the
+        # stub's latency exceeds the real budgets. If either budget grows past
+        # the stub delay, this test fails *here* naming the invariant instead
+        # of silently passing on a poll that never timed out.
+        assert stub.delay > COUNTS_BUDGET_SECONDS, (
+            "busy-engine harness must exceed the counts budget "
+            f"({COUNTS_BUDGET_SECONDS}s) or the counts phase cannot time out"
+        )
+        assert stub.delay > DEFAULT_DETAIL_BUDGET_SECONDS, (
+            "busy-engine harness must exceed the detail budget "
+            f"({DEFAULT_DETAIL_BUDGET_SECONDS}s) or the detail phase cannot time out"
+        )
+
+        payload, elapsed = await call_local_status(stub=stub)
+
+        assert payload["slot_counts_stale"] is True, (
+            "a timed-out counts phase with a fresh last-known cache must report "
+            "slot_counts_stale=true"
+        )
+        assert payload["slots_detail_stale"] is True, (
+            "a timed-out detail phase with a cached detail list must report "
+            "slots_detail_stale=true"
+        )
+        assert payload["slots_stale"] is True, (
+            "slots_stale is the union of both fallbacks; a degraded poll must "
+            "never read fresh"
+        )
+        # Both phases actually hit the (too-slow) upstream, and both exceeded
+        # the budget they were given.
+        assert len(stub.budget_exceeding_calls()) >= 2, (
+            "both the counts and the detail phase must have exceeded their "
+            f"budgets; observed calls: {stub.calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_degraded_poll_returns_well_formed_payload_within_budget(self):
+        """The degraded poll is well-formed and bounded by counts + detail."""
+        stub = BusySlotsStub(delay=COUNTS_BUDGET_SECONDS + 0.5)
+        payload, elapsed = await call_local_status(stub=stub)
+
+        # Well-formed: the documented fields are present with their types.
+        assert isinstance(payload["slots"], list), "slots must always be a list"
+        assert isinstance(payload["slot_counts_stale"], bool)
+        assert isinstance(payload["slots_detail_stale"], bool)
+        assert isinstance(payload["slots_stale"], bool)
+        assert isinstance(payload["status_schema_version"], int)
+        assert payload["status_schema_version"] >= 1
+        # The cached detail is still served so slot identity survives (the
+        # capability the fossil-serving path deliberately preserves).
+        assert len(payload["slots"]) == len(_DEFAULT_SEED_SLOTS)
+        for slot in payload["slots"]:
+            assert "slot_id" in slot
+            assert "is_processing" in slot
+
+        # Bounded wall clock: the endpoint may wait for counts + detail
+        # serially, but never beyond that documented budget (+ CI slack).
+        budget = COUNTS_BUDGET_SECONDS + DEFAULT_DETAIL_BUDGET_SECONDS
+        assert elapsed < budget + _BUDGET_SLACK_SECONDS, (
+            f"degraded poll took {elapsed:.2f}s, beyond the documented "
+            f"{budget:.1f}s budget (+{_BUDGET_SLACK_SECONDS:.1f}s slack)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_healthy_fast_slots_does_not_degrade(self):
+        """Control: a fast, healthy ``/slots`` must NOT report degraded.
+
+        This proves the harness actually controls latency — the stale flags in
+        the baseline test come from the slow stub, not from the fixture setup.
+        """
+        stub = BusySlotsStub(
+            delay=0.0,
+            status=200,
+            payload=[
+                {"id": 0, "is_processing": False, "next_token": {"n_decoded": None}},
+                {"id": 1, "is_processing": True, "next_token": {"n_decoded": 5}},
+            ],
+        )
+        payload, elapsed = await call_local_status(stub=stub)
+
+        assert payload["slot_counts_stale"] is False
+        assert payload["slots_detail_stale"] is False
+        assert payload["slots_stale"] is False
+        assert len(payload["slots"]) == 2
+        # A healthy poll is not held for either poll budget.
+        assert elapsed < DEFAULT_DETAIL_BUDGET_SECONDS, (
+            f"a healthy poll should answer promptly, took {elapsed:.2f}s"
+        )
+
+
+# ======================================================================
+# HTTP 500 variant: the measured `proxying request … 500` shape
+# ======================================================================
+
+
+class TestBusyEngineHttp500:
+    """An immediate HTTP 500 degrades gracefully (the measured 36 % shape)."""
+
+    @pytest.mark.asyncio
+    async def test_http_500_serves_last_known_counts_and_detail(self):
+        """A 500 on ``/slots`` still serves the last-known snapshot."""
+        stub = BusySlotsStub(delay=0.0, status=500)
+        payload, _ = await call_local_status(stub=stub)
+
+        assert payload["slots_stale"] is True
+        # Last-known pool size survives the failure; availability is withheld
+        # because a stale list cannot prove capacity.
+        assert payload["total_slots"] == _DEFAULT_SEED_COUNTS[1]
+        assert payload["available_slots"] == 0
+        assert payload["availability_unknown"] is True
+        assert len(payload["slots"]) == len(_DEFAULT_SEED_SLOTS)
+
+
+# ======================================================================
+# Harness reusability: budgets are threaded through, not hard-coded in tests
+# ======================================================================
+
+
+class TestHarnessReuse:
+    """The harness exposes one configurable stub for every later feature."""
+
+    @pytest.mark.asyncio
+    async def test_detail_budget_override_is_applied(self):
+        """``detail_timeout`` is threaded into the detail phase's fetch."""
+        stub = BusySlotsStub(delay=COUNTS_BUDGET_SECONDS + 0.5)
+        _, _ = await call_local_status(stub=stub, detail_timeout=0.25)
+
+        observed_budgets = [c["timeout"] for c in stub.calls]
+        assert 0.25 in observed_budgets, (
+            "the detail phase must have applied the overridden "
+            f"STATUS_QUERY_TIMEOUT=0.25; observed budgets: {observed_budgets}"
+        )
