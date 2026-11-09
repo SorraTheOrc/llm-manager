@@ -524,3 +524,154 @@ class TestDetailPhaseFailureReason:
         assert result2 == []
         assert out2.get("reason") == "timeout", out2
         assert _failure_count("timeout") == before_timeout
+
+
+# ======================================================================
+# ETA availability contract (LP-0MW3ED4Z30036L4E)
+#
+# Routing reads ``prefill_eta_seconds`` / ``queue_eta_seconds``, but the status
+# builder nulls both whenever the detail phase is stale — so they are ``null``
+# for the whole of a busy-engine generation. These tests pin the intended
+# contract so LP-0MW3ED6K5000RT5R implements it without guessing:
+#
+#   * available (a live/derived estimate) when the detail is fresh;
+#   * otherwise the **last measured** value with an explicit ``<field>_stale``
+#     marker and ``<field>_age_seconds`` — never a silent ``null``;
+#   * with no measurement ever, both stay ``null`` (never a fabricated ``0``);
+#   * the markers/ages are additive; existing fields keep their names/meaning.
+#
+# The repo runs a green suite, so the not-yet-satisfied case is pinned with
+# ``xfail(strict=True)``: it fails today (the ETA is silently nulled on stale
+# detail) and turns into an unexpected pass — forcing the xfail mark off — once
+# the contract lands.
+# ======================================================================
+
+#: A ``status_estimate``-shaped result with a live ETA available.
+_ETA_AVAILABLE = {
+    "prefill_eta_seconds": 12.5,
+    "queue_eta_seconds": 25.0,
+    "queue_eta_occupancy_seconds": 13.0,
+    "queue_eta_busy_slots": 1,
+    "prefill_eta_kind": "reference_cold_bound",
+    "prefill_eta_assumed_cached_ratio": 0.0,
+    "prefill_eta_reference_tokens": 32000,
+    "prefill_eta_samples": 5,
+    "prefill_eta_calibrated": True,
+    "prefill_eta_rate_bucket": "solitary",
+    "prefill_eta_contended_samples": 2,
+    "prefill_budget_seconds": 60.0,
+}
+
+#: A ``status_estimate``-shaped result where no measurement exists at all.
+_ETA_UNAVAILABLE = {
+    "prefill_eta_seconds": None,
+    "queue_eta_seconds": None,
+    "queue_eta_occupancy_seconds": None,
+    "queue_eta_busy_slots": None,
+    "prefill_eta_kind": "reference_cold_bound",
+    "prefill_eta_assumed_cached_ratio": 0.0,
+    "prefill_eta_reference_tokens": None,
+    "prefill_eta_samples": 0,
+    "prefill_eta_calibrated": False,
+    "prefill_eta_rate_bucket": "solitary",
+    "prefill_eta_contended_samples": 0,
+    "prefill_budget_seconds": None,
+}
+
+
+def _eta_patch(estimate):
+    return patch("proxy.prefill_eta.status_estimate", return_value=estimate)
+
+
+def _stale_detail_kwargs():
+    """Drive a poll whose detail read times out (stale detail served)."""
+    return dict(
+        stub=BusySlotsStub(delay=5.0),
+        counts_query=AsyncMock(return_value=(1, 2)),
+        detail_timeout=0.2,
+    )
+
+
+class TestEtaAvailabilityContract:
+    """The ETA is available, or last-measured with a stale marker — never null."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_detail_publishes_live_eta(self):
+        """A fresh detail poll publishes the live/derived ETA and its labelling."""
+        stub = BusySlotsStub(
+            delay=0.0,
+            status=200,
+            payload=[
+                {"id": 0, "is_processing": False, "next_token": {"n_decoded": None}},
+                {"id": 1, "is_processing": True, "next_token": {"n_decoded": 5}},
+            ],
+        )
+        with _eta_patch(_ETA_AVAILABLE):
+            payload, _ = await call_local_status(stub=stub)
+
+        assert payload["prefill_eta_seconds"] == 12.5
+        assert payload["queue_eta_seconds"] == 25.0
+        # Additive labelling is untouched and present.
+        assert payload["prefill_eta_kind"] == "reference_cold_bound"
+        assert payload["prefill_eta_assumed_cached_ratio"] == 0.0
+        # No stale marker on a fresh poll (additive, so ``not True`` is enough).
+        assert payload.get("prefill_eta_stale") is not True
+        assert payload.get("queue_eta_stale") is not True
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "LP-0MW3ED4Z30036L4E red-first (AC1/AC2): today the handler nulls "
+            "prefill_eta_seconds and queue_eta_seconds unconditionally when the "
+            "detail is stale, so the last measured ETA vanishes for the whole "
+            "generation. LP-0MW3ED6K5000RT5R must publish the last measured "
+            "value with a stale marker + age — remove the xfail when it lands."
+        ),
+    )
+    async def test_stale_detail_publishes_last_measured_eta_with_marker(self):
+        """After a measurement, a stale poll republishes it with a marker + age."""
+        # Poll 1: fresh detail → a live measurement is recorded.
+        fresh_stub = BusySlotsStub(
+            delay=0.0,
+            status=200,
+            payload=[
+                {"id": 0, "is_processing": False, "next_token": {"n_decoded": None}},
+                {"id": 1, "is_processing": True, "next_token": {"n_decoded": 5}},
+            ],
+        )
+        with _eta_patch(_ETA_AVAILABLE):
+            fresh, _ = await call_local_status(stub=fresh_stub)
+            assert fresh["prefill_eta_seconds"] == 12.5  # measurement recorded
+            # Poll 2: detail times out → a stale snapshot is served.
+            stale, _ = await call_local_status(**_stale_detail_kwargs())
+
+        assert stale["slots_detail_stale"] is True
+        # The last measured value survives, with an explicit marker and age.
+        assert stale["prefill_eta_seconds"] == 12.5, (
+            "the last measured prefill ETA must not be silently nulled on a "
+            "stale poll"
+        )
+        assert stale.get("prefill_eta_stale") is True
+        age = stale.get("prefill_eta_age_seconds")
+        assert isinstance(age, (int, float)) and age >= 0, age
+        # Same contract for the queue ETA.
+        assert stale["queue_eta_seconds"] == 25.0, (
+            "the last measured queue ETA must not be silently nulled on a "
+            "stale poll"
+        )
+        assert stale.get("queue_eta_stale") is True
+        assert stale.get("queue_eta_age_seconds") is not None
+
+    @pytest.mark.asyncio
+    async def test_no_measurement_ever_stays_null(self):
+        """With no measurement recorded, both ETAs stay null (never a 0)."""
+        with _eta_patch(_ETA_UNAVAILABLE):
+            payload, _ = await call_local_status(**_stale_detail_kwargs())
+
+        assert payload["slots_detail_stale"] is True
+        assert payload["prefill_eta_seconds"] is None
+        assert payload["queue_eta_seconds"] is None
+        # Never a fabricated zero.
+        assert payload["prefill_eta_seconds"] != 0
+        assert payload["queue_eta_seconds"] != 0
