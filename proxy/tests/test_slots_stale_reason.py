@@ -278,6 +278,16 @@ class _FailingClient:
     def __init__(self, mode="error"):
         self.mode = mode
 
+    # httpx.AsyncClient is an async context manager and ``_do_slots_fetch``
+    # opens it as one on the detail path (which builds its own client), so the
+    # shim must support the protocol or the detail read fails with a TypeError
+    # instead of the simulated transport error (LP-0MW3ED73W007JYGI).
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
     async def get(self, url, **kwargs):
         if self.mode == "timeout":
             raise TimeoutError()

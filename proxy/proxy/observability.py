@@ -1326,6 +1326,7 @@ async def _query_slots_detail(
     endpoint: str | None = None,
     _client: httpx.AsyncClient | None = None,
     provenance_out: dict | None = None,
+    status_out: dict | None = None,
 ) -> list[dict]:
     """Query the llama-server ``/slots`` endpoint and return per-slot details.
 
@@ -1342,6 +1343,15 @@ async def _query_slots_detail(
             and return HTTP 400 without it.
         _client: Internal — for testing only.  Pass a mock client to
             avoid real HTTP calls in unit tests.
+        status_out: Optional (additive) outcome dict filled with the failure
+            ``{"status": int | None, "reason": str | None}`` — the same shape
+            ``_query_slots`` publishes — so the ``/llama/local/status`` detail
+            path can record ``llama_slots_query_failures_total{reason=...}``
+            with ``timeout`` and ``http_<code>`` distinguished
+            (LP-0MW3ED73W007JYGI). ``status_out is None`` (every call site but
+            the status path) records nothing and changes no behaviour; the
+            general caller-tagged call-site instrumentation remains
+            LP-0MVTDMXXH005D5D5's.
 
     Returns a list of dicts, one per slot, with keys:
 
@@ -1366,7 +1376,8 @@ async def _query_slots_detail(
                 provenance_out, source="upstream", fetched_at=None, upstream_calls=1
             )
             slots_resp = await _client.get(url)
-            if slots_resp.status_code == 200:
+            status = int(getattr(slots_resp, "status_code", 0) or 0)
+            if status == 200:
                 slots_data = await _safe_parse_json_response(slots_resp)
             else:
                 slots_data = None
@@ -1375,8 +1386,17 @@ async def _query_slots_detail(
             status, slots_data = await _fetch_slots_payload(
                 url, timeout, None, provenance_out=provenance_out
             )
-            if status != 200:
-                slots_data = None
+        # LP-0MW3ED73W007JYGI: publish the phase outcome (opt-in via
+        # ``status_out``) so the status handler can record the failure reason
+        # instead of the detail path swallowing it into a debug log (the
+        # measured 36 % failure rate was invisible in the metrics surface).
+        if status != 200:
+            _set_slots_status_out(status_out, status=status, reason=f"http_{status}")
+            slots_data = None
+        elif not isinstance(slots_data, list):
+            _set_slots_status_out(status_out, status=status, reason="invalid_payload")
+        else:
+            _set_slots_status_out(status_out, status=status, reason=None)
         if isinstance(slots_data, list):
             result = []
             for i, slot in enumerate(slots_data):
@@ -1399,7 +1419,16 @@ async def _query_slots_detail(
                     "context_tokens": _slot_context_tokens(slot),
                 })
             return result
+    except TimeoutError:
+        # LP-0MW3ED73W007JYGI: distinguish a timeout from an HTTP error on the
+        # status detail path (``_query_slots`` already does this for counts).
+        _set_slots_status_out(status_out, reason="timeout")
+        _srv().logger.debug("Slot detail query timed out for %s", url)
     except Exception as exc:
+        if isinstance(exc, (ConnectionError, OSError)):
+            _set_slots_status_out(status_out, reason="connection_error")
+        else:
+            _set_slots_status_out(status_out, reason="unknown")
         _srv().logger.debug(
             "Slot detail query failed [%s] for %s: %s",
             type(exc).__name__, url, exc,

@@ -459,7 +459,16 @@ async def get_llama_local_status(request: Request):
          "local_route_available": bool,
          "local_route_reason": str | None,
          "local_route_cooldown_remaining_s": int | None,
+         "slots_snapshot_source": str,
+         "slots_snapshot_age_seconds": float | None,
          "status_schema_version": int}
+
+    ``slots_snapshot_source`` (``upstream`` | ``snapshot`` | ``ttl_cache`` |
+    ``failure_backoff`` | ``none``) and ``slots_snapshot_age_seconds`` publish
+    the provenance of the served ``/slots`` data — which read path produced it
+    and how old the snapshot is — so a degraded poll's authoritative-path
+    choice is visible in the payload itself (LP-0MW3ED73W007JYGI). They mirror
+    the same-named ``status_request`` log fields and are additive.
 
     ``local_idle_seconds`` reports how long the local backend has been idle
     (LP-0MVGD9Z8Z0055Y5J) — the same monotonic signal the idle-aware routing
@@ -887,15 +896,34 @@ async def get_llama_local_status(request: Request):
                 # timeout, so a slow /slots response cannot blow the
                 # endpoint's response budget (AC3).
                 detail_provenance: dict = {}
+                detail_outcome: dict = {}
                 _detail_t0 = time.monotonic()
                 try:
                     detail = await _query_slots_detail(
                         llama_port, timeout=timeout, model=cm,
                         provenance_out=detail_provenance,
+                        status_out=detail_outcome,
                     )
                 except Exception:
                     detail = None
                 slots_detail_ms = int((time.monotonic() - _detail_t0) * 1000)
+                # LP-0MW3ED73W007JYGI: a detail-phase failure on the status
+                # path is recorded in ``llama_slots_query_failures_total`` with
+                # its reason (``timeout`` / ``http_<code>`` / …), so the
+                # measured ~36 % failure rate is visible in the metrics
+                # surface instead of only a debug log. Only the status path
+                # opts in (via ``status_out``); the counts phase records its
+                # own outcome in ``_query_slots`` and the general caller-tagged
+                # call-site instrumentation remains LP-0MVTDMXXH005D5D5's.
+                _detail_failure_reason = (
+                    detail_outcome.get("reason")
+                    if isinstance(detail_outcome, dict)
+                    else None
+                )
+                if _detail_failure_reason:
+                    from proxy.observability import _record_slots_query_failure
+
+                    _record_slots_query_failure(_detail_failure_reason)
                 if isinstance(detail, list) and detail:
                     slots = detail
                 else:
@@ -1472,6 +1500,14 @@ async def get_llama_local_status(request: Request):
         # without knowing the config, and so ``snapshot_too_old`` is
         # self-explanatory.
         "slots_max_snapshot_age_seconds": slots_max_snapshot_age_seconds,
+        # Provenance of the served snapshot (LP-0MW3ED73W007JYGI): which read
+        # path produced the served slot data and how old that snapshot is, so a
+        # degraded poll's authoritative-path choice is visible in the *payload*
+        # and not only in the ``status_request`` log line. Additive — existing
+        # field names and meanings are unchanged, so consumers that ignore
+        # unknown fields are unaffected.
+        "slots_snapshot_source": slots_snapshot_source,
+        "slots_snapshot_age_seconds": slots_snapshot_age_seconds,
         # Truthful in-flight local request count, derived from live dispatch
         # records (``None`` in legacy mode with no record registry).
         # ``local_active_query`` mirrors ``> 0``; ``Null`` is never emitted.

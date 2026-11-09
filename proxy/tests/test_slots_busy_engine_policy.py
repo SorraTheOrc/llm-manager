@@ -1,9 +1,4 @@
 
-# <!-- REFACTOR-LP-0MW8QY8HE0051UNZ
-# smell: unused_import
-# severity: critical
-# description: Redefinition of unused `app` from line 219: `app` redefined here
-# -->
 """Busy-engine ``/slots`` regression harness for ``/llama/local/status``.
 
 LP-0MW3ED3XN003TPXI (child of LP-0MW10EZXX004M7BI).
@@ -46,9 +41,10 @@ import asyncio
 import contextlib
 import os
 import time
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
+import proxy.metrics as metrics
 import pytest
 
 # Documented proxy poll budgets. The stub latency must exceed BOTH to
@@ -144,11 +140,15 @@ class _FakeLock:
 
 
 @contextlib.contextmanager
-def _status_endpoint(stub: BusySlotsStub, *, seed_counts, seed_slots, config):
+def _status_endpoint(stub: BusySlotsStub, *, seed_counts, seed_slots, config, counts_query=None):
     """Context manager installing every patch a status poll needs.
 
     Mirrors the established slots tests' patch set (server state + the
     last-known caches) and adds the busy-engine stub at the fetch choke point.
+
+    ``counts_query`` optionally replaces the counts phase (``_query_slots``) so
+    a feature can isolate the *detail* phase (e.g. LP-0MW3ED73W007JYGI, which
+    must prove the failure it records is the detail phase's, not the counts').
     """
     from proxy.server import app
 
@@ -156,6 +156,12 @@ def _status_endpoint(stub: BusySlotsStub, *, seed_counts, seed_slots, config):
 
     async def fake_query():
         return {"llama_server_running": True}
+
+    # A stale coalesced entry from an earlier test on the same URL would serve
+    # the next poll from cache and bypass the stub; start each poll clean.
+    from proxy.observability import reset_slots_poll_cache
+
+    reset_slots_poll_cache()
 
     counts_cache = None
     if seed_counts is not None:
@@ -191,8 +197,17 @@ def _status_endpoint(stub: BusySlotsStub, *, seed_counts, seed_slots, config):
                 list(seed_slots) if seed_slots is not None else [],
             )
         )
-        stack.enter_context(patch("proxy.observability._last_slot_details_at", 0.0))
+        # A fresh-but-not-zero stamp so a degraded poll that serves the detail
+        # cache publishes a real ``slots_snapshot_age_seconds`` (LP-0MW3ED73W007JYGI
+        # asserts the provenance is visible), while staying inside the ceiling.
+        stack.enter_context(
+            patch("proxy.observability._last_slot_details_at", time.monotonic() - 2.0)
+        )
         stack.enter_context(stub.patch())
+        if counts_query is not None:
+            stack.enter_context(
+                patch("proxy.observability._query_slots", counts_query)
+            )
         yield app
 
 
@@ -203,6 +218,7 @@ async def call_local_status(
     seed_slots=None,
     detail_timeout: float | None = None,
     config: dict | None = None,
+    counts_query=None,
 ):
     """Drive ``GET /llama/local/status`` under a :class:`BusySlotsStub`.
 
@@ -215,6 +231,8 @@ async def call_local_status(
             module default (:data:`_DEFAULT_SEED_SLOTS`).
         detail_timeout: Override ``STATUS_QUERY_TIMEOUT`` for the detail phase.
         config: Server config override.
+        counts_query: Optional awaitable replacing the counts phase (a mock
+            returning ``(available, total)``), used to isolate the detail phase.
 
     Returns:
         ``(payload, elapsed_seconds)`` where *payload* is the parsed JSON body.
@@ -222,9 +240,12 @@ async def call_local_status(
     stub = stub if stub is not None else BusySlotsStub(delay=0.0, payload=[])
     seed_slots = _DEFAULT_SEED_SLOTS if seed_slots is None else seed_slots
 
-    app = None
     with _status_endpoint(
-        stub, seed_counts=seed_counts, seed_slots=seed_slots, config=config
+        stub,
+        seed_counts=seed_counts,
+        seed_slots=seed_slots,
+        config=config,
+        counts_query=counts_query,
     ) as app:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
@@ -403,3 +424,103 @@ class TestHarnessReuse:
             "the detail phase must have applied the overridden "
             f"STATUS_QUERY_TIMEOUT=0.25; observed budgets: {observed_budgets}"
         )
+
+
+# ======================================================================
+# Detail-phase failure reason observability (LP-0MW3ED73W007JYGI)
+#
+# The status detail path used to swallow a /slots failure into a debug log, so
+# the measured ~36 % failure rate was invisible in the metrics surface and a
+# timeout could not be told from an HTTP 500. These tests reuse the single
+# busy-engine harness above (`BusySlotsStub`) rather than adding a second stub.
+# ======================================================================
+
+
+def _failure_count(reason: str) -> float:
+    """Current value of ``llama_slots_query_failures_total{reason}``."""
+    return metrics.llama_slots_query_failures_total.labels(reason=reason)._value.get()
+
+
+class TestDetailPhaseFailureReason:
+    """A status detail failure records a labelled ``timeout`` / ``http_<code>``."""
+
+    @pytest.mark.asyncio
+    async def test_http_500_detail_failure_records_http_500(self):
+        """A 500 on the detail read records ``http_500`` and degrades gracefully."""
+        # Counts succeeds (mocked) so the recorded failure is provably the
+        # DETAIL phase's — otherwise the counts phase would record too and the
+        # increment could not be attributed to the detail path.
+        counts_query = AsyncMock(return_value=(1, 2))
+        before = _failure_count("http_500")
+        stub = BusySlotsStub(delay=0.0, status=500)
+        payload, _ = await call_local_status(stub=stub, counts_query=counts_query)
+        after = _failure_count("http_500")
+
+        assert after > before, "a detail-phase HTTP 500 must increment http_500"
+        # AC1: the graceful-degradation contract is unchanged.
+        assert payload["slots_detail_stale"] is True
+        assert payload["slots_stale"] is True
+        assert len(payload["slots"]) == len(_DEFAULT_SEED_SLOTS)
+        # AC3: provenance names the served snapshot and its age.
+        assert payload["slots_snapshot_source"] == "snapshot"
+        assert payload["slots_snapshot_age_seconds"] is not None
+
+    @pytest.mark.asyncio
+    async def test_detail_timeout_records_timeout_not_http_500(self):
+        """A detail timeout records ``timeout`` (distinct from ``http_500``)."""
+        counts_query = AsyncMock(return_value=(1, 2))
+        before_timeout = _failure_count("timeout")
+        before_500 = _failure_count("http_500")
+        stub = BusySlotsStub(delay=COUNTS_BUDGET_SECONDS + 0.5)  # > detail budget
+        payload, _ = await call_local_status(
+            stub=stub, counts_query=counts_query, detail_timeout=0.2
+        )
+        after_timeout = _failure_count("timeout")
+        after_500 = _failure_count("http_500")
+
+        assert after_timeout > before_timeout, "a detail timeout must increment timeout"
+        assert after_500 == before_500, "a timeout must NOT be labelled http_500"
+        # Same graceful-degradation payload shape as the 500 case.
+        assert payload["slots_detail_stale"] is True
+        assert payload["slots_stale"] is True
+        assert payload["slots_snapshot_source"] == "snapshot"
+
+    @pytest.mark.asyncio
+    async def test_query_slots_detail_fills_status_out_but_never_records(self):
+        """The query helper publishes the outcome only via ``status_out``.
+
+        Pins the *scope*: recording lives at the status call site (the handler),
+        so a bare ``_query_slots_detail`` call never touches the metric — the
+        general caller-tagged call-site instrumentation remains
+        LP-0MVTDMXXH005D5D5's.
+        """
+        from proxy.observability import _query_slots_detail, reset_slots_poll_cache
+
+        # 500 → http_500 surfaced through status_out.
+        before_500 = _failure_count("http_500")
+        out: dict = {}
+        stub = BusySlotsStub(delay=0.0, status=500)
+        with stub.patch():
+            result = await _query_slots_detail(
+                8080, timeout=1.0, model="Qwen3", status_out=out
+            )
+        assert result == []
+        assert out.get("reason") == "http_500", out
+        assert _failure_count("http_500") == before_500, (
+            "_query_slots_detail must not record — only the status handler does"
+        )
+
+        # Timeout → timeout surfaced through status_out, still no recording.
+        # A failed fetch is cached for the failure-backoff window, so clear the
+        # coalesced cache or this call would replay the cached 500.
+        reset_slots_poll_cache()
+        before_timeout = _failure_count("timeout")
+        out2: dict = {}
+        stub2 = BusySlotsStub(delay=5.0)
+        with stub2.patch():
+            result2 = await _query_slots_detail(
+                8080, timeout=0.1, model="Qwen3", status_out=out2
+            )
+        assert result2 == []
+        assert out2.get("reason") == "timeout", out2
+        assert _failure_count("timeout") == before_timeout
