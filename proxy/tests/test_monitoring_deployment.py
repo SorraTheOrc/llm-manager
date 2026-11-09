@@ -288,6 +288,27 @@ def _consumer_guard_offenders(path: Path) -> list[str]:
 ATTRIBUTABLE_SHARE_SERIES = "gpu:computing_workload:bool"
 ATTRIBUTABLE_SHARE_PRODUCER = PROJECT_ROOT / "scripts" / "gpu_utilisation.py"
 
+#: Python PromQL consumers, discovered by directory so a new script cannot slip
+#: past the one-producer guard by not being listed here.
+PYTHON_PROMQL_SOURCE_GLOBS = (
+    "scripts/*.py",
+    ".pi/skills/proxy-usage-analysis/scripts/*.py",
+)
+
+#: Grafana dashboards, discovered by directory (test fixtures under
+#: ``monitoring/tests/`` are recorded payloads, not queries, and are excluded).
+DASHBOARD_SOURCE_GLOBS = (
+    "monitoring/*.json",
+    "monitoring/grafana/**/*.json",
+)
+
+#: Documentation that quotes PromQL. A doc is a surface a reader copies from.
+DOCUMENTATION_SOURCE_GLOBS = (
+    "monitoring/*.md",
+    "docs/**/*.md",
+    ".pi/skills/**/*.md",
+)
+
 #: PromQL aggregation functions that turn the attributable rule into a
 #: share/percentage over a window. Applying any of them to the rule re-derives
 #: the figure — exactly what the one-producer doctrine forbids outside the CLI.
@@ -343,45 +364,59 @@ def _dashboard_expressions(path: Path) -> list[str]:
 
 
 def _promql_machine_sources() -> list[tuple[Path, str, list[str]]]:
-    """Every machine-consumed PromQL surface: rules, CLI and report, dashboards.
+    """Every surface that shows or consumes PromQL, machine or human.
 
     Each item is ``(path, source_label, expressions)`` so the one-producer
     guard can exempt the named producer path and report the rest by name.
+
+    The surface list is **discovered**, never hard-coded (epic AC2,
+    LP-0MW5K7ST10050Y1O): rule files come from ``prometheus.yml``, Python
+    consumers and dashboards from directory globs, and documentation from
+    markdown globs. A doc counts as a surface because a reader can copy a
+    query out of it into a dashboard — that is how a second producer appears.
     """
     sources: list[tuple[Path, str, list[str]]] = []
     for path in _configured_rule_files():
         sources.append((path, path.name, _rule_expressions(path)))
-    for path in CLI_QUERY_SOURCES:
-        if path.exists():
-            sources.append(
-                (
-                    path,
-                    path.name,
-                    _promql_expressions_in_python(path.read_text(), filename=str(path)),
-                )
+    for path in _globbed_sources(PYTHON_PROMQL_SOURCE_GLOBS):
+        try:
+            expressions = _promql_expressions_in_python(
+                path.read_text(), filename=str(path)
             )
-    report_script = (
-        PROJECT_ROOT
-        / ".pi"
-        / "skills"
-        / "proxy-usage-analysis"
-        / "scripts"
-        / "gpu_busy.py"
-    )
-    if report_script.exists():
+        except SyntaxError:  # not a Python 3 PromQL consumer; nothing to scan
+            expressions = []
+        sources.append((path, path.name, expressions))
+    for path in _globbed_sources(DASHBOARD_SOURCE_GLOBS):
+        sources.append((path, path.name, _dashboard_expressions(path)))
+    for path in _globbed_sources(DOCUMENTATION_SOURCE_GLOBS):
         sources.append(
             (
-                report_script,
-                report_script.name,
-                _promql_expressions_in_python(
-                    report_script.read_text(), filename=str(report_script)
-                ),
+                path,
+                str(path.relative_to(PROJECT_ROOT)),
+                _documentation_expressions(path),
             )
         )
-    for path in (DASHBOARD_PATH, PROVISIONED_DASHBOARD_PATH):
-        if path.exists():
-            sources.append((path, path.name, _dashboard_expressions(path)))
     return sources
+
+
+def _globbed_sources(patterns: tuple[str, ...]) -> list[Path]:
+    """Return every existing file matched by *patterns*, de-duplicated."""
+    found: set[Path] = set()
+    for pattern in patterns:
+        found.update(PROJECT_ROOT.glob(pattern))
+    return sorted(path for path in found if path.is_file())
+
+
+def _documentation_expressions(path: Path) -> list[str]:
+    """Return the lines of *path* a reader could copy into a query surface.
+
+    PromQL appears in docs both fenced and inline, so the whole prose is
+    offered line by line and the derivation regex decides. A line that merely
+    names a series is not an expression; only an aggregation over it is (see
+    ``_share_derivation_functions``), so documentation may still explain the
+    series and forbid the idiom — in words rather than by quoting the query.
+    """
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
 
 
 def _share_producer_offenders(
@@ -1073,15 +1108,51 @@ class TestAttributableShareSingleProducer:
     """
 
     def test_exactly_one_producer_across_every_machine_promql_surface(self):
-        """AC2: no rule, report or dashboard re-derives the share."""
+        """AC2: no rule, report, dashboard **or doc** re-derives the share."""
         sources = _promql_machine_sources()
         assert sources, "no PromQL surface was scanned by the one-producer guard"
+        scanned = {path.resolve() for path, _, _ in sources}
+        assert (MONITORING_DIR / "README.md").resolve() in scanned, (
+            "the documentation is not scanned by the one-producer guard; a "
+            "hand-rolled query in a doc is a producer a reader can copy"
+        )
         offenders = _share_producer_offenders(sources)
         assert not offenders, (
             "a non-producer surface re-derives the attributable GPU-activity "
             "share (gpu:computing_workload:bool); scripts/gpu_utilisation.py "
             "is the only producer:\n" + "\n".join(offenders)
         )
+
+    def test_one_producer_guard_flags_a_documented_derivation(self, tmp_path):
+        """Non-vacuous for docs: a markdown query is reported, not missed."""
+        doc = tmp_path / "runbook.md"
+        doc.write_text(
+            "# Runbook\n\n```promql\n"
+            f"sum_over_time({ATTRIBUTABLE_SHARE_SERIES}[24h:15s]) * 15 / 86400\n"
+            "```\n"
+        )
+        offenders = _share_producer_offenders(
+            [(doc, doc.name, _documentation_expressions(doc))]
+        )
+        assert len(offenders) == 1
+        assert ATTRIBUTABLE_SHARE_SERIES in offenders[0]
+
+    def test_one_producer_guard_ignores_a_doc_that_only_names_the_series(
+        self, tmp_path
+    ):
+        """Explaining the series, or scoping a derivation of another one, is
+        not a second producer."""
+        doc = tmp_path / "notes.md"
+        doc.write_text(
+            f"`{ATTRIBUTABLE_SHARE_SERIES}` is the input; the CLI is its only "
+            "producer.\n"
+            "Power-only computing seconds: "
+            "`sum_over_time(gpu:computing:bool[24h:15s]) * 15`.\n"
+        )
+        offenders = _share_producer_offenders(
+            [(doc, doc.name, _documentation_expressions(doc))]
+        )
+        assert offenders == []
 
     def test_the_cli_is_the_named_producer_and_queries_the_rule_series(self):
         """The allowlist is not vacuous: the producer exists, selects the
@@ -2805,18 +2876,22 @@ class TestMonitoringReadmeCookbook:
     """The cookbook must answer the four operational questions asked of it."""
 
     def test_covers_gpu_computing_fraction_from_power(self):
-        """AC3 (LP-0MW5K90EQ001W0R1): a busy percentage is never a bare
-        `avg_over_time(...)`; the cookbook points at the CLI (grid-honest,
-        unknown explicit) or at a coverage-honest query that divides by
-        in-window seconds."""
+        """AC3 (LP-0MW5K90EQ001W0R1) + epic AC2 (LP-0MW5K7ST10050Y1O): a busy
+        percentage is never a bare `avg_over_time(...)`, and the attributable
+        share is never hand-derived at all — the cookbook routes the figure
+        through the CLI, its only producer."""
         content = _readme()
         assert "scripts/gpu_utilisation.py" in content, (
             "the cookbook must route the busy percentage through the CLI"
         )
         assert "gpu:power_watts:avg5m" in content
-        assert "sum_over_time(gpu:computing_workload:bool[24h:15s]) * 15 / 86400" in content, (
-            "the cookbook must show the coverage-honest form that divides by "
-            "in-window seconds"
+        assert ATTRIBUTABLE_SHARE_SERIES in content, (
+            "the cookbook must name the attributable series it explains"
+        )
+        assert not _share_derivation_functions(content), (
+            "the cookbook must not publish a hand-rolled derivation of the "
+            "attributable share; scripts/gpu_utilisation.py is its only "
+            "producer"
         )
         # A bare over-time average is coverage-blind. The only permitted
         # occurrences are the prose that forbids the idiom and a window *pinned*

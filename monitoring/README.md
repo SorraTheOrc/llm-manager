@@ -448,16 +448,18 @@ python3 scripts/gpu_utilisation.py --window 24h --json | jq '.shares_pct'
 A bare `avg_over_time(gpu:computing:bool[24h])` is **not** a busy percentage:
 it renormalises over the samples that happen to be present, so a monitoring gap
 inflates the figure (the CLI exists precisely because of that
-coverage-blindness). The same applies to the attributable series — do not
-average it by hand. If you need raw PromQL, divide by in-window seconds so
-missing samples contribute zero instead of shrinking the denominator (the
-documented line is conservative: `unknown` folds into the zero term, it can
-never inflate the share):
+coverage-blindness). The same applies to the attributable series — and for that
+one there is deliberately no hand-written query at all: the CLI is its **only**
+producer, so the figure is read from the CLI and never re-derived in PromQL
+(a regression test fails if a rule, report, dashboard or doc aggregates
+`gpu:computing_workload:bool`). A hand-rolled query is not even equivalent: it
+folds `unknown` into the zero term, so it understates the share the CLI reports.
+
+The derivations below are **not** the reported figure — each name states its
+own scope. If you need raw PromQL for one of them, divide by in-window seconds
+so missing samples contribute zero instead of shrinking the denominator:
 
 ```promql
-# Attributable share, coverage-honest (computing-seconds / window-seconds)
-sum_over_time(gpu:computing_workload:bool[24h:15s]) * 15 / 86400
-
 # Power-only computing seconds in the last 24 hours (power-only: any GPU
 # consumer — a scoped derivation, not the reported measure)
 sum_over_time(gpu:computing:bool[24h:15s]) * 15
@@ -484,9 +486,9 @@ processing, 0 otherwise.
 
 It is the **input** of the attributable share, and the CLI is the only consumer
 that turns it into one: the CLI queries this series and does the grid-honest
-share arithmetic locally, and a regression test fails if any rule, report or
-dashboard aggregates it into a second figure. The raw series is still the right
-thing to read for a live yes/no:
+share arithmetic locally, and a regression test fails if any rule, report,
+dashboard or doc aggregates it into a second figure. The raw series is still the
+right thing to read for a live yes/no:
 
 ```promql
 # Is the GPU doing OUR work right now? (0/1, absent => unknown)
