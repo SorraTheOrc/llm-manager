@@ -573,7 +573,7 @@ class TestStatusCapacityTruth:
             return (0, 0)
 
         async def fake_query_detail(
-            port, timeout=2.0, model=None, _client=None, provenance_out=None,
+            port, timeout=2.0, model=None, _client=None, provenance_out=None, status_out=None,
         ):
             queries.append(("detail", port))
             return []

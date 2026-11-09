@@ -442,7 +442,7 @@ class TestStatusHandlerCallSite:
                 return (1, 3)
 
             async def fake_query_detail(
-                port, timeout=2.0, model=None, _client=None, provenance_out=None,
+                port, timeout=2.0, model=None, _client=None, provenance_out=None, status_out=None,
             ):
                 seen["detail_port"] = port
                 return [{"slot_id": 0, "is_processing": False, "n_decoded": 10}]
@@ -476,7 +476,7 @@ class TestStatusHandlerCallSite:
             return (0, 0)
 
         async def fake_query_detail(
-            port, timeout=2.0, model=None, _client=None, provenance_out=None,
+            port, timeout=2.0, model=None, _client=None, provenance_out=None, status_out=None,
         ):
             queries.append(("detail", port))
             return []
