@@ -3444,6 +3444,96 @@ def _acquire_admission_candidate(
         return None
 
 
+def _release_admission_candidate(candidate, *, reason: str | None = None) -> bool:
+    """Release a **refused** admission's slot candidate (never raises).
+
+    Thin wrapper around :func:`proxy.session.release_slot_candidate`, the single
+    release seam (LP-0MW959PWL001WYSM AC2a): every refusal path returns its
+    candidate through it instead of inventing its own release. Idempotent — a
+    second release of the same candidate is a no-op, never a double-free
+    (AC2e). Fail-open: bookkeeping never changes a routing decision.
+    """
+    if candidate is None:
+        return False
+    try:
+        from proxy.session import release_slot_candidate
+
+        return bool(release_slot_candidate(candidate, reason=reason))
+    except Exception:
+        return False
+
+
+def _release_session_admission_candidate(
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    reason: str | None = None,
+) -> bool:
+    """Release a candidate held by *session_id* on *endpoint* (never raises).
+
+    Session-scoped form of :func:`_release_admission_candidate` for a refusal
+    whose candidate was acquired deeper than the caller's own variable — the
+    contention-queue refusal, where the ladder ran inside the queue's bypass
+    mirror (LP-0MW959PWL001WYSM AC2c). Idempotent and fail-open.
+    """
+    if not session_id:
+        return False
+    try:
+        from proxy.session import release_session_candidate
+
+        return bool(
+            release_session_candidate(session_id, endpoint=endpoint, reason=reason)
+        )
+    except Exception:
+        return False
+
+
+class _AdmissionCandidateLease:
+    """Owns one local admission's slot candidate until it is kept or released.
+
+    Candidate-first admission acquires a slot **before** the residency verdict
+    (LP-0MW959P9S005DJY7), which makes an acquired-but-refused candidate a
+    fabricated occupancy that would deny the pool to real work. This lease is
+    the single owner of that lifecycle (LP-0MW959PWL001WYSM AC2d):
+
+    - a refusal records its reason (:meth:`note_refusal`) and the release
+      happens once, on the way out, naming that reason on the
+      ``candidate_released reason=<skip_reason>`` line (AC2b);
+    - an admission calls :meth:`keep`, after which :meth:`release` is a no-op —
+      ownership passes to the existing slot bookkeeping unchanged, with no
+      second assignment and no release at admission time (AC2d);
+    - :meth:`release` is idempotent, so the end-of-attempt safety release and
+      an explicit refusal release can never double-free (AC2e).
+
+    A lease with no candidate (no pool configured, no session, or a full pool)
+    is an inert no-op: nothing was acquired, so nothing can leak.
+    """
+
+    __slots__ = ("candidate", "reason", "_kept", "_released")
+
+    def __init__(self, candidate=None) -> None:
+        self.candidate = candidate
+        self.reason: str | None = None
+        self._kept = False
+        self._released = False
+
+    def note_refusal(self, reason: str | None) -> None:
+        """Record the refusing reason a pending release must name."""
+        if reason:
+            self.reason = reason
+
+    def keep(self) -> None:
+        """Hand the candidate to the dispatch bookkeeping (never released)."""
+        self._kept = True
+
+    def release(self) -> bool:
+        """Release unless the admission was kept; idempotent, never raises."""
+        if self._kept or self._released:
+            return False
+        self._released = True
+        return _release_admission_candidate(self.candidate, reason=self.reason)
+
+
 def _measured_capture_enabled(server_config=None) -> bool:
     """Whether measured-prefill capture is enabled (fail-open to today's rung).
 
@@ -3841,6 +3931,87 @@ def _should_skip_local(
     unmeasured_cold_enabled: bool = True,
     server_config: dict | None = None,
     candidate_slot=None,
+    own_candidate: bool | None = None,
+) -> tuple[bool, str | None]:
+    """The local admission ladder, owning its slot candidate's lifecycle.
+
+    The verdict itself lives in :func:`_should_skip_local_verdict` (which
+    documents every rung). This wrapper adds the **release contract** of
+    candidate-first admission (LP-0MW959PWL001WYSM):
+
+    - when the caller owns the lifecycle (*own_candidate* ``False``, or a
+      *candidate_slot* supplied) nothing is released here, because only the
+      caller can tell a refusal from an override that re-admits the request
+      (idle / capacity / last-resort);
+    - otherwise the candidate is acquired here — before the verdict, so even
+      the ``context_too_large`` rung has one — and is **released on every
+      refusal rung and on any exception**, through the single release seam
+      (AC2a/AC2c), naming the refusing reason (AC2b). An admitted admission
+      keeps it: ownership passes to the dispatch bookkeeping unchanged (AC2d).
+
+    *own_candidate* lets a caller that already tried to acquire say so:
+    ``False`` forbids a second attempt here even when the first returned
+    ``None``. Without it a caller holding a *failed* acquisition could have a
+    candidate acquired behind its back, which its own lease would never release
+    — a leak in the exact race (pool full at the call site, a slot freed a
+    moment later) this contract exists to close.
+
+    Acquisition is gated on the ladder being engaged
+    (``resident_prefix_min_ratio`` > 0), the cold threshold being enabled and
+    the pool being configured, so a deployment without slot bookkeeping keeps
+    its pre-change behaviour with no registry side effect.
+    """
+    if own_candidate is None:
+        own_candidate = candidate_slot is None
+    if own_candidate and resident_prefix_min_ratio > 0.0 and cold_cache_threshold > 0:
+        candidate_slot = _acquire_admission_candidate(
+            session_id, endpoint=endpoint, server_config=server_config
+        )
+    try:
+        verdict = _should_skip_local_verdict(
+            model_name,
+            session_id,
+            body_json,
+            cold_cache_threshold,
+            estimated_tokens=estimated_tokens,
+            warm_cache_threshold=warm_cache_threshold,
+            economic_bypass_serves_local=economic_bypass_serves_local,
+            resident_prefix_min_ratio=resident_prefix_min_ratio,
+            residency_view=residency_view,
+            endpoint=endpoint,
+            session_tenants=session_tenants,
+            tenancy_idle_seconds=tenancy_idle_seconds,
+            unmeasured_cold_enabled=unmeasured_cold_enabled,
+            server_config=server_config,
+            candidate_slot=candidate_slot,
+        )
+    except BaseException:
+        # An exception inside the decision never leaves the candidate behind
+        # (AC2c). The caller's own handle is released too: it cannot act on a
+        # verdict that never returned, and the release is idempotent (AC2e).
+        _release_admission_candidate(candidate_slot, reason="exception")
+        raise
+    if own_candidate and verdict[0]:
+        _release_admission_candidate(candidate_slot, reason=verdict[1])
+    return verdict
+
+
+def _should_skip_local_verdict(
+    model_name: str,
+    session_id: str | None,
+    body_json: dict,
+    cold_cache_threshold: int,
+    estimated_tokens: int | None = None,
+    warm_cache_threshold: int = 0,
+    economic_bypass_serves_local: bool = False,
+    resident_prefix_min_ratio: float = 0.0,
+    residency_view=None,
+    endpoint: str | None = None,
+    session_tenants: int | None = None,
+    tenancy_idle_seconds: float | None = None,
+    unmeasured_cold_enabled: bool = True,
+    server_config: dict | None = None,
+    candidate_slot=None,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -3951,10 +4122,12 @@ def _should_skip_local(
             the prefix-credit margin. ``None`` keeps both shipped defaults.
             It also supplies the candidate pool size
             (``session_slot_pool_size``) for the candidate-first assignment.
-        candidate_slot: An already-assigned candidate
-            (``proxy.session.SlotCandidate``) to evaluate the verdict against,
-            when the caller owns its lifecycle. ``None`` (the default)
-            assigns one here.
+        candidate_slot: The candidate the verdict is measured against. The
+            caller (:func:`_should_skip_local`) acquires it before the verdict
+            and owns its release, so this function never acquires or releases
+            one; ``None`` means no candidate could be assigned (no session, no
+            slot bookkeeping, or an exhausted pool) and keeps the pre-change
+            behaviour.
 
     Returns:
         A tuple ``(skip, reason)`` where:
@@ -4015,21 +4188,18 @@ def _should_skip_local(
         )
 
     if resident_prefix_min_ratio > 0.0:
-        # Candidate-first admission (LP-0MW959P9S005DJY7 AC1a): assign this
-        # admission a slot **before** the residency verdict, so the probe
-        # measures the candidate slot instead of predicting from a
-        # not-yet-existing assignment. Acquisition registers ownership in
-        # ``session._slot_owners`` — the registry every residency rung already
-        # reads — so the resolution needs no extra input and the measurement is
-        # of the candidate. A caller that already holds the handle (e.g. the
-        # release contract, LP-0MW959PWL001WYSM) passes it in via
-        # *candidate_slot*; otherwise it is assigned here. Fail-open: an
-        # unavailable candidate degrades one rung, never refuses local.
+        # Candidate-first admission (LP-0MW959P9S005DJY7 AC1a): the candidate is
+        # assigned **before** the residency verdict, so the probe measures the
+        # candidate slot instead of predicting from a not-yet-existing
+        # assignment. Acquisition registers ownership in ``session._slot_owners``
+        # — the registry every residency rung already reads — so the resolution
+        # needs no extra input and the measurement is of the candidate. The
+        # caller (:func:`_should_skip_local`) acquired it and owns its release
+        # (LP-0MW959PWL001WYSM AC2d): a caller that already holds the handle
+        # passes it in via *candidate_slot*, and an override that re-admits the
+        # request must find it still owned. Fail-open: an unavailable candidate
+        # degrades one rung, never refuses local.
         candidate = candidate_slot
-        if candidate is None:
-            candidate = _acquire_admission_candidate(
-                session_id, endpoint=endpoint, server_config=server_config
-            )
         if candidate is not None:
             # Trace-level only: the decision line (AC6, LP-0MW959SE30012HJJ)
             # is the single INFO seam for the verdict; this one says which
@@ -10517,6 +10687,14 @@ async def _maybe_queue_for_local_slot(
         ),
     )
     if _admission is not None and not _admission.admit:
+        # The queue's admission guard refused local: the candidate the bypass
+        # mirror above acquired (if any) has no dispatch to hand it to, so it is
+        # released with the refusing reason here — the contention-queue refusal
+        # rung of the release contract (LP-0MW959PWL001WYSM AC2c). Idempotent,
+        # so a request that never acquired one is unaffected.
+        _release_session_admission_candidate(
+            session_id, endpoint=endpoint, reason=_admission.reason
+        )
         try:
             setattr(request, "_local_admission_decision", _admission)
         except Exception:
@@ -10611,35 +10789,51 @@ async def _maybe_queue_for_local_slot(
     except Exception:
         logger.debug("retention check failed; queueing as a newcomer", exc_info=True)
     _cause_out: list[str] = []
-    elapsed = await contention_queue.wait_for_local_slot(
-        max_wait_seconds=_max_wait_seconds,
-        max_depth=cq["max_depth"],
-        slot_free_check=lambda: _local_slot_free(
-            config, max_local, endpoint=endpoint
-        ),
-        session_id=session_id,
-        retained=_retained,
-        # ETA-aware ordering (LP-0MVIQ0G2M0006QF6 AC1): the admission guard
-        # already costed this request's prefill, so the queue can admit the
-        # shortest projected prefill first within its retention class.
-        eta_seconds=(
-            float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0)
-            if _admission is not None
-            else None
-        ),
-        eta_ordering=bool(cq.get("eta_ordering", False)),
-        promote_after_seconds=float(cq.get("eta_promotion_seconds", 0) or 0),
-        # LP-0MVWPJW2700966ZU: the queue records a loss on its own drop points
-        # (depth cap, wait expiry) with the canonical fall-through reason this
-        # call site reports. The default is ``fallback_after_queue``; the
-        # lease-protected call site passes ``local_lease_active``.
-        loss_reason=loss_reason,
-        cause_out=_cause_out,
-        # Cumulative bookkeeping (AC3): a second wait in the same turn reports
-        # the whole turn's wait, not just this gate's slice.
-        already_waited_seconds=_spent_wait_seconds,
-    )
+    try:
+        elapsed = await contention_queue.wait_for_local_slot(
+            max_wait_seconds=_max_wait_seconds,
+            max_depth=cq["max_depth"],
+            slot_free_check=lambda: _local_slot_free(
+                config, max_local, endpoint=endpoint
+            ),
+            session_id=session_id,
+            retained=_retained,
+            # ETA-aware ordering (LP-0MVIQ0G2M0006QF6 AC1): the admission guard
+            # already costed this request's prefill, so the queue can admit the
+            # shortest projected prefill first within its retention class.
+            eta_seconds=(
+                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0)
+                if _admission is not None
+                else None
+            ),
+            eta_ordering=bool(cq.get("eta_ordering", False)),
+            promote_after_seconds=float(cq.get("eta_promotion_seconds", 0) or 0),
+            # LP-0MVWPJW2700966ZU: the queue records a loss on its own drop points
+            # (depth cap, wait expiry) with the canonical fall-through reason this
+            # call site reports. The default is ``fallback_after_queue``; the
+            # lease-protected call site passes ``local_lease_active``.
+            loss_reason=loss_reason,
+            cause_out=_cause_out,
+            # Cumulative bookkeeping (AC3): a second wait in the same turn reports
+            # the whole turn's wait, not just this gate's slice.
+            already_waited_seconds=_spent_wait_seconds,
+        )
+    except BaseException:
+        # A wait that raises (client disconnect / cancellation) ends the
+        # local route without a dispatch, so the candidate the bypass mirror
+        # acquired is released before the exception continues
+        # (LP-0MW959PWL001WYSM AC2c). Idempotent: never a double-free.
+        _release_session_admission_candidate(
+            session_id, endpoint=endpoint, reason="exception"
+        )
+        raise
     if elapsed is None:
+        # The wait expired or the depth cap refused the enqueue, so the request
+        # falls back to the next provider and its candidate is released with
+        # that reason (LP-0MW959PWL001WYSM AC2c).
+        _release_session_admission_candidate(
+            session_id, endpoint=endpoint, reason=loss_reason
+        )
         # Explicit abandon cause (LP-0MVV29X2E004INFL AC1): the queue reports
         # whether the depth cap refused the enqueue or the wait budget ran out.
         # The fallback line logs it verbatim, so the analyser never infers the
@@ -15814,6 +16008,12 @@ async def _proxy_with_fallback_cycle(
         if _refusal is not None:
             return _refusal
 
+        # The slot candidate this attempt's local admission acquired, if any
+        # (LP-0MW959PWL001WYSM). Reset per provider attempt and released by the
+        # ``finally`` below unless the admission kept it, so no exit path —
+        # refusal, exception, fall-through — can leave a fabricated occupancy
+        # in the slot registry.
+        _candidate_lease = _AdmissionCandidateLease()
         try:
             # Mark attempt
             any_provider_tried = True
@@ -16312,6 +16512,24 @@ async def _proxy_with_fallback_cycle(
                 )
                 _session_tenants = _resolve_tenants(config)
                 _tenancy_idle = _resolve_tenancy_idle(config)
+                # Candidate-first admission (LP-0MW959PWL001WYSM): the candidate
+                # is acquired **here**, at the admission decision point, and
+                # its lifecycle is owned by this branch's lease — kept when the
+                # request goes local, released with the refusing reason on every
+                # refusal (including the ETA-guard refusal below) and on any
+                # exception on the way out, so an acquired-but-refused candidate
+                # never lingers as fabricated occupancy (AC2a–AC2e). The single
+                # attempt is ``own_candidate=False`` for the ladder: a second,
+                # hidden acquisition behind the lease's back could never be
+                # released by it.
+                if _resident_min_ratio > 0.0:
+                    _candidate_lease = _AdmissionCandidateLease(
+                        _acquire_admission_candidate(
+                            _session_id,
+                            endpoint=local_endpoint,
+                            server_config=_server_section(config),
+                        )
+                    )
                 _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,
@@ -16326,6 +16544,8 @@ async def _proxy_with_fallback_cycle(
                     session_tenants=_session_tenants,
                     tenancy_idle_seconds=_tenancy_idle,
                     server_config=_server_section(config),
+                    candidate_slot=_candidate_lease.candidate,
+                    own_candidate=False,
                 )
                 # LP-0MVODJ3P6000AIUM: initialised here so the admission-evidence
                 # stamp below can consult the idle-admit verdict even on the
@@ -16544,6 +16764,14 @@ async def _proxy_with_fallback_cycle(
                         _skip_reason = None
 
                 if _skip_local:
+                    # Every override above had its chance to re-admit; the
+                    # verdict is final, so the candidate acquired for this
+                    # admission is released with the refusing reason
+                    # (LP-0MW959PWL001WYSM AC2b/AC2c). The lease's ``finally``
+                    # safety net covers the exits below (compaction rescue keep
+                    # path, ETA-guard refusal, exceptions) without a second
+                    # release.
+                    _candidate_lease.note_refusal(_skip_reason)
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
@@ -16620,6 +16848,8 @@ async def _proxy_with_fallback_cycle(
                             session_tenants=_session_tenants,
                             tenancy_idle_seconds=_tenancy_idle,
                             server_config=_server_section(config),
+                            candidate_slot=_candidate_lease.candidate,
+                            own_candidate=False,
                         )
                         if _skip_after:
                             logger.info(
@@ -16812,6 +17042,12 @@ async def _proxy_with_fallback_cycle(
                         _direct_reason = str(_direct_admission.reason)
                     else:
                         _direct_reason = "eta_exceeds_budget_direct"
+                    # Record the refusing reason for the candidate release: the
+                    # ETA/capacity guard is the last admission refusal before
+                    # the dispatch, so it must name its reason on the
+                    # ``candidate_released`` line like every ladder rung
+                    # (LP-0MW959PWL001WYSM AC2b/AC2c).
+                    _candidate_lease.note_refusal(_direct_reason)
                     try:
                         setattr(request, "_local_admission_decision", _direct_admission)
                     except Exception:
@@ -17037,6 +17273,12 @@ async def _proxy_with_fallback_cycle(
                 except Exception:
                     pass
 
+                # The admission is now certain to dispatch locally: the
+                # candidate is handed to the existing slot bookkeeping unchanged
+                # — no second assignment and no release (LP-0MW959PWL001WYSM
+                # AC2d). Every exit before this point has already released it
+                # through the lease's ``finally``.
+                _candidate_lease.keep()
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
                 # LP-0MTBOX45O005LD1S AC2: the cheap-mode compaction gate
@@ -18108,6 +18350,15 @@ async def _proxy_with_fallback_cycle(
                 continue
             # Non-connection error — propagate
             raise
+        finally:
+            # The single safety release for this attempt (LP-0MW959PWL001WYSM
+            # AC2a/AC2e): a candidate acquired for a refused admission is handed
+            # back here on every exit this attempt can take — the ladder
+            # refusal, the compaction bail-out, the ETA/capacity guard refusal,
+            # any ``continue``/``return``/``raise`` above — unless the admission
+            # kept it for the dispatch (AC2d). Idempotent, so an explicit
+            # refusal release is never a double-free.
+            _candidate_lease.release()
 
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)

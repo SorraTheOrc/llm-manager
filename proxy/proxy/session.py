@@ -1260,7 +1260,61 @@ def _assign_slot_locked(
     return None
 
 
-def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> None:
+def _release_slot_locked(key: tuple, session_id: str) -> bool:
+    """Pop *key*'s assignment when *session_id* still owns it.
+
+    The single registry-level release step every release seam shares
+    (``_free_slot_assignment``, ``release_slot_candidate``,
+    ``release_session_candidate``). Callers hold :data:`_slot_registry_lock`.
+    Returns ``True`` only when an assignment was actually removed, so a second
+    release of the same candidate is a no-op rather than a double-free
+    (LP-0MW959PWL001WYSM AC2e).
+    """
+    if _slot_owners.get(key) != session_id:
+        return False
+    # Remember who held it: the next assignment to a *different* session is
+    # what invalidates this session's measurement.
+    _slot_last_tenant[key] = session_id
+    _slot_owners.pop(key, None)
+    return True
+
+
+def _clear_release_feedback(session_id: str) -> None:
+    """Drop the state derived from the slot this session just handed back.
+
+    A divergence correction derived from that measurement is equally invalid
+    once the slot changes hands (LP-0MW81DS4W008DKDV AC3). Fail-open: bookkeeping
+    never fails a release.
+    """
+    try:
+        from proxy.provider import clear_divergence_feedback
+
+        clear_divergence_feedback(None, session_id)
+    except Exception:
+        pass
+
+
+def _log_candidate_released(
+    session_id: str, slot_id: int, endpoint: str, reason: str | None
+) -> None:
+    """Emit the one ``candidate_released`` line for a refused admission.
+
+    AC2b (LP-0MW959PWL001WYSM): an acquired-and-returned candidate must be
+    operationally visible, naming the refusing reason, so a refusal that gave
+    the slot back can be told apart from one that leaked it. Never emitted by
+    the ordinary end-of-turn release (``_free_slot_assignment``), which is a
+    dispatched slot being handed back, not a refused admission.
+    """
+    logger.info(
+        "candidate_released reason=%s session=%s slot=%s endpoint=%s",
+        reason or "admission_refused",
+        session_id,
+        slot_id,
+        endpoint or "none",
+    )
+
+
+def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> bool:
     """Release the slot assigned to *session_id* on *endpoint*, if any.
 
     When *endpoint* is None (legacy single-server mode), the first matching
@@ -1275,32 +1329,23 @@ def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> None:
     eviction (``router_helpers._record_local_eviction``), an invalidation
     (:func:`_invalidate_session_and_slot`) and a model switch
     (``lifecycle.ensure_model_loaded``). Fail-open: releasing never raises.
+
+    Returns ``True`` when an assignment was released, ``False`` when the session
+    owned no slot on *endpoint* (or already released it) — the return value
+    makes the refused-admission release (:func:`release_slot_candidate`)
+    idempotent without a second registry lookup.
     """
     if not session_id:
-        return
-    # A divergence correction derived from that measurement is equally invalid
-    # once the slot changes hands (LP-0MW81DS4W008DKDV AC3).
-    try:
-        from proxy.provider import clear_divergence_feedback
-
-        clear_divergence_feedback(None, session_id)
-    except Exception:
-        pass
+        return False
+    _clear_release_feedback(session_id)
     ep = endpoint or ""
     with _slot_registry_lock:
         for key, owner in list(_slot_owners.items()):
             if owner == session_id and (
                 endpoint is None or _slot_key_endpoint(key) == ep
             ):
-                # Remember who held it: the next assignment to a *different*
-                # session is what invalidates this session's measurement.
-                _slot_last_tenant[
-                    _slot_registry_key(
-                        _slot_key_endpoint(key), _slot_key_slot_id(key)
-                    )
-                ] = session_id
-                _slot_owners.pop(key, None)
-                return
+                return _release_slot_locked(key, session_id)
+    return False
 
 
 def acquire_slot_candidate(
@@ -1344,6 +1389,75 @@ def acquire_slot_candidate(
     return SlotCandidate(
         session_id=session_id, slot_id=slot_id, endpoint=endpoint or ""
     )
+
+
+def release_slot_candidate(
+    candidate: SlotCandidate | None, *, reason: str | None = None
+) -> bool:
+    """Release an acquired-but-refused slot candidate (idempotent).
+
+    The single seam a **refused** admission returns its candidate through
+    (LP-0MW959PWL001WYSM AC2a/AC2b/AC2e): the candidate is released through the
+    same registry release the ordinary end-of-turn path uses, so no refusal
+    path invents its own release, no lease or slot snapshot is left behind (a
+    refusal never dispatches) and an admitted request is never released here —
+    its ownership passes to the existing slot bookkeeping unchanged (AC2d).
+
+    *reason* names the refusing rung (``resident_prefix_insufficient``,
+    ``tenant_limit``, …) and is emitted on the one ``candidate_released`` line.
+    Returns ``True`` only when this call actually released the candidate: a
+    second release of the same candidate is a **no-op** (never a double-free),
+    which is what makes the ``finally``-style safety releases safe.
+    """
+    if candidate is None:
+        return False
+    session_id = getattr(candidate, "session_id", "") or ""
+    slot_id = getattr(candidate, "slot_id", None)
+    if not session_id or slot_id is None:
+        return False
+    endpoint = getattr(candidate, "endpoint", "") or ""
+    _clear_release_feedback(session_id)
+    key = _slot_registry_key(endpoint, slot_id)
+    with _slot_registry_lock:
+        released = _release_slot_locked(key, session_id)
+    if released:
+        _log_candidate_released(session_id, slot_id, endpoint, reason)
+    return released
+
+
+def release_session_candidate(
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    reason: str | None = None,
+) -> bool:
+    """Release whatever candidate *session_id* holds on *endpoint*, if any.
+
+    The session-scoped form of :func:`release_slot_candidate`, for a refusal
+    whose candidate was acquired somewhere other than the local variable the
+    caller holds — the contention-queue refusal, where the admission ladder
+    ran inside the queue's bypass mirror (LP-0MW959PWL001WYSM AC2c). Falls back
+    to the whole registry when *endpoint* is ``None`` (legacy single-server
+    mode, matching :func:`_free_slot_assignment`). Idempotent: ``False`` when
+    the session holds no candidate, so a second release is never a double-free.
+    """
+    if not session_id:
+        return False
+    _clear_release_feedback(session_id)
+    ep = endpoint or ""
+    released: int | None = None
+    with _slot_registry_lock:
+        for key, owner in list(_slot_owners.items()):
+            if owner == session_id and (
+                endpoint is None or _slot_key_endpoint(key) == ep
+            ):
+                if _release_slot_locked(key, session_id):
+                    released = _slot_key_slot_id(key)
+                break
+    if released is None:
+        return False
+    _log_candidate_released(session_id, released, ep, reason)
+    return True
 
 
 def _assigned_slot_for_session(

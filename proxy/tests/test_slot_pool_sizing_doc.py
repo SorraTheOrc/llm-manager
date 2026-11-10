@@ -217,17 +217,17 @@ class TestCitationsStillResolve:
         ("proxy/proxy/provider.py", 2758, "effective_per_slot_threshold"),
         # 4 — persistence cap derived from the same clamp
         ("proxy/proxy/provider.py", 2715, "def compute_hard_routing_cap"),
-        ("proxy/proxy/session.py", 1534, "effective_per_slot_threshold"),
+        ("proxy/proxy/session.py", 1648, "effective_per_slot_threshold"),
         # 5 — dispatch-lease cap
         ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
         ("proxy/proxy/router.py", 1611, "_try_acquire_local_dispatch"),
         ("proxy/proxy/router_helpers.py", 4354, "async def _try_acquire_local_dispatch"),
-        ("proxy/proxy/provider.py", 7812, "def _get_local_concurrency_info"),
+        ("proxy/proxy/provider.py", 7982, "def _get_local_concurrency_info"),
         # 6 — slot-ID space
         ("proxy/proxy/session.py", 1210, "def _slot_id_for_session"),
         # 7 — persistence on/off gate + eviction planner
         ("proxy/proxy/session.py", 488, "def _slot_persistence_enabled"),
-        ("proxy/proxy/session.py", 1490, "session_slot_pool_size"),
+        ("proxy/proxy/session.py", 1604, "session_slot_pool_size"),
         ("proxy/proxy/session.py", 848, "def plan_eviction_snapshot"),
         # 8 — tenancy default
         ("proxy/proxy/router_helpers.py", 3990, "def _default_tenants"),
@@ -242,8 +242,8 @@ class TestCitationsStillResolve:
         # was removed by LP-0MW1VDZIX0011D8M — a stale list no longer fabricates
         # a pool size beside available_slots=0.
         # geometry-independent retention + per-session snapshot filenames
-        ("proxy/proxy/session.py", 1423, "def _slot_filename_for_session"),
-        ("proxy/proxy/session.py", 1425, "slot_{safe_id}.bin"),
+        ("proxy/proxy/session.py", 1537, "def _slot_filename_for_session"),
+        ("proxy/proxy/session.py", 1539, "slot_{safe_id}.bin"),
         ("scripts/cleanup-slot-cache.sh", 27, "MAX_AGE_DAYS=7"),
         ("scripts/cleanup-slot-cache.sh", 28, "MAX_SIZE_GB=20"),
         # persistence suppression gates named in the bake-off metrics

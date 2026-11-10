@@ -931,11 +931,65 @@ unchanged: `measured` → `measured_last_dispatch` → `session_slot` →
 per-slot `n_past` / `n_prompt_tokens_processed`, the live rung stays
 unreachable and `measured_last_dispatch` carries the measurement.
 
-Clean release of an acquired-but-refused candidate is the next slice of this
-group (`LP-0MW959PWL001WYSM`): until it lands, a refused admission leaves its
-candidate registered rather than dispatching, which degrades *measurement*
-for later sessions (they fall to `unavailable:no_slot` and the cold-threshold
-denial) without dispatching or fabricating anything.
+## 8. Clean release of a refused candidate (LP-0MW959PWL001WYSM)
+
+Section 7 moves capacity acquisition into the admission path, which makes an
+acquired-but-refused candidate a **fabricated occupancy**: the registry says
+the slot is taken while nothing will ever dispatch on it, so the next real
+request reads a full pool, falls to `unavailable:no_slot` and is denied by the
+cold threshold. The release contract closes that hole.
+
+1. **One acquire point, one release seam.** `_should_skip_local` is now a thin
+   lifecycle wrapper around the verdict (`_should_skip_local_verdict`). When
+   the caller supplies no candidate the wrapper acquires one *before* the
+   verdict — so even the outermost `context_too_large` rung has one — and
+   releases it on **every** refusal rung and on **any exception** raised
+   inside the decision. The release goes through the single seam
+   `session.release_slot_candidate` → the same registry release the ordinary
+   end-of-turn path (`_free_slot_assignment`) uses; no refusal path invents
+   its own release.
+2. **The call site owns the lifecycle.** `_proxy_with_fallback_cycle` wraps
+   the candidate in `provider._AdmissionCandidateLease` and releases it from
+   the attempt's `finally`, so the ladder refusal, the compaction bail-out,
+   the prefill-ETA/capacity guard refusal, a `continue`/`return` and an
+   exception all return the candidate. Only the point immediately before
+   `_dispatch_local` calls `keep()`, after which the lease never releases.
+   The reason recorded on the lease is the refusing rung's skip reason, so the
+   ETA-guard refusal names `prefill_budget_exceeded` rather than a generic
+   token.
+3. **The contention-queue refusal is covered too.** The queue decision point
+   runs the same ladder through `_queue_context_bypass`, and
+   `_maybe_queue_for_local_slot` releases a held candidate when the guard
+   refuses admission or the bounded wait expires (the request falls back).
+   `session.release_session_candidate` is the session-scoped form for that
+   case, where the candidate was acquired deeper than the caller's variable.
+4. **Admission keeps the candidate.** A refused admission releases; an
+   admitted one does not. Ownership passes to the existing slot bookkeeping
+   unchanged — `_build_slot_context` re-enters the same assignment
+   idempotently at dispatch — so there is no second assignment and no release
+   at admission time. This holds when an override (idle admit, capacity
+   admit, last-resort admit) re-admits a prompt the ladder refused: the
+   candidate is still held, because the release happens only after every
+   override has had its say.
+5. **Nothing is left behind, and release is idempotent.** A refusal never
+   dispatches, so it creates no dispatch-lease record, saves no
+   `slot_<session>.bin` snapshot and emits no `abandoned_slot_recorded` (an
+   abandoned slot means a *dispatched* request that never reported). The
+   release emits exactly one line:
+
+   ```
+   candidate_released reason=<skip_reason> session=<id> slot=<n> endpoint=<url>
+   ```
+
+   which makes an acquired-and-returned candidate operationally visible. A
+   second release of the same candidate is a **no-op** — the registry pop is
+   conditional on the session still owning the slot — so the `finally` safety
+   release can never double-free, and a run of refusals returns the registry
+   to its baseline size.
+
+Regression pins: `proxy/tests/test_local_resident_prefix_admission.py`
+(rung sweep, idempotence, leak, exception and keep-through-dispatch cases) and
+`proxy/tests/test_contention_queue_prefill.py` (the queue refusal release).
 
 Replay evidence for the 2026-10-24 thrash window:
 `proxy/tests/test_prefill_thrash_replay_2026_10_24.py` and

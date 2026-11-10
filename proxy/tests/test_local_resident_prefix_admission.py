@@ -2581,11 +2581,16 @@ def test_pricing_uses_the_measured_prefix_not_the_ownership_sentinel(
 #         """Lowest free slot for the session on the endpoint; same-session
 #         re-entry idempotent; None when the pool is full."""
 #
-#     def release_slot_candidate(candidate, *, reason=None) -> None:
+#     def release_slot_candidate(candidate, *, reason=None) -> bool:
 #         """Idempotent release through the existing release seam
 #         (``_free_slot_assignment``); never a double-free. When the release
 #         closes a *refused* admission it names the refusing reason
-#         (``candidate_released reason=<skip_reason>``, F3 AC2b)."""
+#         (``candidate_released reason=<skip_reason>``, F3 AC2b); a second
+#         release returns False and logs nothing (F3 AC2e)."""
+#
+# ``acquire_slot_candidate`` shipped with F2; ``release_slot_candidate`` and
+# the release contract at the admission call site shipped with F3
+# (LP-0MW959PWL001WYSM).
 #
 # Accepted on every refusal rung: ``context_too_large``,
 # ``unmeasured_residency_cold``, ``resident_prefix_insufficient``,
@@ -2617,7 +2622,6 @@ F4_FALLBACK = "LP-0MW959QJ9002MKEI"  # exclusivity + deterministic busy fallback
 #: Pending ``test_scenario*`` → owning item(s). The audit test below reads this
 #: map, so adding a scenario without naming its owner fails the suite (AC5d).
 SCENARIO_OWNERS = {
-    "test_scenario1_refusal_releases_the_candidate": (F3_RELEASE,),
     "test_scenario2_busy_pool_falls_back_deterministically": (F4_FALLBACK,),
 }
 
@@ -2629,6 +2633,7 @@ SCENARIO_OWNERS = {
 #: bounded wait AC3c and the deadlock/consistency tests AC3d).
 IMPLEMENTED_SCENARIOS = {
     "test_scenario1_assign_then_measure_admits": (F2_ASSIGN,),
+    "test_scenario1_refusal_releases_the_candidate": (F3_RELEASE,),
     "test_scenario3_concurrent_admissions_never_share_a_candidate": (
         F2_ASSIGN,
         F4_FALLBACK,
@@ -2717,11 +2722,6 @@ def test_scenario1_assign_then_measure_admits(caplog, monkeypatch):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"F1 scenario 1 (refuse half): pending {F3_RELEASE} — clean candidate "
-    "release on refusal not implemented; remove this marker in that item's commit",
-)
 def test_scenario1_refusal_releases_the_candidate(caplog, monkeypatch):
     """Scenario 1 (refuse half) — assign → measure → refuse → clean release.
 
@@ -3183,3 +3183,355 @@ def test_measurement_survives_the_dispatch_turn_boundary(tmp_path, caplog, monke
     assert event.residency_source == provider.RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH
     assert event.n_past_actual == MEASURED_TOTAL
     assert MEASUREMENT_NO_SLOT not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# F3 — release the slot candidate cleanly on a refused admission
+# (LP-0MW959PWL001WYSM, parent AC2)
+#
+# Candidate-first admission acquires a slot before the verdict, so an
+# acquired-but-refused candidate is a *fabricated occupancy* that would deny
+# the pool to real work. The release contract pinned here:
+#
+# - nothing is left behind (no slot registry entry, no dispatch lease, no
+#   ``slot_<session>.bin``, no ``abandoned_slot_recorded``) — AC2a;
+# - exactly one ``candidate_released reason=<skip_reason>`` line — AC2b;
+# - every refusal rung releases, including an exception inside the decision —
+#   AC2c;
+# - an admitted admission keeps its candidate with no second assignment and no
+#   release — AC2d;
+# - a run of refusals returns the registry to baseline and a second release is
+#   a no-op — AC2e.
+#
+# The release seam is ``proxy.session.release_slot_candidate`` (F1 pins it); the
+# production call site owns it through ``provider._AdmissionCandidateLease``.
+# ---------------------------------------------------------------------------
+
+#: The one line a refused admission must emit (AC2b).
+CANDIDATE_RELEASED = "candidate_released"
+
+
+def _release_config(tmp_path, *, pool_size: int = 2, **extra) -> dict:
+    """A ``server:`` config with the slot bookkeeping a candidate needs."""
+    config = _candidate_config(tmp_path, pool_size=pool_size)
+    config.update(extra)
+    return config
+
+
+def _decide_with_release(tmp_path, *, session_id: str = "sess-a", pool_size: int = 2, **gate_kw):
+    """One admission through the ladder's **own** candidate acquisition.
+
+    The caller does not hold a candidate, so the ladder acquires one and owns
+    its release (the ``_queue_context_bypass`` / direct-call shape).
+    """
+    return provider._should_skip_local(
+        MODEL,
+        session_id,
+        {"messages": []},
+        gate_kw.pop("cold_threshold", COLD_THRESHOLD),
+        estimated_tokens=gate_kw.pop("estimated_tokens", EST_TOKENS),
+        warm_cache_threshold=gate_kw.pop("warm_threshold", 0),
+        resident_prefix_min_ratio=gate_kw.pop("min_ratio", 0.5),
+        unmeasured_cold_enabled=gate_kw.pop("unmeasured_cold_enabled", True),
+        endpoint=gate_kw.pop("endpoint", ""),
+        server_config=_release_config(tmp_path, pool_size=pool_size),
+        **gate_kw,
+    )
+
+
+def _assert_clean_release(caplog, *, session_id: str = "sess-a", reason: str) -> None:
+    """AC2a/AC2b: registry back to baseline, one line naming the reason."""
+    assert dict(session_registry._slot_owners) == {}, (
+        "a refused admission must leave no fabricated occupancy behind"
+    )
+    assert session_registry._assigned_slot_for_session(session_id) is None
+    assert f"{CANDIDATE_RELEASED} reason={reason}" in caplog.text, (
+        f"the release must be operationally visible, naming {reason!r}"
+    )
+    assert "abandoned_slot_recorded" not in caplog.text, (
+        "an abandoned slot means a dispatched request that never reported, "
+        "never a refused admission (AC2a)"
+    )
+
+
+# Rung → the setup that reaches it with a candidate held. ``unmeasured_``
+# ``residency_cold`` is deliberately absent: it is only reachable when **no**
+# candidate could be acquired (it requires an unknown residency source, which
+# owning a candidate rules out), and that case is pinned separately below.
+_REFUSAL_RUNG_CASES = ("context_too_large", SKIP_RESIDENT_PREFIX, SKIP_TENANT_LIMIT,
+                       "large_context_bypass")
+
+
+@pytest.mark.parametrize("rung", _REFUSAL_RUNG_CASES)
+def test_every_refusal_rung_releases_the_candidate(tmp_path, caplog, monkeypatch, rung):
+    """AC2c — every refusal rung that can hold a candidate releases it.
+
+    Each rung is driven through the ladder's own acquisition, so the assertion
+    is about the *decision* releasing, not about a hand-written release in the
+    test: the registry is back to its baseline and the line names that rung's
+    reason. ``context_too_large`` is the outermost rung (it refuses before the
+    residency probe), so it proves the candidate is acquired early enough for
+    every rung to be able to return it.
+    """
+    import logging
+
+    kwargs: dict = {}
+    session_id = "sess-a"
+    if rung == "context_too_large":
+        kwargs["warm_threshold"] = 1_000
+    elif rung == SKIP_RESIDENT_PREFIX:
+        _prime_measurement(5_000)  # reusable fraction ≈ 0.10 < min_ratio 0.5
+        _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+    elif rung == SKIP_TENANT_LIMIT:
+        # Two live tenants occupy the bound; the newcomer (``sess-c``) owns its
+        # candidate and passes the residency gate, so it reaches the tenancy
+        # rung — the one that must return the candidate.
+        session_id = "sess-c"
+        _install_tenancy(["sess-a", "sess-b"])
+        _install_slot_state(
+            monkeypatch, slots=[_slot(0, None, processing=False)], owners={}
+        )
+        kwargs["session_tenants"] = 2
+        kwargs["tenancy_idle_seconds"] = 30.0
+    elif rung == "large_context_bypass":
+        _prime_measurement(MEASURED_TOTAL)
+        _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+        kwargs["cold_threshold"] = 10_000
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_release(tmp_path, session_id=session_id, **kwargs)
+
+    assert (skip, reason) == (True, rung)
+    _assert_clean_release(caplog, session_id=session_id, reason=rung)
+
+
+def test_a_refusal_leaves_no_lease_and_no_slot_snapshot(tmp_path, caplog, monkeypatch):
+    """AC2a — a refusal never dispatches, so nothing is persisted.
+
+    The refused candidate leaves no dispatch-lease record, no
+    ``slot_<session>.bin`` snapshot under the configured save path and no
+    ``abandoned_slot_recorded`` event: the release is bookkeeping only.
+    """
+    import logging
+
+    import proxy.server as server_module
+
+    _prime_measurement(5_000)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+    before = dict(server_module.local_dispatch_records)
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_release(tmp_path)
+
+    assert (skip, reason) == (True, SKIP_RESIDENT_PREFIX)
+    _assert_clean_release(caplog, reason=SKIP_RESIDENT_PREFIX)
+    assert dict(server_module.local_dispatch_records) == before, (
+        "a refused admission must not create a dispatch lease"
+    )
+    assert not list(tmp_path.glob("slot_*.bin")), (
+        "a refused admission must not save a slot snapshot"
+    )
+
+
+def test_release_is_idempotent_and_never_double_frees(tmp_path, caplog):
+    """AC2e — a second release is a no-op: one line, one pop.
+
+    The ``finally``-style safety release and an explicit refusal release both
+    call the same seam, so the seam itself must be idempotent: the second call
+    reports ``False`` and emits no second ``candidate_released`` line.
+    """
+    import logging
+
+    candidate = session_registry.acquire_slot_candidate(
+        "sess-a",
+        endpoint="",
+        pool_size=session_registry.candidate_pool_size(_release_config(tmp_path)),
+    )
+    assert candidate is not None
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        assert session_registry.release_slot_candidate(
+            candidate, reason=SKIP_RESIDENT_PREFIX
+        ) is True
+        assert session_registry.release_slot_candidate(
+            candidate, reason=SKIP_RESIDENT_PREFIX
+        ) is False
+
+    assert dict(session_registry._slot_owners) == {}
+    assert caplog.text.count(CANDIDATE_RELEASED) == 1
+    assert f"{CANDIDATE_RELEASED} reason={SKIP_RESIDENT_PREFIX}" in caplog.text
+
+
+def test_a_run_of_refusals_returns_the_registry_to_baseline(
+    tmp_path, caplog, monkeypatch
+):
+    """AC2e — refusals leak nothing and leave the pool usable.
+
+    Five refusals from four sessions neither grow the registry nor strand a
+    slot: the pool the refusals borrowed from is still fully available
+    afterwards, and each refusal logged its own reason.
+    """
+    import logging
+
+    _prime_measurement(5_000)
+    baseline = dict(session_registry._slot_owners)
+    assert baseline == {}
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        for index, session_id in enumerate(
+            ["sess-a", "sess-b", "sess-c", "sess-d", "sess-a"]
+        ):
+            # Each refusal must be a *refusal*: a measured prefix below the
+            # ratio, re-primed per session because a change of hands forgets the
+            # previous tenant's measurement (AC1d).
+            _prime_measurement(5_000, session=session_id)
+            _install_slot_state(monkeypatch, slots=_free_slots([0, 1]), owners={})
+            skip, reason = _decide_with_release(
+                tmp_path, session_id=session_id, pool_size=2
+            )
+            assert (skip, reason) == (True, SKIP_RESIDENT_PREFIX), index
+
+    assert dict(session_registry._slot_owners) == baseline
+    assert caplog.text.count(CANDIDATE_RELEASED) == 5
+
+    # The pool still hands out candidates: nothing was stranded by the run.
+    reclaimed = session_registry.acquire_slot_candidate(
+        "sess-new",
+        endpoint="",
+        pool_size=session_registry.candidate_pool_size(_release_config(tmp_path)),
+    )
+    assert reclaimed is not None
+    assert reclaimed.slot_id == 0
+
+
+def test_an_exception_inside_the_decision_releases_the_candidate(
+    tmp_path, caplog, monkeypatch
+):
+    """AC2c — a raise inside the decision never leaks the candidate.
+
+    The residency probe raising is the shape a partial failure takes; the
+    candidate acquired for the verdict is returned before the exception is
+    re-raised, with the reason named on the release line.
+    """
+    import logging
+
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("residency probe exploded")
+
+    monkeypatch.setattr(provider, "resolve_resident_prefix", _boom)
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        with pytest.raises(RuntimeError):
+            _decide_with_release(tmp_path)
+
+    assert dict(session_registry._slot_owners) == {}
+    assert f"{CANDIDATE_RELEASED} reason=exception" in caplog.text
+
+
+def test_no_candidate_means_nothing_to_release(caplog, monkeypatch):
+    """AC2c — the unmeasured-cold rung cannot leak: it has no candidate.
+
+    ``unmeasured_residency_cold`` requires an *unknown* residency source, and
+    owning a candidate rules that out; it is therefore only reachable when the
+    pool could not hand one out (here: the single slot belongs to another
+    session). Nothing is acquired, so nothing is released and the occupant
+    keeps its slot.
+    """
+    import logging
+
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = provider._should_skip_local(
+            MODEL,
+            "sess-a",
+            {"messages": []},
+            COLD_THRESHOLD,
+            estimated_tokens=EST_TOKENS,
+            resident_prefix_min_ratio=0.5,
+            endpoint="",
+            server_config={
+                "session_slot_pool_size": 1,
+                "session_slot_save_path": "/tmp/slots",
+            },
+        )
+
+    assert (skip, reason) == (True, provider.SKIP_REASON_UNMEASURED_COLD)
+    assert dict(session_registry._slot_owners) == {("", 0): "sess-other"}
+    assert CANDIDATE_RELEASED not in caplog.text
+
+
+def test_admission_keeps_the_candidate_through_dispatch(tmp_path, caplog, monkeypatch):
+    """AC2d — an admitted request keeps its candidate, unchanged.
+
+    When the caller owns the lifecycle, a refusal-free verdict releases
+    nothing; keeping the lease hands ownership to the dispatch bookkeeping with
+    no second assignment, and a later safety release is a no-op.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    config = _release_config(tmp_path)
+    candidate = session_registry.acquire_slot_candidate(
+        "sess-a",
+        endpoint="",
+        pool_size=session_registry.candidate_pool_size(config),
+    )
+    assert candidate is not None
+    lease = provider._AdmissionCandidateLease(candidate)
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = provider._should_skip_local(
+            MODEL,
+            "sess-a",
+            {"messages": []},
+            COLD_THRESHOLD,
+            estimated_tokens=EST_TOKENS,
+            resident_prefix_min_ratio=0.5,
+            endpoint="",
+            server_config=config,
+            candidate_slot=candidate,
+        )
+
+        assert (skip, reason) == (False, None)
+        assert dict(session_registry._slot_owners) == {("", 0): "sess-a"}
+        assert CANDIDATE_RELEASED not in caplog.text
+
+        # The dispatch path keeps the lease and still holds the same slot.
+        lease.keep()
+        assert lease.release() is False
+        assert dict(session_registry._slot_owners) == {("", 0): "sess-a"}
+        assert CANDIDATE_RELEASED not in caplog.text
+
+
+def test_lease_release_names_the_refusing_reason(tmp_path, caplog):
+    """AC2b/AC2e — the lease releases once, naming the recorded reason."""
+    import logging
+
+    candidate = session_registry.acquire_slot_candidate(
+        "sess-a",
+        endpoint="",
+        pool_size=session_registry.candidate_pool_size(_release_config(tmp_path)),
+    )
+    assert candidate is not None
+    lease = provider._AdmissionCandidateLease(candidate)
+    lease.note_refusal(SKIP_TENANT_LIMIT)
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        assert lease.release() is True
+        assert lease.release() is False  # idempotent safety release
+
+    assert dict(session_registry._slot_owners) == {}
+    assert caplog.text.count(CANDIDATE_RELEASED) == 1
+    assert f"{CANDIDATE_RELEASED} reason={SKIP_TENANT_LIMIT}" in caplog.text
