@@ -1199,7 +1199,10 @@ structurally wrong: 27 distinct sessions cycled through 2 slots in 5.4 h on
 `n_past=738` (1.5 % reusable) on one attempt and 100 % on the immediate retry.
 
 A large prompt (estimated tokens above `local_large_context_cold_cache_threshold`)
-now walks a **five-rung ladder**, in this order:
+now walks a **five-rung ladder**, in this order. The slot candidate is assigned
+**before** the ladder runs (*Candidate-first ordering*, below), so the
+residency rungs measure a real slot rather than predicting from a
+not-yet-existing assignment:
 
 1. **Hard context cap** — `context_too_large` when the prompt exceeds the warm
    threshold. Unchanged, never overridable (the prompt cannot fit the KV slot).
@@ -1301,6 +1304,46 @@ synchronous call would stall every routing decision. `proxy.residency` is
 dependency-free for exactly this reason: no poller, no new task, no upstream
 call.
 
+### Candidate-first ordering (`LP-0MW959P9S005DJY7`, `LP-0MW959PWL001WYSM`)
+
+The ladder used to be probed **before** any slot assignment, so on a pool whose
+slots are handed back at the end of every dispatch the session owned nothing at
+decision time: `measurement=unavailable:no_slot` was emitted on 3 363 of
+~4 500 local checks (~75 %), and the decision fell back to the predicted sidecar
+ratio — which priced a 55 492-token prompt at `new_tokens=172` and admitted it
+warm. The ordering is now:
+
+1. **Assign** a slot candidate (`session.acquire_slot_candidate`) — before the
+   verdict, so even the outermost `context_too_large` rung has one. Acquisition
+   registers ownership in `session._slot_owners`, the registry every residency
+   rung already reads;
+2. **Measure** the candidate (`resolve_resident_prefix`), so the measurement is
+   of *this* request's slot rather than of a prior turn's;
+3. **Price** `new_tokens` from that measurement
+   (`estimated_tokens - min(n_past_actual, estimated_tokens)`, the live-prefix
+   price) and take the verdict;
+4. **Release** the candidate on every refusal rung and on any exception
+   (`session.release_slot_candidate` → the same registry release the normal
+   end-of-turn path uses), so a refused admission leaves no fabricated
+   occupancy — no lease, no dispatch record, no session-slot record. The
+   release emits `candidate_released reason=<skip_reason> session=<id>
+   slot=<n> endpoint=<url>`, and is idempotent. An **admission** keeps the
+   candidate: ownership passes unchanged to the dispatch bookkeeping
+   (`_build_slot_context` re-enters the same assignment), so there is no second
+   assignment.
+
+**`measurement=unavailable:no_slot` now means the pool is exhausted.** It is no
+longer "no slot has been assigned yet" — a candidate is assigned before the
+verdict, so the only way a session has no slot at decision time is that none
+could be given (the pool is full), or that no pool/session id is configured at
+all. A candidate with no prior dispatched measurement reports
+`unavailable:no_prior_measurement` on the `session_slot` rung instead; one with
+a measurement reports `measured` on `measured_last_dispatch`.
+
+Concurrency, cleanup and the latency this added are pinned in the design doc
+(`docs/dev/slot-management-design.md` §7–§10); the field each decision reports
+for that latency is `admission_overhead_ms=` (below).
+
 **Unmeasured is cold (`LP-0MW81DFML006O5KL`).** A missing or stale snapshot
 (> 5 s), a session that owns no slot, or a build that no longer reports
 `context_tokens` (llama.cpp b8782 dropped `n_past`) degrades one rung at a
@@ -1345,9 +1388,9 @@ client restores warm instead of prefilling cold, and the shared
 ### Observability
 
 Every decision logs
-`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass|unmeasured_residency_cold> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=… threshold_applied=<cold|warm|none> threshold_value=<n|none> admission_overhead_ms=<ms|none> slot_candidate=<n|none>`.
+`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass|unmeasured_residency_cold> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=… threshold_applied=<cold|warm|none> threshold_value=<n|none> admission_overhead_ms=<ms|none> slot_candidate=<n|none> new_tokens=<n|none>`.
 
-`slot_candidate=` is appended **last** (LP-0MW959RRO008AAH9 AC10a): the slot
+`slot_candidate=` (LP-0MW959RRO008AAH9 AC10a) is the slot
 candidate-first admission assigned before this verdict, i.e. the slot the
 decision was measured against. It is the association key the dispatch record
 and the eviction event use to attribute the request to a llama slot/task (see
@@ -1355,6 +1398,32 @@ and the eviction event use to attribute the request to a llama slot/task (see
 and is `none` when no candidate was assigned (pool unconfigured or exhausted),
 never a fabricated slot. Every pre-existing key keeps its position, so a
 positional consumer of the line is unaffected.
+
+**The priced `new_tokens=` (`LP-0MW959SE30012HJJ`, parent AC6).** The
+`slot_candidate=` / `n_past_actual=` / `residency_source=` / `measurement=`
+fields say what the verdict was measured against; `new_tokens=` is the number it
+was **held to** — the priced uncached-token count the cold cap compared. It is
+appended **last** (after `slot_candidate=`), so every pre-existing key of the
+line keeps its position and a positional consumer of a pre-change line is
+unaffected.
+
+| Rung that priced the prompt | `new_tokens=` |
+|---|---|
+| measured-resident (live `context_tokens`, or the session's last measured dispatch) | `estimated_tokens - min(n_past_actual, estimated_tokens)` — the live-prefix price |
+| predicted-ratio rollout (`admit_predicted` / `skip_predicted`, `local_unmeasured_residency_cold_enabled: false`) | `int(estimated_tokens × (1 − cached_ratio))` — the sidecar price |
+| hard cap (`context_too_large`), unmeasured-cold (`unmeasured_residency_cold`), tenancy (`tenant_limit`) | `none` — no rung priced the prompt; never a fabricated `0` |
+
+A **refusal** line carries the price wherever the refusing rung had one: a
+`resident_prefix_insufficient` denial reports the measured price the prompt was
+refused *instead of*, so the refusal is attributable to the basis (the ratio)
+rather than looking like a missing price. Both verdicts are emitted by one
+logger with one grammar, so a refusal can never quietly drop a field.
+
+A wrong price is therefore traceable from one line, not by archaeology across
+the dispatch, eviction and `prompt_progress` lines: `slot_candidate=0
+n_past_actual=30000 estimated_tokens=49103 new_tokens=19103
+residency_source=measured_last_dispatch measurement=measured decision=admit`
+reconstructs the arithmetic that admitted the request.
 
 `measurement=` is the additive provenance field (immediately after
 `residency_source=`, before `min_ratio=`) that distinguishes a real measurement
@@ -1369,7 +1438,7 @@ cannot measure" is distinguishable from "there is no slot to measure"
 | `measured` | the ratio came from a real measurement (`residency_source=measured` live `context_tokens`, or `measured_last_dispatch`) |
 | `unavailable:capture_disabled` | the session owns a slot but `local_measured_cache_abort_enabled` is off (the documented rollback), or the switch could not be read (fail-open ⇒ capture not enabled) |
 | `unavailable:no_prior_measurement` | the session owns its slot and capture is enabled, but no local dispatch has been measured yet for `(model, session)` |
-| `unavailable:no_slot` | a **fresh** view shows the session owns no slot, so its reusable prefix is a measured zero |
+| `unavailable:no_slot` | no slot candidate could be assigned — **the pool is exhausted** (or no pool/session id is configured), so the decision was taken with no slot to measure. Since candidate-first ordering assigns before the verdict, this no longer means "not yet assigned" |
 | `unavailable:stale_view` | the residency view is absent/stale (`residency_source=unknown`), or the decision was logged without resolving residency facts (gate disabled: `local_resident_prefix_min_ratio: 0`) |
 
 Precedence is deterministic and first-match: `measured` →

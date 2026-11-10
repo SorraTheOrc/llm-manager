@@ -602,11 +602,11 @@ def test_no_doc_reintroduces_a_retired_fail_open_claim():
     )
 
 
-def test_admission_overhead_is_documented_as_the_last_additive_field():
+def test_admission_overhead_is_documented_as_an_additive_field():
     """``admission_overhead_ms`` (LP-0MW959R5S009WDM8, parent AC4).
 
     The figure is the operator's only view of the latency candidate-first
-    admission added, so the grammar must show it — and must show it **last**,
+    admission added, so the grammar must show it — and must show it appended,
     after the threshold pair, because appending is what keeps every existing
     positional consumer of the line working. The budget the figure is held to
     (p95 ≤ 50 ms) is stated where an operator looks for it, not only in code.
@@ -625,4 +625,79 @@ def test_admission_overhead_is_documented_as_the_last_additive_field():
     )
     assert "prefill_thrash_replay_harness" in text, (
         "routing.md must name the replay that aggregates the figure"
+    )
+
+
+def test_priced_new_tokens_is_the_documented_tail_of_the_decision_line():
+    """``new_tokens=`` (LP-0MW959SE30012HJJ, parent AC6c).
+
+    The priced uncached-token count is the field a wrong price is reconstructed
+    from, so the operator-facing grammar must show it — **last**, after
+    ``slot_candidate=``, because appending is what keeps every positional
+    consumer of the pre-change line working. What each rung reports (live
+    price, predicted price, or ``none``) is stated too, so the field cannot be
+    read as a fabricated ``0`` for an unpriced refusal.
+    """
+    line = _observability_grammar_line()
+
+    assert " new_tokens=<n|none>" in line
+    # The tail of the line: appended after the group's other additive fields.
+    assert line.index("admission_overhead_ms=") < line.index("slot_candidate=")
+    assert line.index("slot_candidate=") < line.index("new_tokens=")
+    assert line.rstrip("`.").endswith("new_tokens=<n|none>")
+
+    text = ROUTING_DOC.read_text(encoding="utf-8")
+    assert "estimated_tokens - min(n_past_actual, estimated_tokens)" in text, (
+        "routing.md must state the live-prefix price the measured rung reports"
+    )
+    assert "no rung priced the prompt" in text, (
+        "routing.md must explain the ``none`` value rather than leave it bare"
+    )
+
+
+def test_routing_doc_documents_the_candidate_first_ordering():
+    """Candidate-first ordering and the new ``no_slot`` meaning (AC6c).
+
+    An operator reading ``measurement=unavailable:no_slot`` must not conclude
+    "the probe ran too early" any more: the candidate is assigned *before* the
+    verdict, so the value now means the pool is exhausted. The release contract
+    is stated beside it, because an acquired-and-refused candidate that is not
+    released fabricates occupancy for the next request.
+    """
+    text = ROUTING_DOC.read_text(encoding="utf-8")
+
+    assert "### Candidate-first ordering" in text
+    assert "acquire_slot_candidate" in text and "release_slot_candidate" in text
+    assert "candidate_released reason=" in text
+    assert "now means the pool is exhausted" in text
+    # The ordering itself, in order: assign before measuring before pricing.
+    section = text.split("### Candidate-first ordering", 1)[1]
+    assert section.index("**Assign**") < section.index("**Measure**") < section.index(
+        "**Price**"
+    )
+    assert section.index("**Price**") < section.index("**Release**")
+
+
+def test_design_doc_records_the_audit_line_and_the_group_hand_off():
+    """``docs/dev/slot-management-design.md`` §11/§12 (AC6d, AC8a, AC9b).
+
+    The shipped behaviour must be discoverable from the design record: the
+    ordering change, the measurement ladder and the clean-release contract (as
+    the audit line's field table), plus the group hand-off — the single proxy
+    restart and the dated-title re-anchoring are owned by the validation item,
+    so this group's items restart nothing themselves.
+    """
+    text = SLOT_DESIGN_DOC.read_text(encoding="utf-8")
+
+    assert "## 11. The decision line is the audit trail" in text
+    assert "new_tokens=" in text
+    assert "LP-0MW959SE30012HJJ" in text
+    # The hand-off: who restarts, and who re-anchors the dated titles.
+    assert "## 12. Group hand-off" in text
+    hand_off = text.split("## 12. Group hand-off", 1)[1]
+    assert "LP-0MW7V0S6A006DKZ4" in hand_off
+    assert "/skill:start-proxy --restart" in hand_off
+    assert "no independent restart" in hand_off.lower()
+    assert "re-anchors" in hand_off and "**12**" in hand_off, (
+        "the hand-off must record the dated-title re-anchoring and its count"
     )

@@ -474,19 +474,24 @@ def test_admission_line_carries_the_slot_candidate(caplog, tmp_path):
 
 
 def test_admission_line_appends_slot_candidate_last(caplog, tmp_path):
-    """AC10e: ``slot_candidate=`` is appended after every pre-existing key."""
+    """AC10e: ``slot_candidate=`` is appended after every pre-existing key.
+
+    The priced ``new_tokens=`` this group appends last
+    (LP-0MW959SE30012HJJ AC6b) follows it, so ``slot_candidate`` remains a
+    suffix field that no deployed parser reads positionally.
+    """
     _admit_through_the_ladder(
         caplog, tmp_path, owner=SESSION, slot=_slot(0, context_tokens=50_000)
     )
 
     line = _admission_line(caplog)
     keys = [part.split("=", 1)[0] for part in line.split() if "=" in part]
-    assert keys[-1] == "slot_candidate"
+    assert keys[-2] == "slot_candidate"
     assert line.startswith("routing_resident_prefix provider=local model=")
     assert keys[:3] == ["provider", "model", "decision"]
     assert "measurement" in keys and "residency_source" in keys
-    # Every pre-existing key still precedes the appended field.
-    assert keys[-2] == "admission_overhead_ms"
+    # Every pre-existing key still precedes the appended fields.
+    assert keys[-3] == "admission_overhead_ms"
 
 
 def test_refused_admission_records_no_association_and_no_lease(caplog, tmp_path):

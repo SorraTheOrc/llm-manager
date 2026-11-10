@@ -4270,3 +4270,214 @@ def test_overhead_budget_verdict_uses_the_measured_p95():
     assert unmeasured.p95_ms is None
     assert unmeasured.over_budget is False
     assert unmeasured.within_budget is False, "an absent figure is not a pass"
+
+
+# ---------------------------------------------------------------------------
+# F7 — the decision line is the audit trail
+# (LP-0MW959SE30012HJJ, parent AC6)
+#
+# F2/F3/F5 made residency *measurable*, *safely releasable* and *bounded*; this
+# slice makes a wrong price **traceable without log archaeology**. The single
+# ``routing_resident_prefix`` line must carry the whole basis of the verdict:
+# the slot candidate it was measured against, the measured ``n_past``, the
+# *priced* ``new_tokens`` the cold cap compared, and the residency provenance
+# (``residency_source`` + ``measurement``).
+#
+# The priced count is the field a bad admission is reconstructed from — the
+# 55 492-token prompt admitted as ``new_tokens=172`` had its inputs on
+# different lines. It is appended **last** so the deployed
+# ``proxy-usage-analysis`` parser (and any other positional consumer of the
+# pre-change line) reads a new line unchanged (AC6b).
+# ---------------------------------------------------------------------------
+
+#: The complete key order of the decision line (AC6a/AC6b).
+#:
+#: The first fifteen keys are the *deployed* contract — they appeared on lines
+#: shipped before this group of changes and their relative order may never
+#: move. The last three are the additive suffix this group appended, in the
+#: order the docs state: ``admission_overhead_ms=`` (F5),
+#: ``slot_candidate=`` (F6) and ``new_tokens=`` (this slice, appended last).
+DECISION_LINE_KEYS = (
+    "provider",
+    "model",
+    "decision",
+    "n_past_actual",
+    "estimated_tokens",
+    "reuse_ratio",
+    "slot_owner_session",
+    "residency_source",
+    "measurement",
+    "min_ratio",
+    "tenants",
+    "occupants",
+    "session",
+    "threshold_applied",
+    "threshold_value",
+    "admission_overhead_ms",
+    "slot_candidate",
+    "new_tokens",
+)
+
+
+def _decision_line(caplog) -> str:
+    """The first ``routing_resident_prefix`` line caught by ``caplog``."""
+    return next(
+        record.getMessage()
+        for record in caplog.records
+        if "routing_resident_prefix" in record.getMessage()
+    )
+
+
+def _decision_keys(line: str) -> list[str]:
+    """The line's keys in emission order (``key=value`` tokens only)."""
+    return [part.split("=", 1)[0] for part in line.split() if "=" in part]
+
+
+def _new_tokens_field(line: str) -> str:
+    """The raw ``new_tokens=`` token of a decision line."""
+    match = re.search(r"\bnew_tokens=(\S+)", line)
+    assert match is not None, line
+    return match.group(1)
+
+
+def test_admission_line_carries_the_priced_new_tokens(caplog, monkeypatch, tmp_path):
+    """AC6a — a measured admission reports the price the cold cap compared.
+
+    ``sess-a``'s last dispatch measured 30 000 tokens against a 49 103-token
+    prompt, so the live-prefix price is 19 103 new tokens (below the 25 000
+    cold cap) and the request is admitted. All four basis facts are on the one
+    line: the candidate, the measurement, the price and the provenance.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_pool(server_config=_candidate_config(tmp_path))
+
+    assert (skip, reason) == (False, None)
+    line = _decision_line(caplog)
+    assert "decision=admit" in line
+    # The whole basis AC6a names, on the one line.
+    assert "slot_candidate=0" in line
+    assert f"n_past_actual={MEASURED_TOTAL}" in line
+    assert f"estimated_tokens={EST_TOKENS}" in line
+    assert "residency_source=measured_last_dispatch" in line
+    assert f"measurement={MEASUREMENT_MEASURED}" in line
+    assert _new_tokens_field(line) == str(EST_TOKENS - MEASURED_TOTAL)
+
+
+def test_refusal_line_carries_the_priced_new_tokens(caplog, monkeypatch):
+    """AC6e — a refusal line is as auditable as an admission line.
+
+    The 2026-10-24 shape: a 49 103-token prompt whose slot measured 738 tokens
+    is refused on residency (1.5 % reusable). The line still reports the price
+    the measured basis implied (48 365 new tokens), so the refusal is
+    attributable to the basis rather than to the price, and the audit trail is
+    not admission-only.
+    """
+    import logging
+
+    view = _view(
+        slots=[_slot(0, N_PAST_COLD)],
+        owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (True, SKIP_RESIDENT_PREFIX)
+    line = _decision_line(caplog)
+    assert f"decision={SKIP_RESIDENT_PREFIX}" in line
+    assert f"n_past_actual={N_PAST_COLD}" in line
+    assert f"measurement={MEASUREMENT_MEASURED}" in line
+    assert _new_tokens_field(line) == str(EST_TOKENS - N_PAST_COLD)
+
+
+def test_decision_line_grammar_is_pinned_for_admit_and_refuse(
+    caplog, monkeypatch, tmp_path
+):
+    """AC6b — one grammar, the same key order on every decision.
+
+    Both verdicts are emitted from the single logger, so the field order — and
+    therefore every positional consumer of the line — is identical whether the
+    request was admitted or refused. The assertion is on the *whole* key list,
+    so a key that moves (rather than being appended) fails, which is the
+    additive-only constraint deployed parsers depend on.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        assert _decide_with_pool(server_config=_candidate_config(tmp_path)) == (
+            False,
+            None,
+        )
+    admitted = _decision_keys(_decision_line(caplog))
+    caplog.clear()
+
+    _install_slot_state(
+        monkeypatch, slots=[_slot(0, N_PAST_COLD)], owners={("", 0): "sess-a"}
+    )
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        assert _decide_with_pool() == (True, SKIP_RESIDENT_PREFIX)
+    refused = _decision_keys(_decision_line(caplog))
+
+    assert admitted == list(DECISION_LINE_KEYS)
+    assert refused == list(DECISION_LINE_KEYS)
+    # The priced count is the appended tail, after every pre-existing key.
+    assert admitted[-1] == "new_tokens" == refused[-1]
+    assert admitted[-2] == "slot_candidate" == refused[-2]
+
+
+def test_decision_line_reports_no_price_when_no_rung_priced(caplog, monkeypatch):
+    """AC6a — an unpriced refusal reports ``none``, never a fabricated ``0``.
+
+    The unmeasured-cold denial refuses on the *absence* of a measurement, so no
+    rung priced the prompt. ``none`` says exactly that; a ``0`` would read as
+    "nothing to prefill" in the usage report and hide the denial.
+    """
+    import logging
+
+    view = _unmeasured_view(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(
+            view=view,
+            estimated_tokens=55_000,
+            predicted_ratio=1.0,
+            monkeypatch=monkeypatch,
+        )
+
+    assert (skip, reason) == (True, provider.SKIP_REASON_UNMEASURED_COLD)
+    line = _decision_line(caplog)
+    assert _new_tokens_field(line) == "none"
+    assert "new_tokens=0" not in line
+
+
+def test_predicted_path_logs_the_predicted_price(caplog, monkeypatch):
+    """AC6a — the rollback path logs the price *it* used, not the measured one.
+
+    With the unmeasured-cold enforcement rolled back the ladder prices from the
+    sidecar prediction again, so ``new_tokens=`` must report that predicted
+    count (55 000 × (1 − 0.2) = 44 000). The field names the number the verdict
+    was held to on whichever rung produced it.
+    """
+    import logging
+
+    view = _unmeasured_view(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(
+            view=view,
+            estimated_tokens=55_000,
+            predicted_ratio=0.2,
+            unmeasured_cold_enabled=False,
+            monkeypatch=monkeypatch,
+        )
+
+    assert (skip, reason) == (True, "large_context_bypass")
+    line = _decision_line(caplog)
+    assert f"decision={provider.DECISION_SKIP_PREDICTED}" in line
+    assert _new_tokens_field(line) == "44000"

@@ -3882,6 +3882,7 @@ def _log_residency_decision(
     warm_cache_threshold: int | None = None,
     admission_overhead_ms: float | None = None,
     slot_candidate: int | None = None,
+    new_tokens: int | None = None,
 ) -> None:
     """Emit the residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5).
 
@@ -3907,12 +3908,24 @@ def _log_residency_decision(
     working, and it is the operator-visible figure a latency regression shows
     up in without a replay.
 
-    ``slot_candidate=`` (LP-0MW959RRO008AAH9 AC10a) is the additively appended
-    final field: the slot candidate-first admission assigned **before** this
-    verdict, i.e. the slot the decision was measured against and the key the
-    dispatch record and eviction event use to attribute the request to a llama
-    slot/task. ``none`` when no candidate was assigned (pool unconfigured or
-    exhausted), never a fabricated slot.
+    ``slot_candidate=`` (LP-0MW959RRO008AAH9 AC10a) is the slot
+    candidate-first admission assigned **before** this verdict, i.e. the slot
+    the decision was measured against and the key the dispatch record and
+    eviction event use to attribute the request to a llama slot/task. ``none``
+    when no candidate was assigned (pool unconfigured or exhausted), never a
+    fabricated slot.
+
+    ``new_tokens=`` (LP-0MW959SE30012HJJ AC6a) is the last additive field: the
+    *priced* uncached-token count this verdict was held to — the number the
+    cold cap compared — so a wrong price is traceable from the line alone
+    instead of across the dispatch, eviction and measurement lines. It is the
+    live-prefix price on the measured rungs
+    (``estimated_tokens - min(n_past_actual, estimated_tokens)``) and the
+    predicted-ratio price on the rollout path; on a rung that priced nothing
+    (hard cap, unmeasured-cold, tenancy) it reports ``none`` — never a
+    fabricated ``0``, which the usage report would read as "nothing to
+    prefill". ``none`` is also never emitted for an unpriced *admission*,
+    because every admitting rung prices the prompt.
 
     Never raises: logging must not become an admission failure mode.
     """
@@ -3969,7 +3982,7 @@ def _log_residency_decision(
             "slot_owner_session=%s residency_source=%s measurement=%s min_ratio=%s "
             "tenants=%s occupants=%d session=%s "
             "threshold_applied=%s threshold_value=%s admission_overhead_ms=%s "
-            "slot_candidate=%s",
+            "slot_candidate=%s new_tokens=%s",
             model_name or "unknown",
             decision,
             n_past if n_past is not None else "none",
@@ -3986,6 +3999,7 @@ def _log_residency_decision(
             threshold_value if threshold_value is not None else "none",
             overhead_field,
             slot_candidate if slot_candidate is not None else "none",
+            int(new_tokens) if isinstance(new_tokens, int) else "none",
         )
     except Exception:
         pass
@@ -4176,7 +4190,10 @@ def _should_skip_local_verdict(
     4. **live-prefix pricing** — price `new_tokens` from that same live
        measurement (`min(n_past_actual, estimated_tokens)` reusable, never the
        predicted sidecar ratio and never the ownership rung's implicit "all
-       tokens reused"), so the cold cap is evaluated against real prefill work;
+       tokens reused"), so the cold cap is evaluated against real prefill work.
+       The price is taken **once**, where the measured basis is resolved, and
+       logged as `new_tokens=` on the decision line — the refusal rungs it also
+       informs report the same figure (LP-0MW959SE30012HJJ AC6a/AC6e);
     5. the idle-exempt override is applied by the *caller* after this
        function returns (``IDLE_OVERRIDABLE_SKIP_REASONS``), so an idle GPU
        still serves cold work. The *unmeasured-cold* denial is not
@@ -4270,6 +4287,16 @@ def _should_skip_local_verdict(
     # (LP-0MW959R5S009WDM8 AC4e).
     overhead_ms: float | None = None
 
+    # The *priced* uncached-token count this verdict is held to, logged as
+    # ``new_tokens=`` on every decision line
+    # (LP-0MW959SE30012HJJ AC6a/AC6b). Priced once, on the rung that prices
+    # it — the measured live-prefix price below, or the predicted-ratio price
+    # on the rollout path — so the logged figure is always the number the
+    # verdict used, never a re-derivation in the logger. Stays ``None`` on the
+    # rungs that refuse before pricing (hard cap, unmeasured-cold, tenancy):
+    # an unpriced refusal reports ``none`` rather than a fabricated ``0``.
+    priced_new_tokens: int | None = None
+
     # Every rung logs through the same decision line, carrying both token
     # thresholds so the *applied* one is auditable (LP-0MW81DHPH00650NY AC1):
     # a cold-priced admission, a measured-resident (warm) admission and an
@@ -4291,6 +4318,9 @@ def _should_skip_local_verdict(
             # against, so the admission line names the slot the dispatch record
             # and the eviction event will attribute the request to.
             slot_candidate=getattr(candidate_slot, "slot_id", None),
+            # LP-0MW959SE30012HJJ AC6a: the price this verdict was held to, so
+            # a wrong price is traceable from the one line.
+            new_tokens=priced_new_tokens,
         )
 
     if resident_prefix_min_ratio > 0.0:
@@ -4329,6 +4359,19 @@ def _should_skip_local_verdict(
         # rest of the ladder or the upstream request
         # (LP-0MW959R5S009WDM8 AC4a).
         overhead_ms = _admission_overhead_ms(overhead_start)
+        if facts.resident:
+            # Live-prefix pricing (AC3) — computed once, here, so the *priced*
+            # figure is the one Check 4 compares **and** the one every
+            # decision informed by this measurement reports, including the
+            # ratio refusal below (where it is the price the prompt was refused
+            # *instead of*). A wrong admission or a wrong refusal is then
+            # traceable from the line alone (LP-0MW959SE30012HJJ AC6a/AC6e).
+            reusable = (
+                min(facts.n_past_actual, estimated_tokens)
+                if facts.n_past_actual is not None
+                else estimated_tokens
+            )
+            priced_new_tokens = max(0, estimated_tokens - reusable)
         if facts.source == RESIDENCY_SOURCE_UNKNOWN:
             if unmeasured_cold_enabled:
                 # Unmeasured is COLD (LP-0MW81DFML006O5KL). With no
@@ -4389,12 +4432,13 @@ def _should_skip_local_verdict(
 
     # Check 4: live-prefix pricing (AC3) when a residency measurement exists.
     if facts is not None and facts.resident:
-        reusable = (
-            min(facts.n_past_actual, estimated_tokens)
-            if facts.n_past_actual is not None
-            else estimated_tokens
-        )
-        if max(0, estimated_tokens - reusable) <= cold_cache_threshold:
+        # ``priced_new_tokens`` was priced from this measurement where the facts
+        # were resolved above; the ``None`` guard is belt-and-braces so a future
+        # rung cannot admit on an unpriced prompt.
+        if (
+            priced_new_tokens is not None
+            and priced_new_tokens <= cold_cache_threshold
+        ):
             _log_decision("admit", facts, resident_prefix_min_ratio)
             return (False, None)
         if economic_bypass_serves_local:
@@ -4414,6 +4458,10 @@ def _should_skip_local_verdict(
         server_config=server_config,
     )
     new_tokens = int(estimated_tokens * (1 - ratio))
+    # The predicted price is the one this path's verdict uses, so it is the one
+    # the decision line reports (AC6a) — same field, same meaning on whichever
+    # rung priced the prompt.
+    priced_new_tokens = new_tokens
     if new_tokens <= cold_cache_threshold:
         if unmeasured_facts is not None:
             _log_decision(

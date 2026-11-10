@@ -1097,3 +1097,98 @@ section: the field on the line, no fabricated figure, no upstream query, the
 fixture replay's budget verdict and the slow-probe failure) and
 ``proxy/tests/test_threshold_decision_logging.py`` (the field is appended, never
 interleaved).
+
+## 11. The decision line is the audit trail (LP-0MW959SE30012HJJ)
+
+Sections 7–10 made residency *measurable* (assign before measuring), *safely
+releasable* (a refusal leaves no occupancy) and *bounded* (p95 ≤ 50 ms). All
+three are worthless to an operator if the resulting verdict cannot be
+reconstructed afterwards: the motivating failure — a 55 492-token prompt
+admitted as ``new_tokens=172`` and evicted at 180.1 s — was visible only by
+triangulating four different lines.
+
+One INFO line, one seam. Every admission decision (admission **and** refusal)
+is emitted by the single logger ``provider._log_residency_decision``; this
+section's field is appended to it and there is no second decision log site.
+Field order, deployed keys first and the additive suffix last:
+
+| # | Field | Meaning |
+|---|-------|---------|
+| 1–3 | ``provider`` ``model`` ``decision`` | who decided what |
+| 4 | ``n_past_actual`` | the measured reusable prefix (``none`` when unmeasured) |
+| 5 | ``estimated_tokens`` | the request's priced size |
+| 6 | ``reuse_ratio`` | measured reuse (``none`` when there is no measurement) |
+| 7 | ``slot_owner_session`` | the other key of the residency comparison |
+| 8 | ``residency_source`` | the measurement rung (Section 6's ladder) |
+| 9 | ``measurement`` | ``measured`` or the closed ``unavailable:<reason>`` |
+| 10–13 | ``min_ratio`` ``tenants`` ``occupants`` ``session`` | the gate's own inputs |
+| 14–15 | ``threshold_applied`` ``threshold_value`` | which cold/warm cap governed |
+| 16 | ``admission_overhead_ms`` | the added work's measured cost (§10) |
+| 17 | ``slot_candidate`` | the slot the verdict was measured against (§7) |
+| 18 | ``new_tokens`` | **the priced uncached count the verdict was held to** |
+
+Fields 1–15 are the deployed contract and may never move or be renamed;
+fields 16–18 were appended by this group in that order. Additive-only is what
+keeps a positional consumer of the pre-change line (and the shipped
+``proxy-usage-analysis`` parser) reading a new line unchanged.
+
+``new_tokens=`` is the number the decision actually compared against the cold
+cap, priced **once** on the rung that prices it — never re-derived in the
+logger, so the logged figure cannot drift from the deciding one:
+
+- **measured rungs** (``measured`` / ``measured_last_dispatch`` /
+  ``session_slot``): ``estimated_tokens - min(n_past_actual,
+  estimated_tokens)`` — the live-prefix price of §6 rung 4, which is also the
+  price a ``resident_prefix_insufficient`` refusal reports (the price the
+  prompt was refused *instead of*);
+- **predicted-ratio rollout** (``local_unmeasured_residency_cold_enabled:
+  false``, decisions ``admit_predicted`` / ``skip_predicted``):
+  ``int(estimated_tokens × (1 − cached_ratio))`` — the sidecar price;
+- **rungs that refuse before pricing** (``context_too_large``,
+  ``unmeasured_residency_cold``, ``tenant_limit``): ``none``. A ``0`` would be
+  a fabricated measurement the usage report could read as "nothing to
+  prefill"; the same discipline as ``reuse_ratio=none`` and
+  ``admission_overhead_ms=none``.
+
+So a wrong price is traceable from the line alone:
+``slot_candidate=0 n_past_actual=30000 estimated_tokens=49103
+new_tokens=19103 residency_source=measured_last_dispatch measurement=measured
+decision=admit`` reconstructs the arithmetic, and the same line with
+``decision=resident_prefix_insufficient`` / ``new_tokens=48365`` shows a refusal
+taken on the *basis*, not on the price.
+
+Regression pins: ``proxy/tests/test_local_resident_prefix_admission.py`` (F7
+section: the full key order pinned for an admission **and** a refusal, the
+priced value on each pricing rung, ``none`` when no rung priced the prompt) and
+``proxy/tests/test_resident_prefix_config_docs.py`` (the grammar line and this
+section cannot drift from the code).
+
+## 12. Group hand-off: restart and dated titles (LP-0MW959SE30012HJJ)
+
+This section records what this group of items does **not** do, so an operator
+does not look for it in the admission code.
+
+- **No independent restart.** Nothing in this group restarts the proxy.
+  The single restart is performed once, for the whole group, by the validation
+  item **LP-0MW7V0S6A006DKZ4** via `/skill:start-proxy --restart`, which
+  records the old/new PID, the start time, the deployed HEAD and `/health`.
+  Deploying an admission-ordering change by restarting per item would put a
+  different group under test in every measurement window, which is exactly what
+  the group-serialised restart exists to prevent.
+- **Dated-title re-anchoring belongs to the same restart.** Because the
+  restart is the group's only one, it is also the only instant at which titles
+  carrying a date are re-anchored: LP-0MW7V0S6A006DKZ4 enumerates every
+  non-terminal item whose title contains a date (`\d{4}-\d{2}-\d{2}`) — **12**
+  at creation — and either re-anchors the date to the new restart (recording
+  old → new) or states why it is unchanged, one comment per item plus a
+  summary comment. Per-item restarts would have to re-anchor repeatedly; a
+  group restart re-anchors once.
+- **No slot-count, context-size or residency-threshold change.** Those belong
+  to LP-0MVN3KPEC007WWL5 and the sibling residency item LP-0MW7V292T0020G02
+  (§6). This group only changes *when* residency is measured, how a refused
+  candidate is released, how the added latency is bounded and what the decision
+  line reports.
+
+Read this section together with §11: the fields an operator audits after the
+validation window are the ones in §11's table, and the window itself (and the
+title re-anchoring that dates it) is LP-0MW7V0S6A006DKZ4's.

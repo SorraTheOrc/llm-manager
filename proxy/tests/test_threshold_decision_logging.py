@@ -356,10 +356,11 @@ def test_existing_keys_keep_their_order_and_new_keys_are_appended(
 ):
     """AC3: the additive suffix cannot disturb a positional consumer.
 
-    Three additive groups are appended, in order: the threshold pair
+    Four additive groups are appended, in order: the threshold pair
     (``LP-0MW81DHPH00650NY``), the per-admission latency figure
-    (``LP-0MW959R5S009WDM8``) and the slot candidate the verdict was measured
-    against (``LP-0MW959RRO008AAH9``). Nothing may be interleaved into the
+    (``LP-0MW959R5S009WDM8``), the slot candidate the verdict was measured
+    against (``LP-0MW959RRO008AAH9``) and the priced ``new_tokens`` the cold cap
+    compared (``LP-0MW959SE30012HJJ``). Nothing may be interleaved into the
     pre-change keys, which is what this pin is for.
     """
     _arrange("measured")
@@ -375,6 +376,7 @@ def test_existing_keys_keep_their_order_and_new_keys_are_appended(
         "threshold_value",
         "admission_overhead_ms",
         "slot_candidate",
+        "new_tokens",
     ], line
 
 
