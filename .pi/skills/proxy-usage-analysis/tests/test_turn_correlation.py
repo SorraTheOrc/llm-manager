@@ -31,6 +31,12 @@ from tests.fixtures import (  # noqa: E402
     DISPATCH_DENIED,
     DISPATCH_FIRST_BYTE_COLD,
     FALLBACK_SESSION,
+    LATE_FALLBACK_FINISHED,
+    LATE_FALLBACK_REMOTE_POST,
+    LATE_FALLBACK_SESSION,
+    LATE_FALLBACK_STARTED,
+    LATE_FALLBACK_TRIGGERED,
+    LATE_FALLBACK_TURN,
     ROUTING_SKIP_CONTEXT_TOO_LARGE,
     ROUTING_SKIP_PROVIDER_CONTEXT,
     TURN_A,
@@ -374,3 +380,130 @@ def test_session_stats_attribution_is_exact_with_interleaved_turns():
     assert session.fallback_reason == "context_too_large"
     assert session.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_SKIP
     assert session.remote_requests == 2
+
+
+# ---------------------------------------------------------------------------
+# Late own fallback line (pre-flight stream buffering)
+# ---------------------------------------------------------------------------
+#
+# LP-0MW8U39FH005GWHY: the proxy logs ``Fallback triggered`` *after* the remote
+# stream it describes has started **and finished** (pre-flight buffering), so a
+# timestamp-first filter drops the session's own, exactly-matching line and the
+# session reads ``unattributed``. The turn id is the exact join key here, so it
+# must win over the timestamp.
+
+LATE_WINDOW_START = datetime(2026, 11, 5, 15, 0, 0)
+LATE_WINDOW_END = datetime(2026, 11, 5, 16, 0, 0)
+# ``Stream started`` of the session's first remote stream: the move time is
+# anchored here, never on the later fallback line.
+LATE_FIRST_REMOTE_TS = datetime(2026, 11, 5, 15, 50, 10, 341000)
+
+
+def test_late_own_fallback_is_attributed_by_its_turn_id():
+    """AC1/AC2: the fallback line arrives after the remote stream, same turn."""
+    lines = [
+        LATE_FALLBACK_REMOTE_POST,
+        LATE_FALLBACK_STARTED,
+        LATE_FALLBACK_FINISHED,
+        LATE_FALLBACK_TRIGGERED,
+    ]
+    schedule = bucketing.schedule_from_entries([("23:59", 8)])
+
+    result = aggregation.aggregate(
+        _events(lines), LATE_WINDOW_START, LATE_WINDOW_END, schedule
+    )
+
+    session = result.sessions[LATE_FALLBACK_SESSION]
+    assert session.fallback_reason == "local_concurrency_limit"
+    assert (
+        session.fallback_attribution
+        == aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK
+    )
+    # The move time never moves later than the first remote stream: the matched
+    # line (15:50:11,243) is reported as the stream's own start (15:50:10,341).
+    assert session.remote_move_time == LATE_FIRST_REMOTE_TS
+
+
+def test_late_own_fallback_keeps_context_anchored_on_the_remote_stream():
+    """A late matched line does not move the ``context_at_fallback`` anchor.
+
+    With the anchor clamped at the first remote stream, the context is the
+    prompt of that remote stream (1000). An anchor left on the late fallback
+    line (15:50:11,243) finds no ``Stream finished`` at/after it and silently
+    falls back to the local turn's prompt (700).
+    """
+    local_started = (
+        "2026-11-05 15:50:00,000 - INFO - Stream started: provider=local "
+        "model=Qwen3 "
+        f"session={LATE_FALLBACK_SESSION} request=[{{'type': 'text', 'text': 'x'}}] "
+        f"turn={LATE_FALLBACK_TURN}"
+    )
+    local_finished = (
+        "2026-11-05 15:50:02,000 - INFO - Stream finished: reason=stop "
+        "tokens=700/50/750 "
+        f"session={LATE_FALLBACK_SESSION} provider=local model=Qwen3 "
+        f"turn={LATE_FALLBACK_TURN}"
+    )
+    lines = [
+        local_started,
+        local_finished,
+        LATE_FALLBACK_REMOTE_POST,
+        LATE_FALLBACK_STARTED,
+        LATE_FALLBACK_FINISHED,
+        LATE_FALLBACK_TRIGGERED,
+    ]
+    schedule = bucketing.schedule_from_entries([("23:59", 8)])
+
+    result = aggregation.aggregate(
+        _events(lines), LATE_WINDOW_START, LATE_WINDOW_END, schedule
+    )
+
+    session = result.sessions[LATE_FALLBACK_SESSION]
+    assert session.remote_move_time == LATE_FIRST_REMOTE_TS
+    assert session.context_at_fallback == 1000
+    assert (
+        session.context_at_fallback_source
+        == aggregation.CONTEXT_AT_FALLBACK_REMOTE_STREAM
+    )
+
+
+def test_own_fallback_picker_prefers_the_turn_even_when_it_is_early():
+    """The picker is timestamp-agnostic only for an exact turn match.
+
+    An at/before line of another turn no longer wins over the turn's own line,
+    and turn-less evidence keeps the historical ``e.ts <= first_remote_ts``
+    rule (latest line wins).
+    """
+    first_remote_ts = datetime(2026, 10, 25, 10, 0, 10)
+    early_other_turn = _event(
+        "2026-10-25 10:00:09,000 - INFO - Fallback triggered for "
+        "model=v1/chat/completions, from=local-qwen3, to=opencode-go, "
+        f"reason=context_too_large session={TURN_SESSION} attempt=1 turn={TURN_A}"
+    )
+    late_own_turn = _event(
+        "2026-10-25 10:00:15,000 - INFO - Fallback triggered for "
+        "model=v1/chat/completions, from=local-qwen3, to=opencode-go, "
+        f"reason=local_concurrency_limit session={TURN_SESSION} attempt=2 "
+        f"turn={TURN_B}"
+    )
+    legacy_own = _event(
+        "2026-10-25 10:00:08,000 - INFO - Fallback triggered for "
+        "model=v1/chat/completions, from=local-qwen3, to=opencode-go, "
+        f"reason=lease_active_legacy session={TURN_SESSION} attempt=1"
+    )
+
+    by_turn = aggregation._attribute_fallback(
+        TURN_SESSION,
+        first_remote_ts,
+        {},
+        [early_other_turn, late_own_turn, legacy_own],
+        turn=TURN_B,
+    )
+    without_turn = aggregation._attribute_fallback(
+        TURN_SESSION, first_remote_ts, {}, [early_other_turn, legacy_own]
+    )
+
+    assert by_turn[1] == "local_concurrency_limit"
+    assert by_turn[2] == aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK
+    # No ids: the latest own line at/before the first remote stream still wins.
+    assert without_turn[1] == "context_too_large"

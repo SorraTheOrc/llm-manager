@@ -1417,6 +1417,45 @@ def _context_at_fallback(
     return None, None
 
 
+def _pick_turn_first_evidence(
+    events: list[LogEvent],
+    first_remote_ts: datetime,
+    turn: str | None,
+) -> LogEvent | None:
+    """Pick this session's own evidence line, turn-first (LP-0MW8U39FH005GWHY).
+
+    *events* must already be scoped to one session's own evidence (``e.session
+    == session_id``), so the picker can only choose among lines that already
+    belong to that session and the no-inheritance guarantee
+    (LP-0MVMBMSWR0036RES) is untouched.
+
+    The turn id is an exact join key (LP-0MVMBM467005BT4A), so it decides
+    **before** any timestamp:
+
+    - An exact ``turn=`` match wins regardless of when the line was logged. The
+      proxy emits ``Fallback triggered`` from ``_handle_streaming_success()``,
+      i.e. *after* ``_preflight_streaming_response()`` has consumed the remote
+      stream — the observed order is ``[remote] POST`` -> ``Stream started`` ->
+      ``Stream finished`` -> ``Fallback triggered``, all carrying the same
+      ``turn=``. A timestamp-first filter drops that line.
+    - Evidence without a turn id keeps the historical rule — the latest line
+      at/before ``first_remote_ts`` — so rotated logs predating the ``turn=``
+      field attribute exactly as before.
+
+    A turn id is unique per client request, so an exact match cannot cross
+    turns: the relaxed timestamp only widens the window to the turn's own
+    lifecycle, never to an unrelated later line.
+    """
+    if turn:
+        exact = [e for e in events if e.turn == turn]
+        if exact:
+            return max(exact, key=lambda e: e.ts)
+    at_or_before = [e for e in events if e.ts <= first_remote_ts]
+    if at_or_before:
+        return max(at_or_before, key=lambda e: e.ts)
+    return None
+
+
 def _attribute_fallback(
     session_id: str,
     first_remote_ts: datetime,
@@ -1438,7 +1477,11 @@ def _attribute_fallback(
        names the provider + ``limit`` whose context ceiling blocked that
        attempt, so it outranks the generic fallback line.
     3. The session's own session-bearing ``Fallback triggered`` line at/before
-       the first remote stream (the actual decision line).
+       the first remote stream (the actual decision line). An exact ``turn=``
+       match wins over the timestamp: the proxy logs that line **after** the
+       pre-flight has already started and finished the remote stream it
+       describes (LP-0MW8U39FH005GWHY), so a timestamp-first filter would drop
+       the session's own line and read the session as ``unattributed``.
     4. The nearest **session-less** ``Fallback triggered`` line within
        ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` before the first remote stream —
        only rotated logs predating the session stamp can reach this branch; a
@@ -1489,18 +1532,17 @@ def _attribute_fallback(
         if ctx_skips:
             e = max(ctx_skips, key=lambda x: x.ts)
             return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
-    own = [
-        e
-        for e in fallback_events
-        if e.session == session_id and e.ts <= first_remote_ts
-    ]
-    exact = _same_turn(own)
-    if exact:
-        e = max(exact, key=lambda x: x.ts)
-        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
-    if own:
-        e = max(own, key=lambda x: x.ts)
-        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
+    own = [e for e in fallback_events if e.session == session_id]
+    picked = _pick_turn_first_evidence(own, first_remote_ts, turn)
+    if picked is not None:
+        # The move time never lands after the first remote stream, even when the
+        # matched line was logged later: ``context_at_fallback`` anchors on the
+        # move time, so a late line must not shift the context anchor.
+        return (
+            min(picked.ts, first_remote_ts),
+            picked.reason,
+            FALLBACK_ATTRIBUTION_OWN_FALLBACK,
+        )
     earliest = first_remote_ts - timedelta(seconds=FALLBACK_ATTRIBUTION_WINDOW_SECONDS)
     candidates = [
         e

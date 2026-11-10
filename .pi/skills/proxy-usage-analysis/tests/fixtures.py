@@ -397,6 +397,50 @@ TURN_B_DISPATCH = (
     f"queue_wait_ms=0.4 session={TURN_SESSION} model=Qwen3 turn={TURN_B}"
 )
 
+# --- Late own fallback line (pre-flight stream buffering) ------------------
+#
+# (LP-0MW8U39FH005GWHY) Observed proxy order, verbatim from
+# ``/var/log/llama-proxy`` (2026-11-05 window, session
+# ``herdr-1793807190-901488-29506``, turn ``f954ca2a``): the remote entry has a
+# next provider in the chain, so ``_preflight_streaming_response()`` consumes the
+# remote stream (``Stream started`` -> ``Stream finished``) **before**
+# ``_handle_streaming_success()`` logs the ``Fallback triggered`` line. The
+# fallback line therefore carries the same ``turn=`` as the remote stream but is
+# timestamped ~2 ms **after** its finish, which the old ``e.ts <=
+# first_remote_ts`` filter discarded (session read as ``unattributed``).
+LATE_FALLBACK_SESSION = "herdr-1793807190-901488-29506"
+LATE_FALLBACK_TURN = "f954ca2a"
+
+LATE_FALLBACK_REMOTE_POST = (
+    "2026-11-05 15:50:09,873 - INFO - [remote] POST "
+    "http://192.168.0.199:8000/v1/chat/completions -> https://opencode.ai/zen/go "
+    'body={"model": "plan", "messages": []} '
+    f"session={{'x-client-request-id': '{LATE_FALLBACK_SESSION}'}} slot=none "
+    f"turn={LATE_FALLBACK_TURN}"
+)
+
+LATE_FALLBACK_STARTED = (
+    "2026-11-05 15:50:10,341 - INFO - Stream started: provider=opencode-go "
+    "model=deepseek-v4-flash "
+    f"session={LATE_FALLBACK_SESSION} "
+    "request=[{'type': 'text', 'text': 'late fallback'}] "
+    f"turn={LATE_FALLBACK_TURN}"
+)
+
+LATE_FALLBACK_FINISHED = (
+    "2026-11-05 15:50:11,241 - INFO - Stream finished: reason=stop "
+    "tokens=1000/200/1200 "
+    f"session={LATE_FALLBACK_SESSION} provider=opencode-go "
+    f"model=deepseek-v4-flash turn={LATE_FALLBACK_TURN}"
+)
+
+LATE_FALLBACK_TRIGGERED = (
+    "2026-11-05 15:50:11,243 - INFO - Fallback triggered for "
+    "model=v1/chat/completions, from=local-qwen3, to=opencode-go, "
+    "reason=local_concurrency_limit "
+    f"session={LATE_FALLBACK_SESSION} attempt=1 turn={LATE_FALLBACK_TURN}"
+)
+
 # Same-session ``local_dispatch_denied`` belonging to turn B only: the denial
 # must never be attributed to turn A.
 TURN_B_DENIED = (
