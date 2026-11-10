@@ -3881,6 +3881,7 @@ def _log_residency_decision(
     cold_cache_threshold: int | None = None,
     warm_cache_threshold: int | None = None,
     admission_overhead_ms: float | None = None,
+    slot_candidate: int | None = None,
 ) -> None:
     """Emit the residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5).
 
@@ -3905,6 +3906,13 @@ def _log_residency_decision(
     every pre-existing key (additive suffix) so positional consumers keep
     working, and it is the operator-visible figure a latency regression shows
     up in without a replay.
+
+    ``slot_candidate=`` (LP-0MW959RRO008AAH9 AC10a) is the additively appended
+    final field: the slot candidate-first admission assigned **before** this
+    verdict, i.e. the slot the decision was measured against and the key the
+    dispatch record and eviction event use to attribute the request to a llama
+    slot/task. ``none`` when no candidate was assigned (pool unconfigured or
+    exhausted), never a fabricated slot.
 
     Never raises: logging must not become an admission failure mode.
     """
@@ -3960,7 +3968,8 @@ def _log_residency_decision(
             "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
             "slot_owner_session=%s residency_source=%s measurement=%s min_ratio=%s "
             "tenants=%s occupants=%d session=%s "
-            "threshold_applied=%s threshold_value=%s admission_overhead_ms=%s",
+            "threshold_applied=%s threshold_value=%s admission_overhead_ms=%s "
+            "slot_candidate=%s",
             model_name or "unknown",
             decision,
             n_past if n_past is not None else "none",
@@ -3976,6 +3985,7 @@ def _log_residency_decision(
             threshold_applied,
             threshold_value if threshold_value is not None else "none",
             overhead_field,
+            slot_candidate if slot_candidate is not None else "none",
         )
     except Exception:
         pass
@@ -4277,6 +4287,10 @@ def _should_skip_local_verdict(
             cold_cache_threshold=cold_cache_threshold,
             warm_cache_threshold=warm_cache_threshold,
             admission_overhead_ms=overhead_ms,
+            # LP-0MW959RRO008AAH9 AC10a: the candidate the verdict was measured
+            # against, so the admission line names the slot the dispatch record
+            # and the eviction event will attribute the request to.
+            slot_candidate=getattr(candidate_slot, "slot_id", None),
         )
 
     if resident_prefix_min_ratio > 0.0:
@@ -10548,6 +10562,7 @@ def _stamp_local_admission_evidence(
     model_name: str | None = None,
     busy_slots: int | None = None,
     in_flight_prefills: int | None = None,
+    slot_id: int | None = None,
 ) -> None:
     """Stamp the routing/admission decision's pricing values on the request.
 
@@ -10565,6 +10580,13 @@ def _stamp_local_admission_evidence(
     admission-time co-residency snapshot: an occupied gate at admission marks
     the dispatch's future calibration sample as contended, which the router
     ORs with a first-byte-time live check before recording the sample.
+
+    *slot_id* (LP-0MW959RRO008AAH9 AC10a) is the candidate slot candidate-first
+    admission assigned **before** the verdict (LP-0MW959P9S005DJY7), so the
+    dispatch record can persist the slot the decision was measured against.
+    ``None`` (no candidate: the pool is unconfigured, exhausted, or the caller
+    is a legacy path) keeps the pre-change behaviour — the record's slot is
+    then resolved from the ownership registry at dispatch instead.
 
     Best-effort: a non-request object or a stamping failure is a no-op — a
     routing decision must never break on observability instrumentation.
@@ -10607,6 +10629,12 @@ def _stamp_local_admission_evidence(
                 if busy_slots is not None else None,
                 "in_flight_prefills": max(0, int(in_flight_prefills or 0))
                 if in_flight_prefills is not None else None,
+                # LP-0MW959RRO008AAH9 AC10a: the candidate slot assigned by
+                # candidate-first admission, persisted on the dispatch record
+                # so the request is attributable to a llama slot/task.
+                "slot_id": int(slot_id)
+                if isinstance(slot_id, int) and not isinstance(slot_id, bool)
+                and slot_id >= 0 else None,
             },
         )
     except Exception:
@@ -17383,6 +17411,10 @@ async def _proxy_with_fallback_cycle(
                         model_name=_llama_model or provider_name,
                         busy_slots=_snapshot_busy,
                         in_flight_prefills=_snapshot_in_flight,
+                        # LP-0MW959RRO008AAH9 AC10a: the candidate slot this
+                        # admission was measured against, so the dispatch record
+                        # carries the association key.
+                        slot_id=getattr(_candidate_lease.candidate, "slot_id", None),
                     )
                 except Exception:
                     pass

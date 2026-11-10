@@ -1362,6 +1362,12 @@ async def _query_slots_detail(
       (``max(n_past, n_prompt_tokens_processed)``) when the build reports it,
       else ``None``; feeds per-slot ``phase``/``prefill_eta_seconds``
       (LP-0MVGDUVGE0024YAI AC5/AC3).
+    - ``id_task`` (int or ``None``) — the llama task id the deployed build
+      publishes for the slot (``None`` when it publishes none, ``-1`` for its
+      idle sentinel); read by
+      :func:`slot_task_id_from_cache` to attribute a dispatch to a backend
+      task (LP-0MW959RRO008AAH9 AC10b). Appended last so the pre-existing
+      keys keep their positions.
 
     Returns an empty list on any failure (HTTP error, connection error,
     timeout, or unexpected response shape).
@@ -1417,6 +1423,14 @@ async def _query_slots_detail(
                     # the single source for context_tokens, sourced from the
                     # same raw fields ``_query_slots_progress`` reads.
                     "context_tokens": _slot_context_tokens(slot),
+                    # LP-0MW959RRO008AAH9 AC10b: the llama task id the deployed
+                    # build publishes for the slot, carried additively so a
+                    # dispatched request can be associated with the backend task
+                    # it used without a second ``/slots`` call. Raw value: a
+                    # published sentinel (``-1``, an idle slot) and an absent
+                    # field (a build that does not publish it) mean different
+                    # things to the resolver, so neither is normalised here.
+                    "id_task": slot.get("id_task"),
                 })
             return result
     except TimeoutError:
@@ -1772,6 +1786,99 @@ Set only when a fresh ``/slots`` query populated
 ``_last_slot_details_cache`` (never when the last-known cache is reused), so
 ``proxy.residency`` can age the measurement and fail open when it is stale.
 """
+
+
+# ---------------------------------------------------------------------------
+# Request ↔ llama task association (LP-0MW959RRO008AAH9, parent AC10)
+#
+# A dispatched local request must be attributable to the backend task it used:
+# the 2026-11-03 eviction evidence carried ``slot_id=unknown
+# llama_task_id=unknown``, so progress, cancellation and eviction could not be
+# mapped onto a llama slot/task. The task id is read from the cached snapshot
+# above — never from a new upstream call: llama-server holds ``/slots`` for
+# >15 s while processing a prompt batch (LP-0MUXTW4MD003TVIC).
+# ---------------------------------------------------------------------------
+
+#: No slot id was available to associate against (the record has no slot).
+SLOT_TASK_REASON_NO_SLOT = "no_slot"
+#: No successful ``/slots`` sample has been taken yet (cache empty).
+SLOT_TASK_REASON_NO_SNAPSHOT = "snapshot_unavailable"
+#: The snapshot has no entry for this slot (the slot was never sampled).
+SLOT_TASK_REASON_NOT_SAMPLED = "slot_not_sampled"
+#: The build publishes no ``id_task`` at all (older llama.cpp builds).
+SLOT_TASK_REASON_UNPUBLISHED = "task_id_unpublished"
+#: The slot is not running a task (``id_task`` sentinel, or ``is_processing``
+#: false). An idle slot keeps the id of the *previous* task it ran, so its id
+#: is never attributed to a new dispatch (measured 2026-10-31, the same fact
+#: ``proxy.metrics.summarise_slot_occupancy`` documents).
+SLOT_TASK_REASON_NOT_STARTED = "task_id_not_started"
+
+#: The closed vocabulary of ``llama_task_id_reason=`` values (AC10c).
+SLOT_TASK_UNAVAILABLE_REASONS: tuple[str, ...] = (
+    SLOT_TASK_REASON_NO_SLOT,
+    SLOT_TASK_REASON_NO_SNAPSHOT,
+    SLOT_TASK_REASON_NOT_SAMPLED,
+    SLOT_TASK_REASON_UNPUBLISHED,
+    SLOT_TASK_REASON_NOT_STARTED,
+)
+
+
+def slot_task_id_from_cache(slot_id: int | None) -> tuple[int | None, str | None]:
+    """Return ``(llama_task_id, unavailable_reason)`` for *slot_id*.
+
+    Reads the **already-cached** ``/slots`` snapshot only (AC10b): no HTTP, no
+    new poller, no lock held across an ``await``. Exactly one of the two
+    elements is set — a resolved task id carries ``None`` as its reason, and an
+    unresolved one carries a value from
+    :data:`SLOT_TASK_UNAVAILABLE_REASONS` so a log line can say *why* it is
+    unknown on a record whose slot is known (AC10c).
+
+    The task id is only trusted for a slot that is actually processing: an idle
+    slot keeps the ``id_task`` of the last task it ran, so attributing that id
+    to a new dispatch would map the request onto the wrong backend task.
+
+    Never raises: association is observability, so a malformed snapshot reads
+    as *unavailable* rather than failing the dispatch path.
+    """
+    if not _slot_id_is_real(slot_id):
+        return None, SLOT_TASK_REASON_NO_SLOT
+    try:
+        snapshot = _last_slot_details_cache
+        if not snapshot:
+            return None, SLOT_TASK_REASON_NO_SNAPSHOT
+        entry = next(
+            (
+                item
+                for item in snapshot
+                if isinstance(item, dict) and item.get("slot_id") == slot_id
+            ),
+            None,
+        )
+        if entry is None:
+            return None, SLOT_TASK_REASON_NOT_SAMPLED
+        id_task = entry.get("id_task")
+        if id_task is None:
+            return None, SLOT_TASK_REASON_UNPUBLISHED
+        if (
+            not isinstance(id_task, int)
+            or isinstance(id_task, bool)
+            or id_task < 0
+            or not bool(entry.get("is_processing"))
+        ):
+            return None, SLOT_TASK_REASON_NOT_STARTED
+        return int(id_task), None
+    except Exception:  # pragma: no cover - defensive: never break dispatch
+        return None, SLOT_TASK_REASON_NO_SNAPSHOT
+
+
+def _slot_id_is_real(slot_id: object) -> bool:
+    """Return True when *slot_id* can name a real llama-server slot."""
+    return (
+        isinstance(slot_id, int)
+        and not isinstance(slot_id, bool)
+        and slot_id >= 0
+    )
+
 
 
 _slot_progress_cache: dict[int, dict] = {}

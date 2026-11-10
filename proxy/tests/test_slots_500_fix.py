@@ -123,17 +123,21 @@ class TestDirectModelInstancePolling:
             _query_slots_detail(8080, model="Qwen3", _client=mock_client)
         )
         assert len(detail) == 2
+        # ``id_task`` is appended by LP-0MW959RRO008AAH9 (request ↔ llama
+        # slot/task association) and is ``None`` when the build publishes none.
         assert detail[0] == {
             "slot_id": 0,
             "is_processing": False,
             "n_decoded": 0,
             "context_tokens": None,
+            "id_task": None,
         }
         assert detail[1] == {
             "slot_id": 1,
             "is_processing": True,
             "n_decoded": 42,
             "context_tokens": None,
+            "id_task": None,
         }
 
     def test_direct_polling_parses_progress(self):

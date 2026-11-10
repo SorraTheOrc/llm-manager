@@ -1345,7 +1345,16 @@ client restores warm instead of prefilling cold, and the shared
 ### Observability
 
 Every decision logs
-`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass|unmeasured_residency_cold> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=… threshold_applied=<cold|warm|none> threshold_value=<n|none> admission_overhead_ms=<ms|none>`.
+`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass|unmeasured_residency_cold> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=… threshold_applied=<cold|warm|none> threshold_value=<n|none> admission_overhead_ms=<ms|none> slot_candidate=<n|none>`.
+
+`slot_candidate=` is appended **last** (LP-0MW959RRO008AAH9 AC10a): the slot
+candidate-first admission assigned before this verdict, i.e. the slot the
+decision was measured against. It is the association key the dispatch record
+and the eviction event use to attribute the request to a llama slot/task (see
+[request ↔ slot/task attribution](#request--llama-slottask-attribution-lp-0mw959rro008aah9))
+and is `none` when no candidate was assigned (pool unconfigured or exhausted),
+never a fabricated slot. Every pre-existing key keeps its position, so a
+positional consumer of the line is unaffected.
 
 `measurement=` is the additive provenance field (immediately after
 `residency_source=`, before `min_ratio=`) that distinguishes a real measurement
@@ -3323,6 +3332,56 @@ turn-N teardown cleared turn-N+1's live-work attribution for its whole prefill
 
 The cache-served `available_slots` paired with a fresh `saturated` hint is a
 **separate** family tracked by LP-0MVXSX0TZ00798KA, not fixed here.
+
+#### Request ↔ llama slot/task attribution (LP-0MW959RRO008AAH9)
+
+A dispatched local request is attributable to the llama-server slot **and task**
+it used (parent AC10, merged from LP-0MW0KZUUS002LICZ). Before this, the dispatch
+record hard-coded `slot_id: None, llama_task_id: None`, so the eviction evidence
+from the 2026-11-03 incident read `slot_id=unknown llama_task_id=unknown` and a
+later event (progress, cancellation, eviction) could not be mapped onto a
+backend task at all.
+
+**Source of the id — cached state only.** `_query_slots_detail()` now carries the
+`id_task` the deployed build publishes for each slot (additively, last in the
+entry). Like every other residency input, it is read from
+`observability._last_slot_details_cache`: llama-server holds `/slots` for >15 s
+while processing a prompt batch, so the association **never** issues an upstream
+query (`observability.slot_task_id_from_cache`).
+
+**Where the ids are persisted.** The accepted-dispatch evidence stores the
+candidate `slot_id` stamped on the admission snapshot
+(`provider._stamp_local_admission_evidence`) and the `llama_task_id` resolved for
+it; `_pin_dispatch_slot` resolves both from the ownership registry as a fallback
+when no snapshot was threaded. The task id is resolved **again at release**,
+because the slot is usually still idle when the record is created (the request
+has not reached llama-server yet) while at release it is running this request.
+A record created outside the guarded routing path keeps the explicit `None`
+markers — only the guarded path claims an association.
+
+**The eviction line.** The `local_eviction_after_acceptance` line is
+append-only: `slot_id=` and `llama_task_id=` keep their positions and, when a
+**known** slot cannot be attributed, a `llama_task_id_reason=` field is appended
+after `endpoint=` so an unavailable id is self-describing instead of a bare
+`unknown`. A record whose slot is unknown (a legacy path) keeps the historical
+`unknown/unknown` rendering. An *idle* slot keeps the `id_task` of the last task
+it ran (measured 2026-10-31, see `proxy/metrics.py`), so its id is never
+attributed to a new dispatch — it reports `task_id_not_started` instead,
+precisely so a request is never mapped onto the wrong backend task.
+
+| `llama_task_id_reason=` | Emitted when |
+|---|---|
+| `no_slot` | the record has no slot id to associate against (legacy path; not emitted) |
+| `snapshot_unavailable` | no successful `/slots` sample has been taken yet (cache empty) |
+| `slot_not_sampled` | the snapshot has no entry for this slot |
+| `task_id_unpublished` | the build publishes no `id_task` at all |
+| `task_id_not_started` | the slot is not running a task (idle, or the `-1` sentinel) |
+
+The vocabulary is closed (`observability.SLOT_TASK_UNAVAILABLE_REASONS`), and
+the association never changes a routing or eviction decision — this is
+attribution only. Tests: `proxy/tests/test_dispatch_slot_task_association.py`
+(cache → resolver → dispatch record → admission line → eviction line, plus the
+refused-admission case, which records no association and no lease).
 
 #### Abandoned local dispatches (LP-0MVRMI5HK00558TB AC1)
 

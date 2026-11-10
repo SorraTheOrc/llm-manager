@@ -2600,6 +2600,13 @@ def _pin_dispatch_slot(
     llama-server reports (LP-0MVUVHAQP001IRKK). ``_dispatch_evidence`` fills
     the same ``slot_id`` key with ``None``, hence the explicit overwrite once
     the record exists. A missing record / unresolvable assignment is a no-op.
+
+    LP-0MW959RRO008AAH9 AC10b: once the slot is known the record's llama task
+    id is resolved from the already-cached ``/slots`` snapshot (never a new
+    upstream call) through the same helper the admission evidence uses. A slot
+    that is still idle resolves to *unavailable* with an explicit reason; the
+    release path re-resolves it when the slot is actually running this
+    request, so the eviction event can name the backend task.
     """
     try:
         records = getattr(srv, "local_dispatch_records", None)
@@ -2611,6 +2618,44 @@ def _pin_dispatch_slot(
         slot_id = _abandoned_slot_lookup(session_key, endpoint)
         if _abandoned_slot_is_real_id(slot_id):
             record["slot_id"] = int(slot_id)  # type: ignore[arg-type]
+        if _abandoned_slot_is_real_id(record.get("slot_id")):
+            _stamp_llama_task_identity(record)
+    except Exception:
+        pass
+
+
+def _stamp_llama_task_identity(record: dict | None) -> None:
+    """Store the record's llama task id (and its reason when unavailable).
+
+    The task id is looked up for the record's **own** pinned ``slot_id``, so a
+    record whose slot was never resolved keeps the explicit ``None`` markers of
+    a record created outside the guarded routing path (AC10 fallback), instead
+    of claiming an association it does not have.
+
+    Both fields are overwritten: a resolved id clears a previously recorded
+    reason, and an unresolved one keeps the reason for the eviction line
+    (AC10c — a known slot never reports a bare ``unknown``). Never raises.
+    """
+    if not isinstance(record, dict):
+        return
+    slot_id = record.get("slot_id")
+    if not _abandoned_slot_is_real_id(slot_id):
+        return
+    try:
+        # Lazy import (as everywhere else in this module) to keep the module
+        # import graph free of the server package; the resolver itself reads the
+        # already-cached ``/slots`` snapshot and never issues an upstream query
+        # (AC10b — llama-server holds ``/slots`` >15 s during a prefill,
+        # LP-0MUXTW4MD003TVIC).
+        from proxy import observability as _observability
+
+        task_id, reason = _observability.slot_task_id_from_cache(int(slot_id))
+        if task_id is not None:
+            record["llama_task_id"] = task_id
+            record["llama_task_id_reason"] = None
+        else:
+            record["llama_task_id"] = None
+            record["llama_task_id_reason"] = reason
     except Exception:
         pass
 
@@ -4255,12 +4300,22 @@ def _dispatch_evidence(
     numbers are stored verbatim, never recomputed from the request body or a
     drifted cached-ratio sample at record creation.
 
+    LP-0MW959RRO008AAH9 (AC10a/AC10b): the same snapshot carries the **slot
+    id** assigned by candidate-first admission, so the record persists the slot
+    the verdict was measured against, and the record's llama task id is
+    resolved from the already-cached ``/slots`` snapshot (never a new upstream
+    call). A slot that is not yet processing resolves to *unavailable* with an
+    explicit reason; the release path re-resolves it (see
+    ``admission_events.record_eviction_after_acceptance``).
+
     Fallback (AC4): when no admission decision is available (a record created
     outside the guarded routing path, e.g. legacy callers), the pricing fields
     are emitted as explicit ``None`` markers — the eviction event renders them
     as ``0``/``unknown`` — rather than silently recomputed from drifted inputs,
-    so a ``new_tokens > budget`` field is unambiguous evidence of an over-
-    budget admission and never a re-pricing artefact.
+    so a ``new_tokens > budget`` field is unambiguous evidence of an
+    over-budget admission and never a re-pricing artefact. The slot/task
+    identity keeps the same ``None`` fallback: only the guarded path claims an
+    association.
 
     ``body_json`` / ``model_name`` / ``session_key`` are retained for call-site
     compatibility only: the prompt is deliberately NOT re-estimated and the
@@ -4298,8 +4353,15 @@ def _dispatch_evidence(
                 evidence["eta_prefill_s"] = value if value == value else None
             except (TypeError, ValueError):
                 evidence["eta_prefill_s"] = None
+        # The candidate slot assigned at admission (AC10a): the association key
+        # the residency verdict was measured against. The registry pin in
+        # ``_pin_dispatch_slot`` is the fallback for a snapshot without one.
+        slot_id = admission_evidence.get("slot_id")
+        if _abandoned_slot_is_real_id(slot_id):
+            evidence["slot_id"] = int(slot_id)  # type: ignore[arg-type]
     except Exception:
         pass
+    _stamp_llama_task_identity(evidence)
     return evidence
 
 

@@ -26,6 +26,14 @@ Contract:
   never re-prices the prompt from drifted state. A record created without a
   snapshot carries explicit ``None`` markers rendered as ``0``/``unknown``
   (AC4) — never a silent recompute.
+- the identity evidence (``slot_id`` / ``llama_task_id``) associates the
+  evicted dispatch with the llama-server slot and task it used
+  (LP-0MW959RRO008AAH9, parent AC10). The slot is the candidate pinned on the
+  record at admission; the task id is read from the already-cached ``/slots``
+  snapshot (never a new upstream call) and re-resolved at release, because the
+  slot is usually still idle when the record is created. A record with a known
+  slot never reports a bare ``llama_task_id=unknown``: when the id cannot be
+  resolved the line carries ``llama_task_id_reason=`` naming why (AC10c).
 - never raises: an eviction path is already an exceptional path.
 """
 
@@ -184,6 +192,39 @@ def record_eviction_after_acceptance(
     llama_task_id = (record or {}).get("llama_task_id")
     endpoint = endpoint or (record or {}).get("endpoint")
 
+    # LP-0MW959RRO008AAH9 (AC10b/AC10c): attribute the eviction to the backend
+    # task this dispatch used. The id is resolved from the already-cached
+    # ``/slots`` snapshot — no new upstream call — and re-resolved here rather
+    # than trusted from record-creation time: the slot is usually still idle
+    # when the record is created (the request has not reached llama-server yet),
+    # while at release it is running this request. A record whose slot is
+    # unknown keeps its explicit ``unknown`` markers (records created outside
+    # the guarded routing path); a record with a **known** slot reports why the
+    # id is unavailable instead of a bare ``unknown/unknown``.
+    task_id_reason = None
+    if slot_id is not None and llama_task_id is None:
+        try:
+            # Lazy import: this module is the single eviction sink (imported by
+            # ``router_helpers``), so importing the observability snapshot
+            # eagerly would couple the two import graphs. The resolver reads the
+            # already-cached ``/slots`` snapshot only — never a new upstream
+            # call (AC10b).
+            from proxy import observability as _observability
+
+            task_id, task_id_reason = _observability.slot_task_id_from_cache(slot_id)
+        except Exception:
+            task_id, task_id_reason = None, None
+        if task_id is not None:
+            llama_task_id = task_id
+            task_id_reason = None
+            # The association the line reports is persisted on the record, so
+            # a later reader sees what this request was attributed to.
+            if isinstance(record, dict):
+                record["llama_task_id"] = task_id
+                record["llama_task_id_reason"] = None
+        elif isinstance(record, dict):
+            record["llama_task_id_reason"] = task_id_reason
+
     _after_acceptance_counts[reason] = _after_acceptance_counts.get(reason, 0) + 1
 
     try:
@@ -196,12 +237,18 @@ def record_eviction_after_acceptance(
     logger = getattr(srv, "logger", None) or logging.getLogger("llama-proxy")
     # One stable, machine-parseable line (AC1/AC7). Unknown values are emitted
     # as ``unknown``/``0`` rather than omitted so the line is always parseable.
+    # The association evidence is APPENDED (AC10e): ``llama_task_id_reason=``
+    # only when a known slot could not be attributed, then any caller evidence,
+    # so every pre-existing key keeps its position for deployed parsers.
     _suffix = _format_extra_fields(extra_fields)
+    _reason_suffix = (
+        f" llama_task_id_reason={task_id_reason}" if task_id_reason else ""
+    )
     try:
         logger.error(
             "local_eviction_after_acceptance session=%s reason=%s "
             "estimated_tokens=%d new_tokens=%d eta_prefill_s=%s "
-            "elapsed_s=%.1f slot_id=%s llama_task_id=%s endpoint=%s%s",
+            "elapsed_s=%.1f slot_id=%s llama_task_id=%s endpoint=%s%s%s",
             session_id or "unknown",
             reason,
             estimated_tokens,
@@ -211,6 +258,7 @@ def record_eviction_after_acceptance(
             "unknown" if slot_id is None else slot_id,
             "unknown" if llama_task_id is None else llama_task_id,
             endpoint or "default",
+            _reason_suffix,
             _suffix,
         )
     except Exception:
