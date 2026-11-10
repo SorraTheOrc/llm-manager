@@ -143,6 +143,22 @@ CONTEXT_AT_FALLBACK_ROUTING_SKIP = "routing_skip"
 CONTEXT_AT_FALLBACK_REMOTE_STREAM = "remote_stream"
 CONTEXT_AT_FALLBACK_SESSION_CONTEXT = "session_context"
 
+# Provenance of a session's "final-turn new tokens" (LP-0MVZ6EAZR001DX5E): the
+# new (uncached) prompt tokens the session's LAST turn cost. It is read from
+# that turn's own admission/routing line, in this order:
+#
+# - ``measured_new_tokens`` — the priced ``new_tokens=`` on that line (the
+#   ``local_admission_guard`` decision, or the ``routing_skip_local`` line that
+#   skipped local for it). A measured count is never re-derived;
+# - ``estimated_uncached`` — ``estimated_tokens= × (1 − cached_ratio=)`` from
+#   the same line, the prompt's uncached remainder on logs that predate
+#   ``new_tokens=``;
+# - ``None`` — the final turn carries no token evidence. The session is
+#   excluded from the banded average and tallied as ``n/a``; an earlier turn's
+#   figure is never borrowed and a zero is never imputed.
+FINAL_TURN_NEW_TOKENS_MEASURED = "measured_new_tokens"
+FINAL_TURN_NEW_TOKENS_ESTIMATED = "estimated_uncached"
+
 # Fallback reasons that describe a PROMPT-SIZE decision (the local or remote
 # entry's context ceiling) rather than an availability/quality problem. They
 # fire as a session's context grows past the configured thresholds, so the
@@ -629,6 +645,13 @@ class SessionStats:
     # when the logs carry no token evidence — rendered ``n/a``).
     context_at_fallback: int | None = None
     context_at_fallback_source: str | None = None
+    # New (uncached) prompt tokens on the session's FINAL turn, with its
+    # provenance (one of the ``FINAL_TURN_NEW_TOKENS_*`` states, or ``None``
+    # when that turn's admission/routing line carries no token evidence).
+    # Additive (LP-0MVZ6EAZR001DX5E): consumers that do not read it are
+    # unaffected, and a missing figure is ``None`` — never ``0``.
+    final_turn_new_tokens: int | None = None
+    final_turn_new_tokens_source: str | None = None
     # Per-session measured-usage coverage (LP-0MVMBM6N400541EH AC3): terminal
     # ``Stream finished`` lines that carried counted ``tokens=`` vs. those that
     # reported no usage at all — ``tokens=missing`` on new logs, an absent
@@ -1368,6 +1391,47 @@ def _count_local_turns(
     return answered, starts - answered
 
 
+def _final_turn_new_tokens(
+    builder: _SessionBuilder,
+    admission_guards: list[LogEvent] | None = None,
+) -> tuple[int | None, str | None]:
+    """Derive ``(new_tokens, source)`` for the session's FINAL turn.
+
+    The final turn is the session's last admission/routing decision that priced
+    its uncached prompt: a ``routing_skip_local`` line (local skipped for the
+    turn) or a ``local_admission_guard`` line (the guard priced it and either
+    admitted or refused the dispatch). Those lines are emitted per request, so
+    the chronologically last one belongs to the last turn the session tried to
+    serve; neither carries a per-turn record on the returned aggregate, which
+    is why the figure is derived here (LP-0MVZ6EAZR001DX5E).
+
+    Order of preference — this session's own evidence only:
+
+    1. the line's measured ``new_tokens=`` (the priced uncached count);
+    2. ``estimated_tokens= × (1 − cached_ratio=)`` when the same line carries
+       both, i.e. the prompt's uncached remainder on logs predating
+       ``new_tokens=``;
+    3. ``(None, None)`` — the final turn carries no token evidence. An earlier
+       turn's figure is never borrowed and a zero is never imputed; the
+       report tallies the session as ``n/a`` instead.
+    """
+    candidates = list(builder.routing_skips) + list(admission_guards or [])
+    if not candidates:
+        return None, None
+    last = max(candidates, key=lambda e: e.ts)
+    measured = getattr(last, "new_tokens", None)
+    if measured is not None:
+        return int(measured), FINAL_TURN_NEW_TOKENS_MEASURED
+    estimated = getattr(last, "estimated_tokens", None)
+    ratio = getattr(last, "cached_ratio", None)
+    if estimated is not None and ratio is not None and 0.0 <= ratio <= 1.0:
+        return (
+            int(round(estimated * (1.0 - ratio))),
+            FINAL_TURN_NEW_TOKENS_ESTIMATED,
+        )
+    return None, None
+
+
 def _context_at_fallback(
     session_id: str,
     anchor_ts: datetime,
@@ -1567,6 +1631,7 @@ def _build_session(
     schedule: bucketing.SlotSchedule,
     mode_map: bucketing.ModeScheduleMap | None = None,
     provider_context_skips: dict[str, list[LogEvent]] | None = None,
+    admission_guards: dict[str, list[LogEvent]] | None = None,
 ) -> SessionStats:
     started = sorted(builder.started, key=lambda e: e.ts)
     finished = sorted(builder.finished, key=lambda e: e.ts)
@@ -1640,6 +1705,14 @@ def _build_session(
     input_tokens = sum(prompt_tokens)
     output_tokens = sum(completion_tokens)
 
+    # Final-turn new (uncached) tokens (LP-0MVZ6EAZR001DX5E): derived from the
+    # session's last admission/routing pricing line — the same per-request
+    # evidence the coverage section's context figure reads, so the two can
+    # never disagree about which turn they describe.
+    final_turn_new_tokens, final_turn_new_tokens_source = _final_turn_new_tokens(
+        builder, (admission_guards or {}).get(builder.session_id)
+    )
+
     # Decode speed fallback: total local completion tokens / local active span
     # (first→last local stream event). Only derivable with local completions
     # and a positive span; conservative (includes inter-request gaps).
@@ -1685,6 +1758,8 @@ def _build_session(
         local_turns_unanswered=local_unanswered,
         context_at_fallback=context_at_fallback,
         context_at_fallback_source=context_source,
+        final_turn_new_tokens=final_turn_new_tokens,
+        final_turn_new_tokens_source=final_turn_new_tokens_source,
         streams_with_usage=builder.streams_with_usage,
         streams_without_usage=builder.streams_without_usage,
     )
@@ -2318,6 +2393,12 @@ def aggregate(
     # Provider context-ceiling skips indexed by session (LP-0MVMBM1Y3001TPRT):
     # per-session attribution input, see ``_attribute_fallback``.
     provider_context_skips: dict[str, list[LogEvent]] = {}
+    # Admission-guard decisions carrying a priced ``new_tokens=``, indexed by
+    # session (LP-0MVZ6EAZR001DX5E): the final-turn uncached-token derivation
+    # prefers this measured figure over an estimate. Kept out of the session
+    # builders so no existing per-session aggregate (duration, busy pairing)
+    # gains an event.
+    admission_guards: dict[str, list[LogEvent]] = {}
     fallback_events: list[LogEvent] = []
     provider_context_skip_events: list[LogEvent] = []
     routing_skip_events: list[LogEvent] = []
@@ -2523,6 +2604,8 @@ def aggregate(
             continue
         if ev.kind == "local_admission_guard":
             local_admission_events.append(ev)
+            if ev.session and ev.new_tokens is not None:
+                admission_guards.setdefault(ev.session, []).append(ev)
             continue
         if ev.kind == STATUS_REQUEST:
             status_request_events.append(ev)
@@ -2594,6 +2677,7 @@ def aggregate(
             schedule,
             mode_map,
             provider_context_skips,
+            admission_guards,
         )
 
     busy = compute_busy_stats(

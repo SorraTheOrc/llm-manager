@@ -647,6 +647,39 @@ RPM budget
 pacing (`provider_budget.py`), **not** an upstream HTTP 429 — those surface as
 `upstream_http_error status=429` events.
 
+## Context size at fallback by percentile band (LP-0MVZ6EAZR001DX5E)
+
+The report answers "does the dominant reason for falling back change as context
+grows, and does the uncached work per turn grow with it?" in a **Context size
+at fallback by percentile band** section rendered immediately after *Local
+model usage by session* and before *Fallback reasons*:
+
+- the cohort is the neighbouring section's cohort (sessions with ≥1 local turn)
+  restricted to those with token evidence at their fallback; the section states
+  how many sessions are included and how many are excluded for missing token
+  evidence (excluded sessions are counted, never rendered as 0);
+- ten **disjoint** decile bands `P0–P10` … `P90–P100` (the report's usual
+  linear-interpolation percentile convention; a session exactly on a cut sits in
+  the higher band, the lowest value in `P0–P10` and the highest in
+  `P90–P100`), each with its session count, average total context size and
+  average final-turn new tokens. An empty band renders `-`, never a fabricated
+  mean;
+- **final-turn new tokens** are the new (uncached) prompt tokens of the
+  session's last turn, taken from that turn's admission/routing line: its
+  measured `new_tokens=`, else `estimated_tokens= × (1 − cached_ratio=)`. A
+  session whose final turn carries no such evidence is excluded from that
+  column's mean and tallied as `n/a` — never imputed as 0;
+- a **top-two fallback reasons per band** table: each band's two most common
+  reasons as a count and a share of that band's sessions (ties break
+  alphabetically), plus an explicit `other` remainder so every row reads as
+  shares of 100 %.
+
+No LLM call, no network call and no new log field: everything is derived from
+lines the pipeline already parses. On a window with no local turns the section
+is omitted entirely (the 05:00 cron still exits 0) while `--json` reports
+`context_at_fallback_by_percentile` with an empty band list and zero cohort
+counts.
+
 ## Contended-pricing surface (LP-0MVS9YKHL007UBBZ)
 
 Since the contended-pricing fix (parent LP-0MVS8T6F4006DGG3: contended

@@ -1232,6 +1232,13 @@ def parse_log_line(line: str) -> LogEvent | None:
             # on lines that carried no ``tokens=`` payload (``None``, never
             # an estimate).
             estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
+            # The same line's uncached-prompt evidence (LP-0MVZ6EAZR001DX5E):
+            # ``new_tokens=`` is the priced uncached count and
+            # ``cached_ratio=`` the prompt-cache share it priced, so the
+            # final-turn new-token derivation does not have to re-read the raw
+            # line. Both are ``None`` on lines that predate them (never 0).
+            new_tokens=_int(RE_GUARD_NEW_TOKENS, msg),
+            cached_ratio=_float(RE_CACHED_RATIO, msg),
             turn=_turn_from(msg),
         )
     if msg.startswith(LOCAL_POST):

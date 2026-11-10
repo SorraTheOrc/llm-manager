@@ -112,6 +112,21 @@ Outputs written to:
   A `% local turns` of 100 means the session never used remote; a null
   `context_at_fallback` means the logs carried no token evidence (the report
   renders `n/a`, never an estimate).
+- `--json` summary field `context_at_fallback_by_percentile` — the banded
+  context-at-fallback view behind the report's
+  `## Context size at fallback by percentile band` section
+  (LP-0MVZ6EAZR001DX5E): `{"sessions_in_window": N,
+  "sessions_with_local": M, "sessions_included": N,
+  "sessions_excluded_no_context": N, "sessions_without_final_turn_tokens": N,
+  "bands": [{"label": "P0–P10", "lower_decile": 0, "upper_decile": 10,
+  "lower_bound": i|null, "upper_bound": i|null, "sessions": N,
+  "avg_context_at_fallback": i|null, "avg_final_turn_new_tokens": i|null,
+  "final_turn_new_tokens_samples": N, "final_turn_new_tokens_missing": N,
+  "reasons": [{"reason": r, "sessions": N,
+  "pct_of_band_sessions": f}, …at most two…],
+  "other": {"sessions": N, "pct_of_band_sessions": f}}, …ten bands…]}`.
+  A null average is an empty band (never a fabricated 0); an empty window keeps
+  the key with `"bands": []` and zero cohort counts.
 - `--json` summary field `engine_cross_check` — the engine cross-check
   (LP-0MVNWULLI006ZYXX): proxy-inferred phase slot-time vs llama-server's own
   summed per-task eval durations. `{"unit": "slot-seconds",
@@ -524,6 +539,72 @@ then by session id. When no session used local, the section renders the named
 line `No session in the window used the local model.` instead of empty tables.
 The same derivation is exposed as the `local_turn_coverage` `--json` key, so
 Markdown and machine-readable views cannot disagree.
+
+### Context size at fallback by percentile band
+
+Since LP-0MVZ6EAZR001DX5E the report bands the same cohort so one read answers
+*does the dominant reason for falling back change as context grows, and does
+the uncached work per turn grow with it?*. The section sits **immediately
+after** `## Local model usage by session` and **before** `## Fallback reasons`:
+
+```text
+## Context size at fallback by percentile band
+
+| Band | Sessions | Avg total context size | Avg final-turn new tokens |
+| P0–P10 (1,024–3,347) | … |
+
+### Top two fallback reasons per band
+| Band | Sessions | Most common reason | Second most common | Other |
+```
+
+Operational definitions:
+
+- **Cohort** — the `## Local model usage by session` cohort (a session with
+  ≥1 local turn) **restricted to sessions with token evidence at their
+  fallback** (the same derivation that section's `Context size at fallback`
+  column prints: `routing_skip_local estimated_tokens`, else the first remote
+  `Stream finished` prompt tokens, else the session's own measured context).
+  Because both sections call `local_turn_rows()` and
+  `_fallback_reason_label()`, they cannot disagree about a session's
+  context-at-fallback figure or its fallback reason. The section states the
+  cohort size, how many sessions are included in the banded figures and how
+  many are **excluded** for missing token evidence — an excluded session is
+  counted, never rendered as 0.
+- **Bands** — ten **disjoint** deciles `P0–P10` … `P90–P100` cut at the P10,
+  P20 … P90 **percentiles** of the included sessions, computed with the
+  report's usual `linear interpolation` convention (`_percentile`), so the
+  bands and the sibling section's P10/P50/P90 row agree. Membership rule: a
+  session whose context size is **exactly on a cut belongs to the higher
+  band**, while the cohort minimum always anchors `P0–P10` (the one exception,
+  so a cohort clustered at its minimum still reads as the smallest contexts)
+  and the maximum belongs to `P90–P100`. Each band row carries its session count, the arithmetic mean of
+  its members' context size at fallback, and the arithmetic mean of their
+  final-turn new tokens.
+- **Final-turn new tokens** — the new (uncached) prompt tokens of the
+  session's **final turn**, derived once in `aggregation.py`
+  (`SessionStats.final_turn_new_tokens` + `final_turn_new_tokens_source`) from
+  that turn's own admission/routing line: its measured `new_tokens=`
+  (`measured_new_tokens`, on `local_admission_guard` / `routing_skip_local`),
+  else `estimated_tokens= × (1 − cached_ratio=)` (`estimated_uncached`) when
+  the line carries both. A session whose final turn carries no such evidence is
+  **excluded from that column's mean and tallied as `n/a`** — never imputed
+  as 0, and an earlier turn's figure is never borrowed.
+- **Top-two fallback reasons per band** — the two most common reasons among
+  that band's sessions (deterministic tie-break: higher count, then
+  alphabetical), each as a count and a percentage **of that band's sessions**,
+  plus an explicit `other` remainder so every row reads as shares of 100 %.
+  Reasons are categorical: counts and shares only, no percentiles.
+- **Empty and sparse windows** — an empty band renders `-` (no fabricated
+  mean, no 0). When the cohort is empty (no local turns at all) the whole
+  section is **omitted**, so the unattended 05:00 cron exits 0 on an empty
+  window; `--json` then still carries the
+  `context_at_fallback_by_percentile` key with `"bands": []` and zero cohort
+  counts. Purely additive: no LLM call, no network call, no interactive
+  prompt, and no existing section, column, JSON key or CSV column changes.
+
+The machine-readable projection is the `context_at_fallback_by_percentile`
+`--json` key (shape documented in the outputs list above), so the Markdown
+table and `jq` cannot drift.
 
 ### Archival
 

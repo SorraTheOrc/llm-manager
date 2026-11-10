@@ -460,6 +460,12 @@ class LocalTurnRow:
     # ``context size at fallback`` can read ``n/a`` — those lines carry
     # ``tokens=missing``, so they contribute no prompt tokens to any figure.
     streams_without_usage: int = 0
+    # New (uncached) prompt tokens on this session's final turn, with its
+    # provenance (LP-0MVZ6EAZR001DX5E). ``None`` means the final turn carried
+    # no token evidence — the banded table excludes the session from that
+    # column's mean and tallies it as ``n/a`` rather than counting a 0.
+    final_turn_new_tokens: int | None = None
+    final_turn_new_tokens_source: str | None = None
 
 
 NO_LOCAL_TURNS_TEXT = "No session in the window used the local model."
@@ -506,6 +512,10 @@ def local_turn_rows(
             context_at_fallback=s.context_at_fallback,
             context_source=s.context_at_fallback_source,
             streams_without_usage=getattr(s, "streams_without_usage", 0),
+            final_turn_new_tokens=getattr(s, "final_turn_new_tokens", None),
+            final_turn_new_tokens_source=getattr(
+                s, "final_turn_new_tokens_source", None
+            ),
         )
         for s in candidates
         if s.local_requests > 0
@@ -638,6 +648,170 @@ def local_turn_coverage(summary: AnalysisResult) -> dict:
 
 def _round1(value: float | None) -> float | None:
     return round(value, 1) if value is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Context size at fallback by percentile band (LP-0MVZ6EAZR001DX5E)
+# ---------------------------------------------------------------------------
+#
+# "Does the dominant reason for falling back change as context grows, and does
+# the uncached work per turn grow with it?" One derived, banded view rendered
+# immediately after ``## Local model usage by session`` so the answer is in the
+# nightly report instead of inferred by sorting the per-session table:
+#
+# - the cohort is that section's cohort (a session with >=1 local turn) further
+#   restricted to sessions with token evidence at their fallback, so the two
+#   sections cannot disagree about a session's context-at-fallback figure or
+#   its fallback reason — both call ``local_turn_rows`` /
+#   ``_fallback_reason_label``;
+# - the bands are DISJOINT deciles (`P0–P10` … `P90–P100`) cut at the same
+#   linear-interpolation percentile convention (``_percentile``) the sibling
+#   section's P10/P50/P90 rows use. Disjoint bands (not cumulative "<= Pk"
+#   cohorts) are what make a per-band reason share readable as a share of that
+#   band. A value exactly on a cut belongs to the HIGHER band, the cohort
+#   minimum to ``P0–P10`` and the maximum to ``P90–P100``;
+# - ``avg final-turn new tokens`` is the arithmetic mean over the band's
+#   sessions that carry the figure (``SessionStats.final_turn_new_tokens``,
+#   derived once in aggregation). A session without it is excluded from that
+#   column and tallied as ``n/a`` — never imputed as 0;
+# - an empty band renders ``-`` (no fabricated mean) and an empty cohort omits
+#   the whole section (the 05:00 cron must exit 0 on an empty window), while
+#   ``--json`` keeps the key with an empty band list and zero cohort counts.
+CONTEXT_AT_FALLBACK_SECTION_TITLE = "Context size at fallback by percentile band"
+CONTEXT_AT_FALLBACK_JSON_KEY = "context_at_fallback_by_percentile"
+
+#: Decile cut points between the bands: ``P0–P10`` … ``P90–P100``.
+CONTEXT_BAND_DECILES = (0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+#: How many fallback reasons each band shows (plus the ``other`` remainder).
+CONTEXT_BAND_TOP_REASONS = 2
+
+
+def _band_label(lower: int, upper: int) -> str:
+    """``P0–P10`` … ``P90–P100`` (an en dash, as the section heading names them)."""
+    return f"P{lower}\u2013P{upper}"
+
+
+def _band_index(value: float, cuts: list[float], minimum: float) -> int:
+    """Decile band index of *value*, given the nine interior cut points.
+
+    A value exactly on a cut belongs to the **higher** band: the index is the
+    number of cuts at or below it, so the cohort maximum lands in
+    ``P90–P100`` (every cut is below it). The cohort minimum is the one
+    exception — it always anchors ``P0–P10`` — because a cohort clustered at
+    its own minimum would otherwise have every decile cut equal that minimum
+    and push the whole cluster into the top band, where "the smallest contexts"
+    would read as "the largest".
+    """
+    if value <= minimum:
+        return 0
+    return sum(1 for cut in cuts if cut <= value)
+
+
+def context_at_fallback_by_percentile(summary: AnalysisResult) -> dict:
+    """Machine-readable banded context-at-fallback view (report + ``--json``).
+
+    Returns the cohort counts, the ten band rows (session count, mean context
+    at fallback, mean final-turn new tokens with its ``n/a`` tally) and the
+    per-band top-two fallback-reason shares with an ``other`` remainder, so the
+    Markdown section and the ``--json`` key can never disagree.
+    """
+    rows = local_turn_rows(summary.sessions)
+    with_local = len(rows)
+    sampled = [r for r in rows if r.context_at_fallback is not None]
+    values = sorted(float(r.context_at_fallback) for r in sampled)
+    cuts = [
+        _percentile(values, decile)
+        for decile in CONTEXT_BAND_DECILES[1:-1]
+    ]
+    bounds = {
+        decile: _percentile(values, decile) for decile in CONTEXT_BAND_DECILES
+    }
+
+    def _bound(decile: int) -> int | None:
+        value = bounds[decile]
+        return int(round(value)) if value is not None else None
+
+    members: dict[int, list[LocalTurnRow]] = {
+        index: [] for index in range(len(CONTEXT_BAND_DECILES) - 1)
+    }
+    minimum = values[0] if values else 0.0
+    for row in sampled:
+        members[
+            _band_index(float(row.context_at_fallback), cuts, minimum)
+        ].append(row)
+
+    bands: list[dict] = []
+    for index, (lower, upper) in enumerate(
+        zip(CONTEXT_BAND_DECILES, CONTEXT_BAND_DECILES[1:])
+    ):
+        band_rows = members[index]
+        contexts = [r.context_at_fallback for r in band_rows]
+        new_tokens = [
+            r.final_turn_new_tokens
+            for r in band_rows
+            if r.final_turn_new_tokens is not None
+        ]
+        reason_counts = Counter(r.reason for r in band_rows)
+        # Higher count first, then alphabetical: the row order is deterministic
+        # whatever order the sessions were parsed in.
+        ordered = sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        top = ordered[:CONTEXT_BAND_TOP_REASONS]
+        other = len(band_rows) - sum(count for _, count in top)
+        band_size = len(band_rows)
+        bands.append(
+            {
+                "label": _band_label(lower, upper),
+                "lower_decile": lower,
+                "upper_decile": upper,
+                "lower_bound": _bound(lower),
+                "upper_bound": _bound(upper),
+                "sessions": band_size,
+                "avg_context_at_fallback": (
+                    int(round(sum(contexts) / len(contexts)))
+                    if contexts
+                    else None
+                ),
+                "avg_final_turn_new_tokens": (
+                    int(round(sum(new_tokens) / len(new_tokens)))
+                    if new_tokens
+                    else None
+                ),
+                "final_turn_new_tokens_samples": len(new_tokens),
+                "final_turn_new_tokens_missing": band_size - len(new_tokens),
+                "reasons": [
+                    {
+                        "reason": reason,
+                        "sessions": count,
+                        "pct_of_band_sessions": round(
+                            count / band_size * 100.0, 1
+                        ),
+                    }
+                    for reason, count in top
+                ],
+                "other": {
+                    "sessions": other,
+                    "pct_of_band_sessions": (
+                        round(other / band_size * 100.0, 1) if band_size else 0.0
+                    ),
+                },
+            }
+        )
+
+    return {
+        "sessions_in_window": len(summary.sessions),
+        "sessions_with_local": with_local,
+        # Sessions within the banded figures (context-at-fallback evidence)…
+        "sessions_included": len(sampled),
+        # …and those excluded from them for missing token evidence. Never 0 as
+        # a stand-in for "unknown".
+        "sessions_excluded_no_context": with_local - len(sampled),
+        "sessions_without_final_turn_tokens": sum(
+            1 for r in sampled if r.final_turn_new_tokens is None
+        ),
+        # Empty cohort (no local turns at all) => no bands, so the key reports
+        # the empty window instead of ten fabricated rows.
+        "bands": bands if with_local else [],
+    }
 
 
 def _fmt_count(value: float | None) -> str:
@@ -818,6 +992,114 @@ def _append_local_turn_coverage_section(
             "tokens." + marker_note + " They render `n/a`; the report never "
             "fabricates an estimate."
         )
+
+
+def _context_band_cell(band: dict) -> str:
+    """Band label plus its two context bounds, e.g. ``P10–P20 (3,347–5,120)``."""
+    cell = band["label"]
+    if band["lower_bound"] is not None:
+        cell += f" ({band['lower_bound']:,}\u2013{band['upper_bound']:,})"
+    return cell
+
+
+def _context_band_int_cell(value: int | None) -> str:
+    """A banded token figure, or an explicit ``-`` (an empty band, not a 0)."""
+    return "-" if value is None else f"{value:,}"
+
+
+def _append_context_at_fallback_band_section(
+    ap, summary: AnalysisResult
+) -> None:
+    """Append ``## Context size at fallback by percentile band``.
+
+    Two deterministic tables — the ten disjoint decile bands (session count,
+    mean context at fallback, mean final-turn new tokens) and the per-band
+    top-two fallback reasons with an ``other`` remainder — derived once by
+    ``context_at_fallback_by_percentile`` so this Markdown and the ``--json``
+    key cannot disagree (LP-0MVZ6EAZR001DX5E). Omitted entirely when no
+    session used local, so an empty window still renders a clean report.
+    """
+    data = context_at_fallback_by_percentile(summary)
+    if not data["sessions_with_local"]:
+        return
+    included = data["sessions_included"]
+    missing = data["sessions_without_final_turn_tokens"]
+
+    ap("")
+    ap(f"## {CONTEXT_AT_FALLBACK_SECTION_TITLE}")
+    ap("")
+    ap(
+        "Sessions with at least one local turn: "
+        f"**{data['sessions_with_local']} of "
+        f"{data['sessions_in_window']}** sessions. **{included}** carry token "
+        "evidence at their fallback and are banded below; "
+        f"**{data['sessions_excluded_no_context']} session(s) excluded for "
+        "missing token evidence** (never counted as 0)."
+    )
+    ap("")
+    ap(
+        "| Band | Sessions | Avg total context size | "
+        "Avg final-turn new tokens |"
+    )
+    ap("|---|---|---|---|")
+    for band in data["bands"]:
+        ap(
+            f"| {_context_band_cell(band)} | {band['sessions'] or '-'} | "
+            f"{_context_band_int_cell(band['avg_context_at_fallback'])} | "
+            f"{_context_band_int_cell(band['avg_final_turn_new_tokens'])} |"
+        )
+    ap("")
+    ap(
+        "Bands are disjoint deciles of context size at fallback, cut at the "
+        "P10–P90 percentiles (linear interpolation) over the "
+        f"{included} banded session(s); a session exactly on a cut sits in the "
+        "higher band, while the lowest value always anchors `P0–P10` and the "
+        "highest `P90–P100`. An empty band renders `-`, never a fabricated "
+        "mean."
+    )
+    if included:
+        ap("")
+        ap(
+            "`Avg final-turn new tokens` is the mean, over the band's sessions "
+            "with evidence, of the **final turn's** uncached prompt tokens — "
+            "its admission line's measured `new_tokens=`, else "
+            "`estimated_tokens= × (1 − cached_ratio=)`. "
+            f"**{missing} of {included}** banded session(s) are `n/a` "
+            "(excluded from that column's mean, never imputed as 0)."
+        )
+
+    ap("")
+    ap("### Top two fallback reasons per band")
+    ap("")
+    ap("| Band | Sessions | Most common reason | Second most common | Other |")
+    ap("|---|---|---|---|---|")
+    for band in data["bands"]:
+        cell = _context_band_cell(band)
+        if not band["sessions"]:
+            ap(f"| {cell} | - | - | - | - |")
+            continue
+        reason_cells = [
+            f"{row['reason']} {row['sessions']} "
+            f"({row['pct_of_band_sessions']:.1f}%)"
+            for row in band["reasons"]
+        ]
+        while len(reason_cells) < CONTEXT_BAND_TOP_REASONS:
+            reason_cells.append("-")
+        other = band["other"]
+        reason_cells.append(
+            f"{other['sessions']} ({other['pct_of_band_sessions']:.1f}%)"
+        )
+        ap(f"| {cell} | {band['sessions']} | " + " | ".join(reason_cells) + " |")
+    ap("")
+    ap(
+        "Percentages are shares of that band's sessions and sum to 100 % with "
+        "the `other` remainder; ties break alphabetically. A reason is "
+        "categorical, so it is reported as counts and shares only — no "
+        "percentiles. The reason is the session's own attribution "
+        "(`no_remote_fallback` when it never used remote, `unattributed` when "
+        "it has no evidence), exactly as `## Local model usage by session` "
+        "reports it."
+    )
 
 
 def _ap_fallback_attribution(ap, summary: AnalysisResult) -> None:
@@ -1395,6 +1677,14 @@ def build_report(
     # many turns it answered, the per-session share and the reason each session
     # moved to remote — read straight from the session aggregates above.
     _append_local_turn_coverage_section(ap, summary)
+
+    # Context size at fallback by percentile band (LP-0MVZ6EAZR001DX5E): the
+    # same cohort banded into disjoint deciles, so "does the dominant fallback
+    # reason change as context grows, and does the uncached work per turn grow
+    # with it?" is answered by the report itself. It reads immediately after
+    # the per-session table it bands and before the whole-window fallback
+    # reasons it splits per band.
+    _append_context_at_fallback_band_section(ap, summary)
 
     if summary.fallback_reason_counts:
         ap("")
@@ -4736,6 +5026,13 @@ def summary_to_json(
         # Local-turn coverage (LP-0MVM93DE6009JGBU): the same derivation the
         # Markdown section renders, so `--json` consumers need not scrape it.
         "local_turn_coverage": local_turn_coverage(summary),
+        # Context size at fallback by percentile band (LP-0MVZ6EAZR001DX5E):
+        # the same derivation the Markdown section renders (cohort counts, the
+        # ten band rows and the per-band top-two reason shares). ADDITIVE —
+        # every key above keeps its value and meaning; an empty window reports
+        # an empty band list and zero cohort counts rather than omitting the
+        # key.
+        CONTEXT_AT_FALLBACK_JSON_KEY: context_at_fallback_by_percentile(summary),
         # Local capacity signals (LP-0MVU8O4EL005IYP9 AC1.5): the same
         # ``slots_stale`` figures and target verdict the Markdown section
         # renders. ADDITIVE — every key above keeps its value and meaning.
