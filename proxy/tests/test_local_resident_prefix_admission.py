@@ -2621,9 +2621,9 @@ F4_FALLBACK = "LP-0MW959QJ9002MKEI"  # exclusivity + deterministic busy fallback
 
 #: Pending ``test_scenario*`` → owning item(s). The audit test below reads this
 #: map, so adding a scenario without naming its owner fails the suite (AC5d).
-SCENARIO_OWNERS = {
-    "test_scenario2_busy_pool_falls_back_deterministically": (F4_FALLBACK,),
-}
+#: Empty today: scenario 2 went green with F4 (LP-0MW959QJ9002MKEI), the last
+#: pending scenario. A future scenario must be added here with its owner.
+SCENARIO_OWNERS: dict[str, tuple[str, ...]] = {}
 
 #: Implemented ``test_scenario*`` → the item(s) that made it green once the
 #: requirement exists. These carry **no** xfail marker; the audit asserts that,
@@ -2633,6 +2633,7 @@ SCENARIO_OWNERS = {
 #: bounded wait AC3c and the deadlock/consistency tests AC3d).
 IMPLEMENTED_SCENARIOS = {
     "test_scenario1_assign_then_measure_admits": (F2_ASSIGN,),
+    "test_scenario2_busy_pool_falls_back_deterministically": (F4_FALLBACK,),
     "test_scenario1_refusal_releases_the_candidate": (F3_RELEASE,),
     "test_scenario3_concurrent_admissions_never_share_a_candidate": (
         F2_ASSIGN,
@@ -2751,12 +2752,6 @@ def test_scenario1_refusal_releases_the_candidate(caplog, monkeypatch):
     assert event.residency_source == provider.RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"F1 scenario 2: pending {F4_FALLBACK} — candidate acquisition with "
-    "deterministic busy-pool fallback not implemented; remove this marker in "
-    "that item's commit",
-)
 def test_scenario2_busy_pool_falls_back_deterministically(caplog, monkeypatch):
     """Scenario 2 — slot busy: no free candidate → deterministic fallback.
 
@@ -2776,6 +2771,7 @@ def test_scenario2_busy_pool_falls_back_deterministically(caplog, monkeypatch):
     monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.99)
 
     outcomes = []
+    bases = []
     with caplog.at_level(logging.INFO, logger="llama-proxy"):
         for _ in range(2):  # deterministic across runs (F4 AC3b)
             candidate, skip, reason = _candidate_decision(
@@ -2783,15 +2779,23 @@ def test_scenario2_busy_pool_falls_back_deterministically(caplog, monkeypatch):
             )
             assert candidate is None, "a full 1-slot pool has no candidate"
             outcomes.append((skip, reason))
+            # Parse each run before clearing: the identical basis (source +
+            # measurement) is part of the stable fallback, not only the reason.
+            bases.append(
+                (
+                    _parse_logged_caught(caplog, "routing_resident_prefix"),
+                    _measurement_field(caplog),
+                )
+            )
             caplog.clear()
 
     assert outcomes[0] == outcomes[1], "fallback must be deterministic (F4 AC3b)"
     assert outcomes[0] == (True, SKIP_RESIDENT_PREFIX)
     # Pool unchanged: the occupant keeps the slot, the session gains nothing.
     assert dict(session_registry._slot_owners) == {("", 0): "sess-other"}
-    event = _parse_logged_caught(caplog, "routing_resident_prefix")
-    assert event.residency_source == provider.RESIDENCY_SOURCE_NON_RESIDENT
-    assert _measurement_field(caplog) == MEASUREMENT_NO_SLOT
+    for event, measurement in bases:
+        assert event.residency_source == provider.RESIDENCY_SOURCE_NON_RESIDENT
+        assert measurement == MEASUREMENT_NO_SLOT
 
 
 def test_scenario3_concurrent_admissions_never_share_a_candidate(caplog, monkeypatch):
@@ -3535,3 +3539,502 @@ def test_lease_release_names_the_refusing_reason(tmp_path, caplog):
     assert dict(session_registry._slot_owners) == {}
     assert caplog.text.count(CANDIDATE_RELEASED) == 1
     assert f"{CANDIDATE_RELEASED} reason={SKIP_TENANT_LIMIT}" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# F4 — candidate exclusivity and deterministic busy-pool fallback
+# (LP-0MW959QJ9002MKEI, parent AC3)
+#
+# Candidate-first admission (F2/F3) moved capacity acquisition into the
+# admission path. That turns a previously-impossible race into an admission-time
+# one, so the contract is proven here rather than assumed:
+#
+# - AC3a: two concurrent admissions never receive the same candidate; when the
+#   pool cannot serve both, the loser is refused explicitly (``None``) instead
+#   of sharing;
+# - AC3b: a full pool falls back deterministically — the same reason for the
+#   same inputs, on both decision seams (the direct admission ladder and the
+#   contention-queue mirror), and the occupant's occupancy is untouched;
+# - AC3c: acquisition is bounded — a busy pool returns immediately and never
+#   introduces a wait primitive of its own (any real wait is the existing
+#   contention queue, whose budget is ``prefill_eta.wait_budget_seconds``);
+# - AC3d: concurrent acquire/release cycles leave the registry consistent (no
+#   slot shared, no double release) and complete under a hard timeout;
+# - AC3e: a session that already owns a candidate re-enters it idempotently,
+#   concurrently too, and never consumes a second slot.
+#
+# Every test drives the real registry (``session._slot_owners`` +
+# ``_slot_registry_lock``); the residency snapshot stub is the one documented in
+# the module header. No sleeps: concurrency is real threads, bounded by a
+# join/acquire timeout instead of a clock.
+# ---------------------------------------------------------------------------
+
+#: Hard bound for a concurrency test to complete (a deadlock fails here).
+CONCURRENCY_TIMEOUT = 30.0
+
+
+def _busy_pool_config(tmp_path, *, pool_size: int = 1) -> dict:
+    """A full ``server:`` config with the slot bookkeeping a candidate needs.
+
+    Nested so the residency readers (``_effective_resident_prefix_min_ratio``,
+    ``_effective_large_context_thresholds``) resolve exactly as in production.
+    """
+    return {
+        "server": {
+            "session_slot_pool_size": pool_size,
+            "session_slot_save_path": str(tmp_path),
+            "local_large_context_cold_cache_threshold": COLD_THRESHOLD,
+            "local_resident_prefix_min_ratio": 0.5,
+        }
+    }
+
+
+def _busy_pool_decision(
+    config: dict, *, session_id: str = "sess-a"
+) -> tuple[bool, str | None, object]:
+    """One admission decision in the shape the dispatch loop uses.
+
+    Acquire the attempt's candidate, take the verdict without letting the
+    ladder acquire a second one (``own_candidate=False``) and hand the
+    candidate back on a refusal — the production sequence of
+    ``_proxy_with_fallback_cycle`` + ``_AdmissionCandidateLease``. Returns
+    ``(skip, reason, candidate)``.
+    """
+    server_config = provider._server_section(config)
+    candidate = provider._acquire_admission_candidate(
+        session_id, endpoint="", server_config=server_config
+    )
+    lease = provider._AdmissionCandidateLease(candidate)
+    skip, reason = provider._should_skip_local(
+        MODEL,
+        session_id,
+        {"messages": []},
+        COLD_THRESHOLD,
+        estimated_tokens=EST_TOKENS,
+        warm_cache_threshold=0,
+        resident_prefix_min_ratio=provider._effective_resident_prefix_min_ratio(
+            config
+        ),
+        unmeasured_cold_enabled=provider._unmeasured_residency_cold_enabled(config),
+        endpoint="",
+        server_config=server_config,
+        candidate_slot=candidate,
+        own_candidate=False,
+    )
+    if skip:
+        lease.note_refusal(reason)
+    else:
+        lease.keep()  # admitted: ownership passes to the dispatch bookkeeping
+    lease.release()
+    return skip, reason, candidate
+
+
+def _registry_snapshot() -> dict:
+    """Copy the ownership registry under its own lock (never blocks unbounded).
+
+    The registry documents one locking discipline for mutation; taking the same
+    lock for a consistent read also proves it is never held unboundedly — a
+    lock held across a wait would fail here instead of hanging the suite.
+    """
+    lock = session_registry._slot_registry_lock
+    assert lock.acquire(timeout=CONCURRENCY_TIMEOUT), (
+        "slot registry lock held unboundedly (AC3c/AC3d)"
+    )
+    try:
+        return dict(session_registry._slot_owners)
+    finally:
+        lock.release()
+
+
+def _registry_violations(owners: dict, *, pool_size: int) -> list[str]:
+    """AC3d invariants: one owner per slot, one slot per session per endpoint."""
+    violations: list[str] = []
+    per_session: dict[tuple[str, str], list[int]] = {}
+    for key, owner in owners.items():
+        endpoint = session_registry._slot_key_endpoint(key)
+        slot_id = session_registry._slot_key_slot_id(key)
+        if not isinstance(owner, str) or not owner:
+            violations.append(f"slot {key!r} has no owning session")
+            continue
+        if not 0 <= slot_id < pool_size:
+            violations.append(f"slot {slot_id} outside the {pool_size}-slot pool")
+        per_session.setdefault((endpoint, owner), []).append(slot_id)
+    for (endpoint, owner), slots in per_session.items():
+        if len(slots) > 1:
+            violations.append(
+                f"{owner} owns slots {sorted(slots)} on endpoint {endpoint!r}"
+            )
+    return violations
+
+
+def _run_concurrently(target, count: int):
+    """Run *target(index)* in *count* daemon threads, joined under a timeout.
+
+    Daemon threads (never a pool) so a deadlocked run fails the assertion
+    instead of hanging interpreter teardown. Returns ``(results, alive)``.
+    """
+    import threading
+
+    results: list = [None] * count
+    barrier = threading.Barrier(count)
+
+    def _worker(index: int) -> None:
+        barrier.wait(timeout=CONCURRENCY_TIMEOUT)
+        results[index] = target(index)
+
+    threads = [
+        threading.Thread(target=_worker, args=(index,), daemon=True)
+        for index in range(count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=CONCURRENCY_TIMEOUT)
+    return results, [thread for thread in threads if thread.is_alive()]
+
+
+def _install_full_pool(monkeypatch: pytest.MonkeyPatch, *, session: str = "sess-other"):
+    """Install the 1-slot pool occupied by another session (a busy pool)."""
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): session},
+    )
+
+
+def test_busy_pool_reason_is_stable_across_identical_decisions(
+    tmp_path, caplog, monkeypatch
+):
+    """AC3b — a full pool falls back with one stable reason, run after run.
+
+    A fully warm prediction is stubbed (0.99): a busy pool must not be rescued
+    by the predictive ratio, so the fallback is the measured non-resident
+    denial every time, and the occupant's occupancy is never touched.
+    """
+    import logging
+
+    _install_full_pool(monkeypatch)
+    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.99)
+    config = _busy_pool_config(tmp_path)
+
+    outcomes = []
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        for _ in range(12):
+            skip, reason, candidate = _busy_pool_decision(config)
+            assert candidate is None, "a full 1-slot pool cannot hand out a slot"
+            outcomes.append((skip, reason))
+
+    assert set(outcomes) == {(True, SKIP_RESIDENT_PREFIX)}, (
+        f"the busy-pool fallback must be deterministic (AC3b): {set(outcomes)}"
+    )
+    # The occupant keeps its slot; no admission gains occupancy by refusing.
+    assert _registry_snapshot() == {("", 0): "sess-other"}
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == provider.RESIDENCY_SOURCE_NON_RESIDENT
+    assert _measurement_field(caplog) == MEASUREMENT_NO_SLOT
+
+
+def test_busy_pool_contention_queue_mirror_agrees_with_the_ladder(
+    tmp_path, caplog, monkeypatch
+):
+    """AC3b — both decision seams name the same fallback for one busy pool.
+
+    The contention-queue decision point runs the same ladder through
+    ``_queue_context_bypass``. For a pinned-local client a *busy pool* is a
+    residency denial, not a capacity wait, so the mirror refuses
+    deterministically (the request steps to the next provider / retryable
+    refusal) and never enqueues: the queue stays empty.
+    """
+    import asyncio
+    import logging
+
+    from proxy import contention_queue
+
+    _install_full_pool(monkeypatch)
+    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.99)
+    config = _busy_pool_config(tmp_path)
+    model_config = {"providers": [{"name": "local", "type": "local"}]}
+    provider_cfg = {"name": "local", "type": "local", "llama_model": MODEL}
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        direct = _busy_pool_decision(config)[:2]
+        caplog.clear()
+        mirrored = [
+            asyncio.run(
+                provider._queue_context_bypass(
+                    config,
+                    model_config,
+                    provider_cfg,
+                    None,  # request is unused when estimated_tokens is supplied
+                    {"messages": []},
+                    "sess-a",
+                    priority="medium",
+                    estimated_tokens=EST_TOKENS,
+                    endpoint="",
+                )
+            )
+            for _ in range(2)
+        ]
+
+    assert direct == (True, SKIP_RESIDENT_PREFIX)
+    assert mirrored == [direct, direct], (
+        "the queue mirror must agree with the admission ladder (AC3b)"
+    )
+    assert contention_queue.queue_depth() == 0, (
+        "a busy pool is not a capacity wait: nothing may be enqueued"
+    )
+    assert _registry_snapshot() == {("", 0): "sess-other"}
+
+
+def test_busy_pool_acquisition_is_bounded_by_the_existing_wait_budget(
+    tmp_path, monkeypatch
+):
+    """AC3c — a busy pool returns at once; no new wait primitive is introduced.
+
+    Twenty contended decisions on a full pool all return well inside the
+    *existing* local wait budget (``prefill_eta.wait_budget_seconds``, the
+    contention-queue window), with nothing enqueued. The bound is asserted
+    against that shipped budget rather than a new constant, so an acquisition
+    that started waiting would have to spend it. The budget's own identity is
+    pinned by ``tests/test_contention_queue.py`` and
+    ``tests/test_prefill_eta.py`` — not duplicated here.
+    """
+    import time
+
+    from proxy import contention_queue, prefill_eta
+
+    _install_full_pool(monkeypatch)
+    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.99)
+    config = _busy_pool_config(tmp_path)
+    budget_seconds = prefill_eta.wait_budget_seconds(config, "medium")
+    assert budget_seconds > 0, "the shipped contention-queue budget is enabled"
+
+    started = time.monotonic()
+    for _ in range(20):
+        skip, reason, candidate = _busy_pool_decision(config)
+        assert (skip, reason, candidate) == (True, SKIP_RESIDENT_PREFIX, None)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < budget_seconds, (
+        f"acquisition must not wait: {elapsed:.3f}s against the existing "
+        f"{budget_seconds:.1f}s wait budget (AC3c)"
+    )
+    assert contention_queue.queue_depth() == 0
+
+
+def test_concurrent_pool_exhaustion_hands_out_distinct_candidates(tmp_path):
+    """AC3a — concurrent admissions get distinct candidates or a refusal.
+
+    Eight sessions race for a two-slot pool: exactly two candidates are handed
+    out, on distinct slots, and the other six are refused explicitly (never a
+    shared slot). The registry then holds exactly the two winners.
+    """
+    pool_size = 2
+    config = _busy_pool_config(tmp_path, pool_size=pool_size)
+    sessions = [f"sess-{index}" for index in range(8)]
+
+    results, alive = _run_concurrently(
+        lambda index: session_registry.acquire_slot_candidate(
+            sessions[index],
+            endpoint="",
+            pool_size=session_registry.candidate_pool_size(
+                provider._server_section(config)
+            ),
+        ),
+        len(sessions),
+    )
+
+    assert not alive, "concurrent acquisition deadlocked (AC3d)"
+    granted = [(session, candidate) for session, candidate in zip(sessions, results)
+               if candidate is not None]
+    assert len(granted) == pool_size, (
+        f"a {pool_size}-slot pool must grant exactly {pool_size} candidates, "
+        f"got {[(s, c.slot_id) for s, c in granted]}"
+    )
+    slots = [candidate.slot_id for _, candidate in granted]
+    assert len(set(slots)) == pool_size, f"two admissions shared a candidate: {slots}"
+    assert set(slots) == {0, 1}
+    assert all(candidate is None for session, candidate in zip(sessions, results)
+               if session not in {s for s, _ in granted})
+
+    owners = _registry_snapshot()
+    assert owners == {("", candidate.slot_id): session for session, candidate in granted}
+    assert _registry_violations(owners, pool_size=pool_size) == []
+
+    for session, candidate in granted:
+        assert session_registry.release_slot_candidate(candidate, reason="test") is True
+    assert _registry_snapshot() == {}
+
+
+def test_concurrent_acquire_release_cycles_keep_the_registry_consistent():
+    """AC3d — acquire/release churn leaves no shared slot and no double free.
+
+    Eight threads run interleaved acquire / double-release cycles over a
+    four-slot pool. Every observed registry state is consistent (one owner per
+    slot, one slot per session), a second release of the same candidate is a
+    no-op, and the whole cycle completes under the hard join timeout — the
+    registry has no lock held across a wait, so no deadlock.
+    """
+    pool_size = 4
+    sessions = [f"sess-{index}" for index in range(12)]
+    cycles = 40
+    violations: list[str] = []
+
+    def _cycle(index: int):
+        import random
+
+        rng = random.Random(index)
+        for _ in range(cycles):
+            session = sessions[rng.randrange(len(sessions))]
+            candidate = session_registry.acquire_slot_candidate(
+                session, endpoint="", pool_size=pool_size
+            )
+            owners = _registry_snapshot()
+            violations.extend(_registry_violations(owners, pool_size=pool_size))
+            if candidate is None:
+                continue
+            owned = owners.get(("", candidate.slot_id))
+            if owned != session:
+                violations.append(
+                    f"{session} was handed slot {candidate.slot_id} owned by {owned}"
+                )
+            released = session_registry.release_slot_candidate(candidate, reason="churn")
+            if session_registry.release_slot_candidate(candidate, reason="churn"):
+                violations.append(f"slot {candidate.slot_id} was double-released")
+            after = _registry_snapshot()
+            violations.extend(_registry_violations(after, pool_size=pool_size))
+            if released and after.get(("", candidate.slot_id)) == session:
+                violations.append(
+                    f"slot {candidate.slot_id} still owned by {session} after release"
+                )
+        return session
+
+    _, alive = _run_concurrently(_cycle, 8)
+
+    assert not alive, "concurrent acquire/release deadlocked (AC3d)"
+    assert violations == [], f"registry inconsistencies under contention: {violations[:5]}"
+    for session in sessions:
+        session_registry._free_slot_assignment(session)
+    assert _registry_snapshot() == {}, "the churn leaked an occupied slot"
+
+
+def test_same_session_candidate_re_entry_is_idempotent_under_concurrency():
+    """AC3e — concurrent re-entry consumes exactly one slot.
+
+    Eight threads acquire for the *same* session on a two-slot pool: every call
+    re-enters the same candidate, so the registry holds one entry and the
+    second slot is still free for another session.
+    """
+    pool_size = 2
+
+    results, alive = _run_concurrently(
+        lambda _index: session_registry.acquire_slot_candidate(
+            "sess-a", endpoint="", pool_size=pool_size
+        ),
+        8,
+    )
+
+    assert not alive, "concurrent same-session re-entry deadlocked (AC3d)"
+    assert all(candidate is not None for candidate in results)
+    slots = {candidate.slot_id for candidate in results}
+    assert slots == {0}, f"re-entry walked the pool: {sorted(slots)} (AC3e)"
+    assert _registry_snapshot() == {("", 0): "sess-a"}
+
+    other = session_registry.acquire_slot_candidate(
+        "sess-b", endpoint="", pool_size=pool_size
+    )
+    assert other is not None and other.slot_id == 1, (
+        "re-entry must leave the remaining slot free for another session"
+    )
+
+
+def test_concurrent_assignments_stay_exclusive_under_a_widened_window(
+    monkeypatch,
+):
+    """AC3a — the assign step is mutually exclusive, not merely fast.
+
+    Two sessions race for a two-slot pool while the assignment's critical
+    section is deliberately widened (the change-of-hands bookkeeping yields the
+    GIL). Without mutual exclusion both threads would observe an empty registry
+    inside the widened window and both be handed slot 0; with the registry lock
+    the second thread waits and takes slot 1. This is the pressure that makes
+    the pin a proof of exclusivity rather than of a lucky interleaving.
+    """
+    import time
+
+    real_forget = session_registry._forget_previous_tenant
+
+    def _slow_forget(key, session_id):
+        time.sleep(0.05)
+        real_forget(key, session_id)
+
+    monkeypatch.setattr(session_registry, "_forget_previous_tenant", _slow_forget)
+
+    results, alive = _run_concurrently(
+        lambda index: session_registry.acquire_slot_candidate(
+            f"sess-{index}", endpoint="", pool_size=2
+        ),
+        2,
+    )
+
+    assert not alive, "the assign step deadlocked (AC3d)"
+    assert all(candidate is not None for candidate in results)
+    slots = [candidate.slot_id for candidate in results]
+    assert len(set(slots)) == 2, f"two admissions shared a candidate: {slots}"
+    # Which session wins slot 0 is scheduling-dependent; that each holds exactly
+    # one slot of the pair is not.
+    owners = _registry_snapshot()
+    assert sorted(owners) == [("", 0), ("", 1)]
+    assert sorted(owners.values()) == ["sess-0", "sess-1"]
+    assert _registry_violations(owners, pool_size=2) == []
+
+
+def test_concurrent_release_of_one_candidate_frees_it_once(monkeypatch):
+    """AC3d — two concurrent releases of one candidate free it exactly once.
+
+    The registry mapping's ``pop`` is widened so a check-then-pop without
+    mutual exclusion would free the slot twice (both releases report success
+    and both would emit a release line). The release is one atomic step over
+    the registry, so exactly one caller frees it and the other is a no-op.
+    """
+    import threading
+    import time
+
+    candidate = session_registry.acquire_slot_candidate(
+        "sess-a", endpoint="", pool_size=2
+    )
+    assert candidate is not None
+
+    class _SlowPopDict(dict):
+        """Registry mapping whose pop yields the GIL (pressure, not behaviour)."""
+
+        def pop(self, key, *default):
+            time.sleep(0.05)
+            return super().pop(key, *default)
+
+    registry = _SlowPopDict(session_registry._slot_owners)
+    monkeypatch.setattr(session_registry, "_slot_owners", registry)
+
+    outcomes: list[bool] = []
+    outcomes_lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    def _release() -> None:
+        barrier.wait(timeout=CONCURRENCY_TIMEOUT)
+        released = session_registry.release_slot_candidate(candidate, reason="race")
+        with outcomes_lock:
+            outcomes.append(released)
+
+    threads = [threading.Thread(target=_release, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=CONCURRENCY_TIMEOUT)
+
+    assert not any(thread.is_alive() for thread in threads), (
+        "the release step deadlocked (AC3d)"
+    )
+    assert outcomes.count(True) == 1, (
+        f"exactly one release may free the slot, got {outcomes}"
+    )
+    assert dict(registry) == {}

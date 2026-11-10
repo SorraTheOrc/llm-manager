@@ -994,3 +994,55 @@ Regression pins: `proxy/tests/test_local_resident_prefix_admission.py`
 Replay evidence for the 2026-10-24 thrash window:
 `proxy/tests/test_prefill_thrash_replay_2026_10_24.py` and
 `docs/dev/slot-thrashing-investigation/findings.md`.
+
+## 9. Exclusivity and deterministic busy-pool fallback (LP-0MW959QJ9002MKEI)
+
+Sections 7–8 moved capacity acquisition *into* the admission path. Two
+admissions can now race for the same pool at decision time — a race that did
+not exist when a slot was assigned later, at dispatch. This section pins the
+guarantees that make that safe; the code is the registry's own locking
+discipline, not a new mechanism.
+
+1. **Acquisition is atomic over the registry.** `session.acquire_slot_candidate`
+   delegates to `_slot_id_for_session`, whose lookup-then-assign runs as one
+   operation under `_slot_registry_lock` (`session._assign_slot_locked`). Two
+   concurrent admissions therefore never receive the same slot candidate: the
+   second sees the first's assignment and takes the next free slot. When the
+   pool cannot serve both, the loser gets an explicit `None` (a refusal), never
+   a shared slot. The lock is held only across pure dict work — never across an
+   `await`, an upstream call or a config read — so it adds no wait primitive and
+   cannot be held unboundedly.
+2. **Release is atomic and conditional on ownership.** `release_slot_candidate`
+   / `release_session_candidate` / `_free_slot_assignment` all funnel into
+   `_release_slot_locked`, which pops only when the candidate's session still
+   owns the slot. A double release is therefore a reported no-op rather than a
+   double free, and a late release can never steal a slot another session has
+   since been assigned.
+3. **A busy pool falls back deterministically, on the existing ladder.** When
+   the pool is full no candidate is assigned, the session is measured
+   `non_resident` against a fresh view, and the admission is denied with
+   `resident_prefix_insufficient` — the same reason and the same
+   `residency_source` / `measurement=unavailable:no_slot` basis for identical
+   inputs, run after run. The request then follows the pre-existing ladder:
+   - capacity saturation while local was *admitted* waits in the contention
+     queue, bounded by `prefill_eta.wait_budget_seconds`
+     (`contention_queue_max_wait_seconds`), the one budget both the queue and
+     the admission guard read;
+   - a residency denial (the busy-pool case) never enqueues: it steps to the
+     next provider, and for a pin-local client the same reason becomes the
+     retryable local-only refusal — the queue stays empty, because waiting
+     cannot make another session's resident prefix reusable.
+4. **Idempotent same-session re-entry.** A session that already owns a
+   candidate re-enters the same assignment (`_assign_slot_locked` returns the
+   existing slot for its endpoint) and never consumes a second slot, including
+   under concurrent re-entry. The dispatch path's `_build_slot_context` relies
+   on exactly this to avoid a double assign.
+
+Regression pins (`proxy/tests/test_local_resident_prefix_admission.py`, F4
+section): the exclusive-assignment pin runs the race with a deliberately
+widened critical section, so it fails if the registry lock is removed rather
+than passing on a lucky interleaving; the concurrent-release pin widens the
+registry pop for the same reason; the churn and pool-exhaustion pins assert the
+aggregate invariants (one owner per slot, one slot per session, no leaked
+occupancy) under a hard join timeout, and `test_scenario2_*` pins the
+deterministic busy-pool reason.
