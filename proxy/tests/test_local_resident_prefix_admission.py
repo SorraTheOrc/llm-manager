@@ -104,10 +104,12 @@ def _reset_residency_state():
     observability._last_slot_details_cache[:] = []
     observability._last_slot_details_at = 0.0
     session_registry._slot_owners.clear()
+    session_registry._slot_last_tenant.clear()
     yield
     observability._last_slot_details_cache[:] = []
     observability._last_slot_details_at = 0.0
     session_registry._slot_owners.clear()
+    session_registry._slot_last_tenant.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -2047,25 +2049,59 @@ def test_eviction_invalidates_a_stored_measurement(caplog, monkeypatch):
     assert (_measurement_field(caplog) or "").startswith("unavailable:")
 
 
-def test_slot_reassignment_invalidates_only_that_sessions_measurement():
-    """AC3(iv) slot reassignment: freeing a slot forgets its measurement.
+def test_same_session_slot_release_keeps_the_measurement():
+    """AC1d (survive half): a same-session release keeps the measurement.
 
-    ``session._free_slot_assignment`` is where a slot changes hands, so the
-    measurement for that session must go with it — otherwise the next owner's
-    decision would read the previous tenant's prompt size. Other sessions'
-    measurements are untouched (the clear is session-scoped, not a reset), and
-    the clear is model-agnostic because the release path does not know which
-    model the session was routed under.
+    Every local dispatch ends with the slot handed back, so clearing on the
+    plain release made the session's next admission unmeasurable
+    (``unavailable:no_slot`` on ~75 % of local admissions). The measurement
+    survives the release and the same session's re-assignment, so its next
+    turn is priced from the last measured dispatch instead of the predicted
+    sidecar ratio (LP-0MW959P9S005DJY7 AC1d).
     """
     _prime_measurement(MEASURED_TOTAL, session="sess-a")
     _prime_measurement(MEASURED_TOTAL, model="Qwen3-Next", session="sess-a")
     _prime_measurement(MEASURED_TOTAL, session="sess-b")
 
+    slot_id = session_registry._slot_id_for_session("sess-a", 2)
     session_registry._free_slot_assignment("sess-a")
 
+    # Survival across the release, for every model the session was measured
+    # under (the release path knows neither the routed model nor the tenant).
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is not None
+    assert (
+        measured_prefill.get_measured_prefill("Qwen3-Next", "sess-a") is not None
+    )
+    # Other sessions' measurements are untouched (session-scoped bookkeeping).
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-b") is not None
+
+    # The same session re-entering its slot is not a change of hands.
+    assert session_registry._slot_id_for_session("sess-a", 2) == slot_id
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is not None
+
+
+def test_slot_taken_by_a_different_session_forgets_the_previous_tenant():
+    """AC1d (never inherit half): a new tenant clears the previous tenant.
+
+    A slot that changes hands is exactly where the old measurement becomes a
+    stale ratio the new owner must not inherit — the reclaimed slot's previous
+    tenant loses its total, and the new tenant has none of its own. Asserted in
+    both directions.
+    """
+    _prime_measurement(MEASURED_TOTAL, session="sess-a")
+    _prime_measurement(MEASURED_TOTAL, model="Qwen3-Next", session="sess-a")
+
+    slot_id = session_registry._slot_id_for_session("sess-a", 2)
+    session_registry._free_slot_assignment("sess-a")
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is not None
+
+    # A different session takes the released slot: the previous tenant's
+    # measurement is invalidated (model-agnostic), and the new tenant inherits
+    # nothing.
+    assert session_registry._slot_id_for_session("sess-b", 2) == slot_id
     assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is None
     assert measured_prefill.get_measured_prefill("Qwen3-Next", "sess-a") is None
-    assert measured_prefill.get_measured_prefill(MODEL, "sess-b") is not None
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-b") is None
 
 
 def test_model_switch_does_not_reuse_the_previous_models_measurement(caplog, monkeypatch):
@@ -2562,12 +2598,15 @@ def test_pricing_uses_the_measured_prefix_not_the_ownership_sentinel(
 # ownership in ``session._slot_owners``, the registry the residency rungs
 # already read, so the measurement is of the candidate slot.
 #
-# Markers: each scenario is ``xfail(strict=True)`` naming the owning item
-# (F2–F5). Strict xfail means the implementation children **must delete the
-# marker** when their code lands — a silently-passing pin fails the gate
-# instead of rotting (same discipline the file used for the red-first
-# LP-0MVT2PB6U007PKD1 pins). ``test_f1_scenario_owners_are_pinned`` audits
-# that no scenario is dropped or un-pinned (AC5d).
+# Markers: each pending scenario is ``xfail(strict=True)`` naming the owning
+# item (F3–F5). Strict xfail means the implementation child **must delete the
+# marker** when its code lands — a silently-passing pin fails the gate instead
+# of rotting (same discipline the file used for the red-first
+# LP-0MVT2PB6U007PKD1 pins). The implemented scenarios move from
+# ``SCENARIO_OWNERS`` into ``IMPLEMENTED_SCENARIOS`` in the same edit that
+# removes their marker (F2, LP-0MW959P9S005DJY7);
+# ``test_f1_scenario_owners_are_pinned`` audits that no scenario is dropped,
+# left un-pinned, or passes while still claiming to be pending (AC5d).
 # ---------------------------------------------------------------------------
 
 #: Owning implementation items (parent's F-plan children).
@@ -2575,13 +2614,25 @@ F2_ASSIGN = "LP-0MW959P9S005DJY7"  # assign the candidate before the verdict
 F3_RELEASE = "LP-0MW959PWL001WYSM"  # release cleanly on a refused admission
 F4_FALLBACK = "LP-0MW959QJ9002MKEI"  # exclusivity + deterministic busy fallback
 
-#: ``test_scenario*`` → owning item(s). The audit test below reads this map,
-#: so adding a scenario without naming its owner fails the suite (AC5d).
+#: Pending ``test_scenario*`` → owning item(s). The audit test below reads this
+#: map, so adding a scenario without naming its owner fails the suite (AC5d).
 SCENARIO_OWNERS = {
-    "test_scenario1_assign_then_measure_admits": (F2_ASSIGN,),
     "test_scenario1_refusal_releases_the_candidate": (F3_RELEASE,),
     "test_scenario2_busy_pool_falls_back_deterministically": (F4_FALLBACK,),
-    "test_scenario3_concurrent_admissions_never_share_a_candidate": (F4_FALLBACK,),
+}
+
+#: Implemented ``test_scenario*`` → the item(s) that made it green once the
+#: requirement exists. These carry **no** xfail marker; the audit asserts that,
+#: so a scenario cannot be marked pending after it ships (nor silently
+#: re-xfailed). ``test_scenario3`` went green with F2's atomic assignment, which
+#: is F4's AC3a requirement (F4 still owns the busy-pool fallback AC3b, the
+#: bounded wait AC3c and the deadlock/consistency tests AC3d).
+IMPLEMENTED_SCENARIOS = {
+    "test_scenario1_assign_then_measure_admits": (F2_ASSIGN,),
+    "test_scenario3_concurrent_admissions_never_share_a_candidate": (
+        F2_ASSIGN,
+        F4_FALLBACK,
+    ),
     "test_scenario4_probe_error_fails_open_and_logs_the_basis": (F2_ASSIGN,),
     "test_scenario5_stale_view_rereads_once_then_falls_back": (F2_ASSIGN,),
 }
@@ -2635,11 +2686,6 @@ def _candidate_decision(
     return candidate, skip, reason
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"F1 scenario 1 (admit half): pending {F2_ASSIGN} — candidate-first "
-    "admission not implemented; remove this marker in that item's commit",
-)
 def test_scenario1_assign_then_measure_admits(caplog, monkeypatch):
     """Scenario 1 (admit half) — no slot at decision → assign → measure → admit.
 
@@ -2748,11 +2794,6 @@ def test_scenario2_busy_pool_falls_back_deterministically(caplog, monkeypatch):
     assert _measurement_field(caplog) == MEASUREMENT_NO_SLOT
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"F1 scenario 3: pending {F4_FALLBACK} — atomic candidate "
-    "exclusivity not implemented; remove this marker in that item's commit",
-)
 def test_scenario3_concurrent_admissions_never_share_a_candidate(caplog, monkeypatch):
     """Scenario 3 — two concurrent admissions never receive the same candidate.
 
@@ -2797,11 +2838,6 @@ def test_scenario3_concurrent_admissions_never_share_a_candidate(caplog, monkeyp
     assert len(tenants) == 2 and len(set(tenants)) == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"F1 scenario 4: pending {F2_ASSIGN} — probe error must fail open to "
-    "the predicted path and be logged; remove this marker in that item's commit",
-)
 def test_scenario4_probe_error_fails_open_and_logs_the_basis(caplog, monkeypatch):
     """Scenario 4 — the residency probe raises → fail open, but logged.
 
@@ -2838,12 +2874,6 @@ def test_scenario4_probe_error_fails_open_and_logs_the_basis(caplog, monkeypatch
     assert event.n_past_actual is None, "a probe error must not fabricate a size"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"F1 scenario 5: pending {F2_ASSIGN} — stale-view re-read (exactly "
-    "once) then logged fallback not implemented; remove this marker in that "
-    "item's commit",
-)
 def test_scenario5_stale_view_rereads_once_then_falls_back(caplog, monkeypatch):
     """Scenario 5 — ``stale_view``: re-read once, then fall back with reason.
 
@@ -2893,22 +2923,34 @@ def test_scenario5_stale_view_rereads_once_then_falls_back(caplog, monkeypatch):
 
 
 def test_f1_scenario_owners_are_pinned():
-    """AC5d audit — every scenario exists, is strict-xfail, and names its owner.
+    """AC5d audit — every scenario is pinned, and only pending ones are xfail.
 
     Introspects the module's ``test_scenario*`` functions against
-    ``SCENARIO_OWNERS``: a scenario that is dropped, unmarked, softened or
-    mis-owner-tagged fails here, so no AC5a scenario can silently disappear
-    from the suite or lose its owning-item attribution. (Named ``test_f1_``,
-    not ``test_scenario_``, so the audit is not mistaken for a scenario.)
+    ``SCENARIO_OWNERS`` (pending) and ``IMPLEMENTED_SCENARIOS`` (shipped): a
+    scenario that is dropped, un-pinned, softened or mis-owner-tagged fails
+    here, so no AC5a scenario can silently disappear from the suite or lose
+    its owning-item attribution. An implemented scenario must carry **no**
+    xfail marker, so a shipped pin cannot rot into a permanently-skipped one.
+    (Named ``test_f1_``, not ``test_scenario_``, so the audit is not mistaken
+    for a scenario.)
     """
     import sys
 
     module = sys.modules[__name__]
-    missing = [name for name in SCENARIO_OWNERS if not hasattr(module, name)]
+    missing = [
+        name
+        for name in list(SCENARIO_OWNERS) + list(IMPLEMENTED_SCENARIOS)
+        if not hasattr(module, name)
+    ]
     assert not missing, f"F1 scenarios missing from the module: {missing}"
+    assert not set(SCENARIO_OWNERS) & set(IMPLEMENTED_SCENARIOS), (
+        "a scenario cannot be both pending and implemented"
+    )
     extras = [
         name for name in dir(module)
-        if name.startswith("test_scenario") and name not in SCENARIO_OWNERS
+        if name.startswith("test_scenario")
+        and name not in SCENARIO_OWNERS
+        and name not in IMPLEMENTED_SCENARIOS
     ]
     assert not extras, f"F1 scenarios without an owning item: {extras}"
     for name, owners in SCENARIO_OWNERS.items():
@@ -2925,3 +2967,219 @@ def test_f1_scenario_owners_are_pinned():
         assert any(owner in reason for owner in owners), (
             f"{name}: xfail reason {reason!r} must name one of {owners}"
         )
+    for name, owner in IMPLEMENTED_SCENARIOS.items():
+        fn = getattr(module, name)
+        marks = list(getattr(fn, "pytestmark", []) or [])
+        assert not [
+            m for m in marks
+            if getattr(getattr(m, "mark", m), "name", None) == "xfail"
+        ], (
+            f"{name}: implemented by {owner} — delete its xfail marker "
+            "instead of leaving a skipped pin"
+        )
+
+
+# ---------------------------------------------------------------------------
+# F2 — candidate-first admission (LP-0MW959P9S005DJY7)
+#
+# The verdict is taken with a slot candidate already assigned (parent AC1):
+# ``_should_skip_local`` acquires the candidate itself from the configured slot
+# pool, so the residency probe measures the candidate slot instead of
+# predicting from a not-yet-existing assignment. These pins cover the
+# implementation child's own acceptance surface — AC1a (assignment before the
+# verdict), AC1c (``unavailable:no_slot`` only when the pool is exhausted),
+# AC1d (measurement survives a same-session release only) and AC1e (honest
+# degradation, no fabricated context size).
+# ---------------------------------------------------------------------------
+
+
+def _candidate_config(tmp_path, *, pool_size: int = 2) -> dict:
+    """A ``server:`` config with the slot bookkeeping candidate-first needs."""
+    return {
+        "session_slot_pool_size": pool_size,
+        "session_slot_save_path": str(tmp_path),
+    }
+
+
+def _decide_with_pool(
+    *,
+    session_id: str = "sess-a",
+    server_config: dict | None = None,
+    estimated_tokens: int = EST_TOKENS,
+    **gate_kw,
+):
+    """Run one admission through the ladder's **own** candidate acquisition."""
+    return provider._should_skip_local(
+        MODEL,
+        session_id,
+        {"messages": []},
+        COLD_THRESHOLD,
+        estimated_tokens=estimated_tokens,
+        warm_cache_threshold=0,
+        resident_prefix_min_ratio=0.5,
+        unmeasured_cold_enabled=gate_kw.pop("unmeasured_cold_enabled", True),
+        endpoint=gate_kw.pop("endpoint", ""),
+        server_config=server_config,
+        **gate_kw,
+    )
+
+
+def test_admission_assigns_the_candidate_before_the_verdict(tmp_path, caplog, monkeypatch):
+    """AC1a — the verdict is measured against a candidate assigned first.
+
+    ``sess-a`` owns nothing at decision time and the pool has a free slot, so
+    the ladder assigns it before probing. The measurement is of that candidate
+    (``measured_last_dispatch``), not the predicted sidecar ratio, and the
+    ownership registry records the candidate for the dispatch that follows.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_pool(
+            server_config=_candidate_config(tmp_path)
+        )
+
+    assert (skip, reason) == (False, None)
+    assert dict(session_registry._slot_owners) == {("", 0): "sess-a"}
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == "admit"
+    assert event.residency_source == provider.RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH
+    assert event.n_past_actual == MEASURED_TOTAL
+    assert _measurement_field(caplog) == MEASUREMENT_MEASURED
+
+
+def test_candidate_assignment_is_idempotent_for_the_same_session():
+    """AC1a — a session that already owns its candidate re-enters it.
+
+    Re-entry never consumes a second slot and reports the same candidate, so
+    the repeated probes/decisions in one request cycle cannot walk the pool.
+    """
+    config = {"session_slot_pool_size": 2, "session_slot_save_path": "/tmp/slots"}
+
+    first = session_registry.acquire_slot_candidate(
+        "sess-a", endpoint="", pool_size=session_registry.candidate_pool_size(config)
+    )
+    second = session_registry.acquire_slot_candidate(
+        "sess-a", endpoint="", pool_size=session_registry.candidate_pool_size(config)
+    )
+
+    assert first is not None and second is not None
+    assert (first.slot_id, first.session_id) == (second.slot_id, second.session_id)
+    assert first.slot_id == 0
+    assert dict(session_registry._slot_owners) == {("", 0): "sess-a"}
+
+
+def test_no_slot_is_reported_only_when_the_pool_is_exhausted(
+    tmp_path, caplog, monkeypatch
+):
+    """AC1c — ``unavailable:no_slot`` means the pool is full, nothing else.
+
+    A free pool with no measurement reports ``no_prior_measurement`` (the
+    candidate *was* measured — it simply has no prior dispatch); only a pool
+    with no free candidate reports ``no_slot``.
+    """
+    import logging
+
+    # Free pool, no measurement: measured against the candidate.
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        _decide_with_pool(server_config=_candidate_config(tmp_path))
+    free_pool_measurement = _measurement_field(caplog)
+    assert free_pool_measurement == MEASUREMENT_NO_PRIOR
+    assert MEASUREMENT_NO_SLOT not in caplog.text
+    caplog.clear()
+
+    # Pool exhausted: the one slot belongs to another session.
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+    )
+    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.99)
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_pool(
+            server_config=_candidate_config(tmp_path, pool_size=1)
+        )
+
+    assert (skip, reason) == (True, SKIP_RESIDENT_PREFIX)
+    assert _measurement_field(caplog) == MEASUREMENT_NO_SLOT
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == provider.RESIDENCY_SOURCE_NON_RESIDENT
+    # The occupant keeps the slot; the refused session gained nothing.
+    assert dict(session_registry._slot_owners) == {("", 0): "sess-other"}
+
+
+def test_no_pool_configured_keeps_the_pre_change_behaviour(caplog, monkeypatch):
+    """Fail-open — no slot bookkeeping means no candidate and no ownership.
+
+    A deployment without the slot pool must keep today's residency verdict
+    (nothing is registered, the session owns no slot), never a fabricated
+    candidate.
+    """
+    import logging
+
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_pool(server_config=None)
+
+    assert dict(session_registry._slot_owners) == {}
+    assert (skip, reason) == (True, SKIP_RESIDENT_PREFIX)
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == provider.RESIDENCY_SOURCE_NON_RESIDENT
+    assert _measurement_field(caplog) == MEASUREMENT_NO_SLOT
+
+
+def test_candidate_without_a_measurement_degrades_to_session_slot(
+    tmp_path, caplog, monkeypatch
+):
+    """AC1e — no live ``n_past`` and no prior dispatch degrades one rung.
+
+    The candidate is owned but nothing measures its prefix, so the ladder
+    reports ``session_slot`` / ``unavailable:no_prior_measurement`` with
+    ``n_past_actual=none``: the rung is explicit and never logs a fabricated
+    context size.
+    """
+    import logging
+
+    _install_slot_state(monkeypatch, slots=[_slot(0, None)], owners={})
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        _decide_with_pool(server_config=_candidate_config(tmp_path))
+
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == provider.RESIDENCY_SOURCE_SESSION_SLOT
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None
+    assert _measurement_field(caplog) == MEASUREMENT_NO_PRIOR
+
+
+def test_measurement_survives_the_dispatch_turn_boundary(tmp_path, caplog, monkeypatch):
+    """AC1d — the released slot's measurement prices the session's next turn.
+
+    A dispatch ends with ``_free_slot_assignment``; the session's next
+    admission must still be priced from its last measured dispatch (that is
+    what makes ``unavailable:no_slot`` stop being the normal path), and it
+    must do so against the candidate it is re-assigned before the verdict.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+    session_registry._slot_id_for_session("sess-a", 2)
+    session_registry._free_slot_assignment("sess-a")
+    assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is not None
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_pool(
+            server_config=_candidate_config(tmp_path)
+        )
+
+    assert (skip, reason) == (False, None)
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == provider.RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH
+    assert event.n_past_actual == MEASURED_TOTAL
+    assert MEASUREMENT_NO_SLOT not in caplog.text

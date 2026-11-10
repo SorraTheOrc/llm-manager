@@ -12,8 +12,10 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -1091,6 +1093,67 @@ def _sanitize_session_id(session_id: str) -> str:
 _slot_owners: dict[tuple, str] = {}
 """Active slot assignments: ``{(endpoint_or_empty, slot_id): session_id}``."""
 
+_slot_registry_lock = threading.Lock()
+"""Serialises registry mutation (assignment and release).
+
+The lookup-then-assign step is a single atomic operation over
+:data:`_slot_owners` (LP-0MW959QJ9002MKEI AC3a): candidate-first admission
+moves capacity acquisition into the admission path, so two concurrent
+admissions must never be handed the same slot. Held only across pure dict
+work — never across an ``await``, an upstream call or a config read.
+"""
+
+_slot_last_tenant: dict[tuple, str] = {}
+"""The session that most recently held each ``(endpoint, slot_id)``.
+
+Remembered across a release so the *next* admission can tell a same-session
+re-entry from a change of hands (LP-0MW959P9S005DJY7 AC1d). A same-session
+release keeps the session's measured prefill (its next turn is priced from the
+measurement instead of ``unavailable:no_slot``); a slot taken by a different
+session forgets the previous tenant's measurement at the moment of assignment,
+so a stale total can never be read back as this session's warm prefix.
+"""
+
+
+@dataclass(frozen=True)
+class SlotCandidate:
+    """One admission's slot candidate.
+
+    Assigned *before* the admission verdict (LP-0MW959P9S005DJY7 AC1a) so the
+    resident-prefix probe measures the candidate slot instead of predicting
+    from a not-yet-existing assignment. Acquisition registers ownership in
+    :data:`_slot_owners`, which is the registry every residency rung already
+    reads, so no new residency input is needed.
+    """
+
+    session_id: str
+    slot_id: int
+    endpoint: str = ""
+
+
+def candidate_pool_size(server_config: dict | None) -> int:
+    """Return the slot pool eligible for candidate assignment, or ``0``.
+
+    Candidate-first admission may only assign a slot when the existing slot
+    bookkeeping is active — a *pure* read of the config that mirrors
+    ``_build_slot_context``'s gate (pool size > 0 **and** a configured save
+    path) without creating the save directory, so the admission hot path keeps
+    no filesystem side effect. ``0`` means "no candidates": the ladder then
+    keeps its pre-change behaviour (``unavailable:no_slot`` /
+    ``unavailable:stale_view``) instead of fabricating occupancy.
+    """
+    if not isinstance(server_config, dict):
+        return 0
+    try:
+        pool_size = int(server_config.get("session_slot_pool_size", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if pool_size <= 0:
+        return 0
+    if not server_config.get("session_slot_save_path"):
+        return 0
+    return pool_size
+
 
 def _slot_registry_key(endpoint: str | None, slot_id: int) -> tuple:
     """Build the per-endpoint slot-registry key.
@@ -1123,6 +1186,27 @@ def _slot_key_slot_id(key) -> int:
     return key
 
 
+def _forget_previous_tenant(key: tuple, session_id: str) -> None:
+    """Forget the previous tenant's measurement when *key* changes hands.
+
+    A same-session re-entry keeps its measurement (LP-0MW959P9S005DJY7 AC1d:
+    the session's next turn is measured instead of unpriced); a different
+    session taking the slot clears the previous tenant's entry for **every**
+    model, because the assignment path does not know which model it was routed
+    under and a partial clear would leave an orphan a later decision could read
+    as warm. Fail-open: bookkeeping never fails an assignment.
+    """
+    previous = _slot_last_tenant.pop(key, None)
+    if not previous or previous == session_id:
+        return
+    try:
+        from proxy.measured_prefill import clear_measured_prefill
+
+        clear_measured_prefill(None, previous)
+    except Exception:
+        pass
+
+
 def _slot_id_for_session(
     session_id: str, pool_size: int, endpoint: str | None = None
 ) -> int | None:
@@ -1134,10 +1218,26 @@ def _slot_id_for_session(
 
     The registry is keyed per-endpoint so different llama-server instances
     track their own slot pools independently (LP-0MRPILSMW004T4H8).
+
+    Assignment is also where a slot changes hands, so a **different** session
+    taking the slot invalidates the previous tenant's measured prefill
+    (LP-0MW959P9S005DJY7 AC1d); a same-session re-entry keeps it.
+
+    The lookup-then-assign step runs under :data:`_slot_registry_lock`, so two
+    admissions can never be handed the same slot candidate
+    (LP-0MW959QJ9002MKEI AC3a).
     """
     if not session_id or pool_size <= 0:
         return None
 
+    with _slot_registry_lock:
+        return _assign_slot_locked(session_id, pool_size, endpoint)
+
+
+def _assign_slot_locked(
+    session_id: str, pool_size: int, endpoint: str | None
+) -> int | None:
+    """The registry's assign step; callers hold :data:`_slot_registry_lock`."""
     ep = endpoint or ""
     # Check existing assignment on this endpoint
     for key, owner in list(_slot_owners.items()):
@@ -1151,7 +1251,9 @@ def _slot_id_for_session(
     }
     for sid in range(pool_size):
         if sid not in used:
-            _slot_owners[_slot_registry_key(endpoint, sid)] = session_id
+            key = _slot_registry_key(endpoint, sid)
+            _forget_previous_tenant(key, session_id)
+            _slot_owners[key] = session_id
             return sid
 
     # All slots occupied — pool is exhausted
@@ -1164,22 +1266,18 @@ def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> None:
     When *endpoint* is None (legacy single-server mode), the first matching
     assignment is released for backward compatibility.
 
-    Releasing the assignment is also where a slot changes hands, so the
-    session's measured prefill is forgotten with it (LP-0MVT2QFAP0082BKR AC
-    slot release/reassignment): the next owner of that slot must never inherit
-    the previous tenant's prefix size as a numeric reuse ratio. The clear is
-    unconditional and idempotent — the measurement is only ever valid while
-    the session still owns a slot, and the routed model is not known here, so
-    every model's entry for the session goes. Fail-open: clearing never raises.
+    The session's **measured prefill survives this release**
+    (LP-0MW959P9S005DJY7 AC1d): every local dispatch ends with the slot handed
+    back, so clearing on release would make the session's next admission
+    unmeasurable (the measured ``unavailable:no_slot`` on 3 363 of ~4 500
+    checks). The measurement is invalidated where the slot actually changes
+    hands — a different session's assignment (:func:`_slot_id_for_session`),
+    eviction (``router_helpers._record_local_eviction``), an invalidation
+    (:func:`_invalidate_session_and_slot`) and a model switch
+    (``lifecycle.ensure_model_loaded``). Fail-open: releasing never raises.
     """
     if not session_id:
         return
-    try:
-        from proxy.measured_prefill import clear_measured_prefill
-
-        clear_measured_prefill(None, session_id)
-    except Exception:
-        pass
     # A divergence correction derived from that measurement is equally invalid
     # once the slot changes hands (LP-0MW81DS4W008DKDV AC3).
     try:
@@ -1189,12 +1287,63 @@ def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> None:
     except Exception:
         pass
     ep = endpoint or ""
-    for key, owner in list(_slot_owners.items()):
-        if owner == session_id and (
-            endpoint is None or _slot_key_endpoint(key) == ep
-        ):
-            _slot_owners.pop(key, None)
-            return
+    with _slot_registry_lock:
+        for key, owner in list(_slot_owners.items()):
+            if owner == session_id and (
+                endpoint is None or _slot_key_endpoint(key) == ep
+            ):
+                # Remember who held it: the next assignment to a *different*
+                # session is what invalidates this session's measurement.
+                _slot_last_tenant[
+                    _slot_registry_key(
+                        _slot_key_endpoint(key), _slot_key_slot_id(key)
+                    )
+                ] = session_id
+                _slot_owners.pop(key, None)
+                return
+
+
+def acquire_slot_candidate(
+    session_id: str,
+    *,
+    endpoint: str | None = None,
+    pool_size: int | None = None,
+) -> SlotCandidate | None:
+    """Assign (or re-use) this admission's slot candidate.
+
+    The explicit, read-only-for-reporting seam the admission path calls
+    **before** its residency verdict (LP-0MW959P9S005DJY7 AC1a) instead of
+    relying on the assign-as-side-effect call inside ``_build_slot_context``.
+    Semantics are the registry's own:
+
+    - a session that already owns a slot on *endpoint* re-enters idempotently
+      and never consumes a second slot;
+    - otherwise the lowest-numbered free slot is assigned, and the previous
+      tenant's measured prefill is forgotten if this is a change of hands;
+    - ``None`` when *session_id* is empty, *pool_size* is 0/absent, or the pool
+      is full — the caller then falls back one rung (``unavailable:no_slot``
+      only here, when the pool is genuinely exhausted).
+
+    Never raises: an unavailable candidate degrades one rung of the admission
+    ladder, it never refuses local on absent data.
+    """
+    if not session_id:
+        return None
+    try:
+        size = int(pool_size or 0)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0:
+        return None
+    try:
+        slot_id = _slot_id_for_session(session_id, size, endpoint=endpoint)
+    except Exception:
+        return None
+    if slot_id is None:
+        return None
+    return SlotCandidate(
+        session_id=session_id, slot_id=slot_id, endpoint=endpoint or ""
+    )
 
 
 def _assigned_slot_for_session(
@@ -1519,7 +1668,16 @@ async def _invalidate_session_and_slot(
                         pass
         except Exception:
             pass
-    # Free the slot registry entry
+    # Free the slot registry entry (the measured prefill survives an ordinary
+    # release, so an invalidation — which drops this session's prefix — must
+    # forget it explicitly, LP-0MW959P9S005DJY7 AC1d).
+    if session_id:
+        try:
+            from proxy.measured_prefill import clear_measured_prefill
+
+            clear_measured_prefill(None, session_id)
+        except Exception:
+            pass
     _free_slot_assignment(session_id)
 
     # Clear cached ratio entries for this session (LP-0MRMMBZ7T007ER59)

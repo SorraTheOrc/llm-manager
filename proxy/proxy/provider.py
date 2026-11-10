@@ -3409,6 +3409,41 @@ def _session_owns_slot(session_id: str | None, endpoint: str | None = None) -> i
     return None
 
 
+def _acquire_admission_candidate(
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    server_config: dict | None = None,
+):
+    """Assign this admission's slot candidate, or ``None`` (fail-open).
+
+    Thin, never-raising wrapper around :func:`proxy.session.acquire_slot_candidate`
+    (LP-0MW959P9S005DJY7 AC1a). The pool size comes from
+    :func:`proxy.session.candidate_pool_size`, the same config gate
+    ``_build_slot_context`` uses, so a deployment with slot bookkeeping off
+    keeps the pre-change residency behaviour instead of registering ownership
+    nobody will ever use.
+
+    A missing/unreadable session module, an empty session id, a disabled pool
+    or any unexpected error reads as *no candidate*: the ladder then degrades
+    one rung (``unavailable:no_slot`` / ``unavailable:stale_view``), which is
+    exactly the pre-change behaviour. It never refuses local on absent data.
+    """
+    if not session_id:
+        return None
+    try:
+        from proxy.session import acquire_slot_candidate, candidate_pool_size
+
+        pool_size = candidate_pool_size(server_config)
+        if pool_size <= 0:
+            return None
+        return acquire_slot_candidate(
+            session_id, endpoint=endpoint, pool_size=pool_size
+        )
+    except Exception:
+        return None
+
+
 def _measured_capture_enabled(server_config=None) -> bool:
     """Whether measured-prefill capture is enabled (fail-open to today's rung).
 
@@ -3496,10 +3531,20 @@ def resolve_resident_prefix(
     A stored measurement is only valid while its session still owns the slot
     it was captured against: rung 2 is gated on live ownership, and the
     invalidation paths clear the entry when that ownership ends — eviction
-    (``router_helpers._record_local_eviction``), slot release/reassignment
-    (``session._free_slot_assignment``) and a model switch
-    (``lifecycle.ensure_model_loaded``, LP-0MVT2QFAP0082BKR). The ownership
-    gate is the backstop for any clear that was missed.
+    (``router_helpers._record_local_eviction``), a different session taking the
+    slot (``session._slot_id_for_session``), an invalidation
+    (``session._invalidate_session_and_slot``) and a model switch
+    (``lifecycle.ensure_model_loaded``, LP-0MVT2QFAP0082BKR). A same-session
+    release keeps the measurement, so a returning session is priced from its
+    last measured dispatch instead of ``unavailable:no_slot``
+    (LP-0MW959P9S005DJY7 AC1d); the ownership gate is the backstop for any
+    clear that was missed.
+
+    When the supplied (or first-read) residency view is not fresh, the view is
+    re-read **once** before the ladder gives up on it, so a just-missed ~1 s
+    snapshot refresh is not reported as an unmeasurable pool
+    (LP-0MW959P9S005DJY7, F1 scenario 5). The re-read is bounded: never more
+    than one extra read, and still never an upstream ``/slots`` query.
 
     Each rung also sets exactly one ``measurement=`` reason via
     :func:`measurement_reason`: ``measured`` for rungs 1–2,
@@ -3526,6 +3571,23 @@ def resolve_resident_prefix(
             view = get_residency_view(endpoint=endpoint)
         except Exception:
             view = None
+    if view is None or not bool(getattr(view, "known", False)):
+        # A stale or absent view is re-read **exactly once** before the ladder
+        # gives up on measuring it (LP-0MW959P9S005DJY7 / F1 scenario 5): the
+        # snapshot is refreshed ~1/s by the broadcast loop, so an unknown view
+        # is usually a just-missed refresh rather than a pool that cannot be
+        # measured. Never more than one re-read — the hot path stays bounded
+        # and `/slots` is still never queried (>15 s holds,
+        # LP-0MUXTW4MD003TVIC). A refresh that is itself unknown leaves the
+        # honest ``unavailable:stale_view`` basis in place.
+        try:
+            from proxy.residency import get_residency_view
+
+            refreshed = get_residency_view(endpoint=endpoint)
+        except Exception:
+            refreshed = None
+        if refreshed is not None:
+            view = refreshed
 
     known = bool(getattr(view, "known", False))
     slot = None
@@ -3778,6 +3840,7 @@ def _should_skip_local(
     tenancy_idle_seconds: float | None = None,
     unmeasured_cold_enabled: bool = True,
     server_config: dict | None = None,
+    candidate_slot=None,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -3823,6 +3886,15 @@ def _should_skip_local(
     Residency-aware ladder (LP-0MVN1IQTF0037WTG AC1/AC3), applied when
     *resident_prefix_min_ratio* > 0 for a prompt above *cold_cache_threshold*:
 
+    0. **candidate-first assignment** (LP-0MW959P9S005DJY7 AC1a) — a slot
+       candidate is assigned *before* the probe, so the residency rungs are
+       evaluated against the candidate slot rather than a not-yet-existing
+       assignment. Without it the probe reported
+       ``measurement=unavailable:no_slot`` on ~75 % of local admissions
+       (3 363 of ~4 500) and the predicted sidecar ratio decided instead.
+       ``None`` (no session, no slot bookkeeping, or the pool is full) keeps
+       the pre-change behaviour and is the **only** way
+       ``unavailable:no_slot`` is emitted;
     1. the hard ``context_too_large`` cap above (unchanged, still first);
     2. **unmeasured is cold** — when the probe cannot report a measured
        resident prefix at all (``residency_source=unknown``: no fresh
@@ -3877,6 +3949,12 @@ def _should_skip_local(
             predicted-ratio price honours the large-append rule
             (``local_large_append_bytes_threshold``, LP-0MW81DLWY003XOZ2) and
             the prefix-credit margin. ``None`` keeps both shipped defaults.
+            It also supplies the candidate pool size
+            (``session_slot_pool_size``) for the candidate-first assignment.
+        candidate_slot: An already-assigned candidate
+            (``proxy.session.SlotCandidate``) to evaluate the verdict against,
+            when the caller owns its lifecycle. ``None`` (the default)
+            assigns one here.
 
     Returns:
         A tuple ``(skip, reason)`` where:
@@ -3937,6 +4015,32 @@ def _should_skip_local(
         )
 
     if resident_prefix_min_ratio > 0.0:
+        # Candidate-first admission (LP-0MW959P9S005DJY7 AC1a): assign this
+        # admission a slot **before** the residency verdict, so the probe
+        # measures the candidate slot instead of predicting from a
+        # not-yet-existing assignment. Acquisition registers ownership in
+        # ``session._slot_owners`` — the registry every residency rung already
+        # reads — so the resolution needs no extra input and the measurement is
+        # of the candidate. A caller that already holds the handle (e.g. the
+        # release contract, LP-0MW959PWL001WYSM) passes it in via
+        # *candidate_slot*; otherwise it is assigned here. Fail-open: an
+        # unavailable candidate degrades one rung, never refuses local.
+        candidate = candidate_slot
+        if candidate is None:
+            candidate = _acquire_admission_candidate(
+                session_id, endpoint=endpoint, server_config=server_config
+            )
+        if candidate is not None:
+            # Trace-level only: the decision line (AC6, LP-0MW959SE30012HJJ)
+            # is the single INFO seam for the verdict; this one says which
+            # slot the verdict was measured against when a decision is
+            # reconstructed from logs.
+            logger.debug(
+                "admission_candidate session=%s slot=%s endpoint=%s",
+                session_id or "unknown",
+                getattr(candidate, "slot_id", None),
+                getattr(candidate, "endpoint", "") or "",
+            )
         facts = resolve_resident_prefix(
             session_id,
             estimated_tokens,

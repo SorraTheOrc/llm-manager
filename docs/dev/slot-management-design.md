@@ -844,10 +844,13 @@ Approach A plus the occupancy work that followed it:
   (`LP-0MVT2QFAP0082BKR`): a stored total is read only while the session still
   owns the slot it was captured against (the ownership gate is the backstop),
   and the `(model, session)` entry is cleared on eviction
-  (`router_helpers._record_local_eviction`), on slot release/reassignment
-  (`session._free_slot_assignment`) and on a model switch
+  (`router_helpers._record_local_eviction`), when a **different** session takes
+  the slot (`session._slot_id_for_session`), on a session invalidation
+  (`session._invalidate_session_and_slot`) and on a model switch
   (`lifecycle.ensure_model_loaded`). After a clear the next decision reports
   `measurement=unavailable:no_prior_measurement` rather than a stale ratio.
+  A plain slot release (`session._free_slot_assignment`) **keeps** it — see
+  the candidate-first ordering below.
 - **Session tenancy bound**: at most `local_session_tenants` (default: the slot
   count) distinct sessions hold a local reservation at once; a further session
   follows the normal chain instead of evicting a resident. Same-session
@@ -875,6 +878,64 @@ Not shipped here, deliberately: no slot-count change (evaluated separately in
 87,381 tokens, excluding the long-context sessions that dominate this
 workload), and no client-side cooperation (the proxy remains the sole owner of
 abandonment reaping).
+
+## 7. Candidate-first admission (LP-0MW959P9S005DJY7)
+
+Section 6's residency gate measured *after* the fact: `_should_skip_local`
+probed the session's residency **before** any slot assignment, so on a pool
+whose slots are handed back at the end of every dispatch the session owned
+nothing at decision time. The probe therefore reported
+`measurement=unavailable:no_slot` on **3 363 of ~4 500** local admissions
+(≈75 %) and the decision fell back to the predicted sidecar ratio — which
+priced a 55 492-token prompt at `new_tokens=172`.
+
+Candidate-first admission reverses the order:
+
+1. **Assign, then measure.** `provider._should_skip_local` acquires a slot
+   candidate (`session.acquire_slot_candidate`, the explicit seam instead of
+   the assign-as-side-effect inside `session._build_slot_context`) before
+   `resolve_resident_prefix` runs. Acquisition registers ownership in
+   `session._slot_owners`, the registry every residency rung already reads, so
+   the resolution needs no new input and the measurement is of the candidate
+   slot. Positively, the existing `router.proxy_to_local` call to
+   `_build_slot_context` then re-enters the same assignment idempotently for
+   the dispatch (no double-assign).
+2. **`unavailable:no_slot` means the pool is full.** It is emitted only when
+   no candidate could be assigned (pool exhausted). A candidate with no prior
+   dispatch reports `unavailable:no_prior_measurement` on the `session_slot`
+   rung; a candidate with a measurement reports `measured` on
+   `measured_last_dispatch`.
+3. **The measurement survives the turn boundary.** Every dispatch ends with
+   `_free_slot_assignment`, so the measurement is no longer cleared there: the
+   session's next admission re-acquires a candidate and is priced from its
+   last measured dispatch. What invalidates it is a **change of hands** —
+   `_slot_id_for_session` remembers the slot's last tenant and forgets that
+   tenant's measured prefill (all models) when a different session takes it,
+   so a new tenant never inherits the previous tenant's prefix size — plus
+   eviction, session invalidation and model switch.
+4. **Stale view re-read once.** When the residency view is absent or older
+   than `RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS`, `resolve_resident_prefix`
+   re-reads it **exactly once** before falling back, so a just-missed ~1 s
+   snapshot refresh is not reported as an unmeasurable pool. The re-read is
+   still in-memory only: `/slots` is never queried on the admission path
+   (`LP-0MUXTW4MD003TVIC`).
+5. **Fail-open.** No configured slot pool, no session id or an unreadable
+   registry means no candidate, and the ladder keeps its pre-change verdict
+   (`unavailable:no_slot` / `unavailable:stale_view`) instead of fabricating
+   occupancy. An unavailable candidate degrades one rung; it never refuses
+   local on absent data.
+
+The measurement ladder itself (rungs and `measurement=` vocabulary) is
+unchanged: `measured` → `measured_last_dispatch` → `session_slot` →
+`non_resident` / `unknown`. On the deployed b8782 build, which reports no
+per-slot `n_past` / `n_prompt_tokens_processed`, the live rung stays
+unreachable and `measured_last_dispatch` carries the measurement.
+
+Clean release of an acquired-but-refused candidate is the next slice of this
+group (`LP-0MW959PWL001WYSM`): until it lands, a refused admission leaves its
+candidate registered rather than dispatching, which degrades *measurement*
+for later sessions (they fall to `unavailable:no_slot` and the cold-threshold
+denial) without dispatching or fabricating anything.
 
 Replay evidence for the 2026-10-24 thrash window:
 `proxy/tests/test_prefill_thrash_replay_2026_10_24.py` and
