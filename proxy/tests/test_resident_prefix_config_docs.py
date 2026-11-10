@@ -416,8 +416,22 @@ def test_slot_design_doc_records_the_measured_last_dispatch_rung():
         < section.index(RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH)
         < section.index(RESIDENCY_SOURCE_SESSION_SLOT)
     )
-    for event in ("eviction", "slot release/reassignment", "model switch"):
+    # Candidate-first admission (LP-0MW959P9S005DJY7) superseded the old
+    # "slot release/reassignment" trigger: the measurement now survives the turn
+    # boundary, so what invalidates it is a change of hands (a different session
+    # taking the slot), eviction, session invalidation and a model switch.
+    for event in (
+        "eviction",
+        "different",
+        "session invalidation",
+        "model switch",
+    ):
         assert event in section, f"invalidation trigger {event!r} undocumented"
+    # The rule that replaced it: a plain release must NOT invalidate.
+    assert "A plain slot release" in section, (
+        "the design doc must state that a plain slot release keeps the measurement"
+    )
+    assert "**keeps** it" in section
     # Accuracy: the value is an upper bound, never a promise.
     assert "upper bound" in section
     assert "decode" in section
