@@ -2520,3 +2520,408 @@ def test_pricing_uses_the_measured_prefix_not_the_ownership_sentinel(
     assert event.decision == "large_context_bypass"
     assert event.n_past_actual == MEASURED_TOTAL
     assert event.reuse_ratio == pytest.approx(MEASURED_TOTAL / EST_TOKENS)
+
+# ---------------------------------------------------------------------------
+# F1 — candidate-first admission harness and five-scenario fixtures
+# (LP-0MW959KH8008FL42, parent AC5)
+#
+# This item pins the candidate-first admission contract *before* any
+# implementation lands. The harness reuses the residency-ladder fixtures above
+# (``_install_slot_state`` / ``_slot`` / ``_view`` / ``_prime_measurement`` /
+# ``_measurement_field`` / ``_parse_logged_caught``) — no second ladder.
+#
+# Pinned production seam (owned by F2–F4; absent today, so every scenario
+# below is red-first):
+#
+#   proxy/session.py
+#     @dataclass(frozen=True)
+#     class SlotCandidate:
+#         session_id: str
+#         slot_id: int
+#         endpoint: str = ""
+#
+#     def acquire_slot_candidate(session_id, *, endpoint=None,
+#                                pool_size=None) -> SlotCandidate | None:
+#         """Lowest free slot for the session on the endpoint; same-session
+#         re-entry idempotent; None when the pool is full."""
+#
+#     def release_slot_candidate(candidate, *, reason=None) -> None:
+#         """Idempotent release through the existing release seam
+#         (``_free_slot_assignment``); never a double-free. When the release
+#         closes a *refused* admission it names the refusing reason
+#         (``candidate_released reason=<skip_reason>``, F3 AC2b)."""
+#
+# Accepted on every refusal rung: ``context_too_large``,
+# ``unmeasured_residency_cold``, ``resident_prefix_insufficient``,
+# ``tenant_limit``, ``large_context_bypass``, the contention-queue refusal and
+# any exception raised inside the decision (F3 AC2c).
+#
+# The admission call site (F2) acquires the candidate **before** the residency
+# view is materialised, threads it into the ladder, and releases it on every
+# refusal (F3). Residency resolution needs no new input: the acquire registers
+# ownership in ``session._slot_owners``, the registry the residency rungs
+# already read, so the measurement is of the candidate slot.
+#
+# Markers: each scenario is ``xfail(strict=True)`` naming the owning item
+# (F2–F5). Strict xfail means the implementation children **must delete the
+# marker** when their code lands — a silently-passing pin fails the gate
+# instead of rotting (same discipline the file used for the red-first
+# LP-0MVT2PB6U007PKD1 pins). ``test_f1_scenario_owners_are_pinned`` audits
+# that no scenario is dropped or un-pinned (AC5d).
+# ---------------------------------------------------------------------------
+
+#: Owning implementation items (parent's F-plan children).
+F2_ASSIGN = "LP-0MW959P9S005DJY7"  # assign the candidate before the verdict
+F3_RELEASE = "LP-0MW959PWL001WYSM"  # release cleanly on a refused admission
+F4_FALLBACK = "LP-0MW959QJ9002MKEI"  # exclusivity + deterministic busy fallback
+
+#: ``test_scenario*`` → owning item(s). The audit test below reads this map,
+#: so adding a scenario without naming its owner fails the suite (AC5d).
+SCENARIO_OWNERS = {
+    "test_scenario1_assign_then_measure_admits": (F2_ASSIGN,),
+    "test_scenario1_refusal_releases_the_candidate": (F3_RELEASE,),
+    "test_scenario2_busy_pool_falls_back_deterministically": (F4_FALLBACK,),
+    "test_scenario3_concurrent_admissions_never_share_a_candidate": (F4_FALLBACK,),
+    "test_scenario4_probe_error_fails_open_and_logs_the_basis": (F2_ASSIGN,),
+    "test_scenario5_stale_view_rereads_once_then_falls_back": (F2_ASSIGN,),
+}
+
+
+def _free_slots(ids, *, context_tokens: int | None = None) -> list[dict]:
+    """Build a fake ``/slots`` snapshot of *ids* free slots.
+
+    Same snapshot shape the ladder fixtures use (``slot_id`` /
+    ``is_processing`` / ``context_tokens``) — one builder for the candidate
+    harness, no second ladder (AC5c). The snapshot only carries the slot
+    *details*; ownership comes from the live registry at view-build time,
+    exactly as in ``proxy.residency.get_residency_view``.
+    """
+    return [_slot(sid, context_tokens) for sid in ids]
+
+
+def _candidate_decision(
+    *,
+    session_id: str = "sess-a",
+    pool_size: int = 2,
+    **gate_kw,
+):
+    """Run one candidate-first admission the way F2's call site will.
+
+    Order pinned by AC5a scenario 1: acquire the candidate **before** the
+    residency view is materialised (the ladder builds its view from the
+    snapshot + the live ownership registry, so the measurement is of the
+    candidate slot), decide, and release the candidate when the admission was
+    refused (F3's release contract). Returns ``(candidate, skip, reason)``.
+
+    Fails on the pre-change tree because the production seam does not exist —
+    that is exactly the state AC5d pins with the strict xfail markers.
+    """
+    candidate = session_registry.acquire_slot_candidate(
+        session_id, endpoint="", pool_size=pool_size
+    )
+    skip, reason = provider._should_skip_local(
+        gate_kw.pop("model_name", MODEL),
+        session_id,
+        {"messages": []},
+        gate_kw.pop("cold_threshold", COLD_THRESHOLD),
+        estimated_tokens=gate_kw.pop("estimated_tokens", EST_TOKENS),
+        warm_cache_threshold=0,
+        resident_prefix_min_ratio=gate_kw.pop("min_ratio", 0.5),
+        unmeasured_cold_enabled=gate_kw.pop("unmeasured_cold_enabled", True),
+        **gate_kw,
+    )
+    if candidate is not None and skip:
+        session_registry.release_slot_candidate(candidate, reason=reason)
+    return candidate, skip, reason
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=f"F1 scenario 1 (admit half): pending {F2_ASSIGN} — candidate-first "
+    "admission not implemented; remove this marker in that item's commit",
+)
+def test_scenario1_assign_then_measure_admits(caplog, monkeypatch):
+    """Scenario 1 (admit half) — no slot at decision → assign → measure → admit.
+
+    ``sess-a`` owns nothing at decision time; a candidate is assigned before
+    the verdict, so the measurement is of the candidate slot
+    (``residency_source=measured_last_dispatch``, ``measurement=measured``)
+    instead of ``unavailable:no_slot``. AC5b: ``unavailable:no_slot`` must not
+    appear — the pool is *not* exhausted.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        candidate, skip, reason = _candidate_decision(session_id="sess-a")
+
+    assert candidate is not None
+    assert candidate.session_id == "sess-a"
+    assert candidate.slot_id == 0
+    assert (skip, reason) == (False, None)
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == "admit"
+    assert event.residency_source == provider.RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH
+    assert event.n_past_actual == MEASURED_TOTAL
+    assert _measurement_field(caplog) == MEASUREMENT_MEASURED
+    assert MEASUREMENT_NO_SLOT not in caplog.text, (
+        "a free pool must not be reported as unavailable:no_slot (AC5b)"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=f"F1 scenario 1 (refuse half): pending {F3_RELEASE} — clean candidate "
+    "release on refusal not implemented; remove this marker in that item's commit",
+)
+def test_scenario1_refusal_releases_the_candidate(caplog, monkeypatch):
+    """Scenario 1 (refuse half) — assign → measure → refuse → clean release.
+
+    The measured prefix is below the ratio, so the admission is refused; the
+    candidate is released through the production seam: no registry entry left,
+    one ``candidate_released reason=...`` line, no ``abandoned_slot_recorded``
+    (an abandoned slot means a *dispatched* request, never a refusal — F3
+    AC2a/AC2b/AC2e).
+    """
+    import logging
+
+    _prime_measurement(5_000)  # reusable fraction ≈ 0.10 < min_ratio 0.5
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        candidate, skip, reason = _candidate_decision(session_id="sess-a")
+
+    assert candidate is not None
+    assert (skip, reason) == (True, SKIP_RESIDENT_PREFIX)
+    # Measured basis, then a clean release: registry back to its baseline.
+    assert dict(session_registry._slot_owners) == {}
+    assert session_registry._assigned_slot_for_session("sess-a") is None
+    assert f"candidate_released reason={SKIP_RESIDENT_PREFIX}" in caplog.text
+    assert "abandoned_slot_recorded" not in caplog.text
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert _measurement_field(caplog) == MEASUREMENT_MEASURED
+    assert event.residency_source == provider.RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=f"F1 scenario 2: pending {F4_FALLBACK} — candidate acquisition with "
+    "deterministic busy-pool fallback not implemented; remove this marker in "
+    "that item's commit",
+)
+def test_scenario2_busy_pool_falls_back_deterministically(caplog, monkeypatch):
+    """Scenario 2 — slot busy: no free candidate → deterministic fallback.
+
+    The whole pool is occupied by another session, so ``acquire_slot_candidate``
+    returns ``None`` and the decision falls back through the existing ladder.
+    AC5b: ``unavailable:no_slot`` is emitted here *only* because the pool is
+    genuinely exhausted, and the fallback reason is stable across identical
+    runs (F4 AC3b) — measured against identical inputs, twice.
+    """
+    import logging
+
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+    )
+    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.99)
+
+    outcomes = []
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        for _ in range(2):  # deterministic across runs (F4 AC3b)
+            candidate, skip, reason = _candidate_decision(
+                session_id="sess-a", pool_size=1
+            )
+            assert candidate is None, "a full 1-slot pool has no candidate"
+            outcomes.append((skip, reason))
+            caplog.clear()
+
+    assert outcomes[0] == outcomes[1], "fallback must be deterministic (F4 AC3b)"
+    assert outcomes[0] == (True, SKIP_RESIDENT_PREFIX)
+    # Pool unchanged: the occupant keeps the slot, the session gains nothing.
+    assert dict(session_registry._slot_owners) == {("", 0): "sess-other"}
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == provider.RESIDENCY_SOURCE_NON_RESIDENT
+    assert _measurement_field(caplog) == MEASUREMENT_NO_SLOT
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=f"F1 scenario 3: pending {F4_FALLBACK} — atomic candidate "
+    "exclusivity not implemented; remove this marker in that item's commit",
+)
+def test_scenario3_concurrent_admissions_never_share_a_candidate(caplog, monkeypatch):
+    """Scenario 3 — two concurrent admissions never receive the same candidate.
+
+    Two sessions admit concurrently on a 3-slot pool (one occupied, two free);
+    the federated decisions must end on *distinct* candidate slots (or an
+    explicit refusal), the registry must stay consistent (no slot with two
+    owners) and the run must complete under a hard timeout (F4 AC3a/AC3d).
+    """
+    import asyncio
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL, session="sess-a")
+    _prime_measurement(MEASURED_TOTAL, session="sess-b")
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, EST_TOKENS), _slot(1, None), _slot(2, None)],
+        owners={("", 0): "sess-other"},
+    )
+
+    async def _race():
+        a = asyncio.to_thread(
+            _candidate_decision, session_id="sess-a", pool_size=3
+        )
+        b = asyncio.to_thread(
+            _candidate_decision, session_id="sess-b", pool_size=3
+        )
+        return await asyncio.wait_for(asyncio.gather(a, b), timeout=10)
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        (a_cand, a_skip, a_reason), (b_cand, b_skip, b_reason) = asyncio.run(_race())
+
+    assert a_cand is not None and b_cand is not None
+    assert a_cand.slot_id != b_cand.slot_id, "two admissions shared a candidate"
+    assert {a_cand.slot_id, b_cand.slot_id} <= {1, 2}
+    assert (a_skip, a_reason) == (False, None)
+    assert (b_skip, b_reason) == (False, None)
+    # Registry consistent afterwards: the occupant plus two distinct tenants.
+    owners = dict(session_registry._slot_owners)
+    assert owners[("", 0)] == "sess-other"
+    tenants = [sid for (ep, sid), owner in owners.items()
+               if owner in ("sess-a", "sess-b")]
+    assert len(tenants) == 2 and len(set(tenants)) == 2
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=f"F1 scenario 4: pending {F2_ASSIGN} — probe error must fail open to "
+    "the predicted path and be logged; remove this marker in that item's commit",
+)
+def test_scenario4_probe_error_fails_open_and_logs_the_basis(caplog, monkeypatch):
+    """Scenario 4 — the residency probe raises → fail open, but logged.
+
+    A candidate was still assigned before the verdict, yet every residency
+    source becomes unavailable (the snapshot probe raises; ownership
+    consultation degrades to ``None``). The ladder must not propagate the
+    error nor fabricate a measurement: it fails open to the predicted path
+    (rollback flag off), and one decision line records the honest basis
+    (``residency_source=unknown`` / ``measurement=unavailable:stale_view``).
+    """
+    import logging
+
+    from proxy import residency as residency_mod
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("probe error (F1 scenario 4 fixture)")
+
+    monkeypatch.setattr(residency_mod, "get_residency_view", _boom)
+    monkeypatch.setattr(provider, "_session_owns_slot", lambda *a, **k: None)
+    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 1.0)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        candidate, skip, reason = _candidate_decision(
+            session_id="sess-a", unmeasured_cold_enabled=False
+        )
+
+    assert candidate is not None, "the candidate is assigned before the verdict"
+    assert (skip, reason) == (False, None), "fail-open to the predicted path"
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == provider.DECISION_ADMIT_PREDICTED
+    assert event.residency_source == provider.RESIDENCY_SOURCE_UNKNOWN
+    assert _measurement_field(caplog) == MEASUREMENT_STALE_VIEW
+    assert event.n_past_actual is None, "a probe error must not fabricate a size"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=f"F1 scenario 5: pending {F2_ASSIGN} — stale-view re-read (exactly "
+    "once) then logged fallback not implemented; remove this marker in that "
+    "item's commit",
+)
+def test_scenario5_stale_view_rereads_once_then_falls_back(caplog, monkeypatch):
+    """Scenario 5 — ``stale_view``: re-read once, then fall back with reason.
+
+    The snapshot is older than the residency trust window and the pool is
+    full for this session; the ladder re-reads the residency view **exactly
+    once** before falling back, and the decision line carries
+    ``measurement=unavailable:stale_view`` / ``residency_source=unknown`` with
+    the unmeasured-cold skip. ``unavailable:no_slot`` must not appear — the
+    truth is that the view is stale, not that the pool is measured full.
+    """
+    import logging
+
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+    from proxy import residency as residency_mod
+
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+    )
+    calls = {"n": 0}
+    real_view = residency_mod.get_residency_view
+
+    def _counted(*args, **kwargs):
+        calls["n"] += 1
+        return real_view(*args, **kwargs)
+
+    monkeypatch.setattr(residency_mod, "get_residency_view", _counted)
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        candidate, skip, reason = _candidate_decision(
+            session_id="sess-a", pool_size=1
+        )
+
+    assert candidate is None
+    assert (skip, reason) == (True, provider.SKIP_REASON_UNMEASURED_COLD)
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == provider.RESIDENCY_SOURCE_UNKNOWN
+    assert _measurement_field(caplog) == MEASUREMENT_STALE_VIEW
+    assert MEASUREMENT_NO_SLOT not in _measurement_field(caplog)
+    assert calls["n"] == 2, (
+        "stale view must be re-read exactly once before the fallback "
+        f"(got {calls['n']} residency-view reads)"
+    )
+
+
+def test_f1_scenario_owners_are_pinned():
+    """AC5d audit — every scenario exists, is strict-xfail, and names its owner.
+
+    Introspects the module's ``test_scenario*`` functions against
+    ``SCENARIO_OWNERS``: a scenario that is dropped, unmarked, softened or
+    mis-owner-tagged fails here, so no AC5a scenario can silently disappear
+    from the suite or lose its owning-item attribution. (Named ``test_f1_``,
+    not ``test_scenario_``, so the audit is not mistaken for a scenario.)
+    """
+    import sys
+
+    module = sys.modules[__name__]
+    missing = [name for name in SCENARIO_OWNERS if not hasattr(module, name)]
+    assert not missing, f"F1 scenarios missing from the module: {missing}"
+    extras = [
+        name for name in dir(module)
+        if name.startswith("test_scenario") and name not in SCENARIO_OWNERS
+    ]
+    assert not extras, f"F1 scenarios without an owning item: {extras}"
+    for name, owners in SCENARIO_OWNERS.items():
+        fn = getattr(module, name)
+        marks = list(getattr(fn, "pytestmark", []) or [])
+        xfails = [
+            m for m in marks
+            if getattr(getattr(m, "mark", m), "name", None) == "xfail"
+        ]
+        assert xfails, f"{name}: AC5d requires an xfail marker naming its owner"
+        kwargs = getattr(getattr(xfails[0], "mark", xfails[0]), "kwargs", {})
+        assert kwargs.get("strict") is True, f"{name}: xfail must be strict"
+        reason = kwargs.get("reason", "")
+        assert any(owner in reason for owner in owners), (
+            f"{name}: xfail reason {reason!r} must name one of {owners}"
+        )
