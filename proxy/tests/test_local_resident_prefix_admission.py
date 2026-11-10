@@ -2842,6 +2842,23 @@ def test_scenario3_concurrent_admissions_never_share_a_candidate(caplog, monkeyp
                if owner in ("sess-a", "sess-b")]
     assert len(tenants) == 2 and len(set(tenants)) == 2
 
+    # Provenance (AC5b): both concurrent verdicts log their basis, so the outcome
+    # is auditable rather than inferred from the candidate objects alone, and a
+    # free pool must never be reported as unavailable:no_slot.
+    decision_lines = [
+        line for line in caplog.text.splitlines()
+        if "routing_resident_prefix" in line
+    ]
+    assert len(decision_lines) >= 2, (
+        "both concurrent verdicts must log a residency basis line (AC5b)"
+    )
+    for line in decision_lines:
+        assert "residency_source=" in line, f"missing residency_source= in: {line}"
+        assert "measurement=" in line, f"missing measurement= in: {line}"
+    assert f"measurement={MEASUREMENT_NO_SLOT}" not in caplog.text, (
+        "a free pool must not be reported as unavailable:no_slot (AC5b)"
+    )
+
 
 def test_scenario4_probe_error_fails_open_and_logs_the_basis(caplog, monkeypatch):
     """Scenario 4 — the residency probe raises → fail open, but logged.
