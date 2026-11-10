@@ -279,13 +279,40 @@ stays visible exactly as published, so later comparison remains possible.
 
 The post-change baseline is owned by `LP-0MVW8S8OZ00449YR`
 (`[task] Post-change ≥24 h measurement`), which needs a restart-free ≥24 h
-window on a build containing `9f3b9c06`; the window anchor is the proxy
-restart at `2026-11-02T10:39:24Z`, so the earliest it can close is
-**2026-11-03T10:39:24Z** (time gate owned by `LP-0MVZ4R2B20027XK3`). When that
-report lands it updates the affected rows **in place, with its own window and
-provenance**, and the current values remain visible alongside as the
-pre-change column — the same convention already used by the
-reference/post-deploy table above.
+window on a build containing `9f3b9c06`. **That measurement has landed:** the
+window anchor is the controlled restart at `2026-11-06T14:15:52Z` (the
+`2026-11-02T10:39:24Z` anchor was superseded — see
+[prefill-deadline-residual-postchange.md](prefill-deadline-residual-postchange.md)
+§1), and the report covers `2026-11-06 14:15:56` → `2026-11-07 14:15:56`
+(24 h) plus the whole 44.73 h restart-free span.
+
+Post-change column for the rows above that are directly comparable
+(eviction-scoped counts, same tool, same classifier). The window differs, so
+each row keeps its own window and provenance rather than replacing the older
+column:
+
+| Metric (24 h) | pre-change `2026-10-29`→`10-30` | post-change `2026-11-06`→`11-07` | post-change `11-06`→`11-08` (44.73 h) |
+|---|---|---|---|
+| `reason=prefill_deadline` evictions | 60 | **36** (1.500/h) | **67** (1.498/h) |
+| `reason=measured_cache_deficit` evictions | 248 | **40** (1.667/h) | **41** (0.917/h) |
+| `no_progress_watchdog` | 60 | 3 | 11 |
+| `lease_evicted` | 7 | 1 | 3 |
+| user-class combined (`prefill_deadline` + `measured_cache_deficit`) per hour | 5.875 | **2.500** | **1.833** |
+
+**The warm-path rows are deliberately not merged into the older
+"Large warm completions (≥ 20k, first byte < 10 s)" row.** They use a different,
+dispatch-side population (the proxy's own `cache_state=warm` label plus
+`estimated_tokens ≥ 20 000` on the `dispatch_first_byte_ms` line) and are
+measured by a separate instrument (`scripts/measure_warm_path_window.py`); the
+like-for-like warm comparison, with both windows measured by that same
+instrument, is in
+[prefill-deadline-residual-postchange.md](prefill-deadline-residual-postchange.md)
+§6 and in `prefill-deadline-residual-warm-path-2026-11-06.json`.
+
+One confounder travels with the post-change column:
+`local_prefill_deadline_seconds` moved **120 → 180** on 2026-11-04
+(`31c842157`), so `elapsed_s` is not comparable across the change and part of
+the `prefill_deadline` fall is a policy effect.
 
 Measured statements in this document depend on: the mechanism decision record
 `LP-0MVW8S7QY002S7DV`, the upstream cancel (`LP-0MVRMI5HK00558TB`,

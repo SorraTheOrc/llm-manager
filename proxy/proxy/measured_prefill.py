@@ -39,10 +39,15 @@ What this module provides (purely additive — no decision changes here)
     cached-ratio table), so consumers can read the measured reuse of the most
     recent local dispatch without reaching into the transient dispatch-lease
     record (which is released at the end of the stream). A measurement is only
-    valid while its session still owns the slot it was captured against, so
-    the invalidation paths (eviction, slot release/reassignment, model switch)
-    clear it — ``clear_measured_prefill`` forgets one pair, every model for a
-    session, or every session for a model, and
+    valid while its session still owns the slot it was captured against — or
+    is re-assigned a *candidate* for it before the next verdict — so the
+    invalidation paths (eviction, a **different** session taking the slot,
+    session invalidation and model switch) clear it. A plain slot release
+    keeps it: every local dispatch ends with the slot handed back, and
+    clearing there made the session's next admission unmeasurable
+    (``unavailable:no_slot`` on ~75 % of local admissions,
+    LP-0MW959P9S005DJY7 AC1d) — ``clear_measured_prefill`` forgets one pair,
+    every model for a session, or every session for a model, and
     ``clear_measured_prefill_for_other_models`` forgets everything a switch
     cannot prove belongs to the target model (LP-0MVT2QFAP0082BKR).
 
@@ -321,9 +326,14 @@ def clear_measured_prefill(
     - ``(None, session)`` — forget **every** model for that session, in a
       single pass over the store. The reclaim chokepoints
       (``router_helpers._record_local_eviction``,
-      ``session._free_slot_assignment``) know the session but not the routed
-      model name, and a partial clear would leave an orphan that a later
-      dispatch could read as warm;
+      ``session._invalidate_session_and_slot``,
+      ``session._slot_id_for_session`` when a *different* session takes the
+      slot) know the session but not the routed model name, and a partial
+      clear would leave an orphan that a later dispatch could read as warm.
+      A plain slot release (``session._free_slot_assignment``) deliberately
+      does **not** clear: the same session is re-assigned a candidate on its
+      next turn and must still be priced from that measurement
+      (LP-0MW959P9S005DJY7 AC1d);
     - ``(model, None)`` — forget **every** session for that model (the
       model-switch path: the model's slots are torn down, so no session's
       measurement for it may survive);

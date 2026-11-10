@@ -127,7 +127,7 @@ Protection ships in four layers; check each one after an incident.
 
 | Layer | Mechanism | Verify |
 |---|---|---|
-| OOM ranking | proxy `oom_score_adj=-900` (system unit) / `0` (user), backend `+800` | `server.oom_score_adj`, `server.llama_server_oom_score_adj`, unit `OOMScoreAdjust=` |
+| OOM ranking | proxy `oom_score_adj=-900` (system unit) / `0` (user), backend `+800` on the router **and** its model children | `server.oom_score_adj`, `server.llama_server_oom_score_adj`, unit `OOMScoreAdjust=`, `scripts/verify_oom_protection.py` |
 | Supervision | `Restart=always`, `RestartSec=2` on the proxy and backend units | `systemctl --user cat llama-proxy.service` |
 | Cgroup bound | `MemoryMax=4G` (proxy), `MemoryMax=70G` (backend) | `systemctl --user show -p MemoryMax llama-podman-wrapper.service` |
 | Pre-OOM alert | `HostMemoryAvailableLow*`, `GpuGttVsHostRamHigh*` | `/alerts` in Prometheus, `monitoring/README.md` |
@@ -150,6 +150,62 @@ So the backend is killed first and the proxy is last. `oom_badness` here is
 against these numbers (`proxy/tests/test_host_pressure.py`), because actually
 reproducing a global OOM on the live host would risk killing the proxy under
 test.
+
+#### Verify and reapply the backend ranking (`/proc`, LP-0MW3K7XJ30027RV6)
+
+The score has to reach the **`llama-server` process**, not the start-script
+wrapper the proxy spawns. Measured 2026-11-05 before the fix — the config asked
+for `800` and every backend still read `0`:
+
+```
+$ for p in $(pgrep -x llama-server); do echo "$p oom_score_adj=$(cat /proc/$p/oom_score_adj)"; done
+2089209 oom_score_adj=0     # router parent
+2089312 oom_score_adj=0     # its per-model child
+```
+
+`start-llama.sh` runs `llama-server` as a foreground **child** and the kernel
+copies `oom_score_adj` at fork time, so a write to the wrapper issued after that
+fork was never inherited. The proxy now scores the whole process tree as its
+spawn hook (before the quick-exit probe, so later forks inherit) and re-asserts
+the ranking every ~30 s from the watchdog — which also covers the model children
+the router forks when it loads a model, and an adopted backend that predates the
+proxy.
+
+Read the kernel's own values (raw `/proc`, exactly what the OOM killer uses):
+
+```bash
+# every llama-server process, router and model children alike
+for p in $(pgrep -x llama-server); do
+  printf '%s comm=%s oom_score_adj=%s\n' "$p" "$(cat /proc/$p/comm)" "$(cat /proc/$p/oom_score_adj)"
+done
+```
+
+or use the verification tool, which walks the tree from the router (discovered by
+listening port) and prints the same numbers plus a verdict:
+
+```bash
+python3 scripts/verify_oom_protection.py            # read-only, exit 1 on a gap
+python3 scripts/verify_oom_protection.py --json     # machine-readable
+python3 scripts/verify_oom_protection.py --apply    # reapply + re-verify
+python3 scripts/verify_oom_protection.py --pid <wrapper-pid> --apply
+```
+
+`--apply` raises the score on every `llama-server` process it finds (and on the
+root, so later children inherit); raising is always permitted, so it works
+unprivileged and needs no restart.
+
+**When the score cannot be applied (a recorded gap, not a silent pass).** The
+proxy logs one WARNING per distinct gap, naming this remedy:
+
+| Gap | Reason | Operator action |
+|---|---|---|
+| `no llama-server process in the tree of pid(s) …` | the backend is stopped, its start script has not forked it yet, or an adopted backend is undiscoverable (port unreadable) | run `scripts/verify_oom_protection.py`; if the backend is up and still not found, restart it so the proxy scores it at spawn time |
+| `could not set oom_score_adj=… on pid …` | the process exited between discovery and the write (respawn race) | re-run `--apply`; the next router child inherits the router's raised score |
+| proxy score `0` instead of `-900` | negative values need `CAP_SYS_RESOURCE` | install the **system** unit (`OOMScoreAdjust=-900`) or grant the capability; the backend ranking still applies |
+
+The same values are logged at startup and exposed on `/metrics` as
+`llama_oom_score_adj`; `proxy/tests/test_backend_oom_protection.py` pins the
+router-child behaviour against real processes and real `/proc`.
 
 Raising a score (`+800`) is always permitted. Lowering one below 0 needs
 `CAP_SYS_RESOURCE`, which is why the negative proxy score is delivered by the

@@ -70,11 +70,49 @@ def reset() -> None:
     _waiters = deque()
     _condition = None
     _local_grant_times.clear()
+    _publish_depth()
 
 
 def queue_depth() -> int:
     """Current number of waiters in the cross-session queue."""
     return len(_waiters)
+
+
+#: Canonical fall-through reason the queue records when it drops a request.
+#: It is the token the router/provider already logs for a queue loss, so the
+#: live counter and the nightly usage-analysis report share one vocabulary
+#: (LP-0MVWPJW2700966ZU AC1).
+DEFAULT_LOSS_REASON = "fallback_after_queue"
+
+
+def _publish_depth() -> None:
+    """Publish the current waiter count to the depth gauge (best-effort)."""
+    try:
+        from proxy.metrics import record_contention_queue_depth
+
+        record_contention_queue_depth(len(_waiters))
+    except Exception:
+        pass
+
+
+def _record_loss(reason: str) -> None:
+    """Count one queue loss by its canonical fall-through reason."""
+    try:
+        from proxy.metrics import record_contention_queue_loss
+
+        record_contention_queue_loss(reason or DEFAULT_LOSS_REASON)
+    except Exception:
+        pass
+
+
+def _observe_wait(seconds: float) -> None:
+    """Observe one completed wait (admitted or timed-out) on the histogram."""
+    try:
+        from proxy.metrics import observe_contention_queue_wait
+
+        observe_contention_queue_wait(seconds)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -277,12 +315,35 @@ async def wait_for_local_slot(
     eta_seconds: float | None = None,
     eta_ordering: bool = False,
     promote_after_seconds: float = 0.0,
+    loss_reason: str = DEFAULT_LOSS_REASON,
+    cause_out: list[str] | None = None,
+    already_waited_seconds: float = 0.0,
 ) -> float | None:
     """Wait (bounded, cross-session) for a local slot to free.
 
     Returns the elapsed wait in seconds when a slot freed within the caps
     (the caller should dispatch local), or None when the caps were exceeded
     (the caller falls back to the next remote provider exactly as today).
+
+    *already_waited_seconds* is the queue wait this request already spent in
+    the *same turn* — a turn can reach the queue twice (the
+    ``local_concurrency_limit`` gate and the ``local_lease_active`` retry).
+    The caller bounds ``max_wait_seconds`` by the remainder of one budget; this
+    parameter makes the returned elapsed wait and the depth/wait bookkeeping
+    *cumulative* for the turn, so ``queued_duration=`` and the adaptive-timeout
+    subtraction see the whole wait instead of only the last slice
+    (LP-0MVV29Y1M004GAW0 AC2/AC3). It never changes wake-up logic or the
+    budget: the spend is deducted once, by the caller. The histogram observes
+    only this occupancy's own duration, so a two-wait turn is not
+    double-counted across both waits. Defaults to ``0.0`` — existing callers
+    are unchanged.
+
+    When *cause_out* is supplied it receives an explicit abandon cause on a
+    ``None`` return — ``"queue_depth_exceeded"`` when the depth cap refused to
+    enqueue the request, ``"queue_wait_expired"`` when the wait budget ran out
+    — so callers can log the reason instead of inferring it from the duration
+    (LP-0MVV29X2E004INFL AC1). The parameter defaults to ``None`` (no
+    behaviour change) so existing callers keep the ``float | None`` contract.
 
     *slot_free_check* is a zero-arg callable returning True when a local
     slot is currently free (e.g. ``lambda: _get_local_concurrency_info(config)[0] < max_local``).
@@ -295,16 +356,29 @@ async def wait_for_local_slot(
     retention class (LP-0MVIQ0G2M0006QF6 AC1): *eta_seconds* is this
     request's projected prefill, and *promote_after_seconds* bounds long-ETA
     starvation by treating a waiter older than that as highest priority.
+
+    *loss_reason* is the canonical fall-through reason recorded on
+    ``proxy_contention_queue_loss_total`` when the caps drop the request
+    (``fallback_after_queue`` by default; the lease-protected call site passes
+    ``local_lease_active``). It never changes queue behaviour.
     """
     cond = _get_condition()
     started = time.monotonic()
+    try:
+        spent = max(0.0, float(already_waited_seconds or 0.0))
+    except (TypeError, ValueError):
+        spent = 0.0
     async with cond:
         if len(_waiters) >= max_depth:
             # Depth cap exceeded — don't even enqueue; fall back immediately.
+            _record_loss(loss_reason)
+            if cause_out is not None:
+                cause_out.append("queue_depth_exceeded")
             return None
         if slot_free_check():
             # Slot already free (race between the decision point and here).
-            return 0.0
+            # The turn's earlier wait is still part of its queue spend.
+            return spent
         ev = asyncio.Event()
         ahead_of = _enqueue(
             (started, ev, session_id, retained, eta_seconds),
@@ -312,6 +386,9 @@ async def wait_for_local_slot(
             eta_ordering=eta_ordering,
             promote_after_seconds=promote_after_seconds,
         )
+        # AC2: publish depth on this admission decision, so a scrape is never
+        # stale by more than one enqueue.
+        _publish_depth()
         if retained and ahead_of > 0:
             try:
                 overtaken = next(
@@ -354,13 +431,25 @@ async def wait_for_local_slot(
         while True:
             remaining = max_wait_seconds - (time.monotonic() - started)
             if remaining <= 0:
+                _observe_wait(time.monotonic() - started)
+                _record_loss(loss_reason)
+                if cause_out is not None:
+                    cause_out.append("queue_wait_expired")
                 return None
             try:
                 await asyncio.wait_for(ev.wait(), timeout=remaining)
             except TimeoutError:
+                _observe_wait(time.monotonic() - started)
+                _record_loss(loss_reason)
+                if cause_out is not None:
+                    cause_out.append("queue_wait_expired")
                 return None
             if slot_free_check():
-                return time.monotonic() - started
+                # Cumulative for the turn (see *already_waited_seconds*); the
+                # histogram below records this occupancy's own duration only.
+                elapsed = spent + (time.monotonic() - started)
+                _observe_wait(time.monotonic() - started)
+                return elapsed
             # Spurious wake (another waiter claimed the slot) — keep waiting
             # for the remaining budget.
             ev.clear()
@@ -370,3 +459,6 @@ async def wait_for_local_slot(
                 if waiter[1] is ev:
                     del _waiters[i]
                     break
+            # AC2: publish depth on this dequeue decision too, so wins and
+            # timeouts both leave the gauge at the real waiter count.
+            _publish_depth()

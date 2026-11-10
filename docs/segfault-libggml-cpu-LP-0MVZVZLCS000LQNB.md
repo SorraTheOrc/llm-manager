@@ -1,7 +1,18 @@
 # llama-server SIGSEGV in `libggml-cpu.so.0.9.11` — diagnosis (LP-0MVZVZLCS000LQNB)
 
 Status: **diagnosis complete, classification: llama.cpp build defect (CPU backend),
-not a proxy defect**. No cores exist (`core_pattern=apport`, `ulimit -c 0`), so the
+not a proxy defect**.
+
+> **Correction (LP-0MW3K7Y3C003WEXW, 2026-11-05):** §2 and §3 below are
+> superseded. Measured against the artifact the running server actually maps
+> (`/home/rgardler/llama.cpp/build/bin/…`, via `/proc/<pid>/maps`), this build
+> **does** ship arch-specific quant kernels (61/90/14 `ymm` instructions in the
+> Q4_K/Q6_K/Q4_0 bodies) and the crash offsets `0x51048`/`0x51051`/`0x51057`
+> resolve to `ggml_cpu_extra_work_size` +`0x38`/`0x41`/`0x47` — the **CPU repack
+> extra-buffer-type dispatch**, not `ggml_compute_forward_div`. The fix is
+> `-DGGML_CPU_REPACK=OFF`, not arch flags; the census in §2 counted
+> `_generic`/`*avx*` symbol *names*, which no upstream build satisfies. Full
+> record: [build-record-llama-cpu-LP-0MW3K7Y3C003WEXW.md](build-record-llama-cpu-LP-0MW3K7Y3C003WEXW.md). No cores exist (`core_pattern=apport`, `ulimit -c 0`), so the
 report separates what is *proven* from what is *consistent-but-unproven*.
 
 The companion defect that turned each crash into a restart burst — the self-heal
@@ -37,7 +48,7 @@ plain null dereference and not of an alignment fault (an alignment fault is a
 Two distinct instruction offsets appear (`…048` and `…057`, 15 bytes apart), i.e.
 two neighbouring instructions in the same routine.
 
-## 2. Proven: the deployed CPU backend has no arch-specific quant kernels
+## 2. Superseded (see the correction banner): the deployed CPU backend has no arch-specific quant kernels
 
 The deployed artifacts (`/usr/local/bin/llama-server`, `/usr/local/lib64/libggml-cpu.so.0.9.11`,
 both dated 2026-04-13) were inspected:
@@ -64,14 +75,13 @@ reference code**, not the hand-written, alignment-audited AVX2/AVX-512 kernels
 upstream ships. That is a build/configuration defect class: the kernels that
 llama.cpp maintains specifically to be correct on this hardware are absent.
 
-`scripts/rebuild-llama.sh` configures with `-DGGML_HIP=ON` only (plus
-`LLAMA_OPENSSL`), which is consistent with the missing CPU arch kernels; the
-deployed artifacts predate the current script revision and may have been deployed
-via `--deploy-only` from an upstream build. **A rebuild with the CPU arch flags
-enabled is the candidate fix, and it is a follow-up item, not a silent scope
-expansion of this one.**
+`scripts/rebuild-llama.sh` now pins `-DGGML_NATIVE=ON` **and**
+`-DGGML_CPU_REPACK=OFF` and censuses every artifact before deploying it
+(LP-0MW3K7Y3C003WEXW). The two measurements in this section were taken on
+`/usr/local/lib64`, not on the library the running server maps, and the
+`_generic`/`*avx*` name metric cannot distinguish a good build from a bad one.
 
-## 3. Consistent, not proven: the failing code path
+## 3. Superseded (see the correction banner): the failing code path
 
 The kernel's printed `ip`, mapping start and file offset are mutually
 inconsistent for every crash (e.g. `ip …b289a048` with mapping

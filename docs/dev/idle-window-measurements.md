@@ -629,3 +629,30 @@ unchanged.
 stream through `proxy_to_local` and asserts the dispatch line carries
 `priority=` and `estimated_tokens=` without disturbing the pre-existing
 fields.
+
+## Last-resort rung (LP-0MVWAMY8M001KE4W): the post-deploy measurement
+
+The idle-admit rung this document measures is still priced by the flat
+`local_cold_prefill_budget_tokens` cap (25,000), which is why it refused
+1,291 of 1,337 attempts on 2026-10-30 while the GPU was idle and the remote
+chain was empty. The last-resort rung
+(`local_last_resort_idle_seconds`, default 300 s,
+`local_last_resort_deadline_seconds`, default 600 s) is the final rung of the
+same ladder and is **not** priced by that cap; it is covered by
+`proxy/tests/test_local_last_resort_admission.py`,
+`proxy/docs/routing.md` → "Last-resort local admission" and the comments on
+the two knobs in `proxy/config.yaml`.
+
+The ≥ 24 h post-deploy comparison (AC8) uses existing surfaces only:
+
+| Quantity | Source |
+| --- | --- |
+| Last-resort admissions | `grep -c '^.*local_last_resort_admit ' llama-proxy.log` (the line carries `estimated_tokens`, `new_tokens`, `idle_seconds`, `threshold_seconds`, `deadline_s`, `warm_cap`, `remote_exhausted=true`, `session`, `turn`) |
+| `All providers exhausted` inside idle gaps | the baseline this item measured: 236 of 686 in the 2026-10-29/30 window |
+| Evictions after acceptance, `reason=prefill_deadline` | usage report `local_evictions_after_acceptance` |
+| Discarded prefill tokens | usage report prefill-token accounting |
+
+The rung is only a success if the exhaustion count inside idle gaps falls
+**and** neither of the last two metrics rises; a rise in `prefill_deadline`
+evictions means `local_last_resort_deadline_seconds` is too low for the
+measured prompt-eval rate, and the knob (not the code) is the fix.

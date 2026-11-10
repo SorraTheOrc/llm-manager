@@ -192,6 +192,20 @@ def test_registry_direction_matches_the_parent_definition(metric_id, direction):
     assert registry_entry(metric_id).direction == direction
 
 
+def test_gpu_busy_names_its_hardware_scope_and_keeps_a_comparable_history():
+    """AC4 (LP-0MW5K8YE9001QO39): the scorecard label names the hardware
+    scope (power-based, any GPU consumer) rather than reading as local model
+    utilisation, while the unit and direction stay unchanged so the recorded
+    history remains comparable."""
+    metric = registry_entry("gpu_busy")
+
+    assert "power-based" in metric.label
+    assert "any consumer" in metric.label
+    assert "any GPU consumer" in metric.source
+    assert metric.unit == "%"
+    assert metric.direction == HIGHER
+
+
 # --- Direction-aware retention ---------------------------------------------
 
 

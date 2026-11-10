@@ -1,0 +1,7 @@
+
+00000000000f22c0 <ggml_vec_dot_q4_K_q8_K>:
+   f22c0:	f3 0f 1e fa          	endbr64
+   f22c4:	41 b8 01 00 00 00    	mov    $0x1,%r8d
+   f22ca:	48 89 d1             	mov    %rdx,%rcx
+   f22cd:	48 89 f2             	mov    %rsi,%rdx
+   f22d0:	e9 ab b4 f5 ff       	jmp    4d780 <ggml_vec_dot_q4_K_q8_K_generic>

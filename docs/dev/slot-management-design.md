@@ -844,10 +844,13 @@ Approach A plus the occupancy work that followed it:
   (`LP-0MVT2QFAP0082BKR`): a stored total is read only while the session still
   owns the slot it was captured against (the ownership gate is the backstop),
   and the `(model, session)` entry is cleared on eviction
-  (`router_helpers._record_local_eviction`), on slot release/reassignment
-  (`session._free_slot_assignment`) and on a model switch
+  (`router_helpers._record_local_eviction`), when a **different** session takes
+  the slot (`session._slot_id_for_session`), on a session invalidation
+  (`session._invalidate_session_and_slot`) and on a model switch
   (`lifecycle.ensure_model_loaded`). After a clear the next decision reports
   `measurement=unavailable:no_prior_measurement` rather than a stale ratio.
+  A plain slot release (`session._free_slot_assignment`) **keeps** it — see
+  the candidate-first ordering below.
 - **Session tenancy bound**: at most `local_session_tenants` (default: the slot
   count) distinct sessions hold a local reservation at once; a further session
   follows the normal chain instead of evicting a resident. Same-session
@@ -876,6 +879,316 @@ Not shipped here, deliberately: no slot-count change (evaluated separately in
 workload), and no client-side cooperation (the proxy remains the sole owner of
 abandonment reaping).
 
+## 7. Candidate-first admission (LP-0MW959P9S005DJY7)
+
+Section 6's residency gate measured *after* the fact: `_should_skip_local`
+probed the session's residency **before** any slot assignment, so on a pool
+whose slots are handed back at the end of every dispatch the session owned
+nothing at decision time. The probe therefore reported
+`measurement=unavailable:no_slot` on **3 363 of ~4 500** local admissions
+(≈75 %) and the decision fell back to the predicted sidecar ratio — which
+priced a 55 492-token prompt at `new_tokens=172`.
+
+Candidate-first admission reverses the order:
+
+1. **Assign, then measure.** `provider._should_skip_local` acquires a slot
+   candidate (`session.acquire_slot_candidate`, the explicit seam instead of
+   the assign-as-side-effect inside `session._build_slot_context`) before
+   `resolve_resident_prefix` runs. Acquisition registers ownership in
+   `session._slot_owners`, the registry every residency rung already reads, so
+   the resolution needs no new input and the measurement is of the candidate
+   slot. Positively, the existing `router.proxy_to_local` call to
+   `_build_slot_context` then re-enters the same assignment idempotently for
+   the dispatch (no double-assign).
+2. **`unavailable:no_slot` means the pool is full.** It is emitted only when
+   no candidate could be assigned (pool exhausted). A candidate with no prior
+   dispatch reports `unavailable:no_prior_measurement` on the `session_slot`
+   rung; a candidate with a measurement reports `measured` on
+   `measured_last_dispatch`.
+3. **The measurement survives the turn boundary.** Every dispatch ends with
+   `_free_slot_assignment`, so the measurement is no longer cleared there: the
+   session's next admission re-acquires a candidate and is priced from its
+   last measured dispatch. What invalidates it is a **change of hands** —
+   `_slot_id_for_session` remembers the slot's last tenant and forgets that
+   tenant's measured prefill (all models) when a different session takes it,
+   so a new tenant never inherits the previous tenant's prefix size — plus
+   eviction, session invalidation and model switch.
+4. **Stale view re-read once.** When the residency view is absent or older
+   than `RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS`, `resolve_resident_prefix`
+   re-reads it **exactly once** before falling back, so a just-missed ~1 s
+   snapshot refresh is not reported as an unmeasurable pool. The re-read is
+   still in-memory only: `/slots` is never queried on the admission path
+   (`LP-0MUXTW4MD003TVIC`).
+5. **Fail-open.** No configured slot pool, no session id or an unreadable
+   registry means no candidate, and the ladder keeps its pre-change verdict
+   (`unavailable:no_slot` / `unavailable:stale_view`) instead of fabricating
+   occupancy. An unavailable candidate degrades one rung; it never refuses
+   local on absent data.
+
+The measurement ladder itself (rungs and `measurement=` vocabulary) is
+unchanged: `measured` → `measured_last_dispatch` → `session_slot` →
+`non_resident` / `unknown`. On the deployed b8782 build, which reports no
+per-slot `n_past` / `n_prompt_tokens_processed`, the live rung stays
+unreachable and `measured_last_dispatch` carries the measurement.
+
+## 8. Clean release of a refused candidate (LP-0MW959PWL001WYSM)
+
+Section 7 moves capacity acquisition into the admission path, which makes an
+acquired-but-refused candidate a **fabricated occupancy**: the registry says
+the slot is taken while nothing will ever dispatch on it, so the next real
+request reads a full pool, falls to `unavailable:no_slot` and is denied by the
+cold threshold. The release contract closes that hole.
+
+1. **One acquire point, one release seam.** `_should_skip_local` is now a thin
+   lifecycle wrapper around the verdict (`_should_skip_local_verdict`). When
+   the caller supplies no candidate the wrapper acquires one *before* the
+   verdict — so even the outermost `context_too_large` rung has one — and
+   releases it on **every** refusal rung and on **any exception** raised
+   inside the decision. The release goes through the single seam
+   `session.release_slot_candidate` → the same registry release the ordinary
+   end-of-turn path (`_free_slot_assignment`) uses; no refusal path invents
+   its own release.
+2. **The call site owns the lifecycle.** `_proxy_with_fallback_cycle` wraps
+   the candidate in `provider._AdmissionCandidateLease` and releases it from
+   the attempt's `finally`, so the ladder refusal, the compaction bail-out,
+   the prefill-ETA/capacity guard refusal, a `continue`/`return` and an
+   exception all return the candidate. Only the point immediately before
+   `_dispatch_local` calls `keep()`, after which the lease never releases.
+   The reason recorded on the lease is the refusing rung's skip reason, so the
+   ETA-guard refusal names `prefill_budget_exceeded` rather than a generic
+   token.
+3. **The contention-queue refusal is covered too.** The queue decision point
+   runs the same ladder through `_queue_context_bypass`, and
+   `_maybe_queue_for_local_slot` releases a held candidate when the guard
+   refuses admission or the bounded wait expires (the request falls back).
+   `session.release_session_candidate` is the session-scoped form for that
+   case, where the candidate was acquired deeper than the caller's variable.
+4. **Admission keeps the candidate.** A refused admission releases; an
+   admitted one does not. Ownership passes to the existing slot bookkeeping
+   unchanged — `_build_slot_context` re-enters the same assignment
+   idempotently at dispatch — so there is no second assignment and no release
+   at admission time. This holds when an override (idle admit, capacity
+   admit, last-resort admit) re-admits a prompt the ladder refused: the
+   candidate is still held, because the release happens only after every
+   override has had its say.
+5. **Nothing is left behind, and release is idempotent.** A refusal never
+   dispatches, so it creates no dispatch-lease record, saves no
+   `slot_<session>.bin` snapshot and emits no `abandoned_slot_recorded` (an
+   abandoned slot means a *dispatched* request that never reported). The
+   release emits exactly one line:
+
+   ```
+   candidate_released reason=<skip_reason> session=<id> slot=<n> endpoint=<url>
+   ```
+
+   which makes an acquired-and-returned candidate operationally visible. A
+   second release of the same candidate is a **no-op** — the registry pop is
+   conditional on the session still owning the slot — so the `finally` safety
+   release can never double-free, and a run of refusals returns the registry
+   to its baseline size.
+
+Regression pins: `proxy/tests/test_local_resident_prefix_admission.py`
+(rung sweep, idempotence, leak, exception and keep-through-dispatch cases) and
+`proxy/tests/test_contention_queue_prefill.py` (the queue refusal release).
+
 Replay evidence for the 2026-10-24 thrash window:
 `proxy/tests/test_prefill_thrash_replay_2026_10_24.py` and
 `docs/dev/slot-thrashing-investigation/findings.md`.
+
+## 9. Exclusivity and deterministic busy-pool fallback (LP-0MW959QJ9002MKEI)
+
+Sections 7–8 moved capacity acquisition *into* the admission path. Two
+admissions can now race for the same pool at decision time — a race that did
+not exist when a slot was assigned later, at dispatch. This section pins the
+guarantees that make that safe; the code is the registry's own locking
+discipline, not a new mechanism.
+
+1. **Acquisition is atomic over the registry.** `session.acquire_slot_candidate`
+   delegates to `_slot_id_for_session`, whose lookup-then-assign runs as one
+   operation under `_slot_registry_lock` (`session._assign_slot_locked`). Two
+   concurrent admissions therefore never receive the same slot candidate: the
+   second sees the first's assignment and takes the next free slot. When the
+   pool cannot serve both, the loser gets an explicit `None` (a refusal), never
+   a shared slot. The lock is held only across pure dict work — never across an
+   `await`, an upstream call or a config read — so it adds no wait primitive and
+   cannot be held unboundedly.
+2. **Release is atomic and conditional on ownership.** `release_slot_candidate`
+   / `release_session_candidate` / `_free_slot_assignment` all funnel into
+   `_release_slot_locked`, which pops only when the candidate's session still
+   owns the slot. A double release is therefore a reported no-op rather than a
+   double free, and a late release can never steal a slot another session has
+   since been assigned.
+3. **A busy pool falls back deterministically, on the existing ladder.** When
+   the pool is full no candidate is assigned, the session is measured
+   `non_resident` against a fresh view, and the admission is denied with
+   `resident_prefix_insufficient` — the same reason and the same
+   `residency_source` / `measurement=unavailable:no_slot` basis for identical
+   inputs, run after run. The request then follows the pre-existing ladder:
+   - capacity saturation while local was *admitted* waits in the contention
+     queue, bounded by `prefill_eta.wait_budget_seconds`
+     (`contention_queue_max_wait_seconds`), the one budget both the queue and
+     the admission guard read;
+   - a residency denial (the busy-pool case) never enqueues: it steps to the
+     next provider, and for a pin-local client the same reason becomes the
+     retryable local-only refusal — the queue stays empty, because waiting
+     cannot make another session's resident prefix reusable.
+4. **Idempotent same-session re-entry.** A session that already owns a
+   candidate re-enters the same assignment (`_assign_slot_locked` returns the
+   existing slot for its endpoint) and never consumes a second slot, including
+   under concurrent re-entry. The dispatch path's `_build_slot_context` relies
+   on exactly this to avoid a double assign.
+
+Regression pins (`proxy/tests/test_local_resident_prefix_admission.py`, F4
+section): the exclusive-assignment pin runs the race with a deliberately
+widened critical section, so it fails if the registry lock is removed rather
+than passing on a lucky interleaving; the concurrent-release pin widens the
+registry pop for the same reason; the churn and pool-exhaustion pins assert the
+aggregate invariants (one owner per slot, one slot per session, no leaked
+occupancy) under a hard join timeout, and `test_scenario2_*` pins the
+deterministic busy-pool reason.
+
+## 10. The added admission latency is measured and bounded (LP-0MW959R5S009WDM8)
+
+Sections 7–9 put two steps on the request hot path: the slot candidate
+acquisition and the residency resolution priced against that candidate. Admission
+runs for *every* local request, so an unmeasured addition is a regression risk
+the whole chain pays for. This section makes the added cost measurable per
+admission and bounds it.
+
+1. **Measured per admission, on the line the operator already reads.** The
+   ``routing_resident_prefix`` decision line gains one additive suffix,
+   ``admission_overhead_ms=<ms|none>``, appended **last** (after
+   ``threshold_value=``) so every pre-existing key keeps its position and the
+   shipped ``proxy-usage-analysis`` parser reads the line unchanged. The clock
+   is started in the router immediately **before** the candidate is acquired and
+   stopped the moment ``resolve_resident_prefix`` returns, so the figure is the
+   added work — not the ladder, not the upstream request. A disabled ladder
+   measures nothing and reports ``none``; a fabricated ``0.000`` would be
+   averaged in as an impossibly fast admission.
+2. **Bounded at p95 ≤ 50 ms, enforced by a replay of real traffic.** The
+   checked-in 2026-10-24 thrash fixture (1 978 captured admission attempts from
+   38 sessions) is replayed through the **real** admission path, and the
+   production field is read back and aggregated by
+   ``proxy/tests/prefill_thrash_replay_harness.py``
+   (``measure_admission_overhead`` → ``AdmissionOverheadReport``, nearest-rank
+   p50/p95, ``over_budget``/``within_budget``). The harness owns the fixture,
+   the sampling and the percentile maths; the ladder-specific fake pool state is
+   injected by the caller, so no second residency ladder is stood up.
+3. **The guard is itself tested.** A synthetic slow probe (60 ms in the
+   residency resolution) must trip the budget, so the check cannot pass on a
+   degraded or absent measurement: an unmeasured report is neither over budget
+   nor within it.
+4. **In-process only.** No new poller, task, thread or config knob: the measured
+   work is one atomic registry lookup plus the residency resolution, both over
+   already-cached state. A pin patches both ``/slots`` query helpers to raise
+   while a measured admission runs, so a synchronous upstream query on the hot
+   path — the >15 s hold this item must not regress
+   (``LP-0MUXTW4MD003TVIC``) — fails the suite.
+
+Measured on this host (fixture replay, 1 960 of 1 978 attempts priced by the
+ladder; the rest are below the cold threshold and take the early return):
+**p50 0.017 ms, p95 0.020 ms, max 1.65 ms** — three orders of magnitude inside
+the 50 ms budget. The figures are *fixture-derived*: the parent item's open
+question about whether a production-window measurement is additionally required
+is recorded on the child item.
+
+Regression pins: ``proxy/tests/test_local_resident_prefix_admission.py`` (F5
+section: the field on the line, no fabricated figure, no upstream query, the
+fixture replay's budget verdict and the slow-probe failure) and
+``proxy/tests/test_threshold_decision_logging.py`` (the field is appended, never
+interleaved).
+
+## 11. The decision line is the audit trail (LP-0MW959SE30012HJJ)
+
+Sections 7–10 made residency *measurable* (assign before measuring), *safely
+releasable* (a refusal leaves no occupancy) and *bounded* (p95 ≤ 50 ms). All
+three are worthless to an operator if the resulting verdict cannot be
+reconstructed afterwards: the motivating failure — a 55 492-token prompt
+admitted as ``new_tokens=172`` and evicted at 180.1 s — was visible only by
+triangulating four different lines.
+
+One INFO line, one seam. Every admission decision (admission **and** refusal)
+is emitted by the single logger ``provider._log_residency_decision``; this
+section's field is appended to it and there is no second decision log site.
+Field order, deployed keys first and the additive suffix last:
+
+| # | Field | Meaning |
+|---|-------|---------|
+| 1–3 | ``provider`` ``model`` ``decision`` | who decided what |
+| 4 | ``n_past_actual`` | the measured reusable prefix (``none`` when unmeasured) |
+| 5 | ``estimated_tokens`` | the request's priced size |
+| 6 | ``reuse_ratio`` | measured reuse (``none`` when there is no measurement) |
+| 7 | ``slot_owner_session`` | the other key of the residency comparison |
+| 8 | ``residency_source`` | the measurement rung (Section 6's ladder) |
+| 9 | ``measurement`` | ``measured`` or the closed ``unavailable:<reason>`` |
+| 10–13 | ``min_ratio`` ``tenants`` ``occupants`` ``session`` | the gate's own inputs |
+| 14–15 | ``threshold_applied`` ``threshold_value`` | which cold/warm cap governed |
+| 16 | ``admission_overhead_ms`` | the added work's measured cost (§10) |
+| 17 | ``slot_candidate`` | the slot the verdict was measured against (§7) |
+| 18 | ``new_tokens`` | **the priced uncached count the verdict was held to** |
+
+Fields 1–15 are the deployed contract and may never move or be renamed;
+fields 16–18 were appended by this group in that order. Additive-only is what
+keeps a positional consumer of the pre-change line (and the shipped
+``proxy-usage-analysis`` parser) reading a new line unchanged.
+
+``new_tokens=`` is the number the decision actually compared against the cold
+cap, priced **once** on the rung that prices it — never re-derived in the
+logger, so the logged figure cannot drift from the deciding one:
+
+- **measured rungs** (``measured`` / ``measured_last_dispatch`` /
+  ``session_slot``): ``estimated_tokens - min(n_past_actual,
+  estimated_tokens)`` — the live-prefix price of §6 rung 4, which is also the
+  price a ``resident_prefix_insufficient`` refusal reports (the price the
+  prompt was refused *instead of*);
+- **predicted-ratio rollout** (``local_unmeasured_residency_cold_enabled:
+  false``, decisions ``admit_predicted`` / ``skip_predicted``):
+  ``int(estimated_tokens × (1 − cached_ratio))`` — the sidecar price;
+- **rungs that refuse before pricing** (``context_too_large``,
+  ``unmeasured_residency_cold``, ``tenant_limit``): ``none``. A ``0`` would be
+  a fabricated measurement the usage report could read as "nothing to
+  prefill"; the same discipline as ``reuse_ratio=none`` and
+  ``admission_overhead_ms=none``.
+
+So a wrong price is traceable from the line alone:
+``slot_candidate=0 n_past_actual=30000 estimated_tokens=49103
+new_tokens=19103 residency_source=measured_last_dispatch measurement=measured
+decision=admit`` reconstructs the arithmetic, and the same line with
+``decision=resident_prefix_insufficient`` / ``new_tokens=48365`` shows a refusal
+taken on the *basis*, not on the price.
+
+Regression pins: ``proxy/tests/test_local_resident_prefix_admission.py`` (F7
+section: the full key order pinned for an admission **and** a refusal, the
+priced value on each pricing rung, ``none`` when no rung priced the prompt) and
+``proxy/tests/test_resident_prefix_config_docs.py`` (the grammar line and this
+section cannot drift from the code).
+
+## 12. Group hand-off: restart and dated titles (LP-0MW959SE30012HJJ)
+
+This section records what this group of items does **not** do, so an operator
+does not look for it in the admission code.
+
+- **No independent restart.** Nothing in this group restarts the proxy.
+  The single restart is performed once, for the whole group, by the validation
+  item **LP-0MW7V0S6A006DKZ4** via `/skill:start-proxy --restart`, which
+  records the old/new PID, the start time, the deployed HEAD and `/health`.
+  Deploying an admission-ordering change by restarting per item would put a
+  different group under test in every measurement window, which is exactly what
+  the group-serialised restart exists to prevent.
+- **Dated-title re-anchoring belongs to the same restart.** Because the
+  restart is the group's only one, it is also the only instant at which titles
+  carrying a date are re-anchored: LP-0MW7V0S6A006DKZ4 enumerates every
+  non-terminal item whose title contains a date (`\d{4}-\d{2}-\d{2}`) — **12**
+  at creation — and either re-anchors the date to the new restart (recording
+  old → new) or states why it is unchanged, one comment per item plus a
+  summary comment. Per-item restarts would have to re-anchor repeatedly; a
+  group restart re-anchors once.
+- **No slot-count, context-size or residency-threshold change.** Those belong
+  to LP-0MVN3KPEC007WWL5 and the sibling residency item LP-0MW7V292T0020G02
+  (§6). This group only changes *when* residency is measured, how a refused
+  candidate is released, how the added latency is bounded and what the decision
+  line reports.
+
+Read this section together with §11: the fields an operator audits after the
+validation window are the ones in §11's table, and the window itself (and the
+title re-anchoring that dates it) is LP-0MW7V0S6A006DKZ4's.

@@ -172,6 +172,20 @@ def _srv():
     return sys.modules[__name__]
 
 
+def _select_current_model_from_preload(resolved: list[str]) -> str | None:
+    """Select a chat model from the resolved preload list for ``current_model``.
+
+    LP-0MVWBYAGL004BV8X: prefer a non-embed model so that model-scoped paths
+    (slot polling, ``/status`` capacity reporting, SSE per-slot detail) target
+    the chat child rather than an embed preset such as ``mxbai-embed``.
+
+    Returns the first non-embed model id, falling back to ``resolved[0]`` when
+    every preload entry is embed, or ``None`` when ``resolved`` is empty.
+    """
+    non_embed = _non_embed_model_ids(resolved)
+    return non_embed[0] if non_embed else resolved[0] if resolved else None
+
+
 async def _release_lease_on_session_eviction(session_id: str) -> None:
     """Callback invoked when a session is evicted from the session manager.
 
@@ -182,10 +196,17 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
     try:
         import proxy.server as _srv
         from proxy.router_helpers import (
+            _claim_local_dispatch_credit,
+            _close_stream_cm,
             _dispatch_key_session_id,
+            _dispatch_lease_key,
             _emit_eviction_after_acceptance,
             _endpoint_from_record,
+            _note_local_dispatch_release,
+            _record_abandoned_identity,
             _release_local_dispatch,
+            _resolve_abandoned_slot_identity,
+            _spawn_detached_release,
         )
 
         # LP-0MVN4LCED00661MX AC1 (``slot_assignment_freed``): capture the
@@ -218,12 +239,6 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # AC1 (LP-0MVRMI5HK00558TB): capture the slot identities the evicted
         # session owns BEFORE the release frees the assignments (the release
         # below pops the records, the markers and the slot registry entries).
-        from proxy.router_helpers import (
-            _close_stream_cm,
-            _record_abandoned_identity,
-            _resolve_abandoned_slot_identity,
-            _spawn_detached_release,
-        )
 
         abandoned_slots = []
         for record_endpoint, _record in released_records:
@@ -252,6 +267,21 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # Release every record owned by the session: the legacy string key
         # first, then each per-endpoint record (AC1). ``_release_local_dispatch``
         # also frees the corresponding slot assignments and prefill markers.
+        #
+        # LP-0MVWF78QK0060TZH AC1/AC2 (row 13 of the AC2 audit): releasing an
+        # evicted session's records used to drop the record and keep its
+        # ``local_active_queries`` increment — the session is gone, so no
+        # owning request cleanup exists to release it and the counter stayed
+        # inflated until the self-healing clamp repaired it. The credit is now
+        # claimed together with its record in one critical section, so a racing
+        # completion cleanup for the same lease cannot decrement it twice.
+        for record_endpoint, record in released_records:
+            record_key = _dispatch_lease_key(record_endpoint, session_id)
+            # One credit per outstanding dispatch on the record: the session is
+            # gone, so every one of them is released here (a single shared
+            # record can hold several after overlapping turns).
+            while await _claim_local_dispatch_credit(_srv, record_key):
+                pass
         await _release_local_dispatch(_srv, session_id)
         for record_endpoint in {ep for ep, _ in released_records if ep}:
             await _release_local_dispatch(_srv, session_id, endpoint=record_endpoint)
@@ -273,6 +303,16 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
             "lease_released session=%s reason=session_evicted",
             session_id if session_id else "unknown",
         )
+        # LP-0MVYWLHNI000AQ7X AC1: release attribution for the self-healing
+        # clamp (the evicted session's request never runs its own cleanup).
+        for record_endpoint, record in released_records:
+            _note_local_dispatch_release(
+                _srv,
+                session_id,
+                reason="session_evicted",
+                record=record,
+                endpoint=record_endpoint,
+            )
         # Report each accepted-but-unserved dispatch exactly once (AC3); a
         # session with no dispatch record was never accepted, so it is normal
         # churn — no ERROR, no counter increment (AC2).
@@ -346,6 +386,12 @@ async def _dispatch_cleanup_loop() -> None:
 # Health/readiness signal for local backend
 backend_ready: bool = False
 
+# LP-0MW42T6IJ006EQA3: monotonic deadline until which local routing skips
+# the backend (armed by a deterministic connection-refused local dispatch or
+# a failed reachability probe; cleared by a successful dispatch or probe).
+# ``0.0`` = not armed. Owned by ``proxy.observability`` helpers.
+local_backend_unreachable_until: float = 0.0
+
 # Self-healing state for backend recovery attempts
 backend_recovery_state: dict = {
     "in_progress": False,
@@ -361,6 +407,11 @@ backend_watchdog_task: asyncio.Task | None = None
 
 # Background TTS watchdog task (started in lifespan)
 tts_watchdog_task: asyncio.Task | None = None
+
+# Background death-capture sampling task (LP-0MW3K7WD6003TJKZ). It self-disables
+# unless ``server.death_capture_enabled`` is true, so it can be spawned
+# unconditionally alongside the watchdogs.
+death_capture_task: asyncio.Task | None = None
 
 # TTS self-healing recovery state
 # Mirrors backend_recovery_state but for TTS server
@@ -988,8 +1039,7 @@ def _startup_launch_default_model_loader() -> asyncio.Task:
                         if not await router_preload_models(resolved):
                             raise RuntimeError(f"Router preload failed for {router_preload_list}")
                         logger.info(f"Router preload complete: {router_preload_list}")
-                        if resolved:
-                            current_model = resolved[0]
+                        current_model = _select_current_model_from_preload(resolved)
 
                     return
 
@@ -1059,6 +1109,7 @@ def _startup_launch_watchdog_tasks():
     double-initialization).
     """
     global backend_watchdog_task, tts_watchdog_task, model_health_task
+    global death_capture_task
     loop = asyncio.get_running_loop()
     if backend_watchdog_task is None:
         backend_watchdog_task = loop.create_task(_backend_watchdog_loop())
@@ -1066,6 +1117,10 @@ def _startup_launch_watchdog_tasks():
         tts_watchdog_task = loop.create_task(_tts_watchdog_loop())
     if model_health_task is None:
         model_health_task = loop.create_task(_router_model_health_loop())
+    if death_capture_task is None:
+        from .death_capture import death_capture_loop
+
+        death_capture_task = loop.create_task(death_capture_loop())
 
 
 def _startup_restore_provider_state() -> tuple[int, int]:
@@ -1371,6 +1426,7 @@ async def _shutdown_cleanup_tasks():
     Sets each task reference to ``None`` after completion.
     """
     global _dispatch_cleanup_task, backend_watchdog_task, tts_watchdog_task
+    global death_capture_task
     if _dispatch_cleanup_task is not None:
         _dispatch_cleanup_task.cancel()
         try:
@@ -1394,6 +1450,14 @@ async def _shutdown_cleanup_tasks():
         except (Exception, asyncio.CancelledError):
             pass
         tts_watchdog_task = None
+
+    if death_capture_task is not None:
+        death_capture_task.cancel()
+        try:
+            await death_capture_task
+        except (Exception, asyncio.CancelledError):
+            pass
+        death_capture_task = None
 
 
 async def _shutdown_http_client():
@@ -1804,6 +1868,9 @@ from .router import (  # noqa: E402, F401
     log_response_chunk,
     proxy_to_local,
     proxy_to_remote,
+)
+from .router_helpers import (  # noqa: E402
+    _non_embed_model_ids,
 )
 from .session import (  # noqa: E402, F401
     ContentOnlyConsoleHandler,

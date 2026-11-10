@@ -30,6 +30,7 @@ All tests are hermetic: no live llama-server, no GPU.
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -484,3 +485,227 @@ async def test_health_reports_unhealthy_after_broken_relay(tmp_path, monkeypatch
 
     health = await handlers.health_check()
     assert health["llama_log_source_healthy"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LP-0MVZ4UDF10029NDS: rotation must not strand a preserved backend's log
+#
+# A proxy-only restart preserves the running llama-server and adopts it. If the
+# restart also rotates llama-server.log, the backend keeps writing to the
+# *pre-rotation* inode (renamed llama-server.1.log) while the proxy watches the
+# fresh path, so the watched log freezes and /health reports
+# llama_log_source_healthy=false. Rotation must be deferred while a live writer
+# holds the file.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _start_log_writer(log_path: Path) -> subprocess.Popen:
+    """Start a real process whose stdout is ``log_path`` (a live writer).
+
+    Mirrors the preserved llama-server: the child owns the write fd, so the
+    parent must not open the file itself (otherwise the parent would also count
+    as a live writer and mask the assertions).
+    """
+    log_file = open(log_path, "a", encoding="utf-8")
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import time\n"
+            "i = 0\n"
+            "while True:\n"
+            "    print('backend line', i, flush=True)\n"
+            "    i += 1\n"
+            "    time.sleep(0.02)\n",
+        ],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    log_file.close()
+    return child
+
+
+def _wait_for_content(log_path: Path, needle: str = "backend line", timeout: float = 10.0) -> str:
+    deadline = time.time() + timeout
+    content = ""
+    while time.time() < deadline:
+        content = log_path.read_text(encoding="utf-8")
+        if needle in content:
+            return content
+        time.sleep(0.02)
+    return content
+
+
+def test_rotate_defers_when_live_writer_holds_log(tmp_path, monkeypatch):
+    """A preserved backend still holds the file: rotate nothing (AC3)."""
+    log_path = tmp_path / "llama-server.log"
+    log_path.write_text("existing window\n", encoding="utf-8")
+    child = _start_log_writer(log_path)
+    srv = _make_srv(log_dir=tmp_path)
+    monkeypatch.setattr(lifecycle, "_srv", lambda: srv)
+    try:
+        assert "backend line" in _wait_for_content(log_path)
+        inode_before = log_path.stat().st_ino
+
+        assert lifecycle.rotate_llama_logs(log_path) is False
+
+        assert not (tmp_path / "llama-server.1.log").exists(), (
+            "rotation must be deferred while a live writer holds the log"
+        )
+        assert log_path.stat().st_ino == inode_before
+        assert any(
+            "Deferring llama-server log rotation" in str(c.args[0])
+            for c in srv.logger.info.call_args_list
+        )
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+
+
+def test_rotate_renames_when_no_live_writer(tmp_path, monkeypatch):
+    """Normal rotation still works when nothing is writing (no regression)."""
+    log_path = tmp_path / "llama-server.log"
+    log_path.write_text("old window\n", encoding="utf-8")
+    srv = _make_srv(log_dir=tmp_path)
+    monkeypatch.setattr(lifecycle, "_srv", lambda: srv)
+
+    assert lifecycle.rotate_llama_logs(log_path) is True
+    assert not log_path.exists()
+    assert (tmp_path / "llama-server.1.log").read_text(encoding="utf-8") == "old window\n"
+
+
+def test_restart_with_preserved_backend_keeps_watched_log_live(
+    sig_path, tmp_path, monkeypatch
+):
+    """AC1/AC2: restart-with-rotation + preserved backend keeps the watched path live.
+
+    Reproduces the sequence: llama-server running (owns llama-server.log) →
+    proxy restart's spawn path rotates the log → the preserved backend is
+    adopted. The adopted backend's output must land in the watched
+    ``llama-server.log`` (never a rotated-away sibling), and ``/health`` must
+    report the log source healthy.
+    """
+    log_path = tmp_path / "llama-server.log"
+    log_path.write_text("", encoding="utf-8")
+    child = _start_log_writer(log_path)
+    monkeypatch.setattr(lifecycle, "_config_file_sha256", lambda: "hash")
+    monkeypatch.setattr(lifecycle, "_apply_backend_oom_protection", lambda *_a, **_k: None)
+    monkeypatch.setattr(lifecycle, "start_llama_log_tailer", lambda *_a, **_k: None)
+
+    class FakeProc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        lifecycle, "spawn_and_capture", lambda *a, **k: (FakeProc(), None)
+    )
+    srv = _make_srv(log_dir=tmp_path)
+    srv.rotate_llama_logs = lifecycle.rotate_llama_logs
+    srv.broadcast_status_sync = lambda *a, **k: None
+    srv.last_start_failure = None
+    monkeypatch.setattr(lifecycle, "_srv", lambda: srv)
+    try:
+        assert "backend line" in _wait_for_content(log_path)
+        inode_before = log_path.stat().st_ino
+
+        # The restart's spawn path attempts rotation while the backend writes.
+        assert lifecycle.start_llama_server("Qwen3") is not None
+        assert not (tmp_path / "llama-server.1.log").exists(), (
+            "a preserved backend's inode must remain the watched path"
+        )
+        assert log_path.stat().st_ino == inode_before
+
+        # The new proxy adopts the preserved backend.
+        srv.llama_process = None
+        monkeypatch.setattr(
+            lifecycle, "_probe_backend_reachable", AsyncMock(return_value=True)
+        )
+        assert (
+            asyncio.run(
+                lifecycle._try_adopt_running_llama_server(
+                    srv, "Qwen3", router_mode=False
+                )
+            )
+            is True
+        )
+        assert getattr(srv.llama_process, "adopted", False) is True
+        assert not getattr(srv, "llama_log_source_unhealthy", False)
+
+        # AC2: the watched path keeps advancing and /health says healthy.
+        before = log_path.read_text(encoding="utf-8")
+        after = before
+        deadline = time.time() + 10
+        while time.time() < deadline and after == before:
+            time.sleep(0.02)
+            after = log_path.read_text(encoding="utf-8")
+        assert after != before, "the adopted backend's output must keep landing in the watched log"
+        assert lifecycle._llama_log_age_seconds(srv) < 60
+        from proxy.handlers import _llama_log_source_healthy
+
+        assert _llama_log_source_healthy(srv) is True
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+
+
+def test_adoption_warning_names_frozen_path_and_live_sibling(
+    sig_path, tmp_path, monkeypatch
+):
+    """AC4: the unhealthy case names both the frozen path and the live inode.
+
+    Simulates a legacy stranded layout: ``llama-server.log`` is frozen (only a
+    failed-spawn placeholder) while the preserved backend writes to the rotated
+    sibling. Adoption must log a WARNING that names the watched path, the
+    backend's real ``/proc/<pid>/fd/1`` target and the remediation command.
+    """
+    watched = tmp_path / "llama-server.log"
+    rotated = tmp_path / "llama-server.1.log"
+    watched.write_text("failed spawn diagnostics only\n", encoding="utf-8")
+    rotated.write_text("", encoding="utf-8")
+    child = _start_log_writer(rotated)
+    monkeypatch.setattr(lifecycle, "_config_file_sha256", lambda: "hash")
+    monkeypatch.setattr(lifecycle, "_probe_backend_reachable", AsyncMock(return_value=True))
+    monkeypatch.setattr(lifecycle, "start_llama_log_tailer", lambda *_a, **_k: None)
+    monkeypatch.setattr(lifecycle, "_apply_backend_oom_protection", lambda *_a, **_k: None)
+    import proxy.backend_rss as backend_rss
+
+    monkeypatch.setattr(
+        backend_rss, "discover_llama_pids", lambda port=None: [child.pid]
+    )
+    try:
+        assert "backend line" in _wait_for_content(rotated)
+        lifecycle._write_llama_server_signature("Qwen3", 1, router_mode=False)
+
+        srv = _make_srv(log_dir=tmp_path)
+        assert (
+            asyncio.run(
+                lifecycle._try_adopt_running_llama_server(
+                    srv, "Qwen3", router_mode=False
+                )
+            )
+            is True
+        )
+
+        calls = [
+            c
+            for c in srv.logger.warning.call_args_list
+            if "relay is NOT attached" in str(c.args[0])
+        ]
+        assert calls, [
+            str(c.args[0]) for c in srv.logger.warning.call_args_list
+        ]
+        message, named_watched, named_live = calls[-1].args[0], calls[-1].args[1], calls[-1].args[2]
+        assert str(watched) == str(named_watched)
+        assert os.path.realpath(str(rotated)) == str(named_live)
+        assert "readlink /proc/" in message, (
+            "the WARNING must carry the remediation command"
+        )
+        assert getattr(srv, "llama_log_source_unhealthy", False) is True
+    finally:
+        child.terminate()
+        child.wait(timeout=10)

@@ -3,23 +3,36 @@
 # WHY NOT gpu_busy_percent
 # -----------------------
 # On this host (Strix Halo APU, Radeon 8060S iGPU, gfx1151) the driver's busy
-# counter SATURATES at ~20 W: it responds to load within seconds, but reads
-# ~100% for any draw above ~20 W, so idle-with-context stretches report as
-# busy. Measured 2026-10-28 over 7 days of Prometheus history (904 paired
-# samples): mean 94.5% busy against 28.1% of samples at compute power
-# (>= 90 W); 45.2% of samples read >= 90% while power was < 40 W; the longest
-# continuous saturated run was 5.3 h; it never under-reports (0.8% of samples
-# read < 90% while power >= 90 W), which is why a live reading looks
-# convincing. Earlier evidence (2026-07-31, LP-0MS9GA6QL007XTBP, "False-positive
-# guard" in proxy/proxy/backends/llama.py and the llama_gpu_wedge_* block in
+# counter is a two-state detector, not a percentage: its step sits at ~30 W, so
+# it reads 1-10% below 30 W and 92-99% from 30 W upward. The step is BELOW the
+# idle-with-display band (p50 45 W), so idle-with-context and computing both
+# read ~99% and the counter INVERTS across exactly the band that matters.
+# Re-measured 2026-11-06 on kernel 7.0.0-38-generic over the whole post-boot
+# window (2026-10-31 14:28 -> 2026-11-06 14:28 UTC, 25463 observed 15 s
+# samples): 99.2% mean busy at 40-60 W (GPU idle with an active display)
+# against 98.7% at 90-100 W (computing); 7.9% false-busy (busy >= 90% while
+# power < 40 W) and 1.7% false-idle (busy < 90% while power >= 90 W), so it
+# also under-reports slightly. The 20 W latch claim this comment used
+# to carry is retired: measured on the same recipe, the step was already at
+# ~30 W before the 2026-10-31 reboot (20-30 W read 10.2%), and that claim
+# invited the conclusion that the counter is fixed.
+#
+# The full measurement, the pre-reboot comparison column and the PromQL recipe
+# that recomputes every band live in monitoring/README.md, "Why not amd-smi,
+# rocm-smi or amdtop?" (canonical statement; cross-referenced, not restated).
+# Earlier evidence (2026-07-31, LP-0MS9GA6QL007XTBP, "False-positive guard" in
+# proxy/proxy/backends/llama.py and the llama_gpu_wedge_* block in
 # proxy/config.yaml) recorded 30/30 samples at 100 while power showed the GPU
-# idle (~54 W) and computing (~115 W); the saturation measured on 2026-10-28
-# (LP-0MVSQQO910077LYL) explains the same symptom with a threshold rather than
-# a stuck counter. gpu_busy_percent is NOT a utilisation signal here and must
-# not be used in any rule; the proxy's own wedge detector had to be disabled
-# because of it. `amd-smi` is not an alternative either: it reports N/A for
-# usage/power/clocks/energy on this APU, and `amdtop`/`rocm-smi` surface this
-# same counter (monitoring/README.md, "Why not amd-smi, rocm-smi or amdtop?").
+# idle (~54 W) and computing (~115 W); the measured step explains that same
+# symptom with a threshold rather than a stuck counter. gpu_busy_percent is NOT
+# a utilisation signal here and must not be used in any rule; the proxy's own
+# wedge detector had to be disabled because of it. It is also no longer
+# published: the 10 s sysfs sampler stopped reading the attribute on 2026-11-07
+# (LP-0MW5K8ZDZ007YSIX), so the series exists only as history inside the
+# retention window. `amd-smi` is not an
+# alternative either: it reports N/A for usage/power/clocks/energy on this APU,
+# and `amdtop`/`rocm-smi` surface this same counter (LP-0MVSQQO910077LYL,
+# LP-0MW5K7WKZ005VJXA).
 #
 # WHAT IS USED INSTEAD
 # --------------------
@@ -68,12 +81,15 @@
 #
 # QUERIES THESE RULES ENABLE
 # --------------------------
-#   avg_over_time(gpu:computing:bool[2h])      computing-time fraction (0..1)
+# The busy percentage is produced ONLY by scripts/gpu_utilisation.py (grid-
+# honest: computing + idle + unknown = 100 %, unknown explicit). It reads the
+# attributable rule below and does the share arithmetic locally. A bare
+# avg_over_time(<series>[Nh]) is coverage-blind — it renormalises over the
+# samples that happen to be present, so a gap inflates the figure — and must
+# not be quoted as a busy percentage.
 #   gpu:power_watts:avg5m                      smoothed power for dashboards
-#   sum_over_time(gpu:computing:bool[24h:15s]) * 15   computing seconds
-#   avg_over_time(gpu:computing_workload:bool[2h])    share of time the GPU was
-#                                                     doing OUR work (0..1, and
-#                                                     absent => unknown)
+#   gpu:computing:bool                         live power-only check (any consumer)
+#   gpu:computing_workload:bool                live attributable check (our work)
 #
 # Validation: `promtool check rules monitoring/gpu_compute_rules.yaml` and the
 # behavioural unit tests in monitoring/tests/gpu_rules_test.yml

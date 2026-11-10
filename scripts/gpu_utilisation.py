@@ -93,8 +93,38 @@ that is the contract working, not a bug.
       "warnings": []
     }
 
+``rule_cross_check`` keeps the same two keys whether or not it fires; the
+diagnosis (which rule diverged, and therefore which line of
+``monitoring/gpu_compute_rules.yaml`` to check) is in ``warnings``.
+
 Percentages are rounded to four decimal places; the sample counts are exact, so
 nothing is lost by the rounding.
+
+The rule cross-check
+--------------------
+``rule_cross_check`` recomputes ``gpu:computing:bool`` and
+``gpu:computing_workload:bool`` locally from the power and slot series and
+compares them with the recorded rules, so a drifted threshold or expression
+shows up as a ``warnings`` entry instead of a silently different definition.
+
+Both rules are evaluated by Prometheus on its own schedule, against the last
+sample at or before their evaluation instant — which is not necessarily the
+grid instant the CLI queries. At a power step or a slot-state change the
+recording can therefore sit one grid sample behind the raw series for reasons
+that have nothing to do with the definition. The comparison is consequently
+made against a recomputation over a ±1-sample window around the instant
+(earlier sample first, the direction a recording rule looks), so jitter is not
+reported as drift; a real definition change diverges at *every* instant and is
+still caught.
+
+Instants whose inputs are all frozen (nothing scraped or evaluated since the
+previous instant) are skipped: that is a dead sampler, and comparing one frozen
+sample set with another reports a rule drift for an outage.
+
+The warning names the half that actually diverged — ``gpu:computing:bool``
+(then ``THRESHOLD_WATTS`` is the thing to check) or
+``gpu:computing_workload:bool`` (then the power-and-slot expression is, and the
+warning says the threshold is not the cause).
 
 Exit codes
 ----------
@@ -128,6 +158,14 @@ SCRAPE_INTERVAL_SECONDS = 15
 #: definition.
 THRESHOLD_WATTS = 90.0
 HTTP_TIMEOUT_SECONDS = 10.0
+#: How many grid samples of staleness the rule cross-check tolerates on each
+#: input. A recording rule is evaluated on its own schedule against the last
+#: sample at or before that instant, so at a power step or a slot-state change
+#: it can legitimately see one grid sample earlier (or later) than the raw
+#: series query for the same instant. Comparing the recorded rule against a
+#: recomputation over that ±1-sample window separates timestamp jitter from a
+#: genuine definition drift (LP-0MW5K8YWG0069ZD8).
+CROSS_CHECK_STALENESS_SAMPLES = 1
 
 #: Every PromQL expression this CLI issues, in the order it issues them. Keeping
 #: them in one mapping means the shared-definition contract can be inspected
@@ -444,6 +482,105 @@ def classify_instant(
     return power_at_compute(power_watts, threshold) and busy_slots >= 1
 
 
+def cross_check_inputs_frozen(
+    *,
+    power: dict[int, float],
+    slots_busy: dict[int, float],
+    workload_bool: dict[int, float],
+    heartbeat: dict[int, float],
+    timestamp: int,
+    step_seconds: int,
+) -> bool:
+    """True when every cross-check input is the same sample as the previous instant.
+
+    Nothing has been scraped or evaluated since the previous instant, so the
+    latest samples are Prometheus' lookback handing back frozen values: the
+    recorded rule froze on the slot state it last saw, the raw series froze on
+    the next scrape, and the two can disagree by a sample forever after. That
+    is a dead sampler, not a definition drift, so the instant is skipped
+    instead of reporting a rule drift for it (LP-0MW5K8YWG0069ZD8).
+    """
+    previous = timestamp - step_seconds
+    for series in (power, slots_busy, workload_bool, heartbeat):
+        value = series.get(timestamp)
+        if value is None or series.get(previous) != value:
+            return False
+    return True
+
+
+def staleness_candidates(
+    points: dict[int, float],
+    timestamp: int,
+    step_seconds: int,
+    samples: int = CROSS_CHECK_STALENESS_SAMPLES,
+) -> list[float]:
+    """Values *timestamp* could legitimately have been evaluated against.
+
+    A recording rule evaluates against the last sample at or before its own
+    instant, which is not necessarily the grid instant the CLI queries, so a
+    cross-check that only reads ``points[timestamp]`` counts every slot-state
+    or power step as a definition drift. The candidate list is the sample at
+    the instant first, then its neighbours by increasing distance and earlier
+    before later (the direction a recording rule looks), with duplicates
+    dropped.
+    """
+    offsets = [0]
+    for distance in range(1, max(samples, 0) + 1):
+        offsets.extend((-distance, distance))
+
+    candidates: list[float] = []
+    for offset in offsets:
+        value = points.get(timestamp + offset * step_seconds)
+        if value is not None and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def cross_check_warning(
+    *,
+    mismatches: int,
+    compared_samples: int,
+    power_mismatches: int,
+    workload_mismatches: int,
+    threshold_watts: float,
+) -> str:
+    """Explain a cross-check failure by naming the rule that actually drifted.
+
+    ``THRESHOLD_WATTS`` is named only for a power-classification divergence: a
+    slot-join drift cannot be produced by the threshold, so pointing the
+    operator at it would send them to the wrong line
+    (LP-0MW5K8YWG0069ZD8).
+    """
+    causes = []
+    if power_mismatches:
+        causes.append(
+            f"{power_mismatches} instants where gpu:computing:bool is not the "
+            f"local {threshold_watts:g} W classification (check the threshold "
+            f"in monitoring/gpu_compute_rules.yaml against "
+            f"THRESHOLD_WATTS={threshold_watts:g})"
+        )
+    if workload_mismatches:
+        remedy = (
+            "check the power-and-slot expression in "
+            "monitoring/gpu_compute_rules.yaml"
+        )
+        if not power_mismatches:
+            remedy += (
+                " — the power classification itself agrees, so the power "
+                "threshold is not the cause"
+            )
+        causes.append(
+            f"{workload_mismatches} instants where gpu:computing_workload:bool "
+            f"is not the local recomputation ({remedy})"
+        )
+    return (
+        f"the recorded rules disagree with the local recomputation at "
+        f"{mismatches} of {compared_samples} instants (outside a "
+        f"±{CROSS_CHECK_STALENESS_SAMPLES}-sample staleness window): "
+        + "; ".join(causes)
+    )
+
+
 @dataclass(frozen=True)
 class GpuUtilisation:
     """Measured GPU utilisation for one window, with explicit coverage."""
@@ -592,6 +729,7 @@ def compute_utilisation(
 
     computing = idle = power_only = 0
     cross_checked = mismatches = 0
+    power_mismatches = workload_mismatches = 0
     for index in range(expected):
         timestamp = window.start + index * step_seconds
         workload = workload_bool.get(timestamp)
@@ -606,20 +744,38 @@ def compute_utilisation(
         if alive and computing_flag is not None and computing_flag >= 0.5:
             power_only += 1
 
-        if timestamp in power and timestamp in slots_busy and workload is not None:
-            cross_checked += 1
-            local_workload = classify_instant(
-                power[timestamp], slots_busy[timestamp], threshold_watts
+        if (
+            timestamp in power
+            and timestamp in slots_busy
+            and workload is not None
+            and not cross_check_inputs_frozen(
+                power=power,
+                slots_busy=slots_busy,
+                workload_bool=workload_bool,
+                heartbeat=heartbeat,
+                timestamp=timestamp,
+                step_seconds=step_seconds,
             )
-            diverged = local_workload != (workload >= 0.5)
-            if (
-                not diverged
-                and computing_flag is not None
-                and power_at_compute(power[timestamp], threshold_watts)
-                != (computing_flag >= 0.5)
-            ):
-                diverged = True
-            mismatches += int(diverged)
+        ):
+            cross_checked += 1
+            power_here = staleness_candidates(power, timestamp, step_seconds)
+            slots_here = staleness_candidates(slots_busy, timestamp, step_seconds)
+            workload_agrees = any(
+                classify_instant(recorded_power, busy, threshold_watts)
+                == (workload >= 0.5)
+                for recorded_power in power_here
+                for busy in slots_here
+            )
+            power_agrees = True
+            if computing_flag is not None:
+                power_agrees = any(
+                    power_at_compute(recorded_power, threshold_watts)
+                    == (computing_flag >= 0.5)
+                    for recorded_power in power_here
+                )
+            power_mismatches += int(not power_agrees)
+            workload_mismatches += int(not workload_agrees)
+            mismatches += int(not (power_agrees and workload_agrees))
 
     observed = computing + idle
     unknown = expected - observed
@@ -629,10 +785,13 @@ def compute_utilisation(
     warnings: list[str] = []
     if mismatches:
         warnings.append(
-            f"the recorded rules disagree with the local recomputation at "
-            f"{mismatches} of {cross_checked} instants: check "
-            f"monitoring/gpu_compute_rules.yaml against THRESHOLD_WATTS="
-            f"{threshold_watts:g}"
+            cross_check_warning(
+                mismatches=mismatches,
+                compared_samples=cross_checked,
+                power_mismatches=power_mismatches,
+                workload_mismatches=workload_mismatches,
+                threshold_watts=threshold_watts,
+            )
         )
 
     return GpuUtilisation(

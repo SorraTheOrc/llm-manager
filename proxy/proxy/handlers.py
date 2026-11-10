@@ -459,7 +459,16 @@ async def get_llama_local_status(request: Request):
          "local_route_available": bool,
          "local_route_reason": str | None,
          "local_route_cooldown_remaining_s": int | None,
+         "slots_snapshot_source": str,
+         "slots_snapshot_age_seconds": float | None,
          "status_schema_version": int}
+
+    ``slots_snapshot_source`` (``upstream`` | ``snapshot`` | ``ttl_cache`` |
+    ``failure_backoff`` | ``none``) and ``slots_snapshot_age_seconds`` publish
+    the provenance of the served ``/slots`` data — which read path produced it
+    and how old the snapshot is — so a degraded poll's authoritative-path
+    choice is visible in the payload itself (LP-0MW3ED73W007JYGI). They mirror
+    the same-named ``status_request`` log fields and are additive.
 
     ``local_idle_seconds`` reports how long the local backend has been idle
     (LP-0MVGD9Z8Z0055Y5J) — the same monotonic signal the idle-aware routing
@@ -506,6 +515,16 @@ async def get_llama_local_status(request: Request):
     ``availability_unknown: true`` flag says why: availability is **not**
     asserted from a stale list (AC3). ``total_slots`` is never smaller than
     the served ``slots[]`` length, so ``0 <= available_slots <= total_slots``.
+    When only the *counts* pair came from the last-known cache while the
+    detail snapshot is fresh (``slot_counts_stale: true`` with
+    ``slots_detail_stale: false``), the cached counts are likewise never
+    published as a positive ``available_slots``: they are withheld (``0`` plus
+    ``availability_unknown: true``) so the payload cannot pair a fossil
+    ``available_slots>0`` with a fresh-detail ``saturated`` /
+    ``abandoned_busy`` hint (LP-0MVXSX0TZ00798KA; the 2026-10-30 06:01:20
+    shape, where the cached counts said 1 of 2 free while the fresh detail
+    showed both slots decoding). The fresh detail still drives
+    ``capacity_hint`` and the served ``slots[]``.
 
     When llama-server is running with a model loaded but the ``/slots``
     query fails (e.g. HTTP 500 while the model reloads after a cheap-mode
@@ -517,9 +536,11 @@ async def get_llama_local_status(request: Request):
     (worker alive but zero dispatches across an idle window) is observable.
     The two sources are also published separately:
     ``slot_counts_stale`` and ``slots_detail_stale``. Only the detail matters
-    for capacity: a cached ``is_processing``/``phase`` is a fossil of a past
-    request, so a hint derived from it is reconciled with live proxy state
-    (see ``capacity_hint`` below, LP-0MVKSXR4P001V0CM AC3).
+    for the capacity *hint*: a cached ``is_processing``/``phase`` is a fossil
+    of a past request, so a hint derived from it is reconciled with live proxy
+    state (see ``capacity_hint`` below, LP-0MVKSXR4P001V0CM AC3). The counts
+    pair feeds ``available_slots`` only when both reads are fresh; a
+    cache-served counts pair is withheld (see above).
 
     ``slots`` carries the per-slot details (``slot_id``, ``is_processing``,
     ``n_decoded``) from llama-server's ``/slots`` endpoint so consumers such
@@ -685,7 +706,7 @@ async def get_llama_local_status(request: Request):
     except Exception:
         active = False
 
-    # -- local active queries (non-blocking snapshot, LP-0MSL2ZLLS009RVKR) --
+    # -- local active queries: sampled AFTER the /slots query --------------
     # The global counter above also counts remote provider streams, so herdr
     # dispatch needs a local-only signal. local_active_query=true implies
     # active_query=true (local activity is a subset of all activity).
@@ -695,24 +716,11 @@ async def get_llama_local_status(request: Request):
     # not from ``local_active_queries``, whose retained post-stream leases no
     # longer correspond to work. The counter remains the legacy fallback when
     # the server has no dispatch-record registry at all.
-    live_local_requests: int | None = None
-    local_active_query = False
-    try:
-        from proxy.router_helpers import (
-            _count_active_local_dispatch_records as _count_active_records,
-        )
-
-        live_local_requests = _count_active_records(srv)
-    except Exception:
-        live_local_requests = None
-    if live_local_requests is not None:
-        local_active_query = live_local_requests > 0
-    else:
-        try:
-            async with srv.local_active_queries_lock:
-                local_active_query = srv.local_active_queries > 0
-        except Exception:
-            local_active_query = False
+    #
+    # LP-0MVZ3V8UR003KCSZ: this record-registry read is taken *after* the
+    # /slots query (see the consolidated live-work block below), never here,
+    # so the payload cannot pair fresh busy slot detail with an attribution
+    # snapshot taken before a dispatch admitted during a multi-second poll.
 
     # -- slots query (lightweight, short timeout) -------------------------
     available_slots = 0
@@ -888,15 +896,34 @@ async def get_llama_local_status(request: Request):
                 # timeout, so a slow /slots response cannot blow the
                 # endpoint's response budget (AC3).
                 detail_provenance: dict = {}
+                detail_outcome: dict = {}
                 _detail_t0 = time.monotonic()
                 try:
                     detail = await _query_slots_detail(
                         llama_port, timeout=timeout, model=cm,
                         provenance_out=detail_provenance,
+                        status_out=detail_outcome,
                     )
                 except Exception:
                     detail = None
                 slots_detail_ms = int((time.monotonic() - _detail_t0) * 1000)
+                # LP-0MW3ED73W007JYGI: a detail-phase failure on the status
+                # path is recorded in ``llama_slots_query_failures_total`` with
+                # its reason (``timeout`` / ``http_<code>`` / …), so the
+                # measured ~36 % failure rate is visible in the metrics
+                # surface instead of only a debug log. Only the status path
+                # opts in (via ``status_out``); the counts phase records its
+                # own outcome in ``_query_slots`` and the general caller-tagged
+                # call-site instrumentation remains LP-0MVTDMXXH005D5D5's.
+                _detail_failure_reason = (
+                    detail_outcome.get("reason")
+                    if isinstance(detail_outcome, dict)
+                    else None
+                )
+                if _detail_failure_reason:
+                    from proxy.observability import _record_slots_query_failure
+
+                    _record_slots_query_failure(_detail_failure_reason)
                 if isinstance(detail, list) and detail:
                     slots = detail
                 else:
@@ -1070,12 +1097,22 @@ async def get_llama_local_status(request: Request):
     try:
         if slots and total_slots < len(slots):
             total_slots = len(slots)
-        if counts_stale or detail_stale:
+        if detail_stale:
             # ``slots_stale`` (the union) is client-visible; whenever it is
-            # true no summary field may assert availability (AC3). This covers
-            # the counts-only fallback too: cached counts are a stale list of
-            # slot states with no per-slot detail, and serving them as
-            # availability is the same over-dispatch hazard.
+            # true no summary field may assert availability (AC3). A cached
+            # detail list is a stale list of slot states and serving it as
+            # availability is the over-dispatch hazard.
+            available_slots = 0
+            availability_unknown = True
+        elif counts_stale:
+            # LP-0MVXSX0TZ00798KA: the counts pair is cache-served even when
+            # the detail snapshot is fresh. Never publish the cached
+            # ``available_slots`` as a positive count: the 2026-10-30
+            # 06:01:20 shape paired a cached ``available_slots=1`` with a
+            # fresh-detail ``saturated`` hint. Withhold it (``0`` +
+            # ``availability_unknown``) so the pair cannot read as free
+            # capacity; the fresh detail still drives ``capacity_hint`` and
+            # ``slot_counts_stale`` discloses the cache path.
             available_slots = 0
             availability_unknown = True
         elif slots:
@@ -1086,31 +1123,57 @@ async def get_llama_local_status(request: Request):
         # Derivation is best-effort; leave the counts-derived value.
         availability_unknown = bool(counts_stale or detail_stale)
 
-    # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
-    # The owner id is normalised to its bare session-id string: per-endpoint
-    # leases are keyed by ``(endpoint, session_id)`` tuples and the raw key
-    # must never be serialised into the status payload as an array
-    # (WL-0MUKY4MAX0008I0L).
+    # -- live-work attribution (LP-0MR9G183O004SJLO, LP-0MVZ3V8UR003KCSZ) --
+    # Sampled here — *after* the /slots query — so the payload is
+    # self-consistent: a dispatch admitted during a multi-second status poll
+    # cannot yield fresh busy slot detail paired with an empty attribution
+    # snapshot taken before its admission (LP-0MVZ3V8UR003KCSZ AC1).
+    #
+    # One registry read derives both the in-flight count and the owner, so
+    # ``local_in_flight_requests``, ``local_owner_session_id`` and
+    # ``local_active_query`` can never disagree with each other. The owner id
+    # is normalised to its bare session-id string: per-endpoint leases are
+    # keyed by ``(endpoint, session_id)`` tuples and the raw key must never be
+    # serialised into the status payload as an array (WL-0MUKY4MAX0008I0L).
+    live_local_requests: int | None = None
+    local_active_query = False
     local_owner_session_id = None
     local_owner_lease_remaining_seconds = None
     try:
         from proxy.router_helpers import _dispatch_key_session_id
 
         lock = getattr(srv, "local_dispatch_records_lock", None)
-        records = getattr(srv, "local_dispatch_records", {})
-        if lock is not None:
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is None:
+            # Legacy mode: no dispatch-record registry at all.
+            live_local_requests = None
+        elif lock is not None:
             async with lock:
+                live_local_requests = 0
                 for sid, rec in list(records.items()):
-                    if rec.get("active"):
-                        session_id = _dispatch_key_session_id(sid)
-                        if not isinstance(session_id, str):
-                            continue
-                        local_owner_session_id = session_id
-                        remaining = rec.get("expires_at", 0) - time.monotonic()
-                        local_owner_lease_remaining_seconds = max(0.0, remaining)
-                        break
+                    if not isinstance(rec, dict) or not rec.get("active"):
+                        continue
+                    live_local_requests += 1
+                    if local_owner_session_id is not None:
+                        continue
+                    session_id = _dispatch_key_session_id(sid)
+                    if not isinstance(session_id, str):
+                        continue
+                    local_owner_session_id = session_id
+                    remaining = rec.get("expires_at", 0) - time.monotonic()
+                    local_owner_lease_remaining_seconds = max(0.0, remaining)
+        else:
+            live_local_requests = None
     except Exception:
-        pass
+        live_local_requests = None
+    if live_local_requests is not None:
+        local_active_query = live_local_requests > 0
+    else:
+        try:
+            async with srv.local_active_queries_lock:
+                local_active_query = srv.local_active_queries > 0
+        except Exception:
+            local_active_query = False
 
     # -- prefill / queue ETA estimate (LP-0MVGDUV5E005UWBQ) -----------------
     # Published so a dispatcher can pace BEFORE launching a session instead of
@@ -1339,6 +1402,11 @@ async def get_llama_local_status(request: Request):
         "availability_unknown": bool(availability_unknown),
         "total_slots": total_slots,
         "slots_stale": slots_stale,
+        # LP-0MVZ3V96D007A825: the counts-cache half of ``slots_stale`` is
+        # published separately so the residual-attribution CSV can name which
+        # cache served the poll (the counts-stale family is
+        # LP-0MVXSX0TZ00798KA). Additive: older parsers ignore it.
+        "slot_counts_stale": bool(counts_stale),
         "slots_stale_reason": slots_stale_reason,
         "slots_max_snapshot_age_seconds": slots_max_snapshot_age_seconds,
         # Per-phase read-path timing + provenance (LP-0MVVXGHT1001I5YX
@@ -1432,6 +1500,14 @@ async def get_llama_local_status(request: Request):
         # without knowing the config, and so ``snapshot_too_old`` is
         # self-explanatory.
         "slots_max_snapshot_age_seconds": slots_max_snapshot_age_seconds,
+        # Provenance of the served snapshot (LP-0MW3ED73W007JYGI): which read
+        # path produced the served slot data and how old that snapshot is, so a
+        # degraded poll's authoritative-path choice is visible in the *payload*
+        # and not only in the ``status_request`` log line. Additive — existing
+        # field names and meanings are unchanged, so consumers that ignore
+        # unknown fields are unaffected.
+        "slots_snapshot_source": slots_snapshot_source,
+        "slots_snapshot_age_seconds": slots_snapshot_age_seconds,
         # Truthful in-flight local request count, derived from live dispatch
         # records (``None`` in legacy mode with no record registry).
         # ``local_active_query`` mirrors ``> 0``; ``Null`` is never emitted.
@@ -1690,6 +1766,14 @@ async def health_check():
     llama_server_managed = (
         srv.llama_process is not None and srv.llama_process.poll() is None
     )
+    # LP-0MW3MOMD9007DC26 AC2: an adopted sentinel (pid=0, poll() always
+    # None) is owned by the proxy but is not a live process handle — the
+    # proxy never spawned it, so poll() can never observe its death.
+    # ``llama_server_running`` must follow reachability for such a handle,
+    # never the sentinel's perpetual ``poll() is None``: the 2026-11-05
+    # backends reported ``running: true`` while ``backend_reachable`` was
+    # false for 35 minutes / 6.5 h.
+    adopted_handle = getattr(srv.llama_process, "adopted", False) is True
     # LP-0MVZT9L3N001XABB AC2: in router mode a backend can serve the local
     # route while this proxy holds no process handle for it (a self-heal spawn
     # that outlived its readiness wait, or a host-first server started outside
@@ -1700,18 +1784,43 @@ async def health_check():
     # took the wrong action. Reachability is now the signal in router mode and
     # ``llama_server_managed`` keeps an unmanaged backend distinguishable.
     backend_reachable = False
+    probe_ran = False
     if llama_server_managed or router_mode:
         backend_reachable = bool(
             await srv._probe_backend_reachable(llama_port)
         )
-    llama_running = bool(
-        llama_server_managed or (router_mode and backend_reachable)
-    )
+        probe_ran = True
+    # LP-0MW42T6IJ006EQA3 AC2/AC3: write the measured reachability through
+    # to the routing skip state so /health's probe (already paid for) keeps
+    # the pre-dispatch gate fresh without per-request probing at dispatch
+    # time. ``backend_reachable=false`` arms a TTL-bounded skip; a healthy
+    # probe clears it, so a recovered backend is re-tried immediately. Only
+    # written when the probe actually ran (an unmanaged, non-router backend
+    # is not probed — ``False`` there is "not measured", not "dead").
+    if probe_ran:
+        try:
+            from proxy.observability import (
+                _arm_local_backend_unreachable,
+                _clear_local_backend_unreachable,
+            )
+
+            if backend_reachable:
+                _clear_local_backend_unreachable()
+            else:
+                _arm_local_backend_unreachable(
+                    {"server": server_cfg} if isinstance(server_cfg, dict) else None
+                )
+        except Exception:
+            pass
+    if adopted_handle:
+        # The sentinel is never running on its own: reachability decides.
+        llama_running = bool(backend_reachable)
+    else:
+        llama_running = bool(
+            llama_server_managed or (router_mode and backend_reachable)
+        )
     self_healing = srv._is_self_healing_active()
     gpu_wedge_detected = bool(getattr(srv, "gpu_wedge_detected", False))
-    gpu_wedge_detection_disabled = bool(
-        getattr(srv, "gpu_wedge_detection_disabled", False)
-    )
     ready = bool(
         llama_running
         and srv.backend_ready
@@ -1789,7 +1898,8 @@ async def health_check():
         "llama_server_managed": bool(llama_server_managed),
         "self_healing_in_progress": self_healing,
         "gpu_wedge_detected": gpu_wedge_detected,
-        "gpu_wedge_detection_disabled": gpu_wedge_detection_disabled,
+        # LP-0MW5K8ZW3005SEA8: the PINNED auto-disable state was removed with
+        # the busy counter, so no gpu_wedge_detection_disabled field exists.
         "gpu_wedge_signal_count": int(
             srv.backend_signal_counts.get("gpu_wedge", 0) or 0
         ),
@@ -1802,7 +1912,56 @@ async def health_check():
         # log staleness is observable without shell access (AC3).
         "llama_log_age_seconds": _llama_log_age_seconds_health(srv),
         "llama_log_source_healthy": _llama_log_source_healthy(srv),
+        # LP-0MW3K7YO1005C41X: process-group isolation between the GPU
+        # backends. ``state`` is ``isolated`` / ``violation`` / ``unknown``; a
+        # violation means a fault in one backend could signal the other (the
+        # watchdogs also log it). Fail-open — a check failure reports unknown.
+        "backend_isolation": _backend_isolation_health(srv),
+        # LP-0MW3PLK5M002YPOA: the wider supervision boundary — own systemd
+        # unit/cgroup and process group/session. ``state`` is ``isolated`` /
+        # ``coupled`` / ``unknown``; ``coupled`` means a backend spawned inside
+        # the proxy's own cgroup *and* process group, i.e. inside the proxy's
+        # kill set. Advisory (fail-open), never an error.
+        "supervision_boundary": _supervision_boundary_health(srv),
     }
+
+
+def _supervision_boundary_health(srv) -> dict:
+    """Report the backend supervision-boundary verdict (fail-open).
+
+    LP-0MW3PLK5M002YPOA. Never raises: any failure reports ``unknown`` so a
+    guard mis-step cannot break /health.
+    """
+    try:
+        from proxy.backend_boundary import check_supervision_boundary
+
+        return check_supervision_boundary(srv)
+    except Exception:
+        return {
+            "guard": "supervision boundary (own systemd unit/cgroup + own PGID/SID)",
+            "state": "unknown",
+            "violation": False,
+            "reason": "check_failed",
+        }
+
+
+def _backend_isolation_health(srv) -> dict:
+    """Report the GPU-backend process-group isolation verdict (fail-open).
+
+    LP-0MW3K7YO1005C41X. Never raises: any failure reports ``unknown`` so a
+    guard mis-step cannot break /health.
+    """
+    try:
+        from proxy.backend_isolation import check_backend_isolation
+
+        return check_backend_isolation(srv)
+    except Exception:
+        return {
+            "guard": "process-group isolation (start_new_session + disjoint PGIDs)",
+            "state": "unknown",
+            "violation": False,
+            "reason": "check_failed",
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -314,3 +314,62 @@ async def test_dispatch_line_prompt_size_is_a_non_negative_integer(caplog):
     tokens = line.split("estimated_tokens=")[1].split()[0]
     assert tokens.isdigit()
     assert int(tokens) >= 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_record_carries_slot_and_llama_task_id(caplog, monkeypatch, tmp_path):
+    """A dispatched local request persists its slot and llama task id (AC10a/b).
+
+    LP-0MW959RRO008AAH9: the association is read from the **cached** ``/slots``
+    snapshot (the deployed build publishes ``id_task``), so the dispatch record
+    for a real dispatched request names the slot it was assigned and the
+    backend task running on it — the identity an eviction event later reports
+    instead of the old ``slot_id=unknown llama_task_id=unknown``.
+    """
+    import logging
+
+    from proxy import observability as obs
+    from proxy import server as srv_module
+    from proxy import session as session_registry
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(
+        srv_module,
+        "config",
+        {
+            "server": {
+                "llama_router_mode": False,
+                "llama_server_port": 8080,
+                "session_slot_pool_size": 2,
+                "session_slot_save_path": str(tmp_path),
+            }
+        },
+    )
+    # The deployed build's shape: the slot is processing and publishes id_task.
+    previous = list(obs._last_slot_details_cache)
+    obs._last_slot_details_cache[:] = [
+        {
+            "slot_id": 0,
+            "is_processing": True,
+            "n_decoded": None,
+            "context_tokens": None,
+            "id_task": 42_424,
+        }
+    ]
+    try:
+        response = await _drive_local_stream(iterate=False)
+        # The dispatch key is the resolved session id (``measure-session``).
+        record = srv_module.local_dispatch_records.get("measure-session")
+    finally:
+        obs._last_slot_details_cache[:] = previous
+        # The slot registry is process-global: never leak ownership into the
+        # next test in the session.
+        for key, owner in list(session_registry._slot_owners.items()):
+            if owner == "measure-session":
+                session_registry._slot_owners.pop(key, None)
+        session_registry._slot_last_tenant.clear()
+
+    assert response.status_code == 200, response.status_code
+    assert record is not None, srv_module.local_dispatch_records
+    assert record["slot_id"] == 0
+    assert record["llama_task_id"] == 42_424

@@ -623,7 +623,7 @@ the renderer.
 
 | Metric | Baseline | Target | Actual | Result |
 |---|---|---|---|---|
-| GPU busy / local utilisation | 18.4 % (2026-11-03) | n/a | 18.4 % | Insufficient history |
+| GPU activity — power-based, any consumer | 18.4 % (2026-11-03) | n/a | 18.4 % | Insufficient history |
 | Fallback rate | 87.9 % of requests (2026-11-03) | n/a | 87.9 % of requests | Insufficient history |
 | Decode speed | 32.1 tok/s (2026-11-03) | n/a | 32.1 tok/s | Insufficient history |
 …one row per registered metric, in registry order…
@@ -675,7 +675,7 @@ key, the `--json` key and the detail-subsection prefix.
 
 | id | Label | Unit | Direction | Data source |
 |---|---|---|---|---|
-| `gpu_busy` | GPU busy / local utilisation | % | higher is better | GPU telemetry sampler power samples |
+| `gpu_busy` | GPU activity — power-based, any consumer | % | higher is better | GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer) |
 | `fallback_rate` | Fallback rate | % of requests | lower is better | `Fallback triggered` log events |
 | `decode_speed` | Decode speed | tok/s | higher is better | `Stream finished` token counts |
 | `prompt_eval_speed` | Prompt eval speed | tok/s | higher is better | llama-server prompt eval timing |
@@ -689,14 +689,18 @@ key, the `--json` key and the detail-subsection prefix.
 How each value is calculated (`aggregation.performance_metric_inputs` is the
 single roll-up that produces exactly these keys):
 
-- **`gpu_busy`** — power-based busy time from the GPU telemetry sampler
-  (`avg_over_time(gpu:computing:bool[Nh])` over the 15-second hwmon series),
-  corroborated by log-derived local busy time for the same window. This is the
-  **hardware** figure the **Local model utilization** section renders, **not**
-  a local-utilisation signal: decisions still use the log-derived
-  `local_busy` (see [Which busy figure is authoritative for
-decisions](#which-busy-figure-is-authoritative-for-decisions)). `n/a` when
-  Prometheus was unreachable.
+- **`gpu_busy`** — coverage-honest power-based computing share from the GPU
+  telemetry sampler. Every expected 15-second instant across the window is
+  classified `computing`, `idle` or `unknown` from the `gpu:computing:bool`
+  recording rule, with the unobserved share reported as `unknown` (never
+  renormalised away, never counted as `idle`, and never added to the
+  numerator); corroborated by log-derived local busy time for the same window.
+  This is the **hardware** figure the **Local model utilization** section
+  renders, and it counts **any GPU consumer** — **not** a local-utilisation
+  signal: decisions still use the log-derived `local_busy` (see [Which busy
+figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
+  `n/a` when Prometheus was unreachable or the window had no observed
+  instants.
 - **`fallback_rate`** — share of the window's requests that produced
   `Fallback triggered` events, as a percentage; the dominant fallback reason
   is rendered in the **Fallback reasons** section rather than in the table.
@@ -872,6 +876,90 @@ carries `baseline` (`value` + `date`, `null` when nothing is recorded),
 unmeasurable) and `verdict`. It is produced by the same derivation as the
 rendered table, so the two views can never disagree, and it is **read-only**:
 the single state write happens while the report is built.
+
+## Wasted GPU compute (LP-0MW2SQNHJ0044PV6)
+
+`report.md` carries three wasted-compute renderings, and `--json` carries the
+same figures. The analysis is produced by
+`scripts/wasted_compute.py`, which drives the committed analyser
+`proxy/scripts/analyse_prefill_deadline_residual.py` by path and normalises
+its payload — the attribution rules live there, never in the skill.
+
+| Rendering | Anchor in `report.md` |
+|---|---|
+| Summary table | `## Wasted GPU compute (summary)` — after the scorecard, before `## Summary by hour` |
+| Detail section | `## Wasted GPU compute` — after `## Prefill admission regression` |
+| Appendix | `## Appendix: wasted GPU compute — definitions and basis` — the last section |
+
+### `--json` block
+
+```json
+"wasted_compute": {
+  "status": "ok",
+  "hours": 5.609,
+  "reasons": [
+    {"reason": "prefill_deadline", "total": 20, "user": 19, "audit": 1,
+     "per_hour": 3.566, "user_per_hour": 3.387}
+  ],
+  "composite_user_events": 23,
+  "composite_user_per_hour": 4.101,
+  "rate_target_per_hour": 0.5,
+  "rate_ok": false,
+  "attribution": {"predicted-warmth": 14, "capacity": 6, "occupancy": 0},
+  "occupancy_share": 0.0,
+  "capacity_share": 0.3,
+  "abandoned_prefill_overlap": {"events": 0, "total": 20,
+                                "basis": "measured_stop", "measured_available": true},
+  "release_cancel": {"releases_total": 32, "releases_with_observed_cancel": 32,
+                     "cancel_to_stop_p50_s": 0.0, "cancel_to_stop_p90_s": 4.489},
+  "waste": {"priced_tokens_discarded": 120497,
+            "tokens_evaluated_after_cancel": 2048,
+            "wasted_tokens": 122545,
+            "backend_completed_prefills": 730,
+            "client_consumed_local_streams": 389},
+  "coverage": {"verdict": "mismatch", "exact": false},
+  "proxy_restarts_in_window": 0,
+  "backend_restarts_in_window": 0,
+  "restart_free": true,
+  "verdict": "fail",
+  "caveats": ["llama-server log coverage is 'mismatch' (867 backend segments joined against 32 releases): the per-release and backend figures are indicative, not exact"]
+}
+```
+
+Contract:
+
+- **`status`** — `ok`, or `unavailable` with `reason` naming what was missing
+  (analyser absent, no `proxy.log*`, analysis failed). The report renders the
+  reason; a missing section never fails the run. When a run was not given the
+  analysis at all (a library caller), the key is `null`.
+- **`composite_user_per_hour`** — `prefill_deadline` + `measured_cache_deficit`
+  for non-`audit-` sessions, divided by the analysed window length. Both
+  reasons are counted together so a reason conversion cannot read as an
+  improvement.
+- **`occupancy_share` / `capacity_share`** — shares of `prefill_deadline`
+  events by attribution class. Guards: occupancy ≤ 25 %, capacity < 50 %
+  (`occupancy_ok` / `capacity_ok` carry the verdicts).
+- **`restart_free`** — no proxy restart recorded by the analyser and no
+  `backend_restart` eviction. A restart re-prices capacity and discards
+  prefills, so `verdict` is `inconclusive` whenever this is `false`. A
+  backend restart with no dispatch in flight leaves no eviction event, so the
+  flag is a **lower bound** on restarts (stated in the appendix).
+- **`waste.priced_tokens_discarded`** — the `new_tokens` priced by each
+  `prefill_deadline` event, summed; the analyser reports per-event tokens for
+  deadline events only, so an early `measured_cache_deficit` abort (whose loss
+  is bounded by design) is not in this sum.
+- **`coverage`** — the analyser's `abandoned_prefill_windows.coverage`
+  verdict. `exact` only when the backend segments join 1:1 to the window's
+  releases; otherwise `coverage.exact` is `false`, the per-release and backend
+  figures are **indicative**, and a caveat says so.
+- **`verdict`** — `pass` (rate and both guards pass in a restart-free
+  window), `fail` (rate over target, occupancy over 25 %, or capacity ≥ 50 %),
+  or `inconclusive` (everything passes but the window contains a restart).
+- All keys are **additive**; no existing `--json` key changes value or
+  meaning.
+
+Thresholds are the producer-agreed criterion on LP-0MVN3KMGI009BZ0D (option
+b2) and are repeated in the report appendix alongside the window's caveats.
 
 ## Verifying the daily path is agent-free
 
@@ -1370,39 +1458,64 @@ large-context sessions permanently onto remote providers.
 The **Local model utilization** table's primary busy figures are derived from
 proxy logs (the dispatch → finish slot union). Alongside them, when Prometheus
 is reachable, the report adds a **GPU busy — power-based (hardware)** row and
-exposes the same data under `--json`'s `gpu_busy` key. This is the
-**authoritative hardware-side** busy fraction and does **not** depend on the
+exposes the same data under `--json`'s `gpu_busy` key. It is a **scoped
+derivation** of the one-measure doctrine in
+[monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure):
+the single reported GPU-activity figure is the attributable
+`gpu:computing_workload:bool` share produced **only** by
+`scripts/gpu_utilisation.py`, while this row is the power-only
+`gpu:computing:bool` share (any GPU consumer). It does **not** depend on the
 proxy's stream-lifecycle logging — but it is **not** the local model
 utilisation figure: decisions use the log-derived `local_busy` (see
 [Which busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
 
 Why power rather than `gpu_busy_percent`: on this Strix Halo APU that counter
-**saturates at ~20 W** — it responds to load within seconds but reads ~100 % for
-any draw above ~20 W, so it reports idle-with-context stretches as busy
-(LP-0MS9GA6QL007XTBP; measured 2026-10-28 over 7 days: 94.5 % mean busy against
-28.1 % of samples at compute power, 45.2 % false-busy; LP-0MVSQQO910077LYL). It
+is a **two-state detector, not a percentage** — its step sits at **~30 W** (it
+reads 1–10 % below 30 W and 92–99 % from 30 W upward). That step is *below* the
+idle-with-display band (p50 45 W), so idle-with-context and computing both read
+~99 % and the counter **inverts** across exactly the band that matters:
+re-measured 2026-11-06 on kernel 7.0.0-38 it read 99.2 % at 40–60 W (idle with a
+display) against 98.7 % at 90–100 W (computing) (LP-0MW5K7WKZ005VJXA; supersedes
+the retired 20 W latch claim of LP-0MS9GA6QL007XTBP and LP-0MVSQQO910077LYL). It
 is not a utilisation signal. AMD's own tooling is not an alternative either:
 `amd-smi` reports `N/A` for usage/power/clocks/energy on this APU, and
-`amdtop`/`rocm-smi` display the very same saturating counter (see
+`amdtop`/`rocm-smi` display the very same counter (see
 [monitoring/README.md](../../../monitoring/README.md), *Why not `amd-smi`,
-`rocm-smi` or `amdtop`?*). Power draw discriminates
+`rocm-smi` or `amdtop`?*, which carries the measurement, the pre/post-reboot
+comparison and the PromQL recipe that recomputes every band). Power draw
+discriminates
 cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing:bool`
 recording rule (`gpu:power_watts:amdgpu >= bool 90`) is evaluated by Prometheus
-every **15 s** from the node_exporter hwmon series. The report queries
-`avg_over_time(gpu:computing:bool[Nh])` for the window, so the busy fraction is
-computed over the raw 15 s samples (see
-[monitoring/README.md](../../../monitoring/README.md) for the full pipeline).
+every **15 s** from the node_exporter hwmon series. Over the window the report
+classifies **every expected instant on a 15 s grid** as `computing`, `idle` or
+`unknown`: an instant is observed only when a sentinel proves the sampling
+pipeline was alive there (`up{job="llama-proxy"}`, `up{job="node-exporter"}`
+or a fresh `llama_slots_sample_timestamp_seconds` heartbeat) **and** the rule
+has a sample; the remainder is `unknown`. Absence is never folded into `idle`
+and never into the numerator, so a monitoring gap cannot inflate the figure
+(a rolling average over only the present samples would). The three shares
+therefore cover the window exactly — `computing_seconds + idle_seconds +
+unknown_seconds == window_seconds` and the percentages sum to 100 %.
 
+- The figure measures **hardware activity for any GPU consumer**
+  (`gpu:computing:bool`), not only the local model's work; that scope is named
+  in the scorecard label and the row's note.
 - The 15 s cadence is comfortably finer than the workload timescales (median
 decode 2.4 s, worst prefill 108 s), so sub-15-second sampling would add no
 accuracy.
 - The row is **best-effort**: if Prometheus is unreachable the query returns
   `None`, the row is omitted from the report, and `--json`'s `gpu_busy` is
-  `null`. A report run never fails because monitoring is down.
+  `null`. A report run never fails because monitoring is down. A window with
+  **no observed instants at all** keeps that same "no row" behaviour rather
+  than reporting a fabricated `0 %`; a partially observed window keeps the row
+  and names its `unknown` share.
 - The `gpu_busy` block carries `computing_fraction` (0–1), `busy_pct`,
-  `busy_seconds`, `idle_seconds`, `total_seconds`, and `smoothed_power` — the
-  `gpu:power_watts:avg5m` trace at 1-minute resolution, derived from the 15 s
-  raw series by a 5-minute rolling average, for warm-up/cooldown context.
+  `busy_seconds`, `idle_pct`, `idle_seconds`, `unknown_pct`, `unknown_seconds`,
+  `total_seconds`, a `coverage` block (`expected_samples`, `observed_samples`,
+  `computing_samples`, `idle_samples`, `unknown_samples`), the three
+  `shares_pct` values, and `smoothed_power` — the `gpu:power_watts:avg5m` trace
+  at 1-minute resolution, derived from the 15 s raw series by a 5-minute
+  rolling average, for warm-up/cooldown context.
 
 #### Which busy figure is authoritative for decisions
 
@@ -1414,6 +1527,17 @@ comparisons quote *that* number: it is the only figure measuring
 **proxy-served** local work (slot occupancy, queued time included), so it is
 what "how busy was the local model?" means when deciding whether local
 capacity is contended (e.g. the `> 60 %` local-busy gate).
+
+The one reported GPU-activity measure is the attributable
+`gpu:computing_workload:bool` share produced **only** by
+`scripts/gpu_utilisation.py` (the doctrine in
+[monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure));
+the report's `gpu_busy` row is a **scoped derivation** of it — the power-only
+`gpu:computing:bool` share (any GPU consumer) — and `llama_slots_busy` is the
+rule's input. The two `--json` keys state their scope in one sentence each:
+
+- `local_busy` — the log-derived `dispatch → finish` slot-union share measuring local capacity/contention (the figure gates and alerts quote), not a GPU measurement.
+- `gpu_busy` — the power-derived `gpu:computing:bool` share measuring hardware activity for any GPU consumer, not local model utilisation.
 
 **Prefer `gpu_busy` for hardware questions only** — was the GPU computing at
 all, is another workload using it, is it power/thermally limited. The row is
@@ -1435,6 +1559,105 @@ gaps, unfinished streams, or GPU work outside the proxy's slot accounting, so
 the same window can legitimately report `local_busy` 12.6 % next to a
 power-based 39.3 % — and only the former answers whether local capacity was
 contended.
+
+## Contention-queue Prometheus series (LP-0MVWPJW2700966ZU)
+
+The nightly report's queue evidence is retrospective: the `queue_wait_ms` split
+in the prefill breakdown and the `fallback_after_queue` reason are computed
+from the *logs* of a finished window (`docs/dev/single-slot-impact.md` §6,
+uncovered gap E6). At a single slot a filled queue is the primary cost centre,
+so the proxy also publishes the same three quantities **live** from
+`proxy/proxy/metrics.py`, updated at the contention queue's own admit / wait /
+drop points:
+
+| Series | Type | Meaning |
+|---|---|---|
+| `proxy_contention_queue_depth` | gauge | requests currently waiting in the local contention queue |
+| `proxy_contention_queue_wait_seconds` | histogram | elapsed wait per completed wait, admitted **and** timed-out |
+| `proxy_contention_queue_loss_total{reason}` | counter | requests dropped by the queue (depth cap / wait-budget expiry) by canonical fall-through reason |
+
+The `reason` label reuses the report's canonical vocabulary, so a live alert
+and the nightly report speak the same language:
+
+- `fallback_after_queue` — the wait budget expired, or the depth cap refused to
+  enqueue the request at the concurrency limit.
+- `local_lease_active` — a lease-protected slot did not free within the budget.
+
+The live series and the report are complementary, not redundant: the report
+answers *how much queue time did this window accumulate, per session*, while
+the counter answers *is a queue dropping requests right now*, which a nightly
+window cannot. A missing series reads as no queue activity (the proxy publishes
+the gauge to zero on every dequeue). See
+[monitoring/README.md](../../../monitoring/README.md) for the PromQL examples.
+
+## Prefix-reuse and slot-steal Prometheus series (LP-0MVWPK2VH008YWBD)
+
+E7 of `docs/dev/single-slot-impact.md` predicts that at one slot every session
+maps to slot 0, so each session switch evicts the previous prefix (the recorded
+`95 %` steal rate that the same report's §5.8 requires be re-measured). Before
+this change no metric recorded the **cause** — prefix reuse vs steal — so the
+only evidence of thrash was a rising `prefill_slot_seconds` per served turn,
+which a decode-side or prompt-size change could mimic. The proxy now publishes
+the cause directly, from `proxy/proxy/metrics.py`:
+
+| Series | Type | Meaning |
+|---|---|---|
+| `llama_prefix_cache_reuse_total{outcome}` | counter | served local streams by measured prefix-cache reuse outcome (`reused` = at least one `prompt_tokens_details.cached_tokens`; `cold` = none) |
+| `llama_slot_steal_total{reason}` | counter | slot steals/evictions — a resident KV prefix discarded when the slot changes hands — by the eviction `reason` the save/restore path already uses (`proxy.admission_events.EVICTION_REASONS`) |
+
+**How a single-slot regime shows up.** Two things move together and only in the
+thrashing direction:
+
+- the `reused` share of `llama_prefix_cache_reuse_total` **collapses** — with
+  one slot and two interleaving sessions, almost every served stream is `cold`
+  because the previous session's prefix was evicted before it could be reused;
+- `llama_slot_steal_total` **rises per 100 local turns** — every session switch
+  at pool size one is a handover that discards a resident prefix, so the steal
+  rate approaches the switch rate rather than staying near zero (the two-slot
+  baseline, where each session owns its own slot and steals nothing).
+
+A missing series reads as no activity: the counters are only created when
+`prometheus_client` is available, and an unmeasured stream (no usable
+`prompt_tokens`) increments nothing — an absent measurement is never counted as
+`cold`, so a reporting gap cannot be mistaken for thrash.
+
+### Pre-registered steal threshold (committed with the counters)
+
+The decision rule below is committed in the **same** change that lands the
+counters, i.e. before any measurement window is read, so the eventual verdict
+cannot be retrofitted to the data. The rule may be tightened after the fact but
+**not loosened**. Steal is **real** when either condition holds in the window:
+
+- **(a)** `≥ 5` steal events per 100 local turns; or
+- **(b)** measured aggregate prefix reuse `≤ 50 %` for prompts `> 20,000` tokens.
+
+Condition (b) must be **sustained across at least two sessions sharing a pool of
+one** in the same window — a single session cannot demonstrate a steal, because
+it never evicts another session's prefix.
+
+The reproducible queries (Prometheus, 24 h window):
+
+```promql
+# Share of served local streams that reused any prefix (1 = all reused).
+sum(rate(llama_prefix_cache_reuse_total{outcome="reused"}[24h]))
+  / clamp_min(sum(rate(llama_prefix_cache_reuse_total[24h])), 1)
+
+# Steal/eviction events per 100 local turns (local turns = every counted stream).
+100 * sum(increase(llama_slot_steal_total[24h]))
+  / clamp_min(sum(increase(llama_prefix_cache_reuse_total[24h])), 1)
+```
+
+The size-filtered ratio for condition (b) (`prompts > 20,000` tokens) is not on
+the live counter — it carries no prompt-size label, to keep cardinality flat —
+so read it from the nightly report's per-dispatch `cached_ratio` for
+`prompt_tokens > 20000` (`## Prompt cache` / `prompt_cache_hit_ratio`); the
+report's `local_eviction` records are the log-side equivalent of
+`llama_slot_steal_total` (same reason vocabulary, same eviction chokepoint), so
+the two figures can always be cross-checked against the series.
+
+> **Verdict status.** The verdict itself is recorded on LP-0MVWPK2VH008YWBD once
+a pool-of-one window of at least 24 h exists. It cannot be produced from the
+shipped two-slot geometry, where a steal is structurally rare.
 
 ## Legacy reason normalisation
 

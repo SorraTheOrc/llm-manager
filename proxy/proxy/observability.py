@@ -53,6 +53,7 @@ See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 
 import asyncio
 import contextlib
+import errno
 import json
 import re
 import threading
@@ -118,6 +119,173 @@ def _classify_backend_exception(exc: Exception) -> str:
     if isinstance(exc, (httpx.ReadTimeout, httpx.TimeoutException)):
         return "timeout_failures"
     return "other_failures"
+
+
+# ===================================================================
+# Local-backend reachability skip state (LP-0MW42T6IJ006EQA3)
+#
+# The 2026-11-05 21:36 incident: a dead llama-server (killed ~15:13) was
+# still advertised available, so every request dispatched local and burned
+# ~28 s on ``backend_retry_attempts=8`` x chain-hold cycles of deterministic
+# ``ConnectError`` (connection refused) before falling to a remote provider.
+# The retry loop retried a *deterministic* error — nothing inside the
+# backoff horizon can fix a refused connect — and no pre-dispatch check
+# consulted the reachability evidence ``/health`` already had.
+#
+# This module owns the reachability bookkeeping shared by the dispatcher
+# (lifecycle.py), the ``/health`` handler (handlers.py) and the routing
+# cycle (provider.py):
+#
+#   - :func:`_is_connection_refused` — deterministic connection-refused
+#     detection used by the dispatch fail-fast (AC1).
+#   - the skip deadline on the server module
+#     (``srv.local_backend_unreachable_until``), armed by a refused local
+#     dispatch or a failed reachability probe and cleared by a successful
+#     dispatch or probe (AC3 — bounded, so a recovered backend is re-tried
+#     promptly, never a permanent quarantine).
+#   - :func:`_local_backend_unreachable_remaining_seconds` — the pre-dispatch
+#     routing gate combining the armed deadline with the slots-snapshot
+#     staleness signal (AC2).
+# ===================================================================
+
+
+def _local_backend_skip_seconds(config: dict | None = None) -> float:
+    """TTL (seconds) of the local-backend-unreachable routing skip.
+
+    Reads ``server.local_backend_skip_seconds`` (default 60). The skip is
+    bounded so a recovered backend is re-tried promptly (AC3): a real
+    dispatcher re-arms it on the next refused attempt, and a fresh
+    ``/health`` probe clears it before the TTL when health is being polled.
+    """
+    server_cfg = {}
+    if isinstance(config, dict):
+        server_cfg = config.get("server") or {}
+        if not isinstance(server_cfg, dict):
+            server_cfg = {}
+    try:
+        val = float(server_cfg.get("local_backend_skip_seconds") or 60)
+    except (TypeError, ValueError):
+        val = 60.0
+    return val if val > 0 else 60.0
+
+
+def _arm_local_backend_unreachable(config: dict | None = None) -> None:
+    """Arm the routing skip: local is not to be dispatched for
+    ``local_backend_skip_seconds``."""
+    try:
+        _srv().local_backend_unreachable_until = (
+            time.monotonic() + _local_backend_skip_seconds(config)
+        )
+    except Exception:
+        pass
+
+
+def _clear_local_backend_unreachable() -> None:
+    """Clear the routing skip — the backend just proved reachable."""
+    try:
+        _srv().local_backend_unreachable_until = 0.0
+    except Exception:
+        pass
+
+
+def _is_connection_refused(exc: Exception) -> bool:
+    """Return True when *exc* is a deterministic connection-refused error.
+
+    A refused connection (``ECONNREFUSED``) is deterministic: the local port
+    has no listener and nothing inside the retry/backoff horizon can change
+    that, so retrying it only burns latency (AC1). Non-refused connect
+    errors (timeouts, DNS, network unreachable) stay retryable. The cause
+    chain is walked because httpx attaches the socket error via ``from`` and
+    an OSError may or may not be a ``ConnectionRefusedError`` instance.
+    """
+    if not isinstance(exc, httpx.ConnectError):
+        return False
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionRefusedError):
+            return True
+        if isinstance(cur, OSError) and cur.errno == errno.ECONNREFUSED:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return "connection refused" in f"{exc}".lower()
+
+
+def _record_connection_refused_fail_fast(
+    path: str, stream: bool, attempt: int, max_attempts: int, exc: Exception
+) -> None:
+    """Record, arm and re-raise a deterministic connection-refused error.
+
+    The local dispatch retry loop (``lifecycle._call_with_backend_retries``)
+    calls this instead of retrying (LP-0MW42T6IJ006EQA3 AC1): a refused
+    connect cannot be fixed by the backoff horizon, so retrying it only burns
+    ~28 s per request (8 attempts x chain-hold cycles on 2026-11-05). The
+    caller's fallback chain serves the next provider after the raise.
+
+    Effects (all idempotent): the ``connect_failures`` signal is recorded,
+    ``backend_ready`` flips to ``False``, the routing skip is armed (AC2/AC3,
+    read by the pre-dispatch gate) and a log line naming the fail-fast reason
+    is emitted.
+    """
+    srv = _srv()
+    _record_backend_signal("connect_failures")
+    try:
+        srv.backend_ready = False
+    except Exception:
+        pass
+    _arm_local_backend_unreachable(getattr(srv, "config", None))
+    try:
+        srv.logger.warning(
+            "backend_fail_fast path=%s stream=%s attempt=%s/%s "
+            "signal=%s error=%s reason=connection_refused",
+            path,
+            stream,
+            attempt,
+            max_attempts,
+            "connect_failures",
+            type(exc).__name__,
+        )
+    except Exception:
+        pass
+    raise exc
+
+
+def _local_backend_unreachable_remaining_seconds(config: dict | None = None) -> float:
+    """Seconds local routing should keep skipping the backend (0 = usable).
+
+    Two independent signals (AC2):
+
+    1. the armed fail-fast deadline
+       (``srv.local_backend_unreachable_until``, set by a refused local
+       dispatch or a failed reachability probe);
+    2. a slots snapshot older than the configured staleness bound
+       (``local_slots_max_snapshot_age_seconds``) — a dead backend leaves
+       the counts cache stale (6.5 h in the incident), and a missing
+       snapshot (``None``) is *not* evidence of staleness, mirroring
+       :func:`slots_snapshot_too_old`.
+
+    Returns 0.0 when neither signal says unreachable, so a healthy backend is
+    always dispatched (fail-open).
+    """
+    srv = _srv()
+    try:
+        deadline = float(getattr(srv, "local_backend_unreachable_until", 0.0) or 0.0)
+        if deadline > 0:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                return remaining
+    except Exception:
+        pass
+    try:
+        stamp = last_known_slot_counts_stamp()
+        if stamp is not None:
+            ceiling = local_slots_max_snapshot_age_seconds(config)
+            if slots_snapshot_too_old(max(0.0, time.monotonic() - stamp), ceiling):
+                return _local_backend_skip_seconds(config)
+    except Exception:
+        pass
+    return 0.0
 
 
 # ===================================================================
@@ -1158,6 +1326,7 @@ async def _query_slots_detail(
     endpoint: str | None = None,
     _client: httpx.AsyncClient | None = None,
     provenance_out: dict | None = None,
+    status_out: dict | None = None,
 ) -> list[dict]:
     """Query the llama-server ``/slots`` endpoint and return per-slot details.
 
@@ -1174,6 +1343,15 @@ async def _query_slots_detail(
             and return HTTP 400 without it.
         _client: Internal — for testing only.  Pass a mock client to
             avoid real HTTP calls in unit tests.
+        status_out: Optional (additive) outcome dict filled with the failure
+            ``{"status": int | None, "reason": str | None}`` — the same shape
+            ``_query_slots`` publishes — so the ``/llama/local/status`` detail
+            path can record ``llama_slots_query_failures_total{reason=...}``
+            with ``timeout`` and ``http_<code>`` distinguished
+            (LP-0MW3ED73W007JYGI). ``status_out is None`` (every call site but
+            the status path) records nothing and changes no behaviour; the
+            general caller-tagged call-site instrumentation remains
+            LP-0MVTDMXXH005D5D5's.
 
     Returns a list of dicts, one per slot, with keys:
 
@@ -1184,6 +1362,12 @@ async def _query_slots_detail(
       (``max(n_past, n_prompt_tokens_processed)``) when the build reports it,
       else ``None``; feeds per-slot ``phase``/``prefill_eta_seconds``
       (LP-0MVGDUVGE0024YAI AC5/AC3).
+    - ``id_task`` (int or ``None``) — the llama task id the deployed build
+      publishes for the slot (``None`` when it publishes none, ``-1`` for its
+      idle sentinel); read by
+      :func:`slot_task_id_from_cache` to attribute a dispatch to a backend
+      task (LP-0MW959RRO008AAH9 AC10b). Appended last so the pre-existing
+      keys keep their positions.
 
     Returns an empty list on any failure (HTTP error, connection error,
     timeout, or unexpected response shape).
@@ -1198,7 +1382,8 @@ async def _query_slots_detail(
                 provenance_out, source="upstream", fetched_at=None, upstream_calls=1
             )
             slots_resp = await _client.get(url)
-            if slots_resp.status_code == 200:
+            status = int(getattr(slots_resp, "status_code", 0) or 0)
+            if status == 200:
                 slots_data = await _safe_parse_json_response(slots_resp)
             else:
                 slots_data = None
@@ -1207,8 +1392,17 @@ async def _query_slots_detail(
             status, slots_data = await _fetch_slots_payload(
                 url, timeout, None, provenance_out=provenance_out
             )
-            if status != 200:
-                slots_data = None
+        # LP-0MW3ED73W007JYGI: publish the phase outcome (opt-in via
+        # ``status_out``) so the status handler can record the failure reason
+        # instead of the detail path swallowing it into a debug log (the
+        # measured 36 % failure rate was invisible in the metrics surface).
+        if status != 200:
+            _set_slots_status_out(status_out, status=status, reason=f"http_{status}")
+            slots_data = None
+        elif not isinstance(slots_data, list):
+            _set_slots_status_out(status_out, status=status, reason="invalid_payload")
+        else:
+            _set_slots_status_out(status_out, status=status, reason=None)
         if isinstance(slots_data, list):
             result = []
             for i, slot in enumerate(slots_data):
@@ -1229,9 +1423,26 @@ async def _query_slots_detail(
                     # the single source for context_tokens, sourced from the
                     # same raw fields ``_query_slots_progress`` reads.
                     "context_tokens": _slot_context_tokens(slot),
+                    # LP-0MW959RRO008AAH9 AC10b: the llama task id the deployed
+                    # build publishes for the slot, carried additively so a
+                    # dispatched request can be associated with the backend task
+                    # it used without a second ``/slots`` call. Raw value: a
+                    # published sentinel (``-1``, an idle slot) and an absent
+                    # field (a build that does not publish it) mean different
+                    # things to the resolver, so neither is normalised here.
+                    "id_task": slot.get("id_task"),
                 })
             return result
+    except TimeoutError:
+        # LP-0MW3ED73W007JYGI: distinguish a timeout from an HTTP error on the
+        # status detail path (``_query_slots`` already does this for counts).
+        _set_slots_status_out(status_out, reason="timeout")
+        _srv().logger.debug("Slot detail query timed out for %s", url)
     except Exception as exc:
+        if isinstance(exc, (ConnectionError, OSError)):
+            _set_slots_status_out(status_out, reason="connection_error")
+        else:
+            _set_slots_status_out(status_out, reason="unknown")
         _srv().logger.debug(
             "Slot detail query failed [%s] for %s: %s",
             type(exc).__name__, url, exc,
@@ -1577,6 +1788,99 @@ Set only when a fresh ``/slots`` query populated
 """
 
 
+# ---------------------------------------------------------------------------
+# Request ↔ llama task association (LP-0MW959RRO008AAH9, parent AC10)
+#
+# A dispatched local request must be attributable to the backend task it used:
+# the 2026-11-03 eviction evidence carried ``slot_id=unknown
+# llama_task_id=unknown``, so progress, cancellation and eviction could not be
+# mapped onto a llama slot/task. The task id is read from the cached snapshot
+# above — never from a new upstream call: llama-server holds ``/slots`` for
+# >15 s while processing a prompt batch (LP-0MUXTW4MD003TVIC).
+# ---------------------------------------------------------------------------
+
+#: No slot id was available to associate against (the record has no slot).
+SLOT_TASK_REASON_NO_SLOT = "no_slot"
+#: No successful ``/slots`` sample has been taken yet (cache empty).
+SLOT_TASK_REASON_NO_SNAPSHOT = "snapshot_unavailable"
+#: The snapshot has no entry for this slot (the slot was never sampled).
+SLOT_TASK_REASON_NOT_SAMPLED = "slot_not_sampled"
+#: The build publishes no ``id_task`` at all (older llama.cpp builds).
+SLOT_TASK_REASON_UNPUBLISHED = "task_id_unpublished"
+#: The slot is not running a task (``id_task`` sentinel, or ``is_processing``
+#: false). An idle slot keeps the id of the *previous* task it ran, so its id
+#: is never attributed to a new dispatch (measured 2026-10-31, the same fact
+#: ``proxy.metrics.summarise_slot_occupancy`` documents).
+SLOT_TASK_REASON_NOT_STARTED = "task_id_not_started"
+
+#: The closed vocabulary of ``llama_task_id_reason=`` values (AC10c).
+SLOT_TASK_UNAVAILABLE_REASONS: tuple[str, ...] = (
+    SLOT_TASK_REASON_NO_SLOT,
+    SLOT_TASK_REASON_NO_SNAPSHOT,
+    SLOT_TASK_REASON_NOT_SAMPLED,
+    SLOT_TASK_REASON_UNPUBLISHED,
+    SLOT_TASK_REASON_NOT_STARTED,
+)
+
+
+def slot_task_id_from_cache(slot_id: int | None) -> tuple[int | None, str | None]:
+    """Return ``(llama_task_id, unavailable_reason)`` for *slot_id*.
+
+    Reads the **already-cached** ``/slots`` snapshot only (AC10b): no HTTP, no
+    new poller, no lock held across an ``await``. Exactly one of the two
+    elements is set — a resolved task id carries ``None`` as its reason, and an
+    unresolved one carries a value from
+    :data:`SLOT_TASK_UNAVAILABLE_REASONS` so a log line can say *why* it is
+    unknown on a record whose slot is known (AC10c).
+
+    The task id is only trusted for a slot that is actually processing: an idle
+    slot keeps the ``id_task`` of the last task it ran, so attributing that id
+    to a new dispatch would map the request onto the wrong backend task.
+
+    Never raises: association is observability, so a malformed snapshot reads
+    as *unavailable* rather than failing the dispatch path.
+    """
+    if not _slot_id_is_real(slot_id):
+        return None, SLOT_TASK_REASON_NO_SLOT
+    try:
+        snapshot = _last_slot_details_cache
+        if not snapshot:
+            return None, SLOT_TASK_REASON_NO_SNAPSHOT
+        entry = next(
+            (
+                item
+                for item in snapshot
+                if isinstance(item, dict) and item.get("slot_id") == slot_id
+            ),
+            None,
+        )
+        if entry is None:
+            return None, SLOT_TASK_REASON_NOT_SAMPLED
+        id_task = entry.get("id_task")
+        if id_task is None:
+            return None, SLOT_TASK_REASON_UNPUBLISHED
+        if (
+            not isinstance(id_task, int)
+            or isinstance(id_task, bool)
+            or id_task < 0
+            or not bool(entry.get("is_processing"))
+        ):
+            return None, SLOT_TASK_REASON_NOT_STARTED
+        return int(id_task), None
+    except Exception:  # pragma: no cover - defensive: never break dispatch
+        return None, SLOT_TASK_REASON_NO_SNAPSHOT
+
+
+def _slot_id_is_real(slot_id: object) -> bool:
+    """Return True when *slot_id* can name a real llama-server slot."""
+    return (
+        isinstance(slot_id, int)
+        and not isinstance(slot_id, bool)
+        and slot_id >= 0
+    )
+
+
+
 _slot_progress_cache: dict[int, dict] = {}
 """Per-slot progress data parsed from llama-server log lines.
 
@@ -1887,7 +2191,14 @@ async def query_llama_status() -> dict:
     llama_port = server_config.get("llama_server_port", 8080)
 
     running = srv.llama_process is not None and srv.llama_process.poll() is None
-    if not running and bool(server_config.get("llama_router_mode", False)):
+    # LP-0MW3MOMD9007DC26 AC2: an adopted sentinel (pid=0, poll() always
+    # None) is not a live process handle — its poll() can never observe
+    # death, so it must be probed for reachability instead of being trusted
+    # as "running", in router mode and in single-model mode alike.
+    adopted_handle = getattr(srv.llama_process, "adopted", False) is True
+    if (not running or adopted_handle) and (
+        adopted_handle or bool(server_config.get("llama_router_mode", False))
+    ):
         # LP-0MVZT9L3N001XABB AC2/AC3: a reachable router-mode backend is
         # running even when this proxy holds no process handle for it (an
         # unadopted self-heal spawn, or a host-first server started outside

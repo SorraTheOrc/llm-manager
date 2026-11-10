@@ -984,6 +984,14 @@ class ProjectedWait:
     projected_seconds: float
     busy_slots: int
     coefficients: Coefficients
+    #: The **measured** occupant service taken into this projection's occupancy
+    #: term (LP-0MVV29YDQ00437N6): the live prefilling occupants' remaining
+    #: prefill service or dispatch-lease hold, whichever is larger, from their
+    #: own records. ``0.0`` when no occupant evidence was supplied or usable —
+    #: which is exactly the fail-open case, where the symmetric
+    #: ``eta * busy_slots`` floor alone governs. Reported so a refusal can be
+    #: attributed to measured blocker evidence rather than inferred.
+    measured_occupancy_seconds: float = 0.0
 
 
 def projected_wait_seconds(
@@ -1010,8 +1018,10 @@ def projected_wait_seconds(
 
     *occupant_prefill_seconds* is the **measured** remaining service owed by
     the in-flight prefills, projected from each occupant's own admission
-    evidence (LP-0MVOFVCA2008DQVE). It can only raise the occupancy term above
-    the symmetric floor, never lower it: pricing the occupant at the
+    evidence and live dispatch lease (LP-0MVOFVCA2008DQVE, extended by
+    LP-0MVV29YDQ00437N6 to the diagnosed blocker class: a prefilling holder
+    that keeps the slot past its prefill). It can only raise the occupancy term
+    above the symmetric floor, never lower it: pricing the occupant at the
     newcomer's own ETA is structurally wrong when a small warm prompt queues
     behind a huge cold prefill (measured 2026-10-25: an own ETA of 7.1 s
     waited 120 s behind a single occupant and was cancelled at the deadline).
@@ -1052,6 +1062,7 @@ def projected_wait_seconds(
         projected_seconds=eta + occupancy,
         busy_slots=busy,
         coefficients=coeffs,
+        measured_occupancy_seconds=measured_occupancy,
     )
 
 
@@ -1106,6 +1117,15 @@ class AdmissionDecision:
     #: Samples in the contended window for the priced ``(model, bucket)`` at
     #: decision time (always reported; 0 when none observed).
     contended_samples: int = 0
+    #: The **measured** occupant hold this decision priced into its occupancy
+    #: term (LP-0MVV29YDQ00437N6): the live prefilling occupants' remaining
+    #: prefill service or dispatch-lease hold, whichever is larger, read from
+    #: their own records. ``0.0`` on the fail-open path (no usable occupant
+    #: evidence), so a refusal can be attributed to measured blocker evidence
+    #: from the ``occupant_hold_s`` field on the decision log line rather than
+    #: inferred from the aggregate occupancy term. ``None`` only when no
+    #: projection was costed at all (``policy_off`` / cold-prefill refusal).
+    occupant_hold_seconds: float | None = None
 
     @property
     def active(self) -> bool:
@@ -1290,6 +1310,9 @@ def evaluate_admission(
             contended_samples=(
                 adjudicated.contended_samples if adjudicated else 0
             ),
+            occupant_hold_seconds=(
+                projected.measured_occupancy_seconds if projected else None
+            ),
         )
 
     if guard_cfg.policy == POLICY_OFF:
@@ -1434,6 +1457,7 @@ def evaluate_admission(
         deadline_budget_seconds=deadline_budget,
         rate_bucket=coeffs.rate_bucket,
         contended_samples=coeffs.contended_samples,
+        occupant_hold_seconds=projected.measured_occupancy_seconds,
     )
 
 
@@ -1764,7 +1788,8 @@ def record_guard_decision(
         effective_label = decision.reason
     logger.info(
         "local_admission_guard decision=%s reason=%s enforced=%s "
-        "eta_prefill_s=%.1f eta_occupancy_s=%.1f projected_wait_s=%.1f "
+        "eta_prefill_s=%.1f eta_occupancy_s=%.1f occupant_hold_s=%.1f "
+        "projected_wait_s=%.1f "
         "budget_s=%.1f bound_s=%.1f deadline_s=%.1f deadline_budget_s=%.1f "
         "new_tokens=%d budget_tokens=%d "
         "rate_bucket=%s contended_samples=%d "
@@ -1776,6 +1801,9 @@ def record_guard_decision(
         "false" if decision.admit else "true",
         float(decision.eta_prefill_seconds or 0.0),
         float(decision.eta_occupancy_seconds or 0.0),
+        # Measured blocker evidence (LP-0MVV29YDQ00437N6): 0.0 on the fail-open
+        # path, so "the occupant owed nothing" is never implied by a zero.
+        float(decision.occupant_hold_seconds or 0.0),
         float(projected),
         float(decision.budget_seconds or 0.0),
         float(

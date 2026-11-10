@@ -1,0 +1,413 @@
+{
+  "provenance": {
+    "commands": [
+      "./scripts/measure_warm_path_window.py --since '2026-10-30 16:35:14' --until '2026-10-31 16:35:14' --label prechange_matched --json",
+      "./scripts/measure_warm_path_window.py --since '2026-11-06 16:35:14' --until '2026-11-07 16:35:14' --label postchange_matched --json",
+      "./scripts/measure_warm_path_window.py --since '2026-11-06 14:15:56' --until '2026-11-07 14:15:56' --label postchange_24h --json",
+      "./scripts/measure_warm_path_window.py --since '2026-11-06 14:15:56' --until '2026-11-08 11:00:00' --label postchange_full --json"
+    ],
+    "log_dir": "/var/log/llama-proxy",
+    "parent": "LP-0MVVEQW5Y00962T2",
+    "purpose": "AC5 no-regression metrics not supplied by the other instruments: local completions per hour and large-prompt warm dispatch service latency.",
+    "tool": "scripts/measure_warm_path_window.py",
+    "work_item": "LP-0MVW8S8OZ00449YR"
+  },
+  "windows": {
+    "postchange_24h": {
+      "coverage": {
+        "covered": true,
+        "files_with_lines": 6,
+        "gaps": [],
+        "window_end_gap_seconds": 0.0,
+        "window_start_gap_seconds": 1.0
+      },
+      "definitions": {
+        "first_byte_fast_ms": 10000.0,
+        "large_tokens": 20000,
+        "local_completion": "Stream finished with provider=local and measured tokens",
+        "service_ms": "dispatch_to_first_byte_ms (first byte minus queue wait)",
+        "warm": "proxy cache_state=warm on the dispatch_first_byte_ms line"
+      },
+      "dispatches": {
+        "cache_state_breakdown": {
+          "cold": 462,
+          "restored": 465,
+          "warm": 2011
+        },
+        "other_provider_events_ignored": 0,
+        "per_hour": 122.417,
+        "total": 2938,
+        "unknown_prompt_estimate": 0
+      },
+      "label": "postchange_24h",
+      "large_cold": {
+        "service_ms": {
+          "max": 156269.5,
+          "n": 73,
+          "p50": 58516.0,
+          "p90": 98764.6,
+          "p99": 127139.2
+        },
+        "total": 73
+      },
+      "large_other_cache_state": {
+        "service_ms": {
+          "max": 173421.0,
+          "n": 385,
+          "p50": 3269.8,
+          "p90": 39162.5,
+          "p99": 133541.7
+        },
+        "total": 385
+      },
+      "large_warm": {
+        "first_byte_under_threshold": {
+          "count": 908,
+          "share": 0.7449,
+          "threshold_ms": 10000.0
+        },
+        "per_hour": 50.792,
+        "service_ms": {
+          "max": 175055.3,
+          "n": 1219,
+          "p50": 3967.5,
+          "p90": 35952.0,
+          "p99": 121765.0
+        },
+        "total": 1219
+      },
+      "local_completions": {
+        "large": {
+          "per_hour": 79.25,
+          "total": 1902
+        },
+        "per_hour": 122.292,
+        "prompt_tokens": {
+          "max": 103235.0,
+          "n": 2935,
+          "p50": 25216.0,
+          "p90": 40833.8,
+          "p99": 82195.9
+        },
+        "total": 2935,
+        "usage_missing": 2447
+      },
+      "warm": {
+        "per_hour": 83.792,
+        "service_ms": {
+          "max": 175055.3,
+          "n": 2011,
+          "p50": 2927.2,
+          "p90": 24414.6,
+          "p99": 106831.3
+        },
+        "total": 2011
+      },
+      "window": {
+        "first_seen": "2026-11-06 20:15:52",
+        "hours": 24.0,
+        "last_seen": "2026-11-07 14:15:55",
+        "lines_in_window": 273086,
+        "since": "2026-11-06 14:15:56",
+        "until": "2026-11-07 14:15:56"
+      }
+    },
+    "postchange_full": {
+      "coverage": {
+        "covered": true,
+        "files_with_lines": 53,
+        "gaps": [],
+        "window_end_gap_seconds": 2.0,
+        "window_start_gap_seconds": 0.0
+      },
+      "definitions": {
+        "first_byte_fast_ms": 10000.0,
+        "large_tokens": 20000,
+        "local_completion": "Stream finished with provider=local and measured tokens",
+        "service_ms": "dispatch_to_first_byte_ms (first byte minus queue wait)",
+        "warm": "proxy cache_state=warm on the dispatch_first_byte_ms line"
+      },
+      "dispatches": {
+        "cache_state_breakdown": {
+          "cold": 2407,
+          "restored": 1883,
+          "warm": 6142
+        },
+        "other_provider_events_ignored": 0,
+        "per_hour": 62.965,
+        "total": 10432,
+        "unknown_prompt_estimate": 0
+      },
+      "label": "postchange_full",
+      "large_cold": {
+        "service_ms": {
+          "max": 181290.9,
+          "n": 380,
+          "p50": 54749.8,
+          "p90": 103779.3,
+          "p99": 144513.3
+        },
+        "total": 380
+      },
+      "large_other_cache_state": {
+        "service_ms": {
+          "max": 194660.4,
+          "n": 1388,
+          "p50": 4029.8,
+          "p90": 35787.3,
+          "p99": 125138.4
+        },
+        "total": 1388
+      },
+      "large_warm": {
+        "first_byte_under_threshold": {
+          "count": 2364,
+          "share": 0.6947,
+          "threshold_ms": 10000.0
+        },
+        "per_hour": 20.54,
+        "service_ms": {
+          "max": 179632.3,
+          "n": 3403,
+          "p50": 4208.4,
+          "p90": 45066.3,
+          "p99": 121401.2
+        },
+        "total": 3403
+      },
+      "local_completions": {
+        "large": {
+          "per_hour": 36.1,
+          "total": 5981
+        },
+        "per_hour": 62.585,
+        "prompt_tokens": {
+          "max": 111032.0,
+          "n": 10369,
+          "p50": 22569.0,
+          "p90": 38088.2,
+          "p99": 63350.6
+        },
+        "total": 10369,
+        "usage_missing": 49575
+      },
+      "warm": {
+        "per_hour": 37.072,
+        "service_ms": {
+          "max": 179632.3,
+          "n": 6142,
+          "p50": 3114.6,
+          "p90": 30112.5,
+          "p99": 109174.5
+        },
+        "total": 6142
+      },
+      "window": {
+        "first_seen": "2026-11-01 21:26:40",
+        "hours": 165.678,
+        "last_seen": "2026-11-06 14:15:48",
+        "lines_in_window": 3222843,
+        "since": "2026-10-30 16:35:14",
+        "until": "2026-11-06 14:15:56"
+      }
+    },
+    "postchange_matched": {
+      "coverage": {
+        "covered": true,
+        "files_with_lines": 6,
+        "gaps": [],
+        "window_end_gap_seconds": 5.0,
+        "window_start_gap_seconds": 0.0
+      },
+      "definitions": {
+        "first_byte_fast_ms": 10000.0,
+        "large_tokens": 20000,
+        "local_completion": "Stream finished with provider=local and measured tokens",
+        "service_ms": "dispatch_to_first_byte_ms (first byte minus queue wait)",
+        "warm": "proxy cache_state=warm on the dispatch_first_byte_ms line"
+      },
+      "dispatches": {
+        "cache_state_breakdown": {
+          "cold": 444,
+          "restored": 296,
+          "warm": 2014
+        },
+        "other_provider_events_ignored": 0,
+        "per_hour": 114.75,
+        "total": 2754,
+        "unknown_prompt_estimate": 0
+      },
+      "label": "postchange_matched",
+      "large_cold": {
+        "service_ms": {
+          "max": 156269.5,
+          "n": 73,
+          "p50": 55231.9,
+          "p90": 101660.5,
+          "p99": 153829.6
+        },
+        "total": 73
+      },
+      "large_other_cache_state": {
+        "service_ms": {
+          "max": 173421.0,
+          "n": 248,
+          "p50": 3458.5,
+          "p90": 42746.7,
+          "p99": 138552.9
+        },
+        "total": 248
+      },
+      "large_warm": {
+        "first_byte_under_threshold": {
+          "count": 922,
+          "share": 0.7382,
+          "threshold_ms": 10000.0
+        },
+        "per_hour": 52.042,
+        "service_ms": {
+          "max": 160751.5,
+          "n": 1249,
+          "p50": 3967.5,
+          "p90": 38863.0,
+          "p99": 121340.7
+        },
+        "total": 1249
+      },
+      "local_completions": {
+        "large": {
+          "per_hour": 74.792,
+          "total": 1795
+        },
+        "per_hour": 114.625,
+        "prompt_tokens": {
+          "max": 103235.0,
+          "n": 2751,
+          "p50": 24954.0,
+          "p90": 38748.0,
+          "p99": 70122.5
+        },
+        "total": 2751,
+        "usage_missing": 2406
+      },
+      "warm": {
+        "per_hour": 83.917,
+        "service_ms": {
+          "max": 160751.5,
+          "n": 2014,
+          "p50": 3035.4,
+          "p90": 26556.8,
+          "p99": 106684.3
+        },
+        "total": 2014
+      },
+      "window": {
+        "first_seen": "2026-11-06 20:15:52",
+        "hours": 24.0,
+        "last_seen": "2026-11-07 16:35:09",
+        "lines_in_window": 265095,
+        "since": "2026-11-06 16:35:14",
+        "until": "2026-11-07 16:35:14"
+      }
+    },
+    "prechange_matched": {
+      "coverage": {
+        "covered": true,
+        "files_with_lines": 8,
+        "gaps": [],
+        "window_end_gap_seconds": 0.0,
+        "window_start_gap_seconds": 0.0
+      },
+      "definitions": {
+        "first_byte_fast_ms": 10000.0,
+        "large_tokens": 20000,
+        "local_completion": "Stream finished with provider=local and measured tokens",
+        "service_ms": "dispatch_to_first_byte_ms (first byte minus queue wait)",
+        "warm": "proxy cache_state=warm on the dispatch_first_byte_ms line"
+      },
+      "dispatches": {
+        "cache_state_breakdown": {
+          "cold": 213,
+          "restored": 18,
+          "warm": 392
+        },
+        "other_provider_events_ignored": 0,
+        "per_hour": 25.958,
+        "total": 623,
+        "unknown_prompt_estimate": 0
+      },
+      "label": "prechange_matched",
+      "large_cold": {
+        "service_ms": {
+          "max": 122436.7,
+          "n": 17,
+          "p50": 32258.5,
+          "p90": 99414.5,
+          "p99": 118915.8
+        },
+        "total": 17
+      },
+      "large_other_cache_state": {
+        "service_ms": {
+          "max": 0.0,
+          "n": 0,
+          "p50": 0.0,
+          "p90": 0.0,
+          "p99": 0.0
+        },
+        "total": 0
+      },
+      "large_warm": {
+        "first_byte_under_threshold": {
+          "count": 126,
+          "share": 0.7079,
+          "threshold_ms": 10000.0
+        },
+        "per_hour": 7.417,
+        "service_ms": {
+          "max": 118063.7,
+          "n": 178,
+          "p50": 4585.1,
+          "p90": 27819.5,
+          "p99": 87583.2
+        },
+        "total": 178
+      },
+      "local_completions": {
+        "large": {
+          "per_hour": 10.625,
+          "total": 255
+        },
+        "per_hour": 25.708,
+        "prompt_tokens": {
+          "max": 56441.0,
+          "n": 617,
+          "p50": 17018.0,
+          "p90": 31815.6,
+          "p99": 51179.0
+        },
+        "total": 617,
+        "usage_missing": 3693
+      },
+      "warm": {
+        "per_hour": 16.333,
+        "service_ms": {
+          "max": 118063.7,
+          "n": 392,
+          "p50": 2222.8,
+          "p90": 16288.4,
+          "p99": 65955.0
+        },
+        "total": 392
+      },
+      "window": {
+        "first_seen": "2026-10-30 16:35:14",
+        "hours": 24.0,
+        "last_seen": "2026-10-31 16:35:13",
+        "lines_in_window": 529614,
+        "since": "2026-10-30 16:35:14",
+        "until": "2026-10-31 16:35:14"
+      }
+    }
+  }
+}

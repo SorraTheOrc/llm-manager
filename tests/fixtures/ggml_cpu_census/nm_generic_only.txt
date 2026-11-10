@@ -1,0 +1,7 @@
+000000000004a8d0 T ggml_vec_dot_q4_0_q8_0_generic
+000000000004d780 T ggml_vec_dot_q4_K_q8_K_generic
+000000000004e080 T ggml_vec_dot_q6_K_q8_K_generic
+0000000000050480 T ggml_vec_dot_iq4_nl_q8_0_generic
+0000000000051010 T ggml_cpu_extra_work_size
+0000000000050f90 T ggml_cpu_extra_compute_forward
+000000000001c6b0 T ggml_backend_cpu_get_extra_buffer_types()

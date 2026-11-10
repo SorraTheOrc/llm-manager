@@ -336,7 +336,8 @@ async def test_warm_stream_completes_locally_unchanged(monkeypatch):
         {"name": "session_slot", "slots": [{"slot_id": 0, "context_tokens": None}], "owner": "sess-a"},
         # non_resident: the slot belongs to a different session
         {"name": "non_resident", "slots": [{"slot_id": 0, "context_tokens": 49103}], "owner": "sess-other"},
-        # unknown: no snapshot and no ownership — falls open to the prediction
+        # unknown: no snapshot and no ownership — denied as unmeasured-cold
+        # since LP-0MW81DFML006O5KL (the predicted ratio no longer decides)
         {"name": "unknown", "slots": [], "owner": None},
     ],
     ids=["measured", "session_slot", "non_resident", "unknown"],

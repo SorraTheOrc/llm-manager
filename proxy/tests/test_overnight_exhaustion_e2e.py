@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import proxy.provider as provider
@@ -59,6 +60,17 @@ class _DummyRequest:
 
     async def is_disconnected(self):
         return False
+
+
+def _stateful_request(body: bytes = b'{"model":"test"}') -> _DummyRequest:
+    """A request stub carrying ``state`` (the chain-skip record's home).
+
+    ``_DummyRequest`` deliberately has no ``state``; the residual-chain verdict
+    reads the per-request skip record from it, so the AC9 rows need one.
+    """
+    request = _DummyRequest(body)
+    request.state = SimpleNamespace()
+    return request
 
 
 class _FreeConcurrency:
@@ -366,3 +378,273 @@ def test_exhausted_zero_when_availability_exists():
     body = json.loads(r.body)
     assert body["retry_after"] == 0
     assert r.headers.get("retry-after") == "0"
+
+
+# ======================================================================
+# AC9 (LP-0MVWC9CZH004OZYN): a known-until chain never spins and never
+# schedules a replay earlier than the advertised retry_at.
+# ======================================================================
+
+
+def _known_until_model() -> dict:
+    """Mixed known-until chain: one window-blocked remote + one reset-blocked.
+
+    All entries are deterministically skipped, so the residual-chain verdict
+    fires and the earliest reopening instant (the 9 h usage-limit reset) is
+    ahead of the 11 h window edge — the honest *earliest* answer, not the
+    maximum.
+    """
+    return {
+        "providers": [
+            {
+                "name": "opencode-go-2",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_2_API_KEY",
+                "model": "deepseek-v4-flash",
+                "available_times": _OVERNIGHT_WINDOW,  # next edge ~11 h away
+            },
+            {
+                "name": "opencode-go-3",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_3_API_KEY",
+                "model": "deepseek-v4-flash",
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_known_until_chain_never_holds_or_spins(monkeypatch):
+    """AC9: a known-until-exhausted chain returns at once — no 0 s spin, no hold.
+
+    The recovery is hours away, so holding could only add latency before an
+    inevitable exhaustion: the wrapper must surface the planned-unavailable
+    response immediately with its honest ``retry_at`` and consume no hold.
+    """
+    model = _known_until_model()
+    reset_seconds = 9 * 3600
+    provider._usage_reset_at[
+        provider._usage_limit_account_key(model["providers"][1])
+    ] = time.time() + reset_seconds
+    try:
+        hold_requests: list[float] = []
+
+        async def _record_hold(_req, seconds):
+            hold_requests.append(seconds)
+            return False
+
+        monkeypatch.setattr(provider, "_hold_sleep", _record_hold)
+        monkeypatch.setattr(
+            "proxy.server.proxy_to_remote",
+            AsyncMock(side_effect=AssertionError("blocked remote must not run")),
+        )
+
+        with patch("proxy.provider.datetime", _FixedDateTime):
+            result = await provider.proxy_with_remote_fallback(
+                _stateful_request(), "v1/chat/completions", model,
+                {"provider_cooldown_seconds": 60,
+                 "chain_hold_seconds": 300, "chain_hold_max_cycles": 3,
+                 "max_retry_after_seconds": 100000},
+            )
+    finally:
+        provider._usage_reset_at.pop(
+            provider._usage_limit_account_key(model["providers"][1]), None
+        )
+
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    assert body["code"] == "no_provider_available_in_window"
+    assert body["retryable"] is True
+    # The honest EARLIEST instant is the 9 h reset, ahead of the 11 h edge.
+    # The reset is seeded from the real clock, so allow the sub-second drift
+    # between seeding and measurement (mirrors the sibling rows' tolerance).
+    assert abs(body["retry_after"] - reset_seconds) <= 5
+    assert result.headers.get("retry-after") == str(body["retry_after"])
+    retry_at = datetime.fromisoformat(body["retry_at"])
+    assert abs((retry_at - _FIXED_NOW).total_seconds() - reset_seconds) <= 5
+    # AC9: never a spin — the wrapper does not hold at all.
+    assert hold_requests == [], "a known-until chain must not hold or spin"
+
+
+@pytest.mark.asyncio
+async def test_known_until_hold_within_budget_tracks_retry_at(monkeypatch):
+    """AC9: when a hold is taken it equals the real wait, never the legacy 300 s.
+
+    A known-until response whose earliest reopening is inside the hold budget
+    must schedule its next cycle at that instant (``min(hold, retry_after)``),
+    so the replay is never earlier than the advertised ``retry_at``.
+    """
+    model = _known_until_model()
+    verdict = {
+        "skips": {"opencode-go-2": "outside_available_window"},
+        "terminal": [],
+        "providers": 1,
+        "retry_after_seconds": 120,
+    }
+    response = provider._build_planned_unavailable_response(
+        verdict,
+        {"server": {"max_retry_after_seconds": 100000}},
+        {"providers": [model["providers"][0]]},
+    )
+    assert response is not None
+    assert json.loads(response.body)["retry_after"] == 120
+
+    cycle_responses = [response]
+
+    async def cycle_fn(_req, _path, _model, _config):
+        if cycle_responses:
+            raise provider.ChainExhaustedError(cycle_responses.pop(0))
+        return Response(status_code=200, content=b"ok")
+
+    holds: list[float] = []
+
+    async def _record_hold(_req, seconds):
+        holds.append(seconds)
+        return False
+
+    monkeypatch.setattr(provider, "_hold_sleep", _record_hold)
+    result = await provider._run_chain_cycles(
+        _stateful_request(), "v1/chat/completions", {},
+        {"chain_hold_seconds": 300, "chain_hold_max_cycles": 3},
+        cycle_fn,
+    )
+
+    assert result.status_code == 200
+    assert holds == [120.0], "the hold must equal the real retry_at wait (120 s)"
+    assert holds[0] >= 120, "the replay must not run before the advertised retry_at"
+    assert holds[0] <= 300, "the hold must stay within the existing cap"
+
+
+@pytest.mark.asyncio
+async def test_known_until_fail_fast_returns_immediately_when_streaming(monkeypatch):
+    """AC9 streaming equivalent: a fail-fast chain never opens a streaming hold."""
+    model = _known_until_model()
+
+    async def cycle_fn(req, _path, _model, _config):
+        provider._note_chain_resolution_skip(
+            req, "opencode-go-2", "outside_available_window"
+        )
+        provider._note_chain_resolution_skip(
+            req, "opencode-go-3", "usage_limit_reset_pending"
+        )
+        verdict = provider._residual_chain_verdict(req, _model, [], {})
+        provider._set_chain_fail_fast_verdict(req, verdict)
+        raise provider.ChainExhaustedError(
+            provider._build_planned_unavailable_response(
+                verdict,
+                {"server": {"max_retry_after_seconds": 100000}},
+                _model,
+            )
+        )
+
+    async def _fail_streaming(*_args, **_kwargs):
+        raise AssertionError("a fail-fast chain must not open a streaming hold")
+
+    monkeypatch.setattr(provider, "_build_streaming_hold_response", _fail_streaming)
+    monkeypatch.setattr(provider, "_request_is_streaming", AsyncMock(return_value=True))
+
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        result = await provider._run_chain_cycles(
+            _stateful_request(), "v1/chat/completions", model,
+            {"chain_hold_seconds": 300, "chain_hold_max_cycles": 3},
+            cycle_fn,
+        )
+
+    assert result.status_code == 503
+    assert json.loads(result.body)["code"] == "no_provider_available_in_window"
+
+
+# ======================================================================
+# AC9b (LP-0MVYVX38100841G6): the hold bounds itself by the untruncated
+# retry_at, not the capped client-facing retry_after.
+# ======================================================================
+
+
+def _planned_response_with(true_wait: int, cap: int):
+    """A planned-unavailable response whose true wait exceeds *cap*."""
+    verdict = {
+        "skips": {"opencode-go-2": "outside_available_window"},
+        "terminal": [],
+        "providers": 1,
+        "retry_after_seconds": true_wait,
+    }
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        return provider._build_planned_unavailable_response(
+            verdict,
+            {"server": {"max_retry_after_seconds": cap}},
+            {
+                "providers": [
+                    {
+                        "name": "opencode-go-2",
+                        "type": "remote",
+                        "endpoint": "https://opencode.ai/zen/go",
+                        "available_times": _OVERNIGHT_WINDOW,
+                    }
+                ]
+            },
+        )
+
+
+def test_truncated_planned_response_hold_uses_the_real_wait():
+    """AC9b: a capped advertisement must not shrink the hold to the cap."""
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        response = _planned_response_with(true_wait=7200, cap=60)
+        assert response is not None
+        body = json.loads(response.body)
+        # Client-facing: capped, flagged, with the untruncated instant.
+        assert body["retry_after"] == 60
+        assert body["retry_after_truncated"] is True
+        assert body["retry_at"] == "2026-01-05T15:00:00+00:00"  # 13:00 + 2 h
+
+        # Hold-side: the real 7200 s wait, not the 60 s cap.
+        assert provider._exhaustion_retry_after(response) == 7200
+        # 7200 s exceeds the 300 s x 3 = 900 s budget, so no hold is taken.
+        assert provider._bounded_hold_seconds(300.0, response, 3) is None
+
+
+def test_truncated_planned_response_within_budget_holds_the_real_wait():
+    """AC9b: within the budget the hold equals the real (untruncated) wait."""
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        response = _planned_response_with(true_wait=120, cap=60)
+        assert response is not None
+        body = json.loads(response.body)
+        assert body["retry_after"] == 60
+        assert body["retry_after_truncated"] is True
+
+        assert provider._exhaustion_retry_after(response) == 120
+        assert provider._bounded_hold_seconds(300.0, response, 3) == 120.0
+
+
+def test_streaming_hold_comment_surfaces_the_planned_fields():
+    """AC9: the streaming hold comment carries the new payload's story."""
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        planned = _planned_response_with(true_wait=120, cap=60)
+        assert planned is not None
+        diagnostics = provider._exhaustion_diagnostics(planned)
+    assert "code=no_provider_available_in_window" in diagnostics
+    assert "retry_at=2026-01-05T13:02:00+00:00" in diagnostics
+    assert "opencode-go-2" in diagnostics
+
+
+def test_streaming_hold_comment_is_unchanged_for_generic_exhaustion():
+    """AC9c: a generic payload's diagnostics string is byte-identical."""
+    generic = Response(
+        content=json.dumps(
+            {
+                "error": "All providers exhausted",
+                "code": "all_exhausted",
+                "retry_after": 7,
+                "unavailable_providers": {"a": 7},
+            }
+        ).encode(),
+        status_code=503,
+        media_type="application/json",
+        headers={"Retry-After": "7"},
+    )
+    assert provider._exhaustion_diagnostics(generic) == (
+        "error=All providers exhausted, unavailable={'a': 7}"
+    )

@@ -77,36 +77,96 @@ The `local_admission_guard` `LogEvent` carries `rate_bucket`,
 proxy-usage-analysis report breaks verdicts down by `rate_bucket` and by the
 new-token bands used by `scripts/prefill_admission_conversion.py`.
 
-## Guardrails (unchanged)
+Since `LP-0MVV29YDQ00437N6` the same line also carries `occupant_hold_s`, the
+**measured** occupant hold described below.
 
-`contention_queue_max_wait_seconds` stays **60** and
-`local_prefill_deadline_seconds` stays **120**; the ordering assertion
+### Blocker-hold pricing (LP-0MVV29YDQ00437N6)
+
+Evidence: [`queue-wait-abandonment-diagnosis.md`](queue-wait-abandonment-diagnosis.md)
+(`LP-0MVV29XPT003OXI5`, parent `LP-0MVV1V213002QAIR`). The per-wait diagnosis
+of the post-change 24 h window measured the occupancy term at **exactly** the
+symmetric `eta_prefill_s × busy_slots` floor in **163 of 169** abandoned waits
+that had an admission decision: median projection **28.4 s** against the **60 s**
+budget actually spent, median shortfall **31.6 s**. So the measured
+occupant-remaining term above was inert for the population that loses, and a
+holder that kept the slot for the whole wait was priced as if it owed nothing.
+The dominant blocker class was `prefill_in_flight` (**65.3 %**);
+`lease_holder_generating` was a **13.4 %** minority whose fairness capping stays
+owned by `LP-0MVOJ6KAW004EBV0` (this change does not cap renewals).
+
+The change prices, per live prefilling occupant record, the **remaining
+dispatch-lease hold** (`expires_at`, the record's own monotonic bound on how
+long the local slot stays leased to that holder):
 
 ```
-60 < 120 < 840 < 900
+occupancy = max(eta_newcomer x busy_slots,                      # floor
+                sum(max(occupant_prefill_remaining, lease_hold)))  # measured
+```
+
+Properties (all tested in `proxy/tests/test_occupant_hold_pricing.py`):
+
+- **Measured evidence only raises.** The symmetric floor keeps its exact
+  meaning; the measured term can never lower it, and a record whose lease has
+  expired (or is missing/invalid) contributes nothing.
+- **Deliberately conservative direction.** A live lease is an *upper* bound on
+  how long the slot stays away (the holder may release early), so the term can
+  refuse a wait the queue might have served. That is the documented trade-off:
+  refusing at admission is strictly cheaper than burning the whole budget and
+  detouring remote anyway, which is what the diagnosis measured happening in
+  60.7 % of enqueued waits (`LP-0MVV29XDW006VTWK` baseline).
+- **Fail-open preserved.** No usable occupant evidence ⇒ today's floor,
+  byte-for-byte. The guard still never prices from a guessed multiplier.
+- **Only the diagnosed class.** Only records that are genuinely *prefilling*
+  (`active`, no first byte yet) are priced — exactly the existing
+  measurement eligibility, so the generating minority keeps today's treatment.
+- **No new knob.** The term is not configurable; there is no operator setting
+  to tune, disable or weight it.
+
+Attribution: `occupant_hold_s` on the `local_admission_guard` line reports the
+measured hold the decision priced with (`0.0` = no usable evidence, never "the
+occupant owed nothing"), so a refusal can be attributed to measured blocker
+class rather than inferred from `eta_occupancy_s` alone.
+
+## Guardrails (unchanged)
+
+The guardrail values are the shipped ones and were **not** altered by any of
+these changes (the queue budget and deadline have their own swept history —
+`contention_queue_max_wait_seconds` 60 → 30 in `LP-0MVT1146V007WXA4`,
+`local_prefill_deadline_seconds` 120 → 180 — recorded in `proxy/config.yaml`):
+
+```
+contention_queue_max_wait_seconds            = 30
+local_prefill_deadline_seconds               = 180
+
+30 < 180 < 840 < 900
 (contention_queue_max_wait_seconds
  < local_prefill_deadline_seconds
  < local_dispatch_first_byte_timeout_seconds
  < local_dispatch_max_prefill_seconds)
 ```
 
-must keep holding. No new configuration knobs were added: the contended window
-reuses `local_admission_guard_min_samples`.
+The ordering must keep holding; it is asserted from the *shipped* config by
+`proxy/tests/test_prefill_budget_config.py`
+(`test_shipped_config_passes_the_ordering_validator`,
+`test_ordering_holds_for_the_documented_values`). No new configuration knobs
+were added: the contended window reuses
+`local_admission_guard_min_samples`, and the blocker-hold term
+(`LP-0MVV29YDQ00437N6`) is not configurable at all.
 
 ## Rollback
 
 The documented rollback is unchanged — **no new knob**:
 
 - `server.local_admission_guard_policy: observe` — log the decisions (including
-  `rate_bucket`) but never refuse. Use to validate the contended calibration
-  on live traffic.
+  `rate_bucket` and `occupant_hold_s`) but never refuse. Use to validate the
+  contended calibration and the blocker-hold term on live traffic.
 - `server.local_admission_guard_policy: off` — do not evaluate the guard at
   all.
 - `server.local_prefill_deadline_seconds: 0` — disable only the deadline bound.
 
-Reverting the behavioural change is a code revert of the two feature children
-above; the config values in the guardrail block must not be altered by the
-rollback.
+Reverting a behavioural change is a code revert of the feature children below
+(including the blocker-hold term, `LP-0MVV29YDQ00437N6`); the config values in
+the guardrail block must not be altered by the rollback.
 
 ## Plan: changelog — cross-reference
 
@@ -120,7 +180,9 @@ dependency order):
 | 3 | `LP-0MVS9YK9P006M1NQ` | Occupant-remaining priced from new tokens at the contended rate |
 | 4 | `LP-0MVS9YKHL007UBBZ` | Decision-log and usage-report surface for `rate_bucket` |
 | 5 | `LP-0MVTKTOVI006ZONN` | Post-change 24 h measurement window vs the 85 % baseline (record: [`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md)) |
-| 6 | `LP-0MVS9Z034006MFZ6` | Docs and rollback (this page) |
+| 6 | `LP-0MVV29XDW006VTWK` | Diurnally matched pre-change baseline restatement — 52.6 % working baseline (record: [`prefill-admission-conversion-diurnal-baseline.md`](prefill-admission-conversion-diurnal-baseline.md)) |
+| 7 | `LP-0MVS9Z034006MFZ6` | Docs and rollback (this page) |
+| 8 | `LP-0MVV29YDQ00437N6` | Blocker-hold pricing: price the diagnosed `prefill_in_flight` blocker class (dispatch-lease hold) in the occupancy term — evidence: [`queue-wait-abandonment-diagnosis.md`](queue-wait-abandonment-diagnosis.md) |
 
 Related origin items: `LP-0MVKUKF65008D5UN` (conservative ETA for large
 prompts), `LP-0MVICD2YW004DJPV` (occupancy-aware symmetric floor),
@@ -136,6 +198,16 @@ events") is **not** met on the literal reading: the genuine comparator is
 152 events (6.3 / h) pre-change and 392 (16.3 / h) post-change (×2.6), with
 one genuinely new class, `measured_cache_deficit` (0 → 234). That class is
 triaged in `LP-0MVV9JWL9003A6XR` as expected behaviour of the measured-cache
-early-abort feature, not a defect. The
-stricter working baseline (36.9 %) was not cleared — that regression is tracked
-in `LP-0MVV1V213002QAIR`.
+early-abort feature, not a defect.
+
+The **working baseline** for that share is the **diurnally matched** pre-change
+window `2026-10-28 00:10:18` → `2026-10-29 00:10:18` (24 h, ending exactly at
+the deploy, fully pre-change code): **52.6 %** (71/135), recorded in
+[`prefill-admission-conversion-diurnal-baseline.md`](prefill-admission-conversion-diurnal-baseline.md)
+(`LP-0MVV29XDW006VTWK`). The like-for-like change is `52.6 % → 60.7 %`
+(**+8.1 points**), and it was not cleared — that regression is tracked in
+`LP-0MVV1V213002QAIR`. The `36.9 %` figure from the `19:00`→`19:00` window is
+retained as the **historical** pre-change reference, not as the working
+baseline: 15.7 of the 23.8-point move from it is diurnal mix, since both
+pre-change windows are served by identical code. The literal **85 %** bar is
+unchanged.

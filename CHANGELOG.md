@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.1.29 (2026-11-10)
+### Features
+- Return a meaningful retryable error (real retry_at) when a model's whole chain is blocked by scheduled gates, instead of an opaque 503 retried for hours (LP-0MVWC9CZH004OZYN)
+- [feature] Usage report: wasted GPU compute analysis — summary table, detail section and appendix in report.md (LP-0MW2SQNHJ0044PV6)
+- [impl] Enforce measured prefix residency in local routing: apply the 38k cold threshold when residency is unmeasured (LP-0MW7V292T0020G02)
+- local_active_queries leaks ~1 increment per 2.6 local requests (136 self-heals in 13 h) — capacity signal under-reports free slots (LP-0MVWF78QK0060TZH)
+- Publish contention-queue depth, wait and loss metrics (LP-0MVWPJW2700966ZU)
+- Publish prefix-reuse and KV-cache steal metrics for slot thrash (LP-0MVWPK2VH008YWBD)
+### Bug Fixes
+- Rotation on proxy restart strands the adopted llama-server's log in the rotated-away file (llama-server.log frozen, /health llama_log_source_healthy=false) (LP-0MVZ4UDF10029NDS)
+- [bug] llama-server + TTS SIGKILLed together 3x in 6.8 h (exit 137) with the OOM and churn mitigations live — no >=24 h window can complete (LP-0MW2RI9AM007O1FO)
+- Backend death is invisible when the proxy adopted the backend (Popen-less watchdog) — silent local-route outage (LP-0MW3MOMD9007DC26)
+- Local-route ConnectError retry storm (~28s/request) with dead backend advertised available — fail fast + pre-dispatch probe (RCA 2026-11-05 21:36) (LP-0MW42T6IJ006EQA3)
+- Last-resort local admission when the GPU is idle and every remote provider is exhausted (LP-0MVWAMY8M001KE4W)
+- Router startup pins current_model to preload_list[0] (mxbai-embed) rather than a chat model (LP-0MVWBYAGL004BV8X)
+- Reconcile a cache-served available_slots with a fresh slot-detail snapshot (LP-0MVXSX0TZ00798KA)
+- finish pushes from the main checkout after a refused local-dev fast-forward, so the pre-push pushed-commit guard refuses (LP-0MVWB6AOH001MAB0)
+### Other
+- Harden tests/test_git_hooks.py git fixtures against an inherited GIT_INDEX_FILE (LP-0MVWAQBNB006KQXG)
+- [run-not-before 2026-11-05T22:33:14Z] Post-change ≥24 h measurement (AC3, AC4) (LP-0MVW8S8OZ00449YR)
+- [run-not-before 2026-11-05T22:33:14Z] Restart the LLM proxy onto the starvation-fix commit and let a >=24 h window elapse (window anchor 2026-11-04T22:33:14Z — do not restart) (LP-0MVZ2EPI3006Y0WN)
+- Optimize use of free tokens (LP-0MVWG4U7F0009LTH)
+- OpenCode Go quota gate must honour per-account 'use balance' credit opt-in (LP-0MW46P7QU0064LM3)
+- Run post-change 24 h high_priority_inert evaluation (earliest 2026-11-07T14:16Z) (LP-0MVZRRGD40005T0A)
+- One true GPU-activity measure: consolidate every GPU-activity signal onto the power-derived attributable share (LP-0MW5K7ST10050Y1O)
+- 2026-11-06 14:16:00 ≥24 h zero-kill validation window + restart-free anchor hand-off (LP-0MW3K7Z7T0094JK6)
+- [run-not-before 2026-11-07T07:10Z] Re-measure on a clean single-process night: did the draining-slot annotation remove the residual saturated-without-live-work polls? (LP-0MVUVHBZH007INL1)
+- [run-not-before 2026-11-06T20:16Z] Validate the restart-churn fix over a restart-free window (AC2 >=6 h; AC5 >=24 h closes 2026-11-07T14:16Z) (LP-0MW0JCFMM0000DM2)
+- Refactor: Modernization in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MW3K7WD6003TJKZ-observability-true-death-signal-tts-rest/proxy/proxy/death_capture.py (LP-0MW3L8JJF008R5NB)
+
 ## v0.1.28 (2026-11-04)
 ### Features
 - Annotate the post-cancel release lag so a draining slot is never reported saturated (LP-0MVUTYHG7001S6BM)

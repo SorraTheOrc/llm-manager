@@ -1087,3 +1087,150 @@ async def test_router_prefill_reaper_cancel_releases_on_confirmed_verdict(monkey
     assert any(
         "reason=client_disconnect" in line for line in _log_lines(server.logger)
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Per-dispatch live-work attribution (LP-0MVZ3V87D007R6JA, parent LP-0MVYZEYZY003IQAH)
+#
+# The 2026-11-01/02 residual (72 saturated-without-live-work polls) is a
+# per-session dispatch-record teardown race, not a stale read path. A back-to-back
+# next turn of the SAME session acquires the same ``(endpoint, session_id)``
+# record key; when the previous turn's teardown lands *after* that admission
+# (measured 0.3-0.6 s later) it clears the newer dispatch's live-work
+# attribution for its whole prefill:
+#
+#   05:31:07,383  Stream finished turn N (teardown scheduled)
+#   05:31:07,675  [local] POST turn N+1 admitted (same session/key)
+#   05:31:08,008  lease_renewed (turn N teardown, LATE)
+#   05:31:18,459  status_request avail=1 hint=saturated in_flight=0 owner=None
+#
+# These cases pin the corrected per-dispatch contract: a teardown affects only
+# the dispatch that owns it, and a retained post-stream lease is never live work.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_late_turn_teardown_does_not_clear_newer_dispatch_attribution():
+    """AC1/AC2: teardown of turn N running after admission of turn N+1 must not
+    clear turn N+1's live-work attribution on the shared session record."""
+    srv = _make_srv()
+    session = "back-to-back-session"
+    turn_n_request = SimpleNamespace()
+    turn_n_plus_1_request = SimpleNamespace()
+
+    acquired, _owner, _active, _retry = await helpers._try_acquire_local_dispatch(
+        srv, 1, session, "local", request=turn_n_request
+    )
+    assert acquired is True
+    first_token = srv.local_dispatch_records[session].get("dispatch_token")
+    assert first_token is not None, (
+        "each dispatch must carry its own identity so a teardown can be scoped"
+    )
+
+    acquired, _owner, _active, _retry = await helpers._try_acquire_local_dispatch(
+        srv, 1, session, "local", request=turn_n_plus_1_request
+    )
+    assert acquired is True, "a same-session re-acquisition is always permitted"
+    second_token = srv.local_dispatch_records[session].get("dispatch_token")
+    assert second_token is not None
+    assert second_token != first_token, (
+        "each dispatch must carry its own identity so a teardown can be scoped"
+    )
+
+    # Turn N's teardown lands late — after turn N+1 was admitted.
+    await helpers._decrement_local_active_queries(
+        srv,
+        session_key=session,
+        backend="local",
+        dispatch_token=first_token,
+    )
+
+    record = srv.local_dispatch_records[session]
+    assert record["active"] is True, (
+        "teardown of turn N ran after admission of turn N+1 and cleared the "
+        "newer dispatch's live-work attribution"
+    )
+    assert record["expires_at"] > time.monotonic(), (
+        "the surviving dispatch must still carry a live lease"
+    )
+    assert record["dispatch_token"] == second_token
+
+    # AC2: the status live-work view derived from the registry (as
+    # ``get_llama_local_status`` does) reports the surviving dispatch.
+    assert helpers._count_active_local_dispatch_records(srv) == 1, (
+        "a live prefill must read local_in_flight_requests=1"
+    )
+    owners = [
+        helpers._dispatch_key_session_id(key)
+        for key, rec in srv.local_dispatch_records.items()
+        if rec.get("active")
+    ]
+    assert owners == [session], (
+        "a live prefill must name its owner session in local_owner_session_id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_abandonment_release_does_not_delete_newer_dispatch():
+    """AC4: ``_release_local_dispatch`` scoped to an abandoned dispatch must not
+    delete a newer dispatch's record on the same session key."""
+    srv = _make_srv()
+    session = "abandoned-then-redispatched"
+    turn_n_request = SimpleNamespace()
+    turn_n_plus_1_request = SimpleNamespace()
+
+    await helpers._try_acquire_local_dispatch(
+        srv, 1, session, "local", request=turn_n_request
+    )
+    await helpers._try_acquire_local_dispatch(
+        srv, 1, session, "local", request=turn_n_plus_1_request
+    )
+
+    # Turn N is abandoned after turn N+1 has already acquired the record.
+    removed = await helpers._release_local_dispatch(
+        srv, session, request=turn_n_request
+    )
+
+    assert removed is False, (
+        "a release scoped to turn N must not remove turn N+1's record"
+    )
+    assert session in srv.local_dispatch_records, (
+        "the newer dispatch's record must survive a late abandonment release"
+    )
+    assert srv.local_dispatch_records[session]["active"] is True
+
+    # A release scoped to the owning dispatch still removes it.
+    removed = await helpers._release_local_dispatch(
+        srv, session, request=turn_n_plus_1_request
+    )
+    assert removed is True
+    assert session not in srv.local_dispatch_records
+
+
+@pytest.mark.asyncio
+async def test_last_teardown_retains_the_lease():
+    """AC4: the retained-lease contract is unchanged — after the last dispatch's
+    teardown the record is ``active=False`` with a future ``expires_at``."""
+    srv = _make_srv()
+    session = "single-turn-session"
+    request = SimpleNamespace()
+
+    await helpers._try_acquire_local_dispatch(
+        srv, 1, session, "local", request=request
+    )
+    token = srv.local_dispatch_records[session].get("dispatch_token")
+    assert token is not None
+
+    before = time.monotonic()
+    await helpers._decrement_local_active_queries(
+        srv, session_key=session, backend="local", dispatch_token=token
+    )
+
+    record = srv.local_dispatch_records[session]
+    assert record["active"] is False, (
+        "the final teardown must end the dispatch (no live work)"
+    )
+    assert record["expires_at"] > before, (
+        "the post-stream lease must be retained with a future expiry "
+        "(lease_renewed), preserving slot retention"
+    )

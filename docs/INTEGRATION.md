@@ -143,7 +143,14 @@ the final `exec … -m uvicorn`. That lets it pin the shell-level `--restart`
 preserve-vs-restart decision (signature match preserves llama-server, a
 config change or an unusable signature restarts it, `--keep-llama-server` wins
 over the hash) behaviourally, without ever touching the live proxy,
-llama-server, TTS server or ports 8000/8080/8081. The bare `tests/*.sh`
+llama-server, TTS server or ports 8000/8080/8081. happens to hold 8080/8081. That is why every sandboxed launcher module runs
+with `START_PROXY_PORT_KILL_DISABLED=1` (and a `fuser` stub): the phase cannot be
+sandboxed by a `pgrep` stub, so it is disabled instead. Omitting it in
+`tests/test_start_proxy_self_kill.py` made every suite run `SIGKILL` the live
+TTS server and llama-server router — the class-A backend deaths of
+[death-attribution-class-a-LP-0MW3PLEH8008O4I7.md](death-attribution-class-a-LP-0MW3PLEH8008O4I7.md).
+
+The bare `tests/*.sh`
 harnesses listed above stay opt-in and are not run by default `pytest`.
 
 The embeddings integration tests (`test_embeddings_integration.py`) poll the

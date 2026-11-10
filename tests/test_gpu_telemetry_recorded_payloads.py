@@ -326,6 +326,27 @@ def test_bundle_slot_occupancy_matches_the_workload_definition():
         assert recorded == expected, f"t={ts} power={power[ts]} busy={busy[ts]}"
 
 
+def test_jitter_bundle_documents_its_window_and_serves_every_query():
+    """``window_rules_jitter.json`` is a second full bundle, one window wide.
+
+    It captures the 2026-11-02 jitter hotspot the staleness-aware rule
+    cross-check was written for (LP-0MW5K8YWG0069ZD8), so it must obey the same
+    envelope contract as ``window_with_gap.json``.
+    """
+    bundle = _load("window_rules_jitter.json")
+    capture = bundle["capture"]
+
+    assert capture["endpoint"].endswith("/api/v1/query_range")
+    assert capture["step_seconds"] == STEP_SECONDS
+    assert capture["window"]["end_unix"] - capture["window"]["start_unix"] == 1200
+    assert capture["source"].startswith("captured live")
+    assert capture["notes"].strip()
+    assert set(bundle["responses"]) == set(BUNDLE_QUERIES)
+    for query, response in bundle["responses"].items():
+        assert response["status"] == "success", query
+        assert response["data"]["resultType"] == "matrix", query
+
+
 def test_bundle_contains_a_computing_and_an_idle_stretch():
     """The CLI test needs both outcomes in the same stream to be meaningful."""
     values = [

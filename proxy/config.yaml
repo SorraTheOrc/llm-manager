@@ -85,6 +85,23 @@
 #                     deepseek, opencode-go-deepseek)
 #                     are currently timed to off-peak UTC windows
 #                     (see their entries).
+#
+#                     Planned-unavailable classification
+#                     (LP-0MVWC9CZH004OZYN): when *every* remaining provider
+#                     is blocked by a known-until gate — an
+#                     ``available_times`` window, a usage-limit reset, a quota
+#                     window rollover — the proxy answers with the
+#                     ``no_provider_available_in_window`` 503 instead of the
+#                     generic ``all_exhausted`` body. Its ``retry_at`` is the
+#                     **earliest** instant any entry reopens (the next window
+#                     edge, or the soonest reset), and ``retry_after_truncated:
+#                     true`` marks a cap-limited advertisement while
+#                     ``retry_at`` keeps the untruncated instant. Scheduled
+#                     gaps are deferred-and-reported by design — do not add an
+#                     always-on remote provider to hide them, and do not
+#                     re-time a window to close a gap (operator decision
+#                     2026-10-31). See "Planned-unavailable chain" in
+#                     ``proxy/docs/routing.md``.
 #                     Example:
 #                       - name: deepseek-v4.1-flash
 #                         type: remote
@@ -174,6 +191,24 @@
 #                    (LP-0MVFA1VRT007T9HT). The entry flag overrides
 #                    `server.respect_ratelimit_headers`; default false so
 #                    every existing provider is unchanged (LP-0MVBHDNLB007ALLJ).
+#
+# Prepaid-credit balance opt-in (optional, quota-managed remote providers
+# only; LP-0MW46PAU4006SK7Z):
+#   use_balance - true|false. An OpenCode Go account may be configured in the
+#                    console to fall over onto prepaid **balance** once its
+#                    monthly plan window is spent. When `use_balance: true`
+#                    the quota gate treats a plan-exhausted account as still
+#                    dispatchable onto that credit (wired in the quota-gate
+#                    sibling child); `false` (the default) means a plan-
+#                    exhausted account waits for its window reset. Only a real
+#                    YAML boolean is honoured (fail safe): an omitted key
+#                    defaults to `false` (existing behaviour unchanged) and a
+#                    malformed value is coerced to `false` with one WARN per
+#                    entry — it never fails a load. The flag is meaningful
+#                    only for quota-managed (`opencode-*`) entries; elsewhere
+#                    it is ignored (debug note). The three opencode-go-* entries
+#                    in each chain declare the field; only `opencode-go` opts
+#                    in.
 #
 # Responses-API mode (optional, remote providers only):
 #   api - "openai-completions" (default) or "openai-responses". Some
@@ -432,13 +467,97 @@ models:
         priorities: [low, medium, high]
         type: local
         llama_model: Qwen3
-      # MunitoAI Free (LP-0MV5UPXKL002MSKB): free-tier remote fallback, sits
-      # immediately after local. Uses a separate key resolved from
-      # ~/.pi/agent/auth.json under either ``munitoai_free`` or the
-      # documented hyphenated ``munitoai-free`` — the resolver strips
-      # _API_KEY from MUNITOAI_FREE_API_KEY and tries both the underscore
-      # and hyphenated stems (LP-0MVBJXZY5002UW10). No ``available_times``
-      # window — eligible around the clock.
+      - name: opencode-go-3
+        priorities: [low, medium, high]
+        display_name: OpenCode Go 3
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_3_API_KEY
+        forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
+        #
+        # Deepseek
+        #
+        # IMPORTANT: deepseek-flash via api.deepseek.com has available_times
+        # windows that leave gaps (UTC 01:00-04:00 and 06:00-10:00). During
+        # these gaps the provider is skipped and requests fall to the next
+        # available provider (or enter chain-hold retry). The 10:00-00:00
+        # window covers 14 hours; the 3+2 hour gaps are accepted risk.
+        # (LP-0MU1RXEPL005CK97)
+        #
+        model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
+      - name: opencode-go-2
+        priorities: [low, medium, high]
+        display_name: OpenCode Go 2
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_2_API_KEY
+        forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
+        #
+        # Deepseek
+        #
+        model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
+      - name: opencode-go
+        priorities: [low, medium, high]
+        display_name: OpenCode Go
+        type: remote
+        provider: opencode-go
+        endpoint: https://opencode.ai/zen/go
+        api_key_env: OPENCODE_API_KEY
+        forward_session_headers: false
+        use_balance: true  # may spill onto prepaid credit once the plan window is spent (LP-0MW46PAU4006SK7Z)
+        #
+        # Deepseek
+        #
+        model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
+        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+        #
+        # Muse
+        #
+        # model: muse-spark-1.3-contributor
+        # api: openai-responses
+      # MunitoAI Free (LP-0MV5UPXKL002MSKB, LP-0MVWG4U7F0009LTH): free-tier
+      # remote fallback placed AFTER the three timed opencode-go accounts and
+      # BEFORE the paid ``munitoai`` tier. The free tier draws on a daily-reset
+      # allowance (LP-0MVT8SAZE00570J5), so spending it while a costed tier is
+      # eligible (UTC 00:00-01:00, 04:00-06:00, 10:00-00:00) wastes tokens that
+      # are only useful during the opencode gap periods (UTC 01:00-04:00 and
+      # 06:00-10:00, LP-0MU1RXEPL005CK97) — where this entry is now the first
+      # non-local tier that can serve.
+      # Uses a separate key resolved from ~/.pi/agent/auth.json under either
+      # ``munitoai_free`` or the documented hyphenated ``munitoai-free`` — the
+      # resolver strips _API_KEY from MUNITOAI_FREE_API_KEY and tries both the
+      # underscore and hyphenated stems (LP-0MVBJXZY5002UW10). No
+      # ``available_times`` window — eligible around the clock. The entry's own
+      # knobs (rate limit, reset-header handling, context ceiling) are unchanged
+      # by the repositioning.
       # ``display_name`` marks the free tier so X-Resolved-Model shows
       # ``MunitoAI Free/<model>`` vs the paid ``MunitoAI/<model>`` in Pi
       # (LP-0MVCQ36QV009QX8K).
@@ -490,81 +609,9 @@ models:
         # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
         # both see the full 3-per-window cap.
         rate_limit_rpm: 3
-      - name: opencode-go-3
-        priorities: [low, medium, high]
-        display_name: OpenCode Go 3
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_3_API_KEY
-        forward_session_headers: false
-        #
-        # Deepseek
-        #
-        # IMPORTANT: deepseek-flash via api.deepseek.com has available_times
-        # windows that leave gaps (UTC 01:00-04:00 and 06:00-10:00). During
-        # these gaps the provider is skipped and requests fall to the next
-        # available provider (or enter chain-hold retry). The 10:00-00:00
-        # window covers 14 hours; the 3+2 hour gaps are accepted risk.
-        # (LP-0MU1RXEPL005CK97)
-        #
-        model: deepseek-v4.1-flash
-        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
-        # context window for opencode-go/deepseek-v4.1-flash = 1000000
-        # (OpenCode Go publishes no per-minute token allowance).
-        max_context_tokens: 1000000
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-        #
-        # Muse
-        #
-        # model: muse-spark-1.3-contributor
-        # api: openai-responses
-      - name: opencode-go-2
-        priorities: [low, medium, high]
-        display_name: OpenCode Go 2
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_2_API_KEY
-        forward_session_headers: false
-        #
-        # Deepseek
-        #
-        model: deepseek-v4.1-flash
-        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
-        # context window for opencode-go/deepseek-v4.1-flash = 1000000
-        # (OpenCode Go publishes no per-minute token allowance).
-        max_context_tokens: 1000000
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-        #
-        # Muse
-        #
-        # model: muse-spark-1.3-contributor
-        # api: openai-responses
-      - name: opencode-go
-        priorities: [low, medium, high]
-        display_name: OpenCode Go
-        type: remote
-        provider: opencode-go
-        endpoint: https://opencode.ai/zen/go
-        api_key_env: OPENCODE_API_KEY
-        forward_session_headers: false
-        #
-        # Deepseek
-        #
-        model: deepseek-v4.1-flash
-        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
-        # context window for opencode-go/deepseek-v4.1-flash = 1000000
-        # (OpenCode Go publishes no per-minute token allowance).
-        max_context_tokens: 1000000
-        available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-        #
-        # Muse
-        #
-        # model: muse-spark-1.3-contributor
-        # api: openai-responses
       # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
-      # after the opencode-go chain. Restricted to 10:00-23:00 UTC so
+      # after the free tier, which itself trails the opencode-go chain
+      # (LP-0MVWG4U7F0009LTH). Restricted to 10:00-23:00 UTC so
       # paid dispatches fall within business hours.
       - name: munitoai
         priorities: [low, medium, high]
@@ -667,6 +714,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -689,6 +737,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -711,6 +760,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
+        use_balance: true  # may spill onto prepaid credit once the plan window is spent (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -836,6 +886,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_3_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -858,6 +909,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_2_API_KEY
         forward_session_headers: false
+        use_balance: false  # no prepaid-credit fallback (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -880,6 +932,7 @@ models:
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
+        use_balance: true  # may spill onto prepaid credit once the plan window is spent (LP-0MW46PAU4006SK7Z)
         #
         # Deepseek
         #
@@ -1003,7 +1056,26 @@ server:
   # oom_score_adj applied to the llama-server backend after it is spawned (and
   # to an adopted backend). Raising a child's score is always permitted, so the
   # kernel prefers the model backend over the proxy in every deployment mode.
+  # The value is written to the process TREE, not only to the start-script
+  # wrapper: the router and the per-model children it forks are scored too, and
+  # the backend watchdog re-asserts it every ~30 s (LP-0MW3K7XJ30027RV6 — the
+  # wrapper-only write left the live router and child at 0). Verify with
+  # `python3 scripts/verify_oom_protection.py`.
   llama_server_oom_score_adj: 800
+  # --- Death-signal decoding + death-window capture (LP-0MW3K7WD6003TJKZ) ---
+  # The proxy used to report a blanket ``llama_server_exit_code_137`` for every
+  # backend/TTS death while kern.log held the real signal. Death records now
+  # carry the decoded cause (``llama_server_signal_SIGSEGV`` with its
+  # signal number and ``128+N`` code) and a bounded second-resolution window of
+  # the host state before the death. See docs/death-signal-observability.md.
+  #
+  # Arm the per-second ring buffer. Off by default (it costs one /proc +
+  # sysfs read per second); arm it while attributing a death.
+  death_capture_enabled: true  # armed by LP-0MW3K7WYV001XLL1 — rationale: docs/death-attribution-LP-0MW3K7WYV001XLL1.md
+  # Sampling interval, retained-window length and hard sample cap for the ring.
+  death_capture_interval_seconds: 1
+  death_capture_window_seconds: 120
+  death_capture_capacity: 240
   # Router model-health monitoring cadence (seconds).
   # Preferred key (used by backend health loop):
   llama_model_health_interval_seconds: 10
@@ -1015,39 +1087,43 @@ server:
   llama_model_health_probe_timeout_seconds: 5
   llama_model_health_probe_backoff_seconds: 0.5
   llama_model_health_grace_period_seconds: 15
-  # --- GPU-wedge self-healing (LP-0MS91DHQ9003EGB0) ---
+  # --- GPU-wedge self-healing (LP-0MS91DHQ9003EGB0 / LP-0MW5K8ZW3005SEA8) ---
   # A wedged llama-server is still HTTP-reachable but its GPU kernels never
-  # complete (GPU ~100% busy with all slots idle, no tokens produced). The
-  # model-health loop detects this signature and unloads/reloads the model.
-  # Detection reads gpu_busy_percent from sysfs (AMD) with a rocm-smi
-  # fallback; when neither is available detection is skipped.
+  # complete: compute-level power with all slots idle and no tokens produced.
+  # The model-health loop detects this signature and unloads/reloads the
+  # model. Detection reads GPU power draw from sysfs (AMD hwmon power1_average)
+  # with a rocm-smi fallback; when no power source is available the probe
+  # fails closed and produces no verdict (never a wedge from missing data).
   #
-  # DISABLED BY DEFAULT (LP-0MS9GA6QL007XTBP): on this Strix Halo APU
-  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent saturates at ~20W - measured
-  # 2026-07-31, 30/30 samples read 100 while power draw showed the
-  # GPU idle at ~54W vs ~115W when computing (quantified 2026-10-28 as a ~20W
-  # latch in LP-0MVSQQO910077LYL). The busy+idle signature
-  # therefore false-positives on every idle period, causing constant
-  # unload/reload churn (144 unloads in one day, killing in-flight requests).
-  # On this hardware class a wedged engine (LP-0MS91D782006XIR6, ~53W idle
-  # power) is indistinguishable from normal idle from GPU sensors, so the
-  # busy counter cannot be trusted. Enable only on hardware with a reliable
-  # busy counter; the power-draw discriminator below reduces false positives
-  # and auto-disables detection when the counter is found pinned.
+  # DISABLED BY DEFAULT (LP-0MW5K8ZW3005SEA8): the wedge signature is power
+  # and slot state only - the old busy counter (gpu_busy_percent) was removed
+  # because on this Strix Halo APU (Radeon 8060S iGPU, gfx1151) it is a
+  # two-state detector that inverts across the working band (re-measured
+  # 2026-11-06 on kernel 7.0.0-38 (LP-0MW5K7WKZ005VJXA): 99.2% idle-with-
+  # display vs 98.7% computing, and no threshold in the working range rescues
+  # it), so the busy+idle signature false-positived on every idle period and
+  # caused constant unload/reload churn (144 unloads in one day, 2026-07-31,
+  # LP-0MS9GA6QL007XTBP). Even with the counter gone the power-only signature
+  # stays off: the idle-with-display band (~33-54 W, p50 45 W) sits close to
+  # transient compute (>= p75 92 W), and a wedged engine
+  # (LP-0MS91D782006XIR6, ~53 W idle power) is indistinguishable from normal
+  # idle from the power sensor alone. Enable only with a deliberate decision
+  # to trade churn risk for wedge coverage.
+  #
+  # Removed with LP-0MW5K8ZW3005SEA8: llama_gpu_wedge_busy_threshold_percent
+  # and llama_gpu_wedge_pinned_checks_required. The remaining wedge keys are
+  # documented against the shared compute threshold in monitoring/README.md,
+  # "GPU power calibration (and re-measuring it)".
   llama_gpu_wedge_detection_enabled: false
-  # GPU busy % at or above which the GPU is considered busy.
-  llama_gpu_wedge_busy_threshold_percent: 90
   # Consecutive health-loop checks with the wedge signature before recovery.
   # With the default 10s interval, 2 checks bounds detection to ~20-30s.
   llama_gpu_wedge_idle_checks_required: 2
-  # Power draw (W) below which the GPU is considered NOT genuinely computing.
-  # busy>=threshold + idle slots + power below this = pinned/unreliable busy
-  # counter (or stalled engine) -> never unloads; detection auto-disables if
-  # this state persists for llama_gpu_wedge_pinned_checks_required checks.
+  # Power draw (W) at or above which the GPU counts as genuinely computing.
+  # idle slots + power >= this = wedge; idle slots + power below this = idle
+  # GPU (no wedge); no power source = no verdict (fail closed). Shared with
+  # the monitoring rule threshold (monitoring/gpu_compute_rules.yaml) - keep
+  # them in sync.
   llama_gpu_wedge_power_low_threshold_watts: 90
-  # Consecutive pinned-counter observations (busy high + idle + low power)
-  # before GPU-wedge detection is disabled for the process lifetime.
-  llama_gpu_wedge_pinned_checks_required: 4
   # --- Slot-occupancy sampler (LP-0MVT1O0VG00905EL) ---
   # Cadence (seconds) of the proxy's slot-occupancy sample onto /metrics:
   # llama_slots_total, llama_slots_busy, llama_slot_busy{slot},
@@ -1210,6 +1286,26 @@ server:
   # back to the default, with one WARN per process.
   # Default: 99.5.
   quota_exhaustion_percent: 99.5
+  # Transient-overload and balance-exhaustion handling (LP-0MW46PBWL008T317).
+  # Once a `use_balance: true` account may dispatch on credit, two reactive
+  # paths are live and stay distinct:
+  #   - an OpenCode `[overloaded]` 429 (`Retry-After: 2` / `retry-after-ms`)
+  #     is a SHORT retryable cooldown honouring the upstream wait, never a
+  #     failure-domain exclusion and never an account quarantine — the same
+  #     entry is retried on the next chain-hold cycle and the chain falls
+  #     through to the next provider after the bounded holds;
+  #   - a genuine balance-exhaustion response (HTTP 402 / a usage-limit body
+  #     on a non-429 status) quarantines the failing API-key ACCOUNT with the
+  #     reset-aware usage-limit quarantine (real reset timing, cumulative with
+  #     an existing usage-limit quarantine), keyed on api_key_env@endpoint:model
+  #     so same-gateway siblings stay eligible.
+  # overloaded_cooldown_max_seconds caps the `[overloaded]` cooldown above
+  # (default 30 s), so a wildly large Retry-After can never park a
+  # transiently-overloaded entry for a long cooldown. The standard
+  # `Retry-After` / `retry-after-ms` headers are honoured by the overloaded
+  # path directly; the `respect_ratelimit_headers` flag above is NOT required
+  # for them (it remains the opt-in for the custom `x-ratelimit-*` headers).
+  overloaded_cooldown_max_seconds: 30
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
   # provider repeatedly returns an EMPTY response / stalls (no usable content)
   # across retry cycles, the provider is quarantined for an EXTENDED cooldown
@@ -1430,13 +1526,18 @@ server:
   #   `resident_prefix_insufficient` and follows the normal fallback chain,
   #   exactly like `large_context_bypass` today; the `contention_queue_*`
   #   budget is untouched (a denied request never enters the queue).
-  # - `local_idle_admit_*` (LP-0MVGD9Z8Z0055Y5J) is the LAST rung of the
-  #   ladder: an idle GPU still overrides a residency denial, so enabling this
-  #   gate cannot make an idle local backend refuse cold work.
+  # - `local_idle_admit_*` (LP-0MVGD9Z8Z0055Y5J) is the last ECONOMIC rung of
+  #   the ladder: an idle GPU still overrides a residency denial, so enabling
+  #   this gate cannot make an idle local backend refuse cold work. Below it,
+  #   `local_last_resort_*` (LP-0MVWAMY8M001KE4W) is the final rung and only
+  #   fires when no remote provider can serve the request.
   # - Fail-open: a missing/stale snapshot, a session that owns no slot, or a
   #   build that does not report `context_tokens` (llama.cpp b8782 dropped
   #   `n_past`) degrades to the session-owns-slot check and then to the
-  #   predicted ratio — never to a hard local outage.
+  #   predicted ratio — never to a hard local outage. An *unmeasured* basis is
+  #   now COLD (LP-0MW81DFML006O5KL, see
+  #   `local_unmeasured_residency_cold_enabled` below); that one key restores
+  #   the predicted-ratio rung documented here.
   # - Live-prefix pricing (AC3): when the measurement is available, the
   #   cold-token cap (`local_large_context_cold_cache_threshold`, 25k from
   #   LP-0MVN3KMGI009BZ0D once shipped) is evaluated against the *measured*
@@ -1444,6 +1545,31 @@ server:
   #
   # Default: 0.5 (50 % of the prompt must still be resident).
   local_resident_prefix_min_ratio: 0.5
+
+  # Unmeasured is COLD (LP-0MW81DFML006O5KL) and its SINGLE rollback
+  # (LP-0MW81DJZ60049X5W). When no measurement of the session's reusable prefix
+  # exists (`residency_source=unknown`: no fresh `/slots` snapshot *and* no slot
+  # ownership, or a probe that raised), the predicted cache ratio is NOT
+  # trusted: a prompt above `local_large_context_cold_cache_threshold` skips
+  # local with reason `unmeasured_residency_cold` and follows the normal remote
+  # chain. The 2026-11-07 20:48:51 case — a 55 492-token prompt priced
+  # `cached_ratio=1.00 / new_tokens=172`, admitted at `eta_prefill_s=130.8` and
+  # evicted at 180.1 s — was admitted precisely because nothing had been
+  # measured. The denial is deliberately NOT idle-overridable (it reports a
+  # missing measurement, not a price an idle GPU can beat); `local_last_resort_*`
+  # stays the final local override when no remote can serve the request.
+  #
+  # ROLLBACK — one value, byte-for-byte: set
+  # `local_unmeasured_residency_cold_enabled: false`. The pre-change behaviour
+  # returns exactly: an unmeasured basis degrades to the predicted sidecar
+  # ratio and logs `decision=admit_predicted` / `decision=skip_predicted` with
+  # `n_past_actual=none`, as before LP-0MW81DFML006O5KL. No code revert and no
+  # extra restart-ordering constraint beyond the usual process restart.
+  # `false` / `0` / `off` are all accepted; a missing or malformed value keeps
+  # the default (a typo never silently disables the enforcement).
+  #
+  # Default: true — the intended post-rollout behaviour (unmeasured is cold).
+  local_unmeasured_residency_cold_enabled: true
 
   # Session tenancy bound (LP-0MVN1IQTF0037WTG AC2). Per-request dispatch
   # leases bound *in-flight* requests but not *which* sessions occupy the
@@ -2646,6 +2772,62 @@ server:
   local_idle_admit_seconds: 60
 
   # -----------------------------------------------------------------------
+  # Last-resort local admission (LP-0MVWAMY8M001KE4W)
+  # -----------------------------------------------------------------------
+  # The FINAL rung of the local admission ladder (after the idle-admit rung
+  # above and after every other gate). When every remote provider is measured
+  # unavailable NOW and the GPU has been idle for
+  # ``local_last_resort_idle_seconds``, the prompt is served locally with its
+  # own size-appropriate deadline instead of answering the retryable
+  # ``All providers exhausted`` 503.
+  #
+  # Measured 2026-10-30 (24 h window): 236 of the 686 ``All providers
+  # exhausted`` warnings landed inside idle gaps that carried 98 inbound
+  # requests and ZERO streams, while the remote chain was empty
+  # (``usage_limit_reset_pending`` ~23 h, ``quota_exhausted`` ~18 days,
+  # ``outside available_times``). The idle-admit rung fired 1,337 times in the
+  # same window and refused 1,291 (96.6 %) on ``prefill_budget_exceeded``
+  # (``new_tokens`` p50 79,136 — inside the 120 k warm cap).
+  #
+  # The rung is narrow by construction — it cannot widen admission in the
+  # normal path:
+  #   * the remote chain must be MEASURED empty at decision time (the
+  #     resolver's own eligibility vocabulary: recorded chain skips, cooldown,
+  #     pending usage-limit reset, quota hard stop, ``available_times``), so
+  #     any available remote keeps today's behaviour;
+  #   * the GPU must be provably idle (nothing queued, generating, prefilling,
+  #     loading or switching), which also bounds last-resort concurrency at
+  #     ONE dispatch — a second request is refused exactly as today;
+  #   * the prompt must fit the model's own routing warm cap
+  #     (``local_large_context_warm_cache_threshold`` / the per-slot clamp /
+  #     a per-entry ``max_context_tokens``): this rung never overrides a
+  #     capacity limit, only the economic ones.
+  #
+  # Each admission logs
+  # ``local_last_resort_admit provider=... model=... reason=...
+  #   estimated_tokens=... new_tokens=... idle_seconds=...
+  #   threshold_seconds=... deadline_s=... warm_cap=...
+  #   remote_exhausted=true session=... turn=...`` — the measurement surface
+  # for the post-deploy (>= 24 h) attribution.
+  #
+  # ``local_last_resort_idle_seconds`` is the KILL SWITCH: ``0`` (or a
+  # malformed/non-positive value) restores today's decision matrix
+  # byte-for-byte. Default is ON (300 s = the >5 min idle-gap definition the
+  # measurement window used).
+  local_last_resort_idle_seconds: 300
+  # Prefill deadline a last-resort dispatch uses INSTEAD of
+  # ``local_prefill_deadline_seconds`` (default 600 s). It exists because
+  # admitting a 79 k-token cold prompt under the normal deadline would only
+  # convert the 503 into a ``prefill_deadline`` eviction: at the measured
+  # prompt-eval p50 (~193 tok/s) 79 k needs ~410 s. Values are clamped to
+  # 900 s (the ``local_dispatch_max_prefill_seconds`` lifetime wedge ceiling) and
+  # a malformed/non-positive value falls back to 600 s; the effective
+  # first-byte ceiling is still the tighter of this and
+  # ``local_dispatch_first_byte_timeout_seconds``. It applies to last-resort
+  # dispatches only — every other local dispatch keeps the normal deadline.
+  local_last_resort_deadline_seconds: 600
+
+  # -----------------------------------------------------------------------
   # Expected-reuse prefix credit (LP-0MVI2XOTY008Q4UV)
   # -----------------------------------------------------------------------
   # The routing ``cached_ratio`` is measured on the PREVIOUS local response,
@@ -2664,6 +2846,81 @@ server:
   # architecture, so credit less than the full recorded prompt. Set to 0.0 to
   # disable the credit and restore the previous behaviour exactly.
   cached_prefix_credit_margin: 0.9
+
+  # -----------------------------------------------------------------------
+  # Large-append rule (LP-0MW81DLWY003XOZ2)
+  # -----------------------------------------------------------------------
+  # The measured ``cached_ratio`` describes the PREVIOUS local response's hit
+  # fraction, so it cannot see a single message that appends a large block of
+  # genuinely new work. On 2026-11-03 08:41:54 one 51,945-byte tool-role
+  # message (a whole SKILL.md pasted into history) was appended; the price came
+  # out as ``cached_ratio=0.99 new_tokens=173`` and llama-server then prefilled
+  # 13,002 tokens (53.2 s to first byte, ``measured_cache_abort
+  # deficit_ratio=0.659``).
+  #
+  # When the content appended AFTER the session's recorded prompt prefix
+  # (``provider.record_prompt_prefix``) exceeds this many BYTES, the
+  # pre-dispatch price forces a full prefill (``cached_ratio = 0``), so the
+  # cold threshold is evaluated against the real prefill work. Only the append
+  # counts: a large *resident* prefix plus a small new turn keeps the measured
+  # ratio. With no recorded prefix (e.g. a ratio restored from the slot-snapshot
+  # sidecar) the append boundary is unknown and the measured ratio is used
+  # unchanged — the rule never treats a whole prompt as an append.
+  #
+  # Default 32768 (32 KiB, ≈8k tokens). ``0`` is the disable sentinel: the rule
+  # is off and the price is byte-for-byte the previous behaviour. A missing or
+  # malformed value keeps the default (a typo must not disable the rule).
+  # Sizing: a lower value is more conservative (more prompts priced cold, more
+  # remote fallbacks above the cold threshold); a higher value trusts the
+  # measured ratio for larger appends.
+  local_large_append_bytes_threshold: 32768
+
+  # -----------------------------------------------------------------------
+  # Divergence feedback into the session pricing model (LP-0MW81DS4W008DKDV)
+  # -----------------------------------------------------------------------
+  # The routing ``cached_ratio`` is a prediction. When llama-server's measured
+  # ``prompt_progress`` proves it wrong (``measured_cache_abort`` records
+  # ``deficit_ratio = (total - cache) / total``), the measured truth is fed back
+  # into the session's pricing model instead of the next turn inheriting the
+  # same under-estimate. 2026-11-03 08:41:54: priced ``cached_ratio=0.99
+  # new_tokens=173``, measured ``measured_new_tokens=12936 priced_new_tokens=173
+  # deficit_ratio=0.659`` (53.2 s to first byte). 2026-11-07 20:48:51: the same
+  # shape at 55,492 tokens, evicted at 180.1 s.
+  #
+  # Feedback applied on a divergence (measured deficit at or above the ratio
+  # below):
+  #   * the session's measured ratio becomes the measured ``cache / total``;
+  #   * the next turn's prefix credit is capped at the ``cache`` tokens the
+  #     dispatch proved resident, so the corrected price is the measured work
+  #     (a 55k prompt with 200 resident tokens is priced at ≈55k new tokens and
+  #     therefore falls under the 38k cold threshold / the unmeasured-cold
+  #     rule), not the optimistic 172-token price.
+  #
+  # BOUNDED — never a permanent poisoning: the correction applies to at most
+  # ``local_divergence_feedback_max_turns`` recorded dispatches (default 1) and
+  # expires after ``..._max_age_seconds`` (default 900), so the following
+  # dispatch rewrites the pricing basis and a genuinely warm turn restores the
+  # credit. It is cleared with the model state it corrects: session
+  # invalidation, slot reassignment and model switch.
+  #
+  # ROLLBACK — one value, byte-for-byte: set
+  # ``local_divergence_feedback_enabled: false`` (``0`` / ``off`` also work).
+  # No correction is recorded and the previous pricing behaviour returns
+  # exactly. A missing or malformed switch keeps the enabled default; a
+  # malformed numeric knob keeps its shipped default (a typo can neither
+  # disable the correction nor unbind it).
+  local_divergence_feedback_enabled: true
+  # Minimum measured ``(total - cache) / total`` for a correction. Default 0.25
+  # (the same floor the early abort uses): a genuinely warm dispatch measures
+  # <= 0.01, so it is never treated as a divergence.
+  local_divergence_feedback_min_deficit_ratio: 0.25
+  # How many recorded dispatches the correction applies to. Default 1: exactly
+  # the next turn is priced from the corrected model.
+  local_divergence_feedback_max_turns: 1
+  # Wall-clock expiry for a correction whose dispatch never records a prefix
+  # (e.g. an aborted turn). Default 900 s. A quiet session cannot carry a stale
+  # correction indefinitely.
+  local_divergence_feedback_max_age_seconds: 900
 
   # -----------------------------------------------------------------------
   # Priority routing cheap window (LP-0MVDT94F0003VHUA AC1)
@@ -2974,8 +3231,24 @@ server:
   backend_retry_base_delay_seconds: 0.25
   backend_retry_max_delay_seconds: 2.0
   backend_retry_jitter_ratio: 0.25
+  # TTL (seconds) of the local-backend-unreachable routing skip
+  # (LP-0MW42T6IJ006EQA3). A *deterministic* connection-refused local
+  # dispatch fails fast after a single attempt (no 8x backoff retries) and
+  # arms this skip, so the local route is not re-dispatched — and a stale
+  # slots snapshot (> local_slots_max_snapshot_age_seconds) also skips the
+  # route pre-dispatch. The skip is bounded and cleared by a successful
+  # dispatch / fresh probe, so a recovered backend is used again immediately
+  # (no permanent quarantine). Default: 60.
+  local_backend_skip_seconds: 60
   llama_watchdog_interval_seconds: 5
   llama_backend_probe_timeout_seconds: 2
+  # LP-0MW3MOMD9007DC26: consecutive unreachable reachability probes before an
+  # *adopted* llama-server (pid=0 sentinel, poll() always alive) is declared
+  # dead — the sentinel alone can never trip the poll()-based watchdog, so the
+  # port probe is the only liveness signal. 3 probes ≈ 15 s at the default
+  # watchdog interval: a short window that still absorbs a transient probe
+  # failure without restarting a live backend.
+  llama_adopted_unreachable_probes: 3
   llama_self_heal_max_attempts: 3
   llama_self_heal_window_seconds: 300
   llama_self_heal_backoff_base_seconds: 1

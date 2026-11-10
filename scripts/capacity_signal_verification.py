@@ -661,6 +661,24 @@ def analyse_status_stream(
                                     "available_slots": parse_int(
                                         fields.get("available_slots")
                                     ),
+                                    # LP-0MVZ3V96D007A825: carry the live-work
+                                    # evidence so a residual poll is
+                                    # self-attributable from the artifact
+                                    # alone (empty when the poll's schema does
+                                    # not carry the field — never fabricated).
+                                    "local_in_flight_requests": parse_int(
+                                        fields.get("local_in_flight_requests")
+                                    ),
+                                    "local_active_query": fields.get(
+                                        "local_active_query"
+                                    ),
+                                    "local_owner_session_id": fields.get(
+                                        "local_owner_session_id"
+                                    ),
+                                    "slots_stale": fields.get("slots_stale"),
+                                    "slot_counts_stale": fields.get(
+                                        "slot_counts_stale"
+                                    ),
                                 }
                             )
                     continue
@@ -1090,6 +1108,13 @@ def attribute_violations(
             "latency_ms": poll.get("latency_ms"),
             "slots_detail_stale": poll.get("slots_detail_stale"),
             "available_slots": poll.get("available_slots"),
+            # LP-0MVZ3V96D007A825: live-work evidence columns, copied verbatim
+            # from the poll row (empty when the poll's schema lacks them).
+            "local_in_flight_requests": poll.get("local_in_flight_requests"),
+            "local_active_query": poll.get("local_active_query"),
+            "local_owner_session_id": poll.get("local_owner_session_id"),
+            "slots_stale": poll.get("slots_stale"),
+            "slot_counts_stale": poll.get("slot_counts_stale"),
         }
         index = bisect.bisect_right(event_times, row["timestamp"]) - 1
         if index >= 0:
@@ -1618,6 +1643,14 @@ def write_artifacts(report: dict, out_dir: Path) -> list[Path]:
                 "latency_ms",
                 "slots_detail_stale",
                 "available_slots",
+                # LP-0MVZ3V96D007A825: additive live-work evidence columns,
+                # appended so the existing leading columns and their order are
+                # unchanged for existing readers.
+                "local_in_flight_requests",
+                "local_active_query",
+                "local_owner_session_id",
+                "slots_stale",
+                "slot_counts_stale",
             ],
         )
         writer.writeheader()
