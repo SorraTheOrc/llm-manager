@@ -1,0 +1,11 @@
+00000000000ff110 T ggml_gemm_q4_K_8x8_q8_K
+00000000000fdab0 T ggml_gemv_q4_K_8x8_q8_K
+00000000000f0d50 T ggml_vec_dot_q4_0_q8_0
+000000000004a800 T ggml_vec_dot_q4_0_q8_0_generic
+00000000000f22c0 T ggml_vec_dot_q4_K_q8_K
+000000000004d780 T ggml_vec_dot_q4_K_q8_K_generic
+00000000000f2aa0 T ggml_vec_dot_q6_K_q8_K
+000000000004e080 T ggml_vec_dot_q6_K_q8_K_generic
+00000000000349e0 T ggml_backend_cpu_repack_buffer_type()
+0000000000020290 t repack_q4_K_to_q4_K_8_bl(ggml_tensor*, int, void const*, unsigned long)
+000000000001c6b0 T ggml_backend_cpu_get_extra_buffer_types()

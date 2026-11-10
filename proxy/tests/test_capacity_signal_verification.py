@@ -84,6 +84,8 @@ def status_line(
     detail_stale: str | None = None,
     latency_ms: int = 3,
     per_phase: dict | None = None,
+    owner: str | None = None,
+    counts_stale: str | None = None,
 ) -> str:
     """One ``status_request`` log line, as the proxy writes it.
 
@@ -107,10 +109,14 @@ def status_line(
     ]
     if in_flight is not None:
         fields.append(f"local_in_flight_requests={in_flight}")
+    if owner is not None:
+        fields.append(f"local_owner_session_id={owner}")
     fields += [
         "model_switch_in_progress=false",
         f"slots_stale={stale}",
     ]
+    if counts_stale is not None:
+        fields.append(f"slot_counts_stale={counts_stale}")
     if detail_stale is not None:
         fields.append(f"slots_detail_stale={detail_stale}")
     fields += [
@@ -1305,12 +1311,100 @@ def test_write_artifacts_emits_json_text_and_attribution_csv(csv, tmp_path):
 
     rows = (out_dir / "saturated_without_live_work_attribution.csv").read_text(
     ).splitlines()
+    # LP-0MVZ3V96D007A825 AC2: the seven leading columns keep their order; the
+    # live-work evidence columns are appended (additive).
     assert rows[0] == (
         "timestamp,cause,evidence_timestamp,seconds_since_evidence,"
-        "latency_ms,slots_detail_stale,available_slots"
+        "latency_ms,slots_detail_stale,available_slots,"
+        "local_in_flight_requests,local_active_query,local_owner_session_id,"
+        "slots_stale,slot_counts_stale"
     )
     assert rows[1].startswith("2026-10-23 00:11:00,session_evicted,"
                              "2026-10-23 00:10:00,60,")
+
+
+def test_write_artifacts_carries_live_work_evidence_columns(csv, tmp_path):
+    """LP-0MVZ3V96D007A825 AC1/AC4: the residual CSV carries the live-work
+    evidence columns for one attributed and one unattributed violating poll.
+
+    A violating poll is ``capacity_hint=saturated`` with no live work, so the
+    live-work columns truthfully read 0/false/empty for it; the point is that
+    the artifact *carries* them, so a residual is re-checkable without
+    grepping the rotated logs.
+    """
+    import csv as csvlib
+
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason="prefill_deadline")
+        # Attributed violating poll: schema 3, no live work, counts fresh.
+        + status_line(
+            "2026-10-23 00:11:00",
+            hint="saturated",
+            stale="false",
+            detail_stale="false",
+            counts_stale="false",
+            in_flight=0,
+            local_active="false",
+            available="0",
+        )
+        # Unattributed violating poll: schema 2, no live-work fields at all.
+        + status_line(
+            "2026-10-23 00:30:00",
+            hint="saturated",
+            stale="false",
+            schema=2,
+            available="0",
+        ),
+    )
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+    out_dir = tmp_path / "artifacts"
+    csv.write_artifacts(report, out_dir)
+
+    with (out_dir / "saturated_without_live_work_attribution.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        rows = list(csvlib.DictReader(handle))
+
+    assert list(rows[0].keys()) == [
+        "timestamp",
+        "cause",
+        "evidence_timestamp",
+        "seconds_since_evidence",
+        "latency_ms",
+        "slots_detail_stale",
+        "available_slots",
+        "local_in_flight_requests",
+        "local_active_query",
+        "local_owner_session_id",
+        "slots_stale",
+        "slot_counts_stale",
+    ]
+    attributed = rows[0]
+    assert attributed["timestamp"] == "2026-10-23 00:11:00"
+    assert attributed["cause"] == "prefill_deadline"
+    assert attributed["local_in_flight_requests"] == "0"
+    assert attributed["local_active_query"] == "false"
+    assert attributed["local_owner_session_id"] == ""
+    assert attributed["slots_stale"] == "false"
+    assert attributed["slot_counts_stale"] == "false"
+
+    unattributed = rows[1]
+    assert unattributed["timestamp"] == "2026-10-23 00:30:00"
+    assert unattributed["cause"] == ""
+    # Schema 2 carries no ``local_in_flight_requests``/owner/counts-stale
+    # fields: those columns are empty, never fabricated. Its flag fallback is
+    # present and truthfully false.
+    assert unattributed["local_in_flight_requests"] == ""
+    assert unattributed["local_active_query"] == "false"
+    assert unattributed["local_owner_session_id"] == ""
+    assert unattributed["slot_counts_stale"] == ""
 
 
 def test_cli_write_artifacts_and_lookback(csv, tmp_path, capsys):

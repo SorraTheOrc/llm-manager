@@ -659,6 +659,20 @@ def _validate_config(cfg: dict) -> None:
     _validate_prompt_log_config(cfg)
     # Validate per-provider priority labels (LP-0MVGPZWY0001JD1D AC5)
     _validate_priority_config(cfg)
+    # Validate per-provider use_balance flags (LP-0MW46PAU4006SK7Z AC5)
+    _validate_use_balance_config(cfg)
+
+
+def _validate_use_balance_config(cfg: dict) -> None:
+    """Validate per-provider ``use_balance`` flags (LP-0MW46PAU4006SK7Z AC5).
+
+    Non-raising by design (AC3): a malformed value is coerced to ``False`` at
+    the routing layer, so this hook only surfaces one WARN per malformed entry
+    at load time.
+    """
+    from proxy.provider import validate_use_balance_config as _vubc
+
+    _vubc(cfg)
 
 
 def _validate_prompt_log_config(cfg: dict) -> None:

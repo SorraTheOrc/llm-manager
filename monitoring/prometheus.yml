@@ -17,8 +17,10 @@ global:
 # "monitoring/monitoring/..." and blocked startup).
 #
 # GPU coverage (LP-0MVO8DOHP008FL48): utilisation comes from power draw (see
-# gpu_compute_rules.yaml) because gpu_busy_percent is pinned at 100% on this APU,
-# and GPU-visible memory pressure is measured on GTT (gpu_memory_alerts.yaml)
+# gpu_compute_rules.yaml) because gpu_busy_percent is a two-state detector whose
+# step sits at ~30 W — below the idle-with-display band — and is therefore not a
+# utilisation signal (measured in monitoring/README.md, "Why not amd-smi,
+# rocm-smi or amdtop?"), and GPU-visible memory pressure is measured on GTT (gpu_memory_alerts.yaml)
 # because rocm_vram_* has no exporter. The previous gpu_vram_alerts.yaml was
 # removed (it selected series no exporter publishes). llama_memory_alerts.yaml
 # was also removed there but is restored by LP-0MVO9F877008ZCP7: it selects
@@ -56,7 +58,8 @@ scrape_configs:
   # (node_hwmon_power_average_watt, chip_name="amdgpu") comes from the same
   # exporter's hwmon collector and is the utilisation signal used by
   # gpu_compute_rules.yaml. gpu_busy_percent is scraped for continuity only - it
-  # is pinned at 100% on this APU and is NOT a utilisation measure.
+  # saturates above ~30 W and is NOT a utilisation measure (monitoring/README.md,
+  # "Why not amd-smi, rocm-smi or amdtop?").
   - job_name: "node-exporter"
     static_configs:
       - targets: ["localhost:9100"]

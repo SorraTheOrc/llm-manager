@@ -18,6 +18,14 @@ That page also carries the **post-change 24 h record** (AC4) delivered by
 `LP-0MVTKTOVI006ZONN`, including the `local_eviction_after_acceptance` counts
 by reason.
 
+> **This 19:00→19:00 window is the *historical* reference, not the working
+> baseline.** The diurnally matched restatement — `2026-10-28 00:10:18` →
+> `2026-10-29 00:10:18`, ending exactly at the deploy — is **52.6 % (71/135)**,
+> recorded in
+> [`prefill-admission-conversion-diurnal-baseline.md`](prefill-admission-conversion-diurnal-baseline.md)
+> (`LP-0MVV29XDW006VTWK`). The `36.9 % → 52.6 %` step (+15.7 points) is diurnal
+> mix: both windows are served by identical pre-change code.
+
 ```bash
 scripts/prefill_admission_conversion.py \
   --since "2026-10-27 19:00:00" \
@@ -151,6 +159,7 @@ which is triaged in `LP-0MVV9JWL9003A6XR`.
 | 6 | `LP-0MVS9Z034006MFZ6` | Docs and rollback |
 | 7 | `LP-0MVV9JWL9003A6XR` | Eviction triage that corrected this baseline's `local_eviction_after_acceptance` comparator (152 genuine, not the 463 substring count) and made the harness count only message-anchored eviction records |
 | 8 | `LP-0MVV29WR0009DY1A` | Own-request queue-wait banding — re-banded this baseline (5 waits moved to `unknown`; verdicts unchanged) |
+| 9 | `LP-0MVV29XDW006VTWK` | Diurnally matched pre-change baseline — supersedes this window as the working baseline (**52.6 %**; record: [`prefill-admission-conversion-diurnal-baseline.md`](prefill-admission-conversion-diurnal-baseline.md)) |
 
 Related: [`docs/dev/contended-prefill-pricing.md`](contended-prefill-pricing.md)
 (the contended pricing and rollback page).

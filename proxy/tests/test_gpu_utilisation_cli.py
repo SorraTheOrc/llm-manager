@@ -40,6 +40,16 @@ import gpu_utilisation as gu  # noqa: E402
 
 FIXTURES = PROJECT_ROOT / "monitoring" / "tests" / "fixtures"
 BUNDLE = json.loads((FIXTURES / "window_with_gap.json").read_text())
+#: Live capture of the 2026-11-02 05:25-05:45 slice of the measured worst-case
+#: window: 15 of its 81 instants break a naive same-instant rule comparison.
+JITTER_BUNDLE = json.loads((FIXTURES / "window_rules_jitter.json").read_text())
+#: Live capture of the WHOLE measured worst-case window (2026-11-02
+#: 00:00-12:04 UTC, 2,897 instants at 15 s): 307 of its 2,883 paired instants
+#: break a naive same-instant rule comparison, and 7 instants carry no
+#: recorded-rule sample at all (314 of 2,897 divergent in total).
+FULL_JITTER_BUNDLE = json.loads(
+    (FIXTURES / "window_rules_jitter_full.json").read_text()
+)
 START = BUNDLE["capture"]["window"]["start_unix"]
 END = BUNDLE["capture"]["window"]["end_unix"]
 STEP = 15
@@ -572,7 +582,7 @@ def test_power_only_fraction_uses_the_same_honest_denominator():
     assert result.power_only_computing_pct == pytest.approx(50.0)
 
 
-def test_cross_check_flags_a_recorded_rule_that_disagrees_with_the_threshold():
+def test_cross_check_flags_a_recorded_rule_that_disagrees_with_the_recomputation():
     series = _series(
         {
             # Says "our work" while the GPU drew 40 W and no slot was busy.
@@ -596,6 +606,272 @@ def test_cross_check_flags_a_recorded_rule_that_disagrees_with_the_threshold():
     assert result.warnings
 
 
+def test_cross_check_warning_blames_the_join_when_only_the_workload_rule_drifted():
+    """AC5: the power half agrees, so the warning must not name the threshold."""
+    series = _series(
+        {
+            "computing_workload_bool": {0: 1.0},  # says "our work" at 40 W
+            "computing_bool": {0: 0.0},  # agrees: 40 W is below the threshold
+            "power_watts": {0: 40.0},
+            "slots_busy": {0: 0.0},
+            "slot_heartbeat": {0: 0.0},
+        }
+    )
+
+    result = gu.compute_utilisation(
+        series,
+        window=gu.Window(start=0, end=0),
+        step_seconds=STEP,
+        scrape_interval_seconds=STEP,
+    )
+
+    warning = result.warnings[0]
+    assert "gpu:computing_workload:bool" in warning
+    assert "gpu:computing:bool" not in warning
+    assert "THRESHOLD_WATTS" not in warning
+
+
+def test_cross_check_ignores_a_recorded_rule_one_sample_behind_the_slots():
+    """AC4: jitter, not drift — the recorded rule used the previous slot sample.
+
+    ``llama_slots_busy`` steps to 1 at t=15 but the recording rule evaluated a
+    moment earlier and saw 0, so at t=15 and t=45 the recorded
+    ``gpu:computing_workload:bool`` is one sample behind the slot series. A
+    same-instant comparison calls both a definition drift; the ±1-sample
+    staleness window recognises them as timestamp jitter.
+    """
+    series = _series(
+        {
+            "computing_workload_bool": {0: 0.0, 15: 0.0, 30: 1.0, 45: 1.0},
+            "computing_bool": {0: 1.0, 15: 1.0, 30: 1.0, 45: 1.0},
+            "power_watts": {0: 120.0, 15: 120.0, 30: 120.0, 45: 120.0},
+            "slots_busy": {0: 0.0, 15: 1.0, 30: 1.0, 45: 1.0},
+            "slot_heartbeat": {0: 0.0, 15: 15.0, 30: 30.0, 45: 45.0},
+        }
+    )
+
+    result = gu.compute_utilisation(
+        series,
+        window=gu.Window(start=0, end=45),
+        step_seconds=STEP,
+        scrape_interval_seconds=STEP,
+    )
+
+    assert result.cross_check_samples == 4
+    assert result.cross_check_mismatches == 0
+    assert result.warnings == ()
+
+
+def test_cross_check_ignores_a_recorded_power_rule_one_sample_behind_the_power():
+    """The same staleness tolerance applies to the power input itself."""
+    series = _series(
+        {
+            # Power steps 80 -> 120 W at t=15 and 30; the recorded rules at
+            # t=15 saw the previous (80 W) sample.
+            "computing_workload_bool": {0: 0.0, 15: 0.0, 30: 1.0},
+            "computing_bool": {0: 0.0, 15: 0.0, 30: 1.0},
+            "power_watts": {0: 80.0, 15: 120.0, 30: 120.0},
+            "slots_busy": {0: 1.0, 15: 1.0, 30: 1.0},
+            "slot_heartbeat": {0: 0.0, 15: 15.0, 30: 30.0},
+        }
+    )
+
+    result = gu.compute_utilisation(
+        series,
+        window=gu.Window(start=0, end=30),
+        step_seconds=STEP,
+        scrape_interval_seconds=STEP,
+    )
+
+    assert result.cross_check_samples == 3
+    assert result.cross_check_mismatches == 0
+    assert result.warnings == ()
+
+
+def test_cross_check_still_fires_when_the_recorded_threshold_drifted():
+    """AC3 mutation test: a rule recorded at 100 W must not pass a 90 W check.
+
+    Every instant draws 95 W with one busy slot, so the recorded rule (written
+    for a 100 W threshold) says 0 while the CLI's 90 W classification says 1.
+    No staleness window can explain that, so the check must still fire — and it
+    must name ``THRESHOLD_WATTS``, because the power half is what diverged.
+    """
+    series = _series(
+        {
+            "computing_workload_bool": {0: 0.0, 15: 0.0, 30: 0.0},
+            "computing_bool": {0: 0.0, 15: 0.0, 30: 0.0},
+            "power_watts": {0: 95.0, 15: 95.0, 30: 95.0},
+            "slots_busy": {0: 1.0, 15: 1.0, 30: 1.0},
+            "slot_heartbeat": {0: 0.0, 15: 15.0, 30: 30.0},
+        }
+    )
+
+    result = gu.compute_utilisation(
+        series,
+        window=gu.Window(start=0, end=30),
+        step_seconds=STEP,
+        scrape_interval_seconds=STEP,
+    )
+
+    assert result.cross_check_samples == 3
+    assert result.cross_check_mismatches == 3
+    warning = result.warnings[0]
+    assert "THRESHOLD_WATTS" in warning
+    assert "gpu:computing:bool" in warning
+
+
+def test_cross_check_does_not_report_a_dead_sampler_as_rule_drift():
+    """AC5: frozen inputs are a sampler outage, not a rule definition drift.
+
+    After the pipeline dies every series returns the same last sample, so the
+    recorded rule (frozen on the slot state it last saw) and the raw series
+    (frozen on the next scrape) stay a sample apart forever. That must not
+    produce a warning telling the operator to check the rules.
+    """
+    series = _series(
+        {
+            # The sampler stopped at t=15: the heartbeat repeats from t=30 and
+            # the recorded rule froze on the slot state it last saw (1).
+            "computing_workload_bool": {0: 1.0, 15: 1.0, 30: 1.0, 45: 1.0},
+            "computing_bool": {0: 1.0, 15: 1.0, 30: 1.0, 45: 1.0},
+            "power_watts": {0: 120.0, 15: 120.0, 30: 120.0, 45: 120.0},
+            "slots_busy": {0: 1.0, 15: 1.0, 30: 0.0, 45: 0.0},
+            "slot_heartbeat": {0: 0.0, 15: 15.0, 30: 15.0, 45: 15.0},
+        }
+    )
+
+    result = gu.compute_utilisation(
+        series,
+        window=gu.Window(start=0, end=45),
+        step_seconds=STEP,
+        scrape_interval_seconds=STEP,
+    )
+
+    assert result.cross_check_samples == 3  # t=45 is frozen and skipped
+    assert result.cross_check_mismatches == 0
+    assert result.warnings == ()
+
+
+def test_live_capture_of_the_worst_case_window_reports_no_rule_drift():
+    """AC2/AC4: 2026-11-02 05:25-05:45, the measured jitter hotspot.
+
+    Fifteen instants in this recorded slice are flagged by a naive
+    same-instant comparison — the recording rules were evaluated on their own
+    schedule against the neighbouring power/slot sample. The staleness-aware
+    cross-check must report none of them, and it must still compare every
+    instant in the slice (nothing is skipped by the frozen-input guard).
+    """
+    capture = JITTER_BUNDLE["capture"]
+    window = gu.Window(
+        start=capture["window"]["start_unix"], end=capture["window"]["end_unix"]
+    )
+    step = capture["step_seconds"]
+    expected = gu.expected_sample_count(window.start, window.end, step)
+    series = gu.load_series(
+        getter=bundle_getter(JITTER_BUNDLE["responses"]),
+        prometheus_url=gu.DEFAULT_PROMETHEUS_URL,
+        window=window,
+        step_seconds=step,
+        expected_samples=expected,
+    )
+
+    naive_divergences = [
+        timestamp
+        for timestamp, workload in series["computing_workload_bool"].items()
+        if timestamp in series["power_watts"]
+        and timestamp in series["slots_busy"]
+        and gu.classify_instant(
+            series["power_watts"][timestamp], series["slots_busy"][timestamp]
+        )
+        != (workload >= 0.5)
+    ]
+
+    result = gu.compute_utilisation(
+        series,
+        window=window,
+        step_seconds=step,
+        scrape_interval_seconds=STEP,
+    )
+
+    # The slice must actually exercise the staleness path, or it proves nothing.
+    assert len(naive_divergences) == 15
+    assert result.cross_check_samples == expected == 81
+    assert result.cross_check_mismatches == 0
+    assert result.warnings == ()
+
+
+def test_live_capture_of_the_full_worst_case_window_reports_no_rule_drift():
+    """AC2: the whole 2026-11-02 window, not a 20-minute slice of it.
+
+    The audit that motivated this item measured the jitter hotspot over
+    2026-11-02 and quoted 321 of 2,897 instants flagged by a same-instant
+    comparison. Re-measured over the whole window (2026-11-02T00:00:00Z ..
+    12:04:00Z, 2,897 instants at 15 s, captured live into
+    ``window_rules_jitter_full.json``): 307 of the 2,883 paired instants
+    diverge, and 7 instants carry no recorded-rule sample at all, so 314 of
+    the 2,897 instants disagree under a naive comparison. The staleness-aware
+    cross-check must report none of them — over the whole window, not just
+    over the slice pinned by the test above.
+    """
+    capture = FULL_JITTER_BUNDLE["capture"]
+    window = gu.Window(
+        start=capture["window"]["start_unix"], end=capture["window"]["end_unix"]
+    )
+    step = capture["step_seconds"]
+    expected = gu.expected_sample_count(window.start, window.end, step)
+    series = gu.load_series(
+        getter=bundle_getter(FULL_JITTER_BUNDLE["responses"]),
+        prometheus_url=gu.DEFAULT_PROMETHEUS_URL,
+        window=window,
+        step_seconds=step,
+        expected_samples=expected,
+    )
+
+    grid = [window.start + index * step for index in range(expected)]
+    naive_divergences = [
+        timestamp
+        for timestamp in grid
+        if timestamp in series["computing_workload_bool"]
+        and timestamp in series["power_watts"]
+        and timestamp in series["slots_busy"]
+        and gu.classify_instant(
+            series["power_watts"][timestamp], series["slots_busy"][timestamp]
+        )
+        != (series["computing_workload_bool"][timestamp] >= 0.5)
+    ]
+    unmeasured = [
+        timestamp
+        for timestamp in grid
+        if timestamp not in series["computing_workload_bool"]
+    ]
+
+    result = gu.compute_utilisation(
+        series,
+        window=window,
+        step_seconds=step,
+        scrape_interval_seconds=STEP,
+    )
+
+    # The window must actually be the measured worst case, or the zero below
+    # proves nothing.
+    assert expected == 2897
+    assert len(naive_divergences) == 307
+    assert len(unmeasured) == 7
+    # ... and the cross-check must clear every instant it can compare.
+    assert result.cross_check_samples == 2873
+    assert result.cross_check_mismatches == 0
+    assert result.warnings == ()
+
+
+def test_staleness_candidates_prefer_the_instant_then_its_neighbours():
+    points = {0: 1.0, 15: 2.0, 30: 3.0}
+
+    assert gu.staleness_candidates(points, 15, 15) == [2.0, 1.0, 3.0]
+    assert gu.staleness_candidates(points, 0, 15) == [1.0, 2.0]
+    assert gu.staleness_candidates({}, 0, 15) == []
+    assert gu.staleness_candidates({0: 5.0, 15: 5.0}, 15, 15) == [5.0]
+
+
 # ---------------------------------------------------------------------------
 # CLI: queries, output, exit codes
 # ---------------------------------------------------------------------------
@@ -613,6 +889,38 @@ def test_cli_issues_exactly_the_documented_queries(capsys):
     assert code == gu.EXIT_OK
     assert calls == list(gu.QUERIES.values())
     assert "gpu_busy_percent" not in " ".join(calls)
+
+
+def test_the_cli_is_the_single_producer_of_the_attributable_share():
+    """C6 / epic AC2 (LP-0MW5K90EQ001W0R1): the CLI *is* the producer.
+
+    It queries the attributable rule series itself and does the grid-honest
+    share arithmetic locally, so no PromQL aggregation over
+    ``gpu:computing_workload:bool`` may appear in its query mapping — that is
+    what a second derivation definition would look like. The one-producer guard
+    in ``test_monitoring_deployment.py`` enforces the other side (no rule,
+    report or dashboard may aggregate it).
+    """
+    assert gu.QUERIES["computing_workload_bool"] == "gpu:computing_workload:bool"
+    for key, expression in gu.QUERIES.items():
+        assert "(" not in expression, (
+            f"QUERIES[{key!r}] = {expression!r} is a PromQL expression, not a "
+            "bare series selector; the CLI computes the share from the raw "
+            "series locally"
+        )
+
+
+def test_human_output_names_the_scope_of_the_power_only_derivation(capsys):
+    """AC1: a figure's name states its scope — the human output keeps the
+    'any GPU consumer, not just ours' label on the power-only derivation."""
+    code, out, _err = run_cli(
+        ["--since", str(START), "--until", str(END)],
+        getter=bundle_getter(),
+        capsys=capsys,
+    )
+
+    assert code == gu.EXIT_OK
+    assert "(gpu:computing:bool: any GPU consumer, not just ours)" in out
 
 
 def test_json_output_carries_the_documented_schema(capsys):
@@ -676,6 +984,62 @@ def test_human_output_states_shares_power_slots_and_resolution(capsys):
     assert "step 15s" in out
     assert "scrape floor 15s" in out
     assert "481 expected samples" in out
+
+
+def test_cli_reports_a_rule_drift_on_stderr_and_keeps_the_stable_json_keys(capsys):
+    """AC6: a firing cross-check keeps ``compared_samples`` / ``mismatches``.
+
+    The rules were recorded for a 100 W threshold, the CLI classifies at 90 W,
+    so every 95 W instant diverges. The JSON shape must not change and the
+    diagnosis must reach stderr, where an operator (or cron) will see it.
+    """
+    power = {0: 95.0, 15: 95.0, 30: 95.0}
+    slots = {0: 1.0, 15: 1.0, 30: 1.0}
+    points_by_query = {
+        gu.QUERIES["power_watts"]: power,
+        gu.QUERIES["slots_busy"]: slots,
+        gu.QUERIES["computing_bool"]: {0: 0.0, 15: 0.0, 30: 0.0},
+        gu.QUERIES["computing_workload_bool"]: {0: 0.0, 15: 0.0, 30: 0.0},
+        gu.QUERIES["slot_heartbeat"]: {0: 0.0, 15: 15.0, 30: 30.0},
+        gu.QUERIES["up_llama_proxy"]: {0: 1.0, 15: 1.0, 30: 1.0},
+    }
+
+    code, out, err = run_cli(
+        ["--since", "0", "--until", "30", "--json"],
+        getter=querying_getter(points_by_query),
+        capsys=capsys,
+    )
+
+    assert code == gu.EXIT_OK
+    payload = json.loads(out)
+    assert payload["schema_version"] == 1
+    assert payload["rule_cross_check"] == {"compared_samples": 3, "mismatches": 3}
+    assert payload["warnings"]
+    assert "THRESHOLD_WATTS" in err
+
+
+def test_cli_reports_a_rule_drift_without_the_threshold_advice_for_a_join_drift(
+    capsys,
+):
+    """AC5 at the CLI boundary: the workload-rule warning never names the threshold."""
+    points_by_query = {
+        gu.QUERIES["power_watts"]: {0: 40.0, 15: 40.0, 30: 40.0},
+        gu.QUERIES["slots_busy"]: {0: 0.0, 15: 0.0, 30: 0.0},
+        gu.QUERIES["computing_bool"]: {0: 0.0, 15: 0.0, 30: 0.0},
+        gu.QUERIES["computing_workload_bool"]: {0: 1.0, 15: 1.0, 30: 1.0},
+        gu.QUERIES["slot_heartbeat"]: {0: 0.0, 15: 15.0, 30: 30.0},
+        gu.QUERIES["up_llama_proxy"]: {0: 1.0, 15: 1.0, 30: 1.0},
+    }
+
+    code, _out, err = run_cli(
+        ["--since", "0", "--until", "30"],
+        getter=querying_getter(points_by_query),
+        capsys=capsys,
+    )
+
+    assert code == gu.EXIT_OK
+    assert "gpu:computing_workload:bool" in err
+    assert "THRESHOLD_WATTS" not in err
 
 
 def test_a_coarser_step_is_queried_and_reported(capsys):

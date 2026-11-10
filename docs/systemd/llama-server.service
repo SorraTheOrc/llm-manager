@@ -54,10 +54,32 @@ Environment=HSA_OVERRIDE_GFX_VERSION=11.5.1
 Environment=ROCM_LLVM_PRE_VEGA=1
 Environment=PORT=8080
 
+# Slot geometry (LP-0MW3PLK5M002YPOA): a unit-owned backend is spawned
+# OUTSIDE the proxy, so the proxy cannot export LLAMA_PARALLEL at spawn time
+# as it does for an inline backend. It MUST be set here to match
+# server.session_slot_pool_size (2 in the shipped proxy/config.yaml); a
+# mismatch causes slot exhaustion / restore failures. Keep the two in step
+# and restart the unit after changing either.
+Environment=LLAMA_PARALLEL=2
+
 # Restart policy (LP-0MVZ810NG008A3EW AC2): a backend killed by the OOM killer
 # comes back without an operator.
 Restart=always
 RestartSec=2
+
+# Supervision boundary (LP-0MW3PLK5M002YPOA AC1). This unit gives the router its
+# own cgroup (…/user@1000.service/llama-server.service) and its own session and
+# process group — disjoint from the proxy's login-session scope (e.g.
+# …/session-7.scope). A stray SIGKILL sweep that targets the proxy's scope,
+# process group or name can therefore no longer reach the backend; `KillMode=`
+# bounds what a stop-of-this-unit may signal, and Slice= keeps the cgroup
+# sibling. The wide boundary requires the backend to be started BY THIS UNIT,
+# not inline by the proxy — see
+# docs/dev/backend-supervision-boundary-runbook.md.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Slice=llama.slice
 
 # OOM ranking (LP-0MVZ810NG008A3EW AC1): raising a score is always permitted, so
 # a global OOM sacrifices the model backend before the proxy front door. Keep
@@ -126,9 +148,23 @@ Environment=HSA_OVERRIDE_GFX_VERSION=11.5.1
 Environment=ROCM_LLVM_PRE_VEGA=1
 Environment=PORT=8080
 
+# Slot geometry (LP-0MW3PLK5M002YPOA): must match server.session_slot_pool_size
+# (2 in the shipping config) — the proxy cannot export LLAMA_PARALLEL to a
+# unit-owned backend. See docs/dev/backend-supervision-boundary-runbook.md §6.
+Environment=LLAMA_PARALLEL=2
+
 # Restart policy (LP-0MVZ810NG008A3EW AC2).
 Restart=always
 RestartSec=2
+
+# Supervision boundary (LP-0MW3PLK5M002YPOA AC1): own cgroup, own session and
+# process group, disjoint from the proxy's scope; KillMode bounds a stop of
+# this unit to this unit's processes only. See
+# docs/dev/backend-supervision-boundary-runbook.md.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Slice=llama.slice
 
 # OOM ranking (LP-0MVZ810NG008A3EW AC1): the backend is the preferred victim, so
 # an OOM takes a model down instead of the proxy front door (which the

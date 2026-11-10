@@ -69,6 +69,10 @@ DOCUMENTED_EXIT_TOKENS = {
     "context_too_large",
     "large_context_bypass",
     "resident_prefix_insufficient",
+    # Unmeasured is cold (LP-0MW81DFML006O5KL): a prompt above the cold
+    # threshold with no measured residency skips local under its own token,
+    # distinct from (and not idle-overridable unlike) the measured-zero denial.
+    "unmeasured_residency_cold",
     "tenant_limit",
     "prefill_thrash_cooldown",
     # Thrash-gate refusal, request-scoped half (LP-0MVXSSYTN001TBW5): this very

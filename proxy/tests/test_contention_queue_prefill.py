@@ -309,7 +309,11 @@ async def test_queue_wait_log_carries_the_admission_decisions_own_pricing(caplog
     assert "session=herdr-1" in line
     assert "new_tokens=35077" in line
     assert "rate_bucket=contended" in line
-    assert "trigger=generating" in line
+    # Slice LP-0MVV29X2E004INFL split the two concepts: ``saturation=`` names
+    # the local gate, ``trigger=`` names the entry path. This helper was
+    # called on the default (concurrency-limit) path.
+    assert "saturation=generating" in line
+    assert "trigger=concurrency_limit" in line
     # The dispatch/fallback lines that end this wait read the same evidence
     # back off the request, so all three lines of one wait agree.
     assert (
@@ -483,3 +487,209 @@ async def test_prefill_denied_request_cap_exceeded_falls_back_to_remote(
     )
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_fallback_after_queue" in messages
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVV29X2E004INFL: entry trigger (`trigger=`) and abandon cause (`cause=`)
+# are logged, not inferred from the wait duration.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_queue_wait_enqueue_line_carries_concurrency_limit_trigger(caplog):
+    """AC2: the default (concurrency-limit) entry path is named on the enqueue
+    line, alongside the saturation gate it must not replace."""
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    cfg = _cfg(max_wait=0.05)
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        action, _, _ = await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, request, {}, {}, {}, "s2",
+        )
+
+    assert action == "fallback"
+    lines = _wait_lines(caplog)
+    assert lines, "the enqueue line must be logged"
+    assert "trigger=concurrency_limit" in lines[-1]
+    assert "saturation=" in lines[-1]
+    assert provider._queue_trigger_from_request(request) == "concurrency_limit"
+
+
+@pytest.mark.asyncio
+async def test_queue_wait_enqueue_line_carries_local_lease_active_trigger(caplog):
+    """AC2: the lease-active retry path names its trigger explicitly."""
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    cfg = _cfg(max_wait=0.05)
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, request, {}, {}, {}, "s2",
+            trigger="local_lease_active",
+        )
+
+    assert "trigger=local_lease_active" in _wait_lines(caplog)[-1]
+    assert provider._queue_trigger_from_request(request) == "local_lease_active"
+
+
+def _wait_returning(cause: str):
+    """A ``wait_for_local_slot`` stand-in that reports *cause* via cause_out."""
+
+    async def _wait(*_args, cause_out=None, **_kwargs):
+        if cause_out is not None:
+            cause_out.append(cause)
+        return None
+
+    return _wait
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cause", ["queue_wait_expired", "queue_depth_exceeded"]
+)
+async def test_fallback_wait_stamps_the_explicit_abandon_cause(cause):
+    """AC1: the queue's reported abandon cause is stamped on the request so the
+    fallback line logs it verbatim (never re-derived from ``queued_duration``)."""
+    cfg = _cfg(max_wait=0.05)
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+        patch(
+            "proxy.contention_queue.wait_for_local_slot",
+            new=_wait_returning(cause),
+        ),
+    ):
+        action, _, _ = await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, request, {}, {}, {}, "s2",
+        )
+
+    assert action == "fallback"
+    assert provider._queue_cause_from_request(request) == cause
+
+
+# ---------------------------------------------------------------------------
+# F3 — the contention-queue refusal releases the slot candidate
+# (LP-0MW959PWL001WYSM AC2c)
+#
+# Candidate-first admission acquires a slot before the verdict, and the queue
+# decision point runs the same ladder through ``_queue_context_bypass``. A
+# refusal *here* is the contention-queue rung of the release contract: the
+# queue never dispatches, so the candidate the bypass mirror acquired must be
+# handed back rather than left behind as fabricated occupancy.
+# ---------------------------------------------------------------------------
+
+
+def _candidate_cfg(max_wait: float = 0.1) -> dict:
+    """``_cfg`` plus the slot bookkeeping a candidate needs (AC2a)."""
+    cfg = _cfg(max_wait=max_wait)
+    cfg["server"]["session_slot_save_path"] = "/tmp/slots"
+    return cfg
+
+
+def _pool_size(cfg: dict) -> int:
+    import proxy.session as session_registry
+
+    return session_registry.candidate_pool_size(cfg["server"])
+
+
+@pytest.mark.asyncio
+async def test_queue_fallback_releases_the_refused_candidate():
+    """The wait expiring is a refusal: the queued candidate is released."""
+    import proxy.session as session_registry
+
+    cfg = _candidate_cfg(max_wait=0.05)
+    candidate = session_registry.acquire_slot_candidate(
+        "s2", endpoint="", pool_size=_pool_size(cfg)
+    )
+    assert candidate is not None
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        action, reason, elapsed = await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), {}, {}, {}, "s2",
+        )
+
+    assert action == "fallback"
+    assert elapsed is not None
+    assert dict(session_registry._slot_owners) == {}
+
+
+@pytest.mark.asyncio
+async def test_queue_admission_refusal_releases_the_refused_candidate(caplog):
+    """The guard refusing admission is a refusal: the candidate is released.
+
+    The bypass mirror admits (so a candidate is held), then the prefill-ETA
+    guard refuses local — the request never dispatches, so the candidate must
+    come back with the guard's reason.
+    """
+    import logging
+
+    import proxy.session as session_registry
+
+    class _Refusal:
+        """A guard verdict: refused, with the reason the release must name.
+
+        Carries the pricing fields the queue's own-evidence helper reads off a
+        guard decision (``None`` = not priced, which is what an uncalibrated
+        guard reports).
+        """
+
+        admit = False
+        reason = "prefill_budget_exceeded"
+        new_tokens = None
+        budget_tokens = None
+        eta_prefill_seconds = None
+        rate_bucket = None
+
+    cfg = _candidate_cfg()
+    candidate = session_registry.acquire_slot_candidate(
+        "s2", endpoint="", pool_size=_pool_size(cfg)
+    )
+    assert candidate is not None
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+        patch(
+            "proxy.provider._prefill_admission_guard",
+            new=AsyncMock(return_value=_Refusal()),
+        ),
+    ):
+        action, reason, _elapsed = await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), {}, {}, {}, "s2",
+        )
+
+    # Either queue-refusal exit ends the local route without a dispatch; the
+    # stub resolves to the plain admission refusal (the pin-local 429 needs a
+    # deferrable capacity verdict, which this stub does not carry).
+    assert action == "admission_reject"
+    assert reason == "prefill_budget_exceeded"
+    assert dict(session_registry._slot_owners) == {}
+    assert "candidate_released reason=prefill_budget_exceeded" in caplog.text
+    assert "abandoned_slot_recorded" not in caplog.text

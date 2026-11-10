@@ -1,0 +1,36 @@
+00000000000f22c0 <ggml_vec_dot_q4_K_q8_K>:
+   f2305:	c5 7d 6f 35 13 a6 02 	vmovdqa 0x2a613(%rip),%ymm14        # 11c920 <_ZTSN4ggml3cpu17extra_buffer_typeE+0x540>
+   f230c:	00 
+   f230d:	c5 7d 6f 2d 2b a6 02 	vmovdqa 0x2a62b(%rip),%ymm13        # 11c940 <_ZTSN4ggml3cpu17extra_buffer_typeE+0x560>
+   f2314:	00 
+   f2315:	48 8b 3d ac eb 03 00 	mov    0x3ebac(%rip),%rdi        # 130ec8 <ggml_table_f32_f16@@Base-0x1378>
+   f231c:	48 ba 0f 0f 0f 0f 0f 	movabs $0xf0f0f0f0f0f0f0f,%rdx
+   f2323:	0f 0f 0f 
+   f2326:	c5 7d 6f 25 32 a6 02 	vmovdqa 0x2a632(%rip),%ymm12        # 11c960 <_ZTSN4ggml3cpu17extra_buffer_typeE+0x580>
+   f232d:	00 
+   f232e:	c5 7d 6f 1d 4a a6 02 	vmovdqa 0x2a64a(%rip),%ymm11        # 11c980 <_ZTSN4ggml3cpu17extra_buffer_typeE+0x5a0>
+   f2335:	00 
+   f2336:	48 8d 41 04          	lea    0x4(%rcx),%rax
+   f233a:	c5 7a 10 3d 0e 0e 02 	vmovss 0x20e0e(%rip),%xmm15        # 113150 <__func__.1+0x5b0>
+   f2341:	00 
+   f2342:	c5 7d 6f 15 56 a6 02 	vmovdqa 0x2a656(%rip),%ymm10        # 11c9a0 <_ZTSN4ggml3cpu17extra_buffer_typeE+0x5c0>
+   f2349:	00 
+   f234a:	c5 7d 6f 0d 6e a6 02 	vmovdqa 0x2a66e(%rip),%ymm9        # 11c9c0 <_ZTSN4ggml3cpu17extra_buffer_typeE+0x5e0>
+   f2351:	00 
+   f2352:	31 c9                	xor    %ecx,%ecx
+   f2354:	48 89 e6             	mov    %rsp,%rsi
+   f2357:	c5 7d 6f 05 81 a6 02 	vmovdqa 0x2a681(%rip),%ymm8        # 11c9e0 <_ZTSN4ggml3cpu17extra_buffer_typeE+0x600>
+   f235e:	00 
+   f235f:	62 e1 fd 28 6f 3d 97 	vmovdqa64 0x2a697(%rip),%ymm23        # 11ca00 <_ZTSN4ggml3cpu17extra_buffer_typeE+0x620>
+   f2366:	a6 02 00 
+   f2369:	c5 c8 57 f6          	vxorps %xmm6,%xmm6,%xmm6
+   f236d:	c5 d0 57 ed          	vxorps %xmm5,%xmm5,%xmm5
+   f2371:	62 f2 fd 28 7c da    	vpbroadcastq %rdx,%ymm3
+   f2377:	66 0f 1f 84 00 00 00 	nopw   0x0(%rax,%rax,1)
+   f237e:	00 00 
+   f2380:	0f b7 50 fc          	movzwl -0x4(%rax),%edx
+   f2384:	c4 c1 7a 10 01       	vmovss (%r9),%xmm0
+   f2389:	48 8b 18             	mov    (%rax),%rbx
+   f238c:	ff c1                	inc    %ecx
+   f238e:	44 8b 60 08          	mov    0x8(%rax),%r12d
+   f2392:	c4 c1 7e 6f b9 04 01 	vmovdqu 0x104(%r9),%ymm7

@@ -30,7 +30,7 @@ import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -70,8 +70,18 @@ from proxy.local_route_starvation import (
     LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN,
     record_local_route_arm,
 )
-from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
-from proxy.observability import _record_backend_signal
+
+# ``_coerce_enabled`` is reused deliberately (LP-0MW81DJZ60049X5W): it is the
+# *single* enable-switch vocabulary (bool / 0-1 / "true"|"false"|"yes"|"no"|"on"|
+# "off") shared by the operator-facing rollback switches, so a second copy in
+# this module could drift from it.
+from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON, _coerce_enabled
+from proxy.observability import (
+    _arm_local_backend_unreachable,
+    _is_connection_refused,
+    _local_backend_unreachable_remaining_seconds,
+    _record_backend_signal,
+)
 from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
@@ -914,6 +924,464 @@ _last_prompt_prefix: dict[tuple[str, str], tuple[int, list[str]]] = {}
 #: sidecar's safety margin; llama.cpp may invalidate its own checkpoints).
 _DEFAULT_PREFIX_CREDIT_MARGIN = 0.9
 
+#: Large-append rule (LP-0MW81DLWY003XOZ2): when the content appended after
+#: the recorded prompt prefix exceeds this many bytes, the pre-dispatch price
+#: forces a full prefill (``cached_ratio = 0``) instead of trusting the
+#: in-memory residency ratio. The ratio describes the *previous* response's hit
+#: fraction and cannot see that a single new message added a large block of
+#: genuinely new work: on 2026-11-03 08:41:54 a **51,945-byte** tool-role
+#: message was appended, the price came out as ``cached_ratio=0.99
+#: new_tokens=173``, and llama-server prefilled 13,002 tokens (53.2 s to first
+#: byte, ``measured_cache_abort deficit_ratio=0.659``). Forcing the full-prefill
+#: price holds the prompt to the cold threshold on its real prefill work.
+LARGE_APPEND_BYTES_THRESHOLD_KEY: str = "local_large_append_bytes_threshold"
+
+#: Shipped threshold for the large-append rule: 32 KiB (≈8k tokens) of
+#: appended content. Above it the append alone is a material prefill, so the
+#: measured ratio is not a safe basis for the price. The incident's 51,945-byte
+#: append is caught; an ordinary turn's few-hundred-byte append is not.
+DEFAULT_LARGE_APPEND_BYTES_THRESHOLD: int = 32768
+
+#: Sentinel that disables the large-append rule (``0``, matching the other
+#: threshold knobs in this module): the price is exactly today's.
+DISABLED_LARGE_APPEND_BYTES_THRESHOLD: int = 0
+
+
+def large_append_bytes_threshold(config: dict | None) -> int:
+    """Resolve ``local_large_append_bytes_threshold`` (default 32 768 bytes).
+
+    ``0`` (or any non-positive value) is the disable sentinel
+    (:data:`DISABLED_LARGE_APPEND_BYTES_THRESHOLD`): the large-append rule is
+    off and the pre-dispatch price is byte-for-byte the previous behaviour.
+    A missing value keeps the shipped default; an unusable (malformed) value
+    also keeps the default — a typo must not silently disable the rule.
+    Accepts both the nested (``server:``) and flat forms, like the other
+    routing readers.
+    """
+    candidates: list[Any] = []
+    if isinstance(config, dict):
+        server_cfg = config.get("server", config)
+        if isinstance(server_cfg, dict):
+            candidates.append(server_cfg.get(LARGE_APPEND_BYTES_THRESHOLD_KEY))
+        candidates.append(config.get(LARGE_APPEND_BYTES_THRESHOLD_KEY))
+    for value in candidates:
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            threshold = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        if threshold <= 0:
+            return DISABLED_LARGE_APPEND_BYTES_THRESHOLD
+        return threshold
+    return DEFAULT_LARGE_APPEND_BYTES_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Divergence feedback into the session pricing model (LP-0MW81DS4W008DKDV)
+# ---------------------------------------------------------------------------
+#
+# The predicted ratio above is a *prediction*. When the measured dispatch
+# proves it wrong — ``proxy.measured_cache_abort`` records ``deficit_ratio`` =
+# ``(total - cache) / total`` from llama-server's ``prompt_progress`` — nothing
+# wrote that truth back, so the next turn inherited the same under-estimate:
+# on 2026-11-03 08:41:54 a 19,628-token prompt was priced
+# ``cached_ratio=0.99 new_tokens=173`` and then prefilled 13,002 tokens
+# (``measured_new_tokens=12936 priced_new_tokens=173 deficit_ratio=0.659``,
+# 53.2 s to first byte); the following turn was priced optimistically again.
+# The 2026-11-07 20:48:51 shape was the same at 55,492 tokens
+# (``cached_ratio=1.00 new_tokens=172``, evicted at 180.1 s).
+#
+# The feedback is the minimum that makes the next price honest:
+#
+# 1. the measured reuse ratio ``cache / total`` becomes the session's measured
+#    ratio — the authoritative reuse of the turn just measured, written ahead
+#    of the usage block so an aborted (unmeasured-by-usage) dispatch is
+#    corrected too;
+# 2. the next turn's prefix credit is capped at the ``cache`` tokens proven
+#    resident — both when ``expected_cached_ratio`` reads the credit (the next
+#    routing decision happens before that dispatch completes) and when the
+#    next dispatch records its own prompt prefix, so no later price can credit
+#    more of that prefix than was actually reused (the slot-snapshot sidecar
+#    records the same truthful lower bound).
+#
+# Bounded by construction: at most ``local_divergence_feedback_max_turns``
+# recorded dispatches are corrected (default 1) and the correction expires
+# after ``local_divergence_feedback_max_age_seconds`` (default 900 s), so a
+# session can never be poisoned permanently — the following dispatch rewrites
+# the basis and a genuinely warm turn restores the credit. It is cleared with
+# the model state it corrects: session invalidation
+# (``clear_cached_ratio_for_session``), slot reassignment and model switch
+# (``clear_divergence_feedback`` call sites).
+
+DIVERGENCE_FEEDBACK_ENABLED_KEY = "local_divergence_feedback_enabled"
+DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO_KEY = (
+    "local_divergence_feedback_min_deficit_ratio"
+)
+DIVERGENCE_FEEDBACK_MAX_TURNS_KEY = "local_divergence_feedback_max_turns"
+DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS_KEY = (
+    "local_divergence_feedback_max_age_seconds"
+)
+
+DEFAULT_DIVERGENCE_FEEDBACK_ENABLED: bool = True
+DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO: float = 0.25
+DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS: int = 1
+DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS: float = 900.0
+
+
+@dataclass(frozen=True)
+class DivergenceCorrection:
+    """One session's post-measurement correction to its pricing model.
+
+    ``reusable_tokens`` is the measured ``cache`` (absolute tokens proven
+    resident by llama-server), which is what the next dispatch's recorded
+    prefix credit is capped at. ``turns_remaining`` / ``expires_at`` make the
+    correction bounded; ``deficit_ratio`` / ``priced_new_tokens`` keep it
+    attributable in the log line.
+    """
+
+    reusable_tokens: int
+    total_tokens: int
+    deficit_ratio: float
+    priced_new_tokens: float | None
+    turns_remaining: int
+    recorded_at: float
+    expires_at: float
+
+
+_divergence_feedback: dict[tuple[str, str], DivergenceCorrection] = {}
+
+
+def _divergence_number(value: Any, default: float) -> float:
+    """Coerce *value* to a finite float, falling back to *default*.
+
+    A malformed numeric knob keeps its shipped default rather than
+    silently disabling (or unbinding) the correction.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return number
+
+
+def divergence_feedback_settings(
+    server_config: dict | None,
+) -> tuple[bool, float, int, float]:
+    """Resolve ``(enabled, min_deficit_ratio, max_turns, max_age_seconds)``.
+
+    Reads the ``server`` section (a flat dict is accepted too, like the other
+    routing readers). Fail-open: a missing config keeps the documented
+    defaults; an *unreadable* config or an unusable ``enabled`` switch
+    disables the feedback (pre-change pricing); a malformed numeric knob
+    falls back to its shipped default, so a typo can neither silently disable
+    the correction nor unbind it.
+    """
+    defaults = (
+        DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO,
+        DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS,
+        DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS,
+    )
+    if server_config is None:
+        return (DEFAULT_DIVERGENCE_FEEDBACK_ENABLED, *defaults)
+    if not isinstance(server_config, dict):
+        return (False, *defaults)
+    server_cfg = server_config.get("server", server_config)
+    if not isinstance(server_cfg, dict):
+        return (False, *defaults)
+    enabled = _coerce_enabled(
+        server_cfg.get(
+            DIVERGENCE_FEEDBACK_ENABLED_KEY, DEFAULT_DIVERGENCE_FEEDBACK_ENABLED
+        )
+    )
+    if not enabled:
+        return (False, *defaults)
+
+    ratio = _divergence_number(
+        server_cfg.get(
+            DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO_KEY,
+            DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO,
+        ),
+        DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO,
+    )
+    if not 0.0 <= ratio <= 1.0:
+        ratio = DEFAULT_DIVERGENCE_FEEDBACK_MIN_DEFICIT_RATIO
+
+    turns = int(
+        _divergence_number(
+            server_cfg.get(
+                DIVERGENCE_FEEDBACK_MAX_TURNS_KEY,
+                DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS,
+            ),
+            float(DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS),
+        )
+    )
+    if turns < 1:
+        turns = DEFAULT_DIVERGENCE_FEEDBACK_MAX_TURNS
+
+    max_age = _divergence_number(
+        server_cfg.get(
+            DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS_KEY,
+            DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS,
+        ),
+        DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS,
+    )
+    if max_age <= 0.0:
+        max_age = DEFAULT_DIVERGENCE_FEEDBACK_MAX_AGE_SECONDS
+
+    return (True, ratio, turns, max_age)
+
+
+def _divergence_token_count(value: Any) -> int | None:
+    """Coerce a measured token count, or ``None`` when it is not usable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return int(number)
+
+
+def record_measured_divergence(
+    model_name: str | None,
+    session_id: str | None,
+    total: Any,
+    cache: Any,
+    server_config: dict | None = None,
+    *,
+    priced_new_tokens: float | None = None,
+) -> DivergenceCorrection | None:
+    """Feed a post-measurement divergence back into the session pricing model.
+
+    Called from the local dispatch's measured ``prompt_progress`` capture
+    (``router._observe_prompt_progress`` and the early-abort branch) with the
+    dispatch's measured ``total`` / ``cache`` tokens. When the measured
+    deficit ``(total - cache) / total`` is at or above
+    ``local_divergence_feedback_min_deficit_ratio`` (default ``0.25``), the
+    session's measured ratio becomes the measured ``cache / total`` and the
+    next turn's prefix credit is capped at the ``cache`` tokens proven
+    resident (both on the read path and in the prefix record the next
+    dispatch writes), so the turn cannot be priced with an optimistic credit
+    the measurement just disproved.
+
+    Returns the stored :class:`DivergenceCorrection`, or ``None`` when nothing
+    was recorded (a warm/at-or-below-threshold measurement, a disabled
+    feature, an unusable measurement or a blank identity). Never raises: a
+    metric path must not break a stream.
+    """
+    try:
+        if not model_name or not session_id:
+            return None
+        enabled, min_ratio, max_turns, max_age = divergence_feedback_settings(
+            server_config
+        )
+        if not enabled:
+            return None
+        total_tokens = _divergence_token_count(total)
+        cache_tokens = _divergence_token_count(cache)
+        if total_tokens is None or cache_tokens is None:
+            return None
+        if total_tokens <= 0 or cache_tokens > total_tokens:
+            return None
+        deficit_ratio = (total_tokens - cache_tokens) / total_tokens
+        if deficit_ratio < min_ratio:
+            return None
+
+        now = time.monotonic()
+        correction = DivergenceCorrection(
+            reusable_tokens=cache_tokens,
+            total_tokens=total_tokens,
+            deficit_ratio=deficit_ratio,
+            priced_new_tokens=_divergence_number(priced_new_tokens, 0.0)
+            if priced_new_tokens is not None
+            else None,
+            turns_remaining=max_turns,
+            recorded_at=now,
+            expires_at=now + max_age,
+        )
+        key = (model_name, session_id)
+        if (
+            key not in _divergence_feedback
+            and len(_divergence_feedback) >= _MAX_CACHED_RATIO_ENTRIES
+        ):
+            try:
+                oldest = next(iter(_divergence_feedback))
+                _divergence_feedback.pop(oldest, None)
+            except (StopIteration, KeyError):
+                pass
+        # Measured truth first: the progress measurement is the authoritative
+        # reuse of the turn being measured, so it replaces the (possibly
+        # optimistic) predicted ratio even when the usage block never arrives
+        # (an early-released dispatch).
+        set_cached_ratio(model_name, session_id, cache_tokens / total_tokens)
+        _divergence_feedback[key] = correction
+        logger.info(
+            "routing_divergence_feedback model=%s session=%s deficit_ratio=%.4f "
+            "measured_reusable_tokens=%d measured_new_tokens=%d "
+            "priced_new_tokens=%s turns=%d max_age_s=%.0f",
+            model_name,
+            session_id,
+            deficit_ratio,
+            cache_tokens,
+            total_tokens - cache_tokens,
+            "unknown"
+            if correction.priced_new_tokens is None
+            else f"{correction.priced_new_tokens:.0f}",
+            max_turns,
+            max_age,
+        )
+        return correction
+    except Exception:
+        logger.debug("record_measured_divergence failed", exc_info=True)
+        return None
+
+
+def _live_divergence_correction(
+    model_name: str, session_id: str
+) -> DivergenceCorrection | None:
+    """The stored correction for a pair while it is still live.
+
+    Drops (and reports ``None`` for) an expired correction, so a quiet session
+    cannot carry a stale correction indefinitely.
+    """
+    key = (model_name, session_id)
+    correction = _divergence_feedback.get(key)
+    if correction is None:
+        return None
+    try:
+        if time.monotonic() >= correction.expires_at:
+            _divergence_feedback.pop(key, None)
+            return None
+    except Exception:
+        return None
+    return correction
+
+
+def _divergence_credit_ceiling(
+    model_name: str, session_id: str, tokens: int
+) -> int:
+    """Cap a prefix *credit* at the measured reusable tokens (read path).
+
+    The routing decision happens *before* the next dispatch completes, so the
+    ceiling must be applied to the credit read here, not only to the record
+    the next dispatch will write. Never raises (this is the pricing hot path).
+    """
+    try:
+        correction = _live_divergence_correction(model_name, session_id)
+    except Exception:
+        return tokens
+    if correction is None:
+        return tokens
+    return min(int(tokens), correction.reusable_tokens)
+
+
+def _apply_divergence_ceiling(
+    model_name: str, session_id: str, tokens: int
+) -> int:
+    """Cap a recorded prompt prefix at the measured reusable tokens.
+
+    Consumes one turn of the stored correction (the default bound is one
+    dispatch) and drops it when spent or expired, so the model can never be
+    poisoned permanently. Never raises: this runs inside the usage path.
+    """
+    key = (model_name, session_id)
+    correction = _live_divergence_correction(model_name, session_id)
+    if correction is None:
+        return tokens
+    try:
+        corrected = min(int(tokens), correction.reusable_tokens)
+        remaining = correction.turns_remaining - 1
+        if remaining <= 0:
+            _divergence_feedback.pop(key, None)
+        else:
+            _divergence_feedback[key] = replace(
+                correction, turns_remaining=remaining
+            )
+        if corrected < tokens:
+            logger.info(
+                "routing_divergence_feedback_applied model=%s session=%s "
+                "recorded_tokens=%d corrected_tokens=%d deficit_ratio=%.4f",
+                model_name,
+                session_id,
+                tokens,
+                corrected,
+                correction.deficit_ratio,
+            )
+        return corrected
+    except Exception:
+        logger.debug("divergence feedback ceiling failed", exc_info=True)
+        return tokens
+
+
+def clear_divergence_feedback(
+    model_name: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Forget divergence corrections matching the identity known.
+
+    Dimensioned like ``proxy.measured_prefill.clear_measured_prefill`` because
+    the invalidation call sites know different halves of the key:
+
+    - ``(model, session)`` — forget exactly that pair;
+    - ``(None, session)`` — forget **every** model for that session (session
+      invalidation and slot reassignment know the session, not the routed
+      model name);
+    - ``(model, None)`` — forget **every** session for that model (model
+      switch: the departing model's slots are torn down);
+    - ``(None, None)`` / blank keys — a no-op.
+
+    Never raises: every caller is an invalidation path.
+    """
+    try:
+        if session_id:
+            if model_name:
+                _divergence_feedback.pop((model_name, session_id), None)
+                return
+            for key in [k for k in _divergence_feedback if k[1] == session_id]:
+                _divergence_feedback.pop(key, None)
+            return
+        if model_name:
+            for key in [k for k in _divergence_feedback if k[0] == model_name]:
+                _divergence_feedback.pop(key, None)
+    except Exception:
+        pass
+
+
+def clear_divergence_feedback_for_other_models(
+    *keep_model_names: str | None,
+) -> None:
+    """Forget every correction except those recorded under a *keep* name.
+
+    The model-switch path (``lifecycle._forget_switched_model_measurements``)
+    observes a switch between local models. Enumerating a departing model's
+    aliases is not possible (aliases may be wildcards), so the switch keeps
+    only the names it can prove belong to the target model and forgets
+    everything else — over-clearing is the safe direction (it degrades to the
+    measured-ratio price, never to a fabricated credit). With no usable *keep*
+    name nothing is cleared (no evidence of what the target is).
+    Never raises.
+    """
+    try:
+        keep = {name for name in keep_model_names if name}
+        if not keep:
+            return
+        for key in [k for k in _divergence_feedback if k[0] not in keep]:
+            _divergence_feedback.pop(key, None)
+    except Exception:
+        pass
+
+
+def reset_divergence_feedback() -> None:
+    """Clear the whole store (test isolation; also usable on model switch)."""
+    _divergence_feedback.clear()
+
 
 def record_prompt_prefix(
     model_name: str,
@@ -926,8 +1394,12 @@ def record_prompt_prefix(
     Called from the local streaming loop alongside ``update_cached_ratio``
     (usage path).  *prompt_tokens* is the measured prompt size of the request
     the KV slot now holds, so a later request whose message list extends this
-    one can be credited for them.  Never raises: a metric path must not break
-    a stream.  Also re-caps the dict like ``set_cached_ratio``.
+    one can be credited for them.  A post-measurement divergence caps that
+    record at the tokens llama-server actually reused
+    (``_apply_divergence_ceiling``), so the next turn cannot be credited for a
+    prefix the measurement just disproved (LP-0MW81DS4W008DKDV).  Never
+    raises: a metric path must not break a stream.  Also re-caps the dict like
+    ``set_cached_ratio``.
     """
     if not model_name or not session_id:
         return
@@ -944,6 +1416,7 @@ def record_prompt_prefix(
         logger.debug("record_prompt_prefix failed", exc_info=True)
         return
     key = (model_name, session_id)
+    tokens = _apply_divergence_ceiling(model_name, session_id, tokens)
     if key not in _last_prompt_prefix and len(_last_prompt_prefix) >= _MAX_CACHED_RATIO_ENTRIES:
         try:
             oldest = next(iter(_last_prompt_prefix))
@@ -969,7 +1442,23 @@ def expected_cached_ratio(
       (today's behaviour — cold 0.0 for a fresh session);
     - a matching recorded prefix → ``max(measured, min(1.0, margin *
       prev_prompt / estimate))`` so the credit is proportionate to the
-      incoming prompt and never over-credits.
+      incoming prompt and never over-credits;
+    - a matching recorded prefix whose **appended** content (every message
+      past the recorded prefix) exceeds ``server
+      .local_large_append_bytes_threshold`` bytes → ``0.0``: the append is
+      real prefill work the measured ratio knows nothing about, so the price
+      is a full prefill (LP-0MW81DLWY003XOZ2). ``0`` disables the rule.
+      With no recorded prefix the append boundary is unknown (a ratio restored
+      from the slot-snapshot sidecar), so the measured ratio is returned
+      unchanged rather than treating the whole prompt as an append.
+
+    A post-measurement divergence (``record_measured_divergence``) caps the
+    prefix credit at the tokens the measured dispatch proved resident, so the
+    next turn is priced from the corrected model instead of the optimistic
+    credit the measurement just disproved (LP-0MW81DS4W008DKDV). The cap is
+    bounded (``local_divergence_feedback_max_turns`` /
+    ``..._max_age_seconds``) and cleared with the session/model state it
+    derives from.
     """
     measured = _get_cached_ratio(model_name, session_id)
     if not model_name or not session_id:
@@ -995,12 +1484,48 @@ def expected_cached_ratio(
     try:
         from proxy.slot_cache_ratio import message_fingerprints, prefix_matches
 
-        if not prefix_matches(fingerprints, message_fingerprints(messages)):
+        incoming_fingerprints = message_fingerprints(messages)
+        if not prefix_matches(fingerprints, incoming_fingerprints):
             return measured
     except Exception:
         logger.debug("prefix credit check failed", exc_info=True)
         return measured
-    credit = min(1.0, margin * min(prev_tokens, estimate) / estimate)
+    # Large-append rule (LP-0MW81DLWY003XOZ2): a single message can append a
+    # large block of genuinely new work, which the previous response's measured
+    # ratio cannot see — it describes how much of the *previous* prompt was
+    # cached. Above the configured append size the price is forced to a full
+    # prefill (``cached_ratio = 0``), so the cold threshold is evaluated on the
+    # real prefill work instead of a ratio that was never about this content.
+    # ``0`` disables the rule (sentinel) and restores the previous price.
+    try:
+        from proxy.slot_cache_ratio import appended_content_bytes
+
+        threshold = large_append_bytes_threshold(server_config)
+        if threshold > 0:
+            appended = appended_content_bytes(messages, fingerprints)
+            if appended > threshold:
+                # One stable line so a session that is suddenly priced cold is
+                # explainable (the price, not the measurement, changed).
+                logger.info(
+                    "routing_large_append_full_prefill model=%s session=%s "
+                    "appended_bytes=%d threshold=%d estimated_tokens=%d",
+                    model_name,
+                    session_id or "unknown",
+                    appended,
+                    threshold,
+                    estimate,
+                )
+                return 0.0
+    except Exception:
+        logger.debug("large-append check failed", exc_info=True)
+    credit_tokens = min(prev_tokens, estimate)
+    # A post-measurement divergence caps the credit at the tokens llama-server
+    # actually reused, so the next turn cannot be priced with the same
+    # under-estimate the measurement just disproved (LP-0MW81DS4W008DKDV).
+    credit_tokens = _divergence_credit_ceiling(
+        model_name, session_id, credit_tokens
+    )
+    credit = min(1.0, margin * credit_tokens / estimate)
     return max(measured, credit)
 
 
@@ -1022,6 +1547,9 @@ def clear_cached_ratio_for_session(session_id: str | None) -> None:
     # sidecar are being discarded, so no credit may survive (LP-0MVI2XOTY008Q4UV).
     for key in [k for k in _last_prompt_prefix if k[1] == session_id]:
         _last_prompt_prefix.pop(key, None)
+    # A divergence correction derived from that prefix's measurement is
+    # invalid for the same reason (LP-0MW81DS4W008DKDV AC3).
+    clear_divergence_feedback(None, session_id)
     # A discarded session starts a fresh hop count (LP-0MVI2VRT2000V1AP).
     for key in [k for k in _last_routing_hop if k[1] == session_id]:
         _last_routing_hop.pop(key, None)
@@ -2550,22 +3078,57 @@ class _RoutingEstimateCache:
 #: resident in the session's slot. ``0`` disables the gate entirely.
 RESIDENT_PREFIX_MIN_RATIO_DEFAULT: float = 0.5
 
+#: Single rollback switch for the unmeasured-cold enforcement
+#: (LP-0MW81DFML006O5KL → rollback added by LP-0MW81DJZ60049X5W):
+#: ``server.local_unmeasured_residency_cold_enabled``. Unset/``true`` (the
+#: shipped default, matching the intended post-rollout behaviour) keeps an
+#: *unmeasured* prefix residency cold, so a prompt above the cold threshold
+#: falls through to the remote chain. ``false`` (or ``0``) restores the
+#: pre-change behaviour byte-for-byte: an unmeasured basis degrades to the
+#: predicted sidecar ratio, logging ``admit_predicted`` / ``skip_predicted``,
+#: exactly as before LP-0MW81DFML006O5KL. One value, no code revert.
+UNMEASURED_RESIDENCY_COLD_ENABLED_KEY: str = (
+    "local_unmeasured_residency_cold_enabled"
+)
+UNMEASURED_RESIDENCY_COLD_ENABLED_DEFAULT: bool = True
+
 #: Skip reason emitted when a large prompt's measured reusable prefix is below
 #: `local_resident_prefix_min_ratio`.
 SKIP_REASON_RESIDENT_PREFIX: str = "resident_prefix_insufficient"
 
-#: Admission-decision values logged on the fail-open path, where the residency
-#: view could not measure anything (no fresh snapshot, no ownership) and the
-#: ladder degrades to the predicted sidecar ratio. Logging them keeps
-#: residency-blind admissions visible instead of silently unlogged
-#: (LP-0MVN4LANP0069QQM AC5).
+#: Skip reason emitted when a prompt above the cold threshold has **no**
+#: measurement of the session's resident prefix at all
+#: (``residency_source=unknown``: no fresh ``/slots`` snapshot, no slot
+#: ownership, or a probe that raised). Unmeasured is *cold*
+#: (LP-0MW81DFML006O5KL): without a measurement the warm threshold has no
+#: basis, so the cold threshold governs and the prompt falls through to the
+#: remote chain instead of being admitted on the predicted cache ratio.
+#: Deliberately distinct from the *measured zero* denial
+#: (``SKIP_REASON_RESIDENT_PREFIX``) so "nothing was measured" and "measured
+#: as not resident" stay separable in the log and the usage report.
+SKIP_REASON_UNMEASURED_COLD: str = "unmeasured_residency_cold"
+
+#: Admission-decision values that were logged while the ladder still
+#: **fail-open** on an unmeasured basis (LP-0MVN4LANP0069QQM AC5): no fresh
+#: snapshot and no ownership degraded to the predicted sidecar ratio, logged as
+#: ``admit_predicted`` / ``skip_predicted`` with ``n_past_actual=none``.
+#: Retired by LP-0MW81DFML006O5KL — an unmeasured prompt above the cold
+#: threshold is now denied with :data:`SKIP_REASON_UNMEASURED_COLD` — but kept
+#: in the vocabulary so historical log lines (and the parsers that read them)
+#: keep their meaning.
 DECISION_ADMIT_PREDICTED: str = "admit_predicted"
 DECISION_SKIP_PREDICTED: str = "skip_predicted"
 
 #: Skip reasons an idle local backend may override (LP-0MVGD9Z8Z0055Y5J). The
-#: idle-exempt override is the LAST rung of the admission ladder, so the new
-#: residency gate must not silently disable it: an idle GPU still serves cold
-#: work. The physical `context_too_large` cap is never overridable.
+#: idle-exempt override is the last *economic* rung of the admission ladder (the
+#: last-resort rung below it only fires when no remote can serve the request),
+#: so the residency gate must not silently disable it: an idle GPU still serves
+#: cold work. The physical `context_too_large` cap is never overridable, and
+#: neither is the unmeasured-cold denial: it reports a *missing measurement*,
+#: not a price an idle GPU can beat — the 2026-11-07 incident admitted 55k
+#: prompts precisely because nothing had been measured
+#: (LP-0MW81DFML006O5KL). The last-resort rung stays the final local override
+#: once no remote provider can serve the request.
 IDLE_OVERRIDABLE_SKIP_REASONS: tuple[str, ...] = (
     "large_context_bypass",
     SKIP_REASON_RESIDENT_PREFIX,
@@ -2610,6 +3173,66 @@ MEASUREMENT_VOCABULARY: tuple[str, ...] = (
     MEASUREMENT_UNAVAILABLE_NO_SLOT,
     MEASUREMENT_UNAVAILABLE_STALE_VIEW,
 )
+
+#: ``threshold_applied=`` vocabulary (LP-0MW81DHPH00650NY AC1): which token
+#: threshold governed one admission decision. Recorded together with the
+#: residency basis (``residency_source`` / ``measurement``), so a local
+#: admission of a prompt above the cold threshold is explainable from the line
+#: alone instead of needing the ladder reconstructed by hand:
+#:
+#: - ``cold`` — the cold-cache threshold (38 000) governs, because **no**
+#:   measured residency backs the prompt: the unmeasured-cold denial
+#:   (``unmeasured_residency_cold``) and the measured-zero denial
+#:   (``non_resident``) both fall here;
+#: - ``warm`` — the warm hard cap (120 000) governs, because the session's
+#:   reusable prefix *is* measured-resident (``measured`` /
+#:   ``measured_last_dispatch`` / ``session_slot``);
+#: - ``none`` — the decision has no residency basis at all (the ladder is
+#:   disabled: ``facts`` is ``None``), so no token threshold is attributed.
+THRESHOLD_APPLIED_COLD: str = "cold"
+THRESHOLD_APPLIED_WARM: str = "warm"
+THRESHOLD_APPLIED_NONE: str = "none"
+
+#: The whole closed vocabulary: ``threshold_applied=`` is exactly one of these.
+THRESHOLD_APPLIED_VOCABULARY: tuple[str, ...] = (
+    THRESHOLD_APPLIED_COLD,
+    THRESHOLD_APPLIED_WARM,
+    THRESHOLD_APPLIED_NONE,
+)
+
+
+def applied_threshold(
+    facts,
+    *,
+    cold_cache_threshold: int | None,
+    warm_cache_threshold: int | None,
+) -> tuple[str, int | None]:
+    """Return ``(threshold_applied, threshold_value)`` for one decision.
+
+    The *basis* selects the threshold, never the predicted cache ratio
+    (LP-0MW81DHPH00650NY AC1):
+
+    - measured-resident facts (``measured`` / ``measured_last_dispatch`` /
+      ``session_slot``) keep the warm hard cap — the prompt may be served
+      locally above the cold threshold precisely because its prefix is known
+      to be resident;
+    - a facts object that is *not* resident (the unmeasured ``unknown`` basis
+      and the measured-zero ``non_resident`` basis) falls to the cold
+      threshold, because the warm threshold has no measurement to stand on;
+    - no facts at all (residency ladder disabled) records ``none``: the
+      decision was not made against a token threshold, so attributing one
+      would fabricate a basis.
+
+    ``threshold_value`` is the configured value of that threshold, read from
+    the caller's arguments so a retune is visible on the line; ``None`` (logged
+    as ``none``) when no value was supplied or the threshold is ``0``
+    (disabled).
+    """
+    if facts is None:
+        return THRESHOLD_APPLIED_NONE, None
+    if getattr(facts, "resident", False):
+        return THRESHOLD_APPLIED_WARM, warm_cache_threshold or None
+    return THRESHOLD_APPLIED_COLD, cold_cache_threshold or None
 
 
 @dataclass(frozen=True)
@@ -2693,6 +3316,19 @@ def _closed_measurement_value(measurement: str | None) -> str:
     return MEASUREMENT_UNAVAILABLE_STALE_VIEW
 
 
+def _server_section(config: dict | None) -> dict | None:
+    """Return the ``server:`` mapping of *config* (flat configs pass through).
+
+    The pricing helpers (:func:`expected_cached_ratio`,
+    :func:`large_append_bytes_threshold`) read the ``server`` keys, so the
+    routing pipeline threads this mapping down to them (LP-0MW81DLWY003XOZ2).
+    """
+    if not isinstance(config, dict):
+        return None
+    section = config.get("server", config)
+    return section if isinstance(section, dict) else None
+
+
 def _effective_resident_prefix_min_ratio(config: dict | None) -> float:
     """Resolve `server.local_resident_prefix_min_ratio` (default 0.5).
 
@@ -2711,6 +3347,39 @@ def _effective_resident_prefix_min_ratio(config: dict | None) -> float:
     if value <= 0.0:
         return 0.0
     return min(1.0, value)
+
+
+def _unmeasured_residency_cold_enabled(config: dict | None) -> bool:
+    """Resolve ``local_unmeasured_residency_cold_enabled`` (default ``True``).
+
+    The single rollback for the *unmeasured is cold* enforcement
+    (LP-0MW81DFML006O5KL, rollback LP-0MW81DJZ60049X5W). ``True`` (the shipped
+    default, i.e. the intended post-rollout behaviour) denies local admission
+    to a prompt above the cold threshold whose prefix residency could not be
+    measured; ``False`` restores the pre-change behaviour byte-for-byte — the
+    predicted sidecar ratio decides, and the decision logs
+    ``admit_predicted`` / ``skip_predicted`` again.
+
+    Accepts both the nested (``server:``) and flat forms, like the other
+    routing readers, and shares the enable-switch vocabulary with the other
+    operator rollbacks (``_coerce_enabled``). A missing value keeps the
+    default; an unusable (malformed) value also keeps the default — the
+    enforcement is the intended behaviour, so a typo must not silently
+    disable it.
+    """
+    candidates: list[Any] = []
+    if isinstance(config, dict):
+        server_cfg = config.get("server", config)
+        if isinstance(server_cfg, dict):
+            candidates.append(server_cfg.get(UNMEASURED_RESIDENCY_COLD_ENABLED_KEY))
+        candidates.append(config.get(UNMEASURED_RESIDENCY_COLD_ENABLED_KEY))
+    for value in candidates:
+        if value is None:
+            continue
+        coerced = _coerce_enabled(value)
+        if coerced is not None:
+            return coerced
+    return UNMEASURED_RESIDENCY_COLD_ENABLED_DEFAULT
 
 
 def _session_owns_slot(session_id: str | None, endpoint: str | None = None) -> int | None:
@@ -2738,6 +3407,131 @@ def _session_owns_slot(session_id: str | None, endpoint: str | None = None) -> i
         if slot_id is not None:
             return slot_id
     return None
+
+
+def _acquire_admission_candidate(
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    server_config: dict | None = None,
+):
+    """Assign this admission's slot candidate, or ``None`` (fail-open).
+
+    Thin, never-raising wrapper around :func:`proxy.session.acquire_slot_candidate`
+    (LP-0MW959P9S005DJY7 AC1a). The pool size comes from
+    :func:`proxy.session.candidate_pool_size`, the same config gate
+    ``_build_slot_context`` uses, so a deployment with slot bookkeeping off
+    keeps the pre-change residency behaviour instead of registering ownership
+    nobody will ever use.
+
+    A missing/unreadable session module, an empty session id, a disabled pool
+    or any unexpected error reads as *no candidate*: the ladder then degrades
+    one rung (``unavailable:no_slot`` / ``unavailable:stale_view``), which is
+    exactly the pre-change behaviour. It never refuses local on absent data.
+    """
+    if not session_id:
+        return None
+    try:
+        from proxy.session import acquire_slot_candidate, candidate_pool_size
+
+        pool_size = candidate_pool_size(server_config)
+        if pool_size <= 0:
+            return None
+        return acquire_slot_candidate(
+            session_id, endpoint=endpoint, pool_size=pool_size
+        )
+    except Exception:
+        return None
+
+
+def _release_admission_candidate(candidate, *, reason: str | None = None) -> bool:
+    """Release a **refused** admission's slot candidate (never raises).
+
+    Thin wrapper around :func:`proxy.session.release_slot_candidate`, the single
+    release seam (LP-0MW959PWL001WYSM AC2a): every refusal path returns its
+    candidate through it instead of inventing its own release. Idempotent — a
+    second release of the same candidate is a no-op, never a double-free
+    (AC2e). Fail-open: bookkeeping never changes a routing decision.
+    """
+    if candidate is None:
+        return False
+    try:
+        from proxy.session import release_slot_candidate
+
+        return bool(release_slot_candidate(candidate, reason=reason))
+    except Exception:
+        return False
+
+
+def _release_session_admission_candidate(
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    reason: str | None = None,
+) -> bool:
+    """Release a candidate held by *session_id* on *endpoint* (never raises).
+
+    Session-scoped form of :func:`_release_admission_candidate` for a refusal
+    whose candidate was acquired deeper than the caller's own variable — the
+    contention-queue refusal, where the ladder ran inside the queue's bypass
+    mirror (LP-0MW959PWL001WYSM AC2c). Idempotent and fail-open.
+    """
+    if not session_id:
+        return False
+    try:
+        from proxy.session import release_session_candidate
+
+        return bool(
+            release_session_candidate(session_id, endpoint=endpoint, reason=reason)
+        )
+    except Exception:
+        return False
+
+
+class _AdmissionCandidateLease:
+    """Owns one local admission's slot candidate until it is kept or released.
+
+    Candidate-first admission acquires a slot **before** the residency verdict
+    (LP-0MW959P9S005DJY7), which makes an acquired-but-refused candidate a
+    fabricated occupancy that would deny the pool to real work. This lease is
+    the single owner of that lifecycle (LP-0MW959PWL001WYSM AC2d):
+
+    - a refusal records its reason (:meth:`note_refusal`) and the release
+      happens once, on the way out, naming that reason on the
+      ``candidate_released reason=<skip_reason>`` line (AC2b);
+    - an admission calls :meth:`keep`, after which :meth:`release` is a no-op —
+      ownership passes to the existing slot bookkeeping unchanged, with no
+      second assignment and no release at admission time (AC2d);
+    - :meth:`release` is idempotent, so the end-of-attempt safety release and
+      an explicit refusal release can never double-free (AC2e).
+
+    A lease with no candidate (no pool configured, no session, or a full pool)
+    is an inert no-op: nothing was acquired, so nothing can leak.
+    """
+
+    __slots__ = ("candidate", "reason", "_kept", "_released")
+
+    def __init__(self, candidate=None) -> None:
+        self.candidate = candidate
+        self.reason: str | None = None
+        self._kept = False
+        self._released = False
+
+    def note_refusal(self, reason: str | None) -> None:
+        """Record the refusing reason a pending release must name."""
+        if reason:
+            self.reason = reason
+
+    def keep(self) -> None:
+        """Hand the candidate to the dispatch bookkeeping (never released)."""
+        self._kept = True
+
+    def release(self) -> bool:
+        """Release unless the admission was kept; idempotent, never raises."""
+        if self._kept or self._released:
+            return False
+        self._released = True
+        return _release_admission_candidate(self.candidate, reason=self.reason)
 
 
 def _measured_capture_enabled(server_config=None) -> bool:
@@ -2827,10 +3621,20 @@ def resolve_resident_prefix(
     A stored measurement is only valid while its session still owns the slot
     it was captured against: rung 2 is gated on live ownership, and the
     invalidation paths clear the entry when that ownership ends — eviction
-    (``router_helpers._record_local_eviction``), slot release/reassignment
-    (``session._free_slot_assignment``) and a model switch
-    (``lifecycle.ensure_model_loaded``, LP-0MVT2QFAP0082BKR). The ownership
-    gate is the backstop for any clear that was missed.
+    (``router_helpers._record_local_eviction``), a different session taking the
+    slot (``session._slot_id_for_session``), an invalidation
+    (``session._invalidate_session_and_slot``) and a model switch
+    (``lifecycle.ensure_model_loaded``, LP-0MVT2QFAP0082BKR). A same-session
+    release keeps the measurement, so a returning session is priced from its
+    last measured dispatch instead of ``unavailable:no_slot``
+    (LP-0MW959P9S005DJY7 AC1d); the ownership gate is the backstop for any
+    clear that was missed.
+
+    When the supplied (or first-read) residency view is not fresh, the view is
+    re-read **once** before the ladder gives up on it, so a just-missed ~1 s
+    snapshot refresh is not reported as an unmeasurable pool
+    (LP-0MW959P9S005DJY7, F1 scenario 5). The re-read is bounded: never more
+    than one extra read, and still never an upstream ``/slots`` query.
 
     Each rung also sets exactly one ``measurement=`` reason via
     :func:`measurement_reason`: ``measured`` for rungs 1–2,
@@ -2857,6 +3661,23 @@ def resolve_resident_prefix(
             view = get_residency_view(endpoint=endpoint)
         except Exception:
             view = None
+    if view is None or not bool(getattr(view, "known", False)):
+        # A stale or absent view is re-read **exactly once** before the ladder
+        # gives up on measuring it (LP-0MW959P9S005DJY7 / F1 scenario 5): the
+        # snapshot is refreshed ~1/s by the broadcast loop, so an unknown view
+        # is usually a just-missed refresh rather than a pool that cannot be
+        # measured. Never more than one re-read — the hot path stays bounded
+        # and `/slots` is still never queried (>15 s holds,
+        # LP-0MUXTW4MD003TVIC). A refresh that is itself unknown leaves the
+        # honest ``unavailable:stale_view`` basis in place.
+        try:
+            from proxy.residency import get_residency_view
+
+            refreshed = get_residency_view(endpoint=endpoint)
+        except Exception:
+            refreshed = None
+        if refreshed is not None:
+            view = refreshed
 
     known = bool(getattr(view, "known", False))
     slot = None
@@ -3001,6 +3822,53 @@ def _evaluate_local_tenancy(
         return None
 
 
+#: Name of the additive per-admission latency field on the decision line
+#: (LP-0MW959R5S009WDM8 AC4e). One figure per local admission decision, so a
+#: later regression is visible from the log without a replay.
+ADMISSION_OVERHEAD_FIELD: str = "admission_overhead_ms"
+
+#: Budget for the work candidate-first admission adds to the hot path
+#: (LP-0MW959R5S009WDM8 AC4): the p95 of ``ADMISSION_OVERHEAD_FIELD`` over a
+#: replay must stay at or below this, or the slice is a regression. The added
+#: work is one in-process registry lookup plus the residency resolution — no
+#: upstream query, no poller, no task — so 50 ms is a generous ceiling.
+ADMISSION_OVERHEAD_BUDGET_MS: float = 50.0
+
+
+def _admission_overhead_start(enabled: bool) -> float | None:
+    """Start the admission-overhead clock, or ``None`` when unmeasured.
+
+    Candidate-first admission adds exactly two steps to the request hot path:
+    the slot-candidate acquisition and the residency resolution that prices the
+    verdict against that candidate (LP-0MW959R5S009WDM8 AC4a). The clock is
+    started **before** the acquisition and stopped immediately after the
+    resolution, so the figure covers the added work and not the rest of the
+    ladder. ``None`` (ladder disabled) means *no measurement is taken* — never a
+    fabricated zero.
+    """
+    if not enabled:
+        return None
+    try:
+        return time.perf_counter()
+    except Exception:  # pragma: no cover - perf_counter does not raise
+        return None
+
+
+def _admission_overhead_ms(start: float | None) -> float | None:
+    """Milliseconds elapsed since *start*; ``None`` when unstarted (never raises).
+
+    Measurement is observability only: any failure reads as *not measured*
+    rather than becoming an admission error, exactly like every other field on
+    the decision line.
+    """
+    if start is None:
+        return None
+    try:
+        return max(0.0, (time.perf_counter() - start) * 1000.0)
+    except Exception:  # pragma: no cover - perf_counter does not raise
+        return None
+
+
 def _log_residency_decision(
     *,
     session_id: str | None,
@@ -3010,6 +3878,11 @@ def _log_residency_decision(
     facts=None,
     min_ratio: float | None = None,
     tenancy=None,
+    cold_cache_threshold: int | None = None,
+    warm_cache_threshold: int | None = None,
+    admission_overhead_ms: float | None = None,
+    slot_candidate: int | None = None,
+    new_tokens: int | None = None,
 ) -> None:
     """Emit the residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5).
 
@@ -3019,6 +3892,40 @@ def _log_residency_decision(
     session owned the slot — residency regressions become visible without
     forensics. Consumed by ``proxy-usage-analysis`` (resident-vs-evicted reuse
     split and per-session slot-owner churn).
+
+    The line records the *basis* of the decision (``residency_source`` and the
+    additive ``measurement``) and, since LP-0MW81DHPH00650NY, *which threshold*
+    the verdict was held to: ``threshold_applied`` (``cold`` / ``warm`` /
+    ``none``) with its configured ``threshold_value``. The two threshold fields
+    are appended after ``session=`` so every pre-existing key keeps its
+    relative order and deployed parsers are unaffected.
+
+    The last field, ``admission_overhead_ms=`` (LP-0MW959R5S009WDM8 AC4e), is
+    the measured cost of the *added* work this admission paid for — candidate
+    acquisition plus residency resolution — in milliseconds, or ``none`` when
+    the residency ladder is disabled and nothing is measured. Appended after
+    every pre-existing key (additive suffix) so positional consumers keep
+    working, and it is the operator-visible figure a latency regression shows
+    up in without a replay.
+
+    ``slot_candidate=`` (LP-0MW959RRO008AAH9 AC10a) is the slot
+    candidate-first admission assigned **before** this verdict, i.e. the slot
+    the decision was measured against and the key the dispatch record and
+    eviction event use to attribute the request to a llama slot/task. ``none``
+    when no candidate was assigned (pool unconfigured or exhausted), never a
+    fabricated slot.
+
+    ``new_tokens=`` (LP-0MW959SE30012HJJ AC6a) is the last additive field: the
+    *priced* uncached-token count this verdict was held to — the number the
+    cold cap compared — so a wrong price is traceable from the line alone
+    instead of across the dispatch, eviction and measurement lines. It is the
+    live-prefix price on the measured rungs
+    (``estimated_tokens - min(n_past_actual, estimated_tokens)``) and the
+    predicted-ratio price on the rollout path; on a rung that priced nothing
+    (hard cap, unmeasured-cold, tenancy) it reports ``none`` — never a
+    fabricated ``0``, which the usage report would read as "nothing to
+    prefill". ``none`` is also never emitted for an unpriced *admission*,
+    because every admitting rung prices the prompt.
 
     Never raises: logging must not become an admission failure mode.
     """
@@ -3048,12 +3955,34 @@ def _log_residency_decision(
         # Exactly one value per line: a line logged without residency facts
         # (the gate is disabled) still reports ``unavailable:stale_view``.
         # Existing keys keep their relative order so deployed parsers are
-        # unaffected; ``measurement=`` is the only addition.
+        # unaffected; ``measurement=`` was the only in-place addition.
+        # Additive suffix, after ``session=`` (LP-0MW81DHPH00650NY AC1): the
+        # basis above says *whether* residency was measured, these two say
+        # *which threshold* the verdict was held to, so a >38k local admission
+        # (cold-priced or measured-resident/warm) is attributable from the
+        # line. Appended — never interleaved — so positional consumers keep
+        # working (parent AC3).
+        threshold_applied, threshold_value = applied_threshold(
+            facts,
+            cold_cache_threshold=cold_cache_threshold,
+            warm_cache_threshold=warm_cache_threshold,
+        )
+        # ``admission_overhead_ms=`` is a *measurement*, so an unmeasured
+        # admission reports ``none`` — never 0.000, which the usage report
+        # would average in as a measured latency (same discipline as
+        # ``reuse_ratio`` above).
+        overhead_field = (
+            f"{admission_overhead_ms:.3f}"
+            if isinstance(admission_overhead_ms, (int, float))
+            else "none"
+        )
         logger.info(
             "routing_resident_prefix provider=local model=%s decision=%s "
             "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
             "slot_owner_session=%s residency_source=%s measurement=%s min_ratio=%s "
-            "tenants=%s occupants=%d session=%s",
+            "tenants=%s occupants=%d session=%s "
+            "threshold_applied=%s threshold_value=%s admission_overhead_ms=%s "
+            "slot_candidate=%s new_tokens=%s",
             model_name or "unknown",
             decision,
             n_past if n_past is not None else "none",
@@ -3066,6 +3995,11 @@ def _log_residency_decision(
             tenant_limit if tenant_limit is not None else "none",
             occupants,
             session_id or "unknown",
+            threshold_applied,
+            threshold_value if threshold_value is not None else "none",
+            overhead_field,
+            slot_candidate if slot_candidate is not None else "none",
+            int(new_tokens) if isinstance(new_tokens, int) else "none",
         )
     except Exception:
         pass
@@ -3084,6 +4018,103 @@ def _should_skip_local(
     endpoint: str | None = None,
     session_tenants: int | None = None,
     tenancy_idle_seconds: float | None = None,
+    unmeasured_cold_enabled: bool = True,
+    server_config: dict | None = None,
+    candidate_slot=None,
+    own_candidate: bool | None = None,
+    overhead_start: float | None = None,
+) -> tuple[bool, str | None]:
+    """The local admission ladder, owning its slot candidate's lifecycle.
+
+    The verdict itself lives in :func:`_should_skip_local_verdict` (which
+    documents every rung). This wrapper adds the **release contract** of
+    candidate-first admission (LP-0MW959PWL001WYSM):
+
+    - when the caller owns the lifecycle (*own_candidate* ``False``, or a
+      *candidate_slot* supplied) nothing is released here, because only the
+      caller can tell a refusal from an override that re-admits the request
+      (idle / capacity / last-resort);
+    - otherwise the candidate is acquired here — before the verdict, so even
+      the ``context_too_large`` rung has one — and is **released on every
+      refusal rung and on any exception**, through the single release seam
+      (AC2a/AC2c), naming the refusing reason (AC2b). An admitted admission
+      keeps it: ownership passes to the dispatch bookkeeping unchanged (AC2d).
+
+    *own_candidate* lets a caller that already tried to acquire say so:
+    ``False`` forbids a second attempt here even when the first returned
+    ``None``. Without it a caller holding a *failed* acquisition could have a
+    candidate acquired behind its back, which its own lease would never release
+    — a leak in the exact race (pool full at the call site, a slot freed a
+    moment later) this contract exists to close.
+
+    Acquisition is gated on the ladder being engaged
+    (``resident_prefix_min_ratio`` > 0), the cold threshold being enabled and
+    the pool being configured, so a deployment without slot bookkeeping keeps
+    its pre-change behaviour with no registry side effect.
+
+    *overhead_start* is the admission-overhead clock (LP-0MW959R5S009WDM8). A
+    caller that already acquired the candidate itself (the router's lease) times
+    that acquisition in its own scope and passes the start here, so the reported
+    figure covers the added work from the caller's acquisition through this
+    ladder's residency resolution. When omitted the clock starts here, before
+    this function's own acquisition.
+    """
+    if own_candidate is None:
+        own_candidate = candidate_slot is None
+    ladder_engaged = resident_prefix_min_ratio > 0.0 and cold_cache_threshold > 0
+    if overhead_start is None:
+        overhead_start = _admission_overhead_start(ladder_engaged)
+    if own_candidate and ladder_engaged:
+        candidate_slot = _acquire_admission_candidate(
+            session_id, endpoint=endpoint, server_config=server_config
+        )
+    try:
+        verdict = _should_skip_local_verdict(
+            model_name,
+            session_id,
+            body_json,
+            cold_cache_threshold,
+            estimated_tokens=estimated_tokens,
+            warm_cache_threshold=warm_cache_threshold,
+            economic_bypass_serves_local=economic_bypass_serves_local,
+            resident_prefix_min_ratio=resident_prefix_min_ratio,
+            residency_view=residency_view,
+            endpoint=endpoint,
+            session_tenants=session_tenants,
+            tenancy_idle_seconds=tenancy_idle_seconds,
+            unmeasured_cold_enabled=unmeasured_cold_enabled,
+            server_config=server_config,
+            candidate_slot=candidate_slot,
+            overhead_start=overhead_start,
+        )
+    except BaseException:
+        # An exception inside the decision never leaves the candidate behind
+        # (AC2c). The caller's own handle is released too: it cannot act on a
+        # verdict that never returned, and the release is idempotent (AC2e).
+        _release_admission_candidate(candidate_slot, reason="exception")
+        raise
+    if own_candidate and verdict[0]:
+        _release_admission_candidate(candidate_slot, reason=verdict[1])
+    return verdict
+
+
+def _should_skip_local_verdict(
+    model_name: str,
+    session_id: str | None,
+    body_json: dict,
+    cold_cache_threshold: int,
+    estimated_tokens: int | None = None,
+    warm_cache_threshold: int = 0,
+    economic_bypass_serves_local: bool = False,
+    resident_prefix_min_ratio: float = 0.0,
+    residency_view=None,
+    endpoint: str | None = None,
+    session_tenants: int | None = None,
+    tenancy_idle_seconds: float | None = None,
+    unmeasured_cold_enabled: bool = True,
+    server_config: dict | None = None,
+    candidate_slot=None,
+    overhead_start: float | None = None,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -3129,19 +4160,44 @@ def _should_skip_local(
     Residency-aware ladder (LP-0MVN1IQTF0037WTG AC1/AC3), applied when
     *resident_prefix_min_ratio* > 0 for a prompt above *cold_cache_threshold*:
 
+    0. **candidate-first assignment** (LP-0MW959P9S005DJY7 AC1a) — a slot
+       candidate is assigned *before* the probe, so the residency rungs are
+       evaluated against the candidate slot rather than a not-yet-existing
+       assignment. Without it the probe reported
+       ``measurement=unavailable:no_slot`` on ~75 % of local admissions
+       (3 363 of ~4 500) and the predicted sidecar ratio decided instead.
+       ``None`` (no session, no slot bookkeeping, or the pool is full) keeps
+       the pre-change behaviour and is the **only** way
+       ``unavailable:no_slot`` is emitted;
     1. the hard ``context_too_large`` cap above (unchanged, still first);
-    2. **resident-prefix gate** — admit only when the session's *measured*
+    2. **unmeasured is cold** — when the probe cannot report a measured
+       resident prefix at all (``residency_source=unknown``: no fresh
+       snapshot and no ownership, or a probe that raised), the prediction may
+       not make the prompt cheap: skip with
+       :data:`SKIP_REASON_UNMEASURED_COLD` and let the remote chain serve it
+       (LP-0MW81DFML006O5KL). The single rollback switch
+       *unmeasured_cold_enabled* (``server
+       .local_unmeasured_residency_cold_enabled``, default ``True``) restores
+       the pre-change behaviour: an unmeasured basis degrades to the predicted
+       sidecar ratio and logs ``admit_predicted`` / ``skip_predicted`` again
+       (LP-0MW81DJZ60049X5W);
+    3. **resident-prefix gate** — admit only when the session's *measured*
        reusable prefix (live `/slots` `context_tokens`, else the session's last
        measured dispatch — see `resolve_resident_prefix`) is at least
        `resident_prefix_min_ratio` of the prompt, else skip with
-       `resident_prefix_insufficient`;
-    3. **live-prefix pricing** — price `new_tokens` from that same live
+       `resident_prefix_insufficient`; a *measured zero* (fresh view, no slot
+       of this session's) takes this same denial;
+    4. **live-prefix pricing** — price `new_tokens` from that same live
        measurement (`min(n_past_actual, estimated_tokens)` reusable, never the
        predicted sidecar ratio and never the ownership rung's implicit "all
-       tokens reused"), so the cold cap is evaluated against real prefill work;
-    4. the idle-exempt override is applied by the *caller* after this
+       tokens reused"), so the cold cap is evaluated against real prefill work.
+       The price is taken **once**, where the measured basis is resolved, and
+       logged as `new_tokens=` on the decision line — the refusal rungs it also
+       informs report the same figure (LP-0MW959SE30012HJJ AC6a/AC6e);
+    5. the idle-exempt override is applied by the *caller* after this
        function returns (``IDLE_OVERRIDABLE_SKIP_REASONS``), so an idle GPU
-       still serves cold work.
+       still serves cold work. The *unmeasured-cold* denial is not
+       idle-overridable (see :data:`IDLE_OVERRIDABLE_SKIP_REASONS`).
 
     Args:
         model_name: The llama_model name of the local provider.
@@ -3158,6 +4214,31 @@ def _should_skip_local(
         residency_view: Pre-built residency view (``proxy.residency``); built
             on demand when omitted.
         endpoint: Local llama-server endpoint scope.
+        unmeasured_cold_enabled: The single rollback for the *unmeasured is
+            cold* enforcement (``server
+            .local_unmeasured_residency_cold_enabled``, default ``True``).
+            ``False`` restores the pre-change predicted-ratio decision and its
+            ``admit_predicted`` / ``skip_predicted`` log lines, byte-for-byte
+            (LP-0MW81DJZ60049X5W). Only consulted when
+            ``resident_prefix_min_ratio`` > 0.
+        server_config: The ``server:`` section of the config (flat configs
+            pass through), threaded to :func:`expected_cached_ratio` so the
+            predicted-ratio price honours the large-append rule
+            (``local_large_append_bytes_threshold``, LP-0MW81DLWY003XOZ2) and
+            the prefix-credit margin. ``None`` keeps both shipped defaults.
+            It also supplies the candidate pool size
+            (``session_slot_pool_size``) for the candidate-first assignment.
+        candidate_slot: The candidate the verdict is measured against. The
+            caller (:func:`_should_skip_local`) acquires it before the verdict
+            and owns its release, so this function never acquires or releases
+            one; ``None`` means no candidate could be assigned (no session, no
+            slot bookkeeping, or an exhausted pool) and keeps the pre-change
+            behaviour.
+        overhead_start: The ``time.perf_counter()`` value the admission's added
+            work started at (candidate acquisition), or ``None`` when the
+            ladder is disabled. The duration between it and the end of the
+            residency resolution is logged as ``admission_overhead_ms=`` on the
+            decision line (LP-0MW959R5S009WDM8).
 
     Returns:
         A tuple ``(skip, reason)`` where:
@@ -3165,7 +4246,8 @@ def _should_skip_local(
         - ``skip`` is True if local should be skipped, False for normal
           local routing.
         - ``reason`` is the skip reason when ``skip`` is True
-          (``"context_too_large"``, ``"large_context_bypass"`` or
+          (``"context_too_large"``, ``"large_context_bypass"``,
+          ``"unmeasured_residency_cold"`` or
           ``"resident_prefix_insufficient"``), or None when ``skip`` is
           False.  When ``economic_bypass_serves_local`` is True and the
           economic check would normally trigger but physical capacity is
@@ -3191,12 +4273,80 @@ def _should_skip_local(
     # independent bound on how many distinct sessions may hold the pool.
     facts = None
     # Set when the residency view could not measure anything (no fresh
-    # snapshot and no ownership). The ladder then fails open to the predicted
-    # ratio, but the *decision* must still be logged with an explicit
-    # ``n_past_actual=none`` so residency-blind admissions are visible in the
-    # usage report instead of vanishing (AC5 — LP-0MVN4LANP0069QQM).
+    # snapshot and no ownership) *and* the unmeasured-cold enforcement has been
+    # rolled back. The ladder then fails open to the predicted ratio, but the
+    # *decision* must still be logged with an explicit ``n_past_actual=none``
+    # so residency-blind admissions are visible in the usage report instead of
+    # vanishing (AC5 — LP-0MVN4LANP0069QQM).
     unmeasured_facts = None
+
+    # Measured cost of the *added* work (candidate acquisition, started by the
+    # caller, plus the residency resolution below), in milliseconds. Stays
+    # ``None`` while the ladder is disabled, so an unmeasured admission reports
+    # ``admission_overhead_ms=none`` instead of fabricating a figure
+    # (LP-0MW959R5S009WDM8 AC4e).
+    overhead_ms: float | None = None
+
+    # The *priced* uncached-token count this verdict is held to, logged as
+    # ``new_tokens=`` on every decision line
+    # (LP-0MW959SE30012HJJ AC6a/AC6b). Priced once, on the rung that prices
+    # it — the measured live-prefix price below, or the predicted-ratio price
+    # on the rollout path — so the logged figure is always the number the
+    # verdict used, never a re-derivation in the logger. Stays ``None`` on the
+    # rungs that refuse before pricing (hard cap, unmeasured-cold, tenancy):
+    # an unpriced refusal reports ``none`` rather than a fabricated ``0``.
+    priced_new_tokens: int | None = None
+
+    # Every rung logs through the same decision line, carrying both token
+    # thresholds so the *applied* one is auditable (LP-0MW81DHPH00650NY AC1):
+    # a cold-priced admission, a measured-resident (warm) admission and an
+    # unmeasured-cold denial are distinguishable from the line alone. One
+    # helper here means a future rung cannot forget to pass them.
+    def _log_decision(decision: str, facts, min_ratio, tenancy=None) -> None:
+        _log_residency_decision(
+            session_id=session_id,
+            estimated_tokens=estimated_tokens,
+            decision=decision,
+            model_name=model_name,
+            facts=facts,
+            min_ratio=min_ratio,
+            tenancy=tenancy,
+            cold_cache_threshold=cold_cache_threshold,
+            warm_cache_threshold=warm_cache_threshold,
+            admission_overhead_ms=overhead_ms,
+            # LP-0MW959RRO008AAH9 AC10a: the candidate the verdict was measured
+            # against, so the admission line names the slot the dispatch record
+            # and the eviction event will attribute the request to.
+            slot_candidate=getattr(candidate_slot, "slot_id", None),
+            # LP-0MW959SE30012HJJ AC6a: the price this verdict was held to, so
+            # a wrong price is traceable from the one line.
+            new_tokens=priced_new_tokens,
+        )
+
     if resident_prefix_min_ratio > 0.0:
+        # Candidate-first admission (LP-0MW959P9S005DJY7 AC1a): the candidate is
+        # assigned **before** the residency verdict, so the probe measures the
+        # candidate slot instead of predicting from a not-yet-existing
+        # assignment. Acquisition registers ownership in ``session._slot_owners``
+        # — the registry every residency rung already reads — so the resolution
+        # needs no extra input and the measurement is of the candidate. The
+        # caller (:func:`_should_skip_local`) acquired it and owns its release
+        # (LP-0MW959PWL001WYSM AC2d): a caller that already holds the handle
+        # passes it in via *candidate_slot*, and an override that re-admits the
+        # request must find it still owned. Fail-open: an unavailable candidate
+        # degrades one rung, never refuses local.
+        candidate = candidate_slot
+        if candidate is not None:
+            # Trace-level only: the decision line (AC6, LP-0MW959SE30012HJJ)
+            # is the single INFO seam for the verdict; this one says which
+            # slot the verdict was measured against when a decision is
+            # reconstructed from logs.
+            logger.debug(
+                "admission_candidate session=%s slot=%s endpoint=%s",
+                session_id or "unknown",
+                getattr(candidate, "slot_id", None),
+                getattr(candidate, "endpoint", "") or "",
+            )
         facts = resolve_resident_prefix(
             session_id,
             estimated_tokens,
@@ -3204,31 +4354,58 @@ def _should_skip_local(
             endpoint=endpoint,
             model_name=model_name,
         )
+        # Stop the overhead clock the moment the added work is done: the figure
+        # then covers candidate acquisition + residency resolution and *not* the
+        # rest of the ladder or the upstream request
+        # (LP-0MW959R5S009WDM8 AC4a).
+        overhead_ms = _admission_overhead_ms(overhead_start)
+        if facts.resident:
+            # Live-prefix pricing (AC3) — computed once, here, so the *priced*
+            # figure is the one Check 4 compares **and** the one every
+            # decision informed by this measurement reports, including the
+            # ratio refusal below (where it is the price the prompt was refused
+            # *instead of*). A wrong admission or a wrong refusal is then
+            # traceable from the line alone (LP-0MW959SE30012HJJ AC6a/AC6e).
+            reusable = (
+                min(facts.n_past_actual, estimated_tokens)
+                if facts.n_past_actual is not None
+                else estimated_tokens
+            )
+            priced_new_tokens = max(0, estimated_tokens - reusable)
         if facts.source == RESIDENCY_SOURCE_UNKNOWN:
-            # Fail-open: no fresh measurement and no ownership — degrade to
-            # today's predicted-ratio decision instead of denying local.
+            if unmeasured_cold_enabled:
+                # Unmeasured is COLD (LP-0MW81DFML006O5KL). With no
+                # measurement of the session's reusable prefix the predicted
+                # sidecar ratio cannot make this prompt cheap: on 2026-11-07
+                # 20:48:51 a 55 492-token prompt was priced ``cached_ratio=1.00
+                # / new_tokens=172``, admitted at ``eta_prefill_s=130.8`` and
+                # evicted at 180.1 s — immediately after the probe measured
+                # nothing (``residency_source=non_resident``/``unknown``,
+                # ``measurement=unavailable:*``). The cold threshold therefore
+                # governs, so the prompt falls through to the remote chain with
+                # an explicit reason rather than being admitted on a guess.
+                # The denial is logged through the same decision line as every
+                # other rung, so an unmeasured 55k skip is attributable.
+                _log_decision(
+                    SKIP_REASON_UNMEASURED_COLD, facts, resident_prefix_min_ratio
+                )
+                return (True, SKIP_REASON_UNMEASURED_COLD)
+            # ROLLBACK (LP-0MW81DJZ60049X5W): one config value restores the
+            # pre-change behaviour byte-for-byte — no fresh measurement and no
+            # ownership degrade to the predicted-ratio decision, logged as
+            # ``admit_predicted`` / ``skip_predicted`` below.
             unmeasured_facts = facts
             facts = None
         elif not facts.resident:
             # Fresh view, no slot of its own: the resident prefix is measured
             # at zero, so no prediction can make this prompt cheap.
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=SKIP_REASON_RESIDENT_PREFIX,
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
+            _log_decision(
+                SKIP_REASON_RESIDENT_PREFIX, facts, resident_prefix_min_ratio
             )
             return (True, SKIP_REASON_RESIDENT_PREFIX)
         elif facts.reuse_ratio < resident_prefix_min_ratio:
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=SKIP_REASON_RESIDENT_PREFIX,
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
+            _log_decision(
+                SKIP_REASON_RESIDENT_PREFIX, facts, resident_prefix_min_ratio
             )
             return (True, SKIP_REASON_RESIDENT_PREFIX)
 
@@ -3245,54 +4422,31 @@ def _should_skip_local(
             idle_seconds=tenancy_idle_seconds,
         )
         if tenancy is not None and not tenancy.admitted:
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=SKIP_REASON_TENANT_LIMIT,
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio or None,
+            _log_decision(
+                SKIP_REASON_TENANT_LIMIT,
+                facts,
+                resident_prefix_min_ratio or None,
                 tenancy=tenancy,
             )
             return (True, SKIP_REASON_TENANT_LIMIT)
 
     # Check 4: live-prefix pricing (AC3) when a residency measurement exists.
     if facts is not None and facts.resident:
-        reusable = (
-            min(facts.n_past_actual, estimated_tokens)
-            if facts.n_past_actual is not None
-            else estimated_tokens
-        )
-        if max(0, estimated_tokens - reusable) <= cold_cache_threshold:
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision="admit",
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
-            )
+        # ``priced_new_tokens`` was priced from this measurement where the facts
+        # were resolved above; the ``None`` guard is belt-and-braces so a future
+        # rung cannot admit on an unpriced prompt.
+        if (
+            priced_new_tokens is not None
+            and priced_new_tokens <= cold_cache_threshold
+        ):
+            _log_decision("admit", facts, resident_prefix_min_ratio)
             return (False, None)
         if economic_bypass_serves_local:
             # Cheap mode still recovers the *economic* miss locally; the
             # contention queue (if enabled) waits for a slot.
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision="admit",
-                model_name=model_name,
-                facts=facts,
-                min_ratio=resident_prefix_min_ratio,
-            )
+            _log_decision("admit", facts, resident_prefix_min_ratio)
             return (False, None)
-        _log_residency_decision(
-            session_id=session_id,
-            estimated_tokens=estimated_tokens,
-            decision="large_context_bypass",
-            model_name=model_name,
-            facts=facts,
-            min_ratio=resident_prefix_min_ratio,
-        )
+        _log_decision("large_context_bypass", facts, resident_prefix_min_ratio)
         return (True, "large_context_bypass")
 
     # Check 5: Dynamic new-token calculation (predicted ratio).
@@ -3301,17 +4455,17 @@ def _should_skip_local(
         session_id,
         estimated_tokens,
         (body_json or {}).get("messages") if isinstance(body_json, dict) else None,
+        server_config=server_config,
     )
     new_tokens = int(estimated_tokens * (1 - ratio))
+    # The predicted price is the one this path's verdict uses, so it is the one
+    # the decision line reports (AC6a) — same field, same meaning on whichever
+    # rung priced the prompt.
+    priced_new_tokens = new_tokens
     if new_tokens <= cold_cache_threshold:
         if unmeasured_facts is not None:
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=DECISION_ADMIT_PREDICTED,
-                model_name=model_name,
-                facts=unmeasured_facts,
-                min_ratio=resident_prefix_min_ratio,
+            _log_decision(
+                DECISION_ADMIT_PREDICTED, unmeasured_facts, resident_prefix_min_ratio
             )
         return (False, None)
 
@@ -3321,24 +4475,14 @@ def _should_skip_local(
         # contention queue (if enabled) will wait for a slot when all are
         # busy.
         if unmeasured_facts is not None:
-            _log_residency_decision(
-                session_id=session_id,
-                estimated_tokens=estimated_tokens,
-                decision=DECISION_ADMIT_PREDICTED,
-                model_name=model_name,
-                facts=unmeasured_facts,
-                min_ratio=resident_prefix_min_ratio,
+            _log_decision(
+                DECISION_ADMIT_PREDICTED, unmeasured_facts, resident_prefix_min_ratio
             )
         return (False, None)
 
     if unmeasured_facts is not None:
-        _log_residency_decision(
-            session_id=session_id,
-            estimated_tokens=estimated_tokens,
-            decision=DECISION_SKIP_PREDICTED,
-            model_name=model_name,
-            facts=unmeasured_facts,
-            min_ratio=resident_prefix_min_ratio,
+        _log_decision(
+            DECISION_SKIP_PREDICTED, unmeasured_facts, resident_prefix_min_ratio
         )
     return (True, "large_context_bypass")
 
@@ -3588,6 +4732,261 @@ def _idle_admission_budget_verdict(
     except Exception:
         logger.debug("idle admission budget verdict failed", exc_info=True)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Last-resort local admission (LP-0MVWAMY8M001KE4W)
+#
+# The idle-admit rung above overrides the ECONOMIC bypass on an idle GPU, but
+# it is still priced by the flat ``local_cold_prefill_budget_tokens`` cap
+# (25,000). Measured 2026-10-30 (24 h window): the idle ladder fired 1,337
+# times and refused 1,291 (96.6 %) on ``prefill_budget_exceeded``
+# (``new_tokens`` p50 79,136, all inside the 120 k warm cap; ``idle_seconds``
+# p50 197 s), while the remote chain was empty every time. 236 of the window's
+# 686 ``All providers exhausted`` warnings landed inside idle gaps that
+# carried 98 inbound requests and **zero** streams.
+#
+# The rung below is the LAST rung of the local admission ladder: when there is
+# provably nowhere else to send the request, an idle GPU served slowly is
+# better than a retryable 503. It is deliberately narrow — the remote chain
+# must be measured empty at decision time, the GPU must have been idle for
+# ``local_last_resort_idle_seconds``, and the prompt must fit the model's own
+# routing warm cap (which is why raising the flat cold-prefill cap would have
+# been the wrong fix) — and it awards a size-appropriate prefill deadline
+# instead of the one it was admitted past.
+# ---------------------------------------------------------------------------
+
+LAST_RESORT_REASON = "remote_exhausted_idle_gpu"
+"""Reason recorded when the last-resort rung admits a request."""
+
+DEFAULT_LAST_RESORT_IDLE_SECONDS = 300.0
+"""Idle age required before the rung may fire (the measured >5 min gap)."""
+
+DEFAULT_LAST_RESORT_DEADLINE_SECONDS = 600.0
+"""Prefill deadline a last-resort dispatch uses instead of the normal one."""
+
+MAX_LAST_RESORT_DEADLINE_SECONDS = 900.0
+"""Hard cap: the lifetime wedge bound (``local_dispatch_max_prefill_seconds``)."""
+
+#: Request attribute carrying the accepted last-resort admission. Mirrors
+#: ``proxy.router_helpers.LOCAL_LAST_RESORT_ATTR`` (kept as a literal in both
+#: modules for the same reason as ``TENANCY_SKIP_REASON``: neither may take a
+#: module-level import of the other). ``router_helpers`` reads it to widen the
+#: first-byte ceiling; this module reads it to keep the dispatch-time admission
+#: guards inert for a dispatch the rung already priced.
+LOCAL_LAST_RESORT_ATTR = "_local_last_resort_admission"
+
+
+def _last_resort_config(server_config: dict | None) -> tuple[float, float]:
+    """Return ``(idle_seconds, deadline_seconds)`` for the last-resort rung.
+
+    ``local_last_resort_idle_seconds`` (default 300 s, the >5 min idle-gap
+    definition behind the measured window) is the kill switch: a missing,
+    malformed, boolean or non-positive value disables the rung entirely, so
+    ``0`` restores today's decision matrix byte-for-byte (AC7).
+
+    ``local_last_resort_deadline_seconds`` (default 600 s) is the prefill
+    deadline a last-resort dispatch uses instead of
+    ``local_prefill_deadline_seconds``. A malformed or non-positive value
+    falls back to the default — the rung must never admit a dispatch with no
+    deadline — and every value is clamped to
+    :data:`MAX_LAST_RESORT_DEADLINE_SECONDS` so a config typo cannot outlive
+    the lifetime wedge ceiling.
+    """
+    if not isinstance(server_config, dict):
+        return 0.0, DEFAULT_LAST_RESORT_DEADLINE_SECONDS
+
+    def _positive_float(raw) -> float | None:
+        """Parse a knob into a positive float; ``None`` means unusable."""
+        if isinstance(raw, bool) or raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    raw_idle = server_config.get(
+        "local_last_resort_idle_seconds", DEFAULT_LAST_RESORT_IDLE_SECONDS
+    )
+    idle_seconds = _positive_float(raw_idle)
+    raw_deadline = server_config.get(
+        "local_last_resort_deadline_seconds", DEFAULT_LAST_RESORT_DEADLINE_SECONDS
+    )
+    deadline_seconds = _positive_float(raw_deadline)
+    if deadline_seconds is None:
+        deadline_seconds = DEFAULT_LAST_RESORT_DEADLINE_SECONDS
+    deadline_seconds = min(deadline_seconds, MAX_LAST_RESORT_DEADLINE_SECONDS)
+    if idle_seconds is None:
+        return 0.0, deadline_seconds
+    return idle_seconds, deadline_seconds
+
+
+def _remote_chain_exhausted(
+    request,
+    provider_cfg: dict,
+    model_config: dict | None,
+    config: dict,
+) -> bool:
+    """True when no remote provider could serve this request **now**.
+
+    Delegates to :func:`_remote_chain_has_capacity` — the resolver's own
+    eligibility vocabulary applied read-only (recorded chain-resolution skips,
+    cooldown, pending usage-limit reset, quota hard stop, ``available_times``)
+    — rather than re-deriving availability here, so the rung and the
+    ``All providers exhausted`` verdict can never disagree about what "empty"
+    means.
+
+    Fail-safe: an exception (or a model config whose remote availability cannot
+    be read) is *not* proof of exhaustion, so it returns ``False`` and the rung
+    stays inert — today's behaviour. Over-admitting locally on an unreadable
+    chain state is the worse error (AC6).
+    """
+    try:
+        local_name = provider_cfg.get("name") if isinstance(provider_cfg, dict) else None
+        available = _remote_chain_has_capacity(
+            request, model_config, config, exclude_name=local_name
+        )
+    except Exception:
+        logger.debug("last-resort remote availability check failed", exc_info=True)
+        return False
+    return not available
+
+
+def _evaluate_last_resort_admission(
+    config: dict,
+    provider_cfg: dict,
+    model_config: dict | None,
+    request,
+    estimated_tokens: int,
+    cached_ratio: float = 0.0,
+) -> dict | None:
+    """Decide whether an idle local GPU should serve a request no remote can.
+
+    Only reached when the normal ladder already declined local. All of the
+    following must hold (any failure ⇒ ``None``, today's behaviour):
+
+    1. the rung is enabled (``local_last_resort_idle_seconds`` > 0);
+    2. the estimated prompt fits the model's own routing warm cap, honouring a
+       per-entry ``max_context_tokens`` ceiling — this rung never overrides a
+       capacity limit, only the economic ones (AC5);
+    3. the remote chain is measured **empty at decision time** — the resolver's
+       own availability predicate, not "we did not try yet" (AC2);
+    4. nothing local is in flight, generating, prefilling, queued or loading
+       (:func:`_local_idle_blocker`), which is what bounds last-resort
+       concurrency at one dispatch (AC4);
+    5. the local model has been idle for at least the configured threshold.
+
+    Returns ``None`` when the rung does not apply, else the decision dict the
+    caller stamps on the request (and logs) — carrying ``deadline_s``, the
+    size-appropriate prefill deadline the dispatch must use instead of
+    ``local_prefill_deadline_seconds`` (AC3).
+    """
+    try:
+        server_config = (
+            config.get("server", config) if isinstance(config, dict) else {}
+        )
+        idle_threshold, deadline_seconds = _last_resort_config(server_config)
+        if idle_threshold <= 0:
+            return None
+        try:
+            estimate = int(estimated_tokens or 0)
+        except (TypeError, ValueError):
+            return None
+        if estimate <= 0:
+            return None
+
+        # (2) The prompt must fit the model's own routing warm cap.
+        _, warm_cap = _effective_large_context_thresholds(config)
+        entry_limit = _provider_context_limit(provider_cfg)
+        if entry_limit > 0:
+            warm_cap = min(warm_cap, entry_limit) if warm_cap > 0 else entry_limit
+        if warm_cap <= 0 or estimate > warm_cap:
+            logger.debug(
+                "last_resort_blocked reason=warm_cap estimate=%d warm_cap=%d",
+                estimate,
+                warm_cap,
+            )
+            return None
+
+        # (3) Nowhere else to go: the remote chain is measured empty NOW.
+        if not _remote_chain_exhausted(request, provider_cfg, model_config, config):
+            return None
+
+        # (4) The GPU must be provably idle (this is also the concurrency
+        # bound: an in-flight last-resort dispatch makes the blocker fire, so a
+        # second request is refused exactly as today).
+        endpoint = _get_local_provider_endpoint(provider_cfg, config)
+        blocker = _local_idle_blocker(endpoint)
+        if blocker is not None:
+            logger.debug(
+                "last_resort_blocked reason=%s endpoint=%s estimate=%d",
+                blocker,
+                endpoint or "default",
+                estimate,
+            )
+            return None
+
+        # (5) Long enough idle to be a genuine serving gap.
+        from proxy.local_activity import local_idle_seconds
+
+        idle_seconds = local_idle_seconds()
+        if idle_seconds < idle_threshold:
+            return None
+
+        try:
+            ratio = min(1.0, max(0.0, float(cached_ratio or 0.0)))
+        except (TypeError, ValueError):
+            ratio = 0.0
+        return {
+            "admitted": True,
+            "reason": LAST_RESORT_REASON,
+            "idle_seconds": idle_seconds,
+            "threshold_seconds": idle_threshold,
+            "deadline_s": deadline_seconds,
+            "remote_exhausted": True,
+            "estimated_tokens": estimate,
+            "new_tokens": max(0, int(round(estimate * (1.0 - ratio)))),
+            "warm_cap": warm_cap,
+        }
+    except Exception:
+        logger.debug("last-resort admission evaluation failed", exc_info=True)
+        return None
+
+
+def _log_last_resort_admit(
+    decision: dict,
+    provider_name: str,
+    model: str | None,
+    session_id: str | None,
+) -> None:
+    """Emit the ``local_last_resort_admit`` line (AC9).
+
+    The structured line is the measurement surface AC8 reads: it names the
+    prompt size, the idle age and the deadline the dispatch was given, and it
+    always reports ``remote_exhausted=true`` because that is a precondition of
+    the rung. Never raises into the request path.
+    """
+    try:
+        logger.info(
+            "local_last_resort_admit provider=%s model=%s reason=%s "
+            "estimated_tokens=%d new_tokens=%d idle_seconds=%.1f "
+            "threshold_seconds=%.1f deadline_s=%.1f warm_cap=%d "
+            "remote_exhausted=true session=%s%s",
+            provider_name,
+            model or "unknown",
+            decision.get("reason") or LAST_RESORT_REASON,
+            int(decision.get("estimated_tokens") or 0),
+            int(decision.get("new_tokens") or 0),
+            float(decision.get("idle_seconds") or 0.0),
+            float(decision.get("threshold_seconds") or 0.0),
+            float(decision.get("deadline_s") or 0.0),
+            int(decision.get("warm_cap") or 0),
+            session_id or "unknown",
+            turn_field(),
+        )
+    except Exception:
+        logger.debug("last-resort admit log line failed", exc_info=True)
 
 
 def _provider_context_limit(provider_cfg: dict) -> int:
@@ -3858,6 +5257,68 @@ def _quota_ranked_providers(
     return result
 
 
+#: Account -> already-logged dedupe for the balance-dispatch decision
+#: (LP-0MW46PBD200249WK AC4): the INFO line fires once per account per
+#: process, mirroring the dry-run skip-logging discipline.
+_DISPATCH_ON_BALANCE_LOGGED: set[str] = set()
+
+
+def _dispatch_on_balance(
+    provider_cfg: dict, snapshot: quota_state.QuotaSnapshot, config: dict | None
+) -> bool:
+    """True when the quota hard stop may be softened for *provider_cfg*.
+
+    The hard stop (LP-0MVF7KO8C005NB59) exists so a spent account can never
+    spend real pay-as-you-go money. One case is exempted by the operator: the
+    monthly **plan** window is the only blocking signal (rolling and weekly
+    still hold real headroom) and the entry declares ``use_balance: true``
+    (LP-0MW46PAU4006SK7Z) — the account's console configuration allows
+    billing the over-plan spend to prepaid credit, so the entry must keep
+    dispatching instead of waiting out the whole monthly reset horizon
+    (LP-0MW46PBD200249WK).
+
+    Any other blocking signal keeps the current hard stop: a spent rolling or
+    weekly window — including one whose headroom is at or below the threshold
+    margin (``100 - threshold``), which is genuine exhaustion even when the
+    upstream status is still ``ok`` (AC2) — is never overridden, and an entry
+    without the opt-in behaves byte-identically to today (AC11). With quota
+    behaviour disabled (kill switch) or stale-suspended the predicate refuses
+    too (AC3): the money guard stays byte-identical in those regimes, so a
+    stale "plan spent" reading can never bill balance after the plan reset.
+    """
+    if not get_use_balance(provider_cfg):
+        return False
+    behaviour = _quota_behaviour(config)
+    if behaviour.disabled or behaviour.suspended:
+        return False
+    if snapshot.rolling.blocking or snapshot.weekly.blocking:
+        return False
+    threshold = quota_state.quota_exhaustion_percent(config)
+    margin = 100.0 - threshold
+    if snapshot.rolling.headroom <= margin or snapshot.weekly.headroom <= margin:
+        return False
+    return snapshot.monthly.blocking or snapshot.monthly.percent >= threshold
+
+
+def _log_dispatch_on_balance(
+    provider_cfg: dict, snapshot: quota_state.QuotaSnapshot
+) -> None:
+    """INFO once per account that the entry was dispatched onto balance.
+
+    Distinct, greppable reason separating "plan spent, balance permitted"
+    from the applied ``reason=quota_exhausted`` skips (AC4).
+    """
+    if snapshot.account in _DISPATCH_ON_BALANCE_LOGGED:
+        return
+    _DISPATCH_ON_BALANCE_LOGGED.add(snapshot.account)
+    logger.info(
+        "dispatch_on_balance (account=%s, plan_monthly=%.1f%%, use_balance=%s)",
+        snapshot.account,
+        snapshot.monthly.percent,
+        str(get_use_balance(provider_cfg)).lower(),
+    )
+
+
 def _quota_unavailable_reason(
     provider_cfg: dict, config: dict | None
 ) -> str | None:
@@ -3867,7 +5328,12 @@ def _quota_unavailable_reason(
     entry whose snapshot is
     :attr:`~proxy.quota_state.QuotaSnapshot.exhausted` (any window blocking,
     or no effective headroom left) is treated as unavailable — the same
-    conservative stance the snapshot itself takes.
+    conservative stance the snapshot itself takes. The one exception is the
+    :func:`_dispatch_on_balance` override: when the monthly plan window is
+    the **only** blocker and the entry opts into balance billing
+    (``use_balance: true``), the account is not unavailable — it may keep
+    serving on prepaid credit (LP-0MW46PBD200249WK). The hard stop below
+    logs the ``dispatch_on_balance`` decision.
 
     The decision is gated on the central behaviour predicate
     (:func:`proxy.quota_state.quota_behaviour`): it returns ``None`` (fail
@@ -3885,6 +5351,11 @@ def _quota_unavailable_reason(
         return None
     snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
     if snapshot is None or not snapshot.exhausted:
+        return None
+    if _dispatch_on_balance(provider_cfg, snapshot, config):
+        # The monthly plan window is the only blocker and the account opted
+        # into balance billing: not unavailable — the hard stop below
+        # decides, logging dispatch_on_balance (LP-0MW46PBD200249WK).
         return None
     reason = (
         f"quota_exhausted (account={snapshot.account}, "
@@ -3921,6 +5392,19 @@ def _quota_exhausted(
     ``(False, "")`` (fail open) when the entry is not
     quota-managed or no snapshot has been polled yet — the guard only acts on
     authoritative quota state.
+
+    The one softening is the operator's explicit balance opt-in
+    (:func:`_dispatch_on_balance`, LP-0MW46PBD200249WK): when the **only**
+    blocking signal is the monthly plan window (rolling and weekly still hold
+    real headroom) and the entry declares ``use_balance: true``, ``(False,
+    "")`` is returned and the ``dispatch_on_balance`` decision is logged once
+    per account — the over-plan spend is billed to prepaid credit instead of
+    waiting out the monthly reset horizon. Any other blocker (a spent rolling
+    or weekly window, or no opt-in) keeps the unchanged hard stop. The
+    softening is itself honour-able only with fresh quota state and an
+    enabled behaviour predicate — disabled/stale-suspended regimes keep the
+    byte-identical hard stop (AC3), so a stale "plan spent" reading can never
+    bill balance after the plan reset.
     """
     if not quota_state.is_quota_provider(provider_cfg, config):
         return False, ""
@@ -3934,6 +5418,9 @@ def _quota_exhausted(
         monthly_percent < threshold
         and effective_headroom > 100.0 - threshold
     ):
+        return False, ""
+    if _dispatch_on_balance(provider_cfg, snapshot, config):
+        _log_dispatch_on_balance(provider_cfg, snapshot)
         return False, ""
     return True, (
         f"reason=quota_exhausted (account={snapshot.account}, "
@@ -3964,9 +5451,15 @@ def resolve_provider(
       LP-0MSG45LOO007K236)
     - Does not belong to a usage-limit ACCOUNT with a pending usage-limit
       reset (LP-0MSLJPOCC0001ROJ / LP-0MSMBWB23009XYPW)
-    - Is not marked spent by proactive quota state (LP-0MVF7KIKE002DZVD)
+    - Is not marked spent by proactive quota state (LP-0MVF7KIKE002DZVD) —
+      lifted when the **only** spent signal is the monthly plan window and
+      the entry opts into balance billing (``use_balance: true",
+      LP-0MW46PBD200249WK)
     - Is not at or near its monthly quota cap (the cost-guard hard stop —
-      ``server.quota_exhaustion_percent``, LP-0MVF7KO8C005NB59)
+      ``server.quota_exhaustion_percent``, LP-0MVF7KO8C005NB59) — unless the
+      account opted into balance billing, in which case a monthly-plan-only
+      spend dispatches onto prepaid credit (``use_balance: true",
+      LP-0MW46PBD200249WK)
 
     Quota-managed (``opencode-*``) entries are considered in descending
     headroom urgency instead of config order — see
@@ -4410,6 +5903,7 @@ def reset_surge_bypass_state() -> None:
     """Forget per-account transition / dry-run decision log state (tests)."""
     _SURGE_BYPASS_LOGGED.clear()
     _QUOTA_DRY_RUN_LOGGED.clear()
+    _DISPATCH_ON_BALANCE_LOGGED.clear()
 
 
 def _log_quota_skip_decision(
@@ -5260,6 +6754,109 @@ def _get_respect_ratelimit_headers(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Per-provider ``use_balance`` opt-in (LP-0MW46PAU4006SK7Z)
+#
+# An OpenCode Go account may be configured in the console to fall over onto
+# prepaid credit once its monthly plan window is spent. The quota gate needs
+# to know which accounts are allowed to do that, so ``use_balance`` is a
+# per-entry ``true|false`` flag with a **false** default: entries that omit it
+# behave exactly as before. Only a real YAML boolean is honoured (fail safe):
+# a malformed value (e.g. ``"yes"``, ``2``, a mapping) is coerced to ``false``
+# and logged **once** with a WARN naming the entry — it never raises at load.
+# The flag is meaningful only for quota-managed (``opencode-*``) entries;
+# elsewhere it is read faithfully but ignored (with a one-time debug note).
+# ---------------------------------------------------------------------------
+
+#: Entry-name -> already-warned dedupe so a malformed ``use_balance`` is
+#: logged exactly once per entry instead of on every routed request.
+_USE_BALANCE_MALFORMED_WARNED: set[str] = set()
+
+#: Entry-name -> already-noted dedupe for the "ignored outside quota-managed
+#: entries" debug note (same per-entry-once discipline as the WARN path).
+_USE_BALANCE_NON_QUOTA_NOTED: set[str] = set()
+
+
+def _warn_malformed_use_balance(provider_cfg: dict) -> None:
+    """Log one WARN for a malformed ``use_balance``, deduplicated per entry."""
+    name = provider_cfg.get("name", "<unnamed>")
+    if name in _USE_BALANCE_MALFORMED_WARNED:
+        return
+    _USE_BALANCE_MALFORMED_WARNED.add(name)
+    raw = provider_cfg.get("use_balance")
+    logger.warning(
+        "use_balance on provider entry %r is not a boolean (got %r); "
+        "treating it as false — only true/false are honoured",
+        name,
+        raw,
+    )
+
+
+def get_use_balance(provider_cfg: dict) -> bool:
+    """Return the per-provider ``use_balance`` opt-in (default ``False``).
+
+    Only a real YAML boolean is honoured (fail safe, LP-0MW46PAU4006SK7Z
+    AC2/AC3): an omitted key, an explicit ``null`` or any non-boolean value
+    resolves to ``False``. A *declared but malformed* value additionally logs
+    one WARN naming the entry (deduplicated) and never raises, so a
+    misconfiguration is visible without changing routing.
+
+    The flag is meaningful only for quota-managed (``opencode-*``) entries
+    (the scope this child introduces); when set on any other entry its value
+    is still returned faithfully but a one-time DEBUG note records that the
+    flag is ignored there.
+    """
+    if not isinstance(provider_cfg, dict):
+        return False
+    raw = provider_cfg.get("use_balance")
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        _warn_malformed_use_balance(provider_cfg)
+        return False
+    if not quota_state.is_quota_provider(provider_cfg):
+        name = provider_cfg.get("name", "<unnamed>")
+        if name not in _USE_BALANCE_NON_QUOTA_NOTED:
+            _USE_BALANCE_NON_QUOTA_NOTED.add(name)
+            logger.debug(
+                "use_balance=%r on provider entry %r is ignored: the flag is "
+                "only meaningful for quota-managed (opencode-*) entries",
+                raw,
+                name,
+            )
+    return raw
+
+
+def validate_use_balance_config(config: dict) -> list[str]:
+    """Scan every provider entry's ``use_balance``; WARN once per malformed value.
+
+    Non-raising by design (LP-0MW46PAU4006SK7Z AC3/AC5): a malformed value is
+    coerced to ``False`` by :func:`get_use_balance`, so this hook only
+    surfaces the misconfiguration as one WARN per entry at load time — never a
+    startup failure. Returns an empty problem list (consistent with the
+    validator convention, nothing here ever blocks a load).
+    """
+    if not isinstance(config, dict):
+        return []
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return []
+    for model_cfg in models.values():
+        if not isinstance(model_cfg, dict):
+            continue
+        providers = model_cfg.get("providers")
+        if not isinstance(providers, list):
+            continue
+        for entry in providers:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("use_balance")
+            if raw is not None and not isinstance(raw, bool):
+                # Shares the runtime dedupe, so load + reads never double-WARN.
+                _warn_malformed_use_balance(entry)
+    return []
+
+
 def _get_ratelimit_cooldown_margin_seconds(config: dict | None) -> float:
     """Read the safety margin added to a header-derived cooldown.
 
@@ -6028,6 +7625,13 @@ EXHAUSTION_CODE_ALL = "all_exhausted"
 EXHAUSTION_CODE_TIME_WINDOW = "outside_time_window"
 EXHAUSTION_CODE_SLOTS = "all_slots_exhausted"
 EXHAUSTION_CODE_LOCAL_ADMISSION = "local_admission_reject"
+#: The whole chain is blocked by known-until scheduling gates (scheduled
+#: ``available_times`` windows, usage-limit resets, quota quarantines), so the
+#: client is told *when* it reopens rather than receiving the opaque
+#: ``all_exhausted`` 503 it used to retry every minute for hours
+#: (LP-0MVWC9CZH004OZYN AC4). Additive: the retained prose ``error`` stays
+#: ``All providers exhausted`` for older clients.
+EXHAUSTION_CODE_TIME_WINDOW_BLOCKED = "no_provider_available_in_window"
 
 
 def _build_local_admission_reject_response(
@@ -6904,9 +8508,11 @@ async def _queue_context_bypass(
         warm_cache_threshold=_warm_threshold,
         economic_bypass_serves_local=_recover_economic,
         resident_prefix_min_ratio=_effective_resident_prefix_min_ratio(config),
+        unmeasured_cold_enabled=_unmeasured_residency_cold_enabled(config),
         endpoint=endpoint,
         session_tenants=_resolve_tenants(config),
         tenancy_idle_seconds=_resolve_tenancy_idle(config),
+        server_config=_server_section(config),
     )
     return _skip_local, _skip_reason
 
@@ -6986,7 +8592,7 @@ the occupied gate ahead of it* against the budget, so it needs the number of
 def _local_occupant_prefill_seconds(
     endpoint: str | None = None, session_id: str | None = None
 ) -> float:
-    """Measured remaining prefill service owed by other sessions' prefills.
+    """Measured remaining *hold* owed by other sessions' live prefills.
 
     LP-0MVOFVCA2008DQVE: the symmetric ``eta * busy_slots`` occupancy floor
     prices an occupant at the newcomer's own prefill, which is wrong when a
@@ -6994,7 +8600,10 @@ def _local_occupant_prefill_seconds(
     occupant from its own dispatch record so the deadline bound sees the real
     time to first byte; since LP-0MVS9YK9P006M1NQ the projection re-prices the
     occupant's remaining uncached *new tokens* at the contended co-residency
-    rate instead of decaying its optimistic admission ETA.
+    rate instead of decaying its optimistic admission ETA, and since
+    LP-0MVV29YDQ00437N6 it also carries the occupant's remaining dispatch-lease
+    hold (whichever is larger) so the diagnosed ``prefill_in_flight`` blocker
+    class is priced rather than assumed to owe nothing.
 
     Never raises: a routing decision must not break on an observability gap
     (0.0 leaves the symmetric floor in charge).
@@ -8271,6 +9880,45 @@ def _contention_queue_expiry_seconds(config: dict | None) -> int:
     return max(1, int(math.ceil(max_wait)))
 
 
+def _contention_queue_wait_budget_seconds(
+    config: dict | None, already_waited_seconds: float | None
+) -> float:
+    """Queue wait budget left for a *second* wait in the same turn (AC2).
+
+    LP-0MVV29Y1M004GAW0: one request can reach the contention queue twice in a
+    single turn — the ``local_concurrency_limit`` gate and then the
+    ``local_lease_active`` retry after the local dispatch was denied. Charging
+    each wait the full ``contention_queue_max_wait_seconds`` lets a turn spend
+    up to twice the configured budget, which inflates both the abandoned-wait
+    denominator and the client's latency.
+
+    The spent wait is *measured* (``_contention_queue_wait_seconds``), so the
+    second wait is bounded by the remainder of the same window — never a fresh
+    budget, and never more than the configured cap. A spent wait that already
+    consumed the window yields ``0.0``: the queue then expires the wait
+    immediately (``cause=queue_wait_expired``) instead of parking the request
+    for another full window.
+
+    Returns a float because the bound is the clamped config value the queue
+    itself uses; :func:`_contention_queue_remaining_seconds` stays the
+    whole-second ``Retry-After`` projection of the same window.
+    """
+    try:
+        from proxy.router import _get_contention_queue_config
+
+        server_cfg = (
+            config.get("server", config) if isinstance(config, dict) else {}
+        )
+        window = float(_get_contention_queue_config(server_cfg)["max_wait_seconds"])
+    except Exception:  # pragma: no cover - defensive
+        return 0.0
+    try:
+        spent = max(0.0, float(already_waited_seconds or 0.0))
+    except (TypeError, ValueError):
+        spent = 0.0
+    return max(0.0, window - spent)
+
+
 def _contention_queue_remaining_seconds(
     config: dict | None, elapsed_wait_seconds: float | None
 ) -> int:
@@ -8597,6 +10245,7 @@ async def _prefill_admission_guard(
     reason_label: str | None = None,
     free_slot: bool = False,
     capacity_admitted: bool = False,
+    last_resort_admitted: bool = False,
 ):
     """Evaluate (and log) the prefill-ETA admission guard.
 
@@ -8629,10 +10278,27 @@ async def _prefill_admission_guard(
     prefill deadline, so the flat cold-prefill token cap must not override it
     (the measured bounds still do). Without it the two gates contradict each
     other: routing admitted the prompt and the guard then always refused it.
+
+    *last_resort_admitted* (LP-0MVWAMY8M001KE4W) says the ladder's FINAL rung
+    admitted this dispatch against a provably idle GPU and priced it against
+    its own ``local_last_resort_deadline_seconds``. The flat cold-prefill cap
+    and the normal prefill deadline are precisely the bounds that rung exists
+    to overrule when there is nowhere else to send the request, so the guard is
+    inert for it — the equivalent of ``capacity_admitted`` for the
+    capacity-blind last-resort case. Every other path keeps both bounds.
     """
     try:
         from proxy import prefill_eta
 
+        if last_resort_admitted:
+            logger.info(
+                "local_admission_guard_skipped reason=last_resort_admitted "
+                "estimated_tokens=%d session=%s%s",
+                max(0, int(estimated_tokens or 0)),
+                session_id or "unknown",
+                turn_field(),
+            )
+            return None
         if estimated_tokens <= 0:
             return None
         server_cfg = config.get("server", config) if isinstance(config, dict) else {}
@@ -8768,11 +10434,35 @@ def _local_admission_reject_payload(attempts: list | None) -> dict | None:
 def _set_queue_wait_on_request(request, elapsed: float) -> None:
     """Record the elapsed contention-queue wait on the request so
     ``proxy_to_local`` can subtract it from the adaptive timeout budget
-    (Q2=a: total wait + serve stays within ``llama_adaptive_timeout_*``)."""
+    (Q2=a: total wait + serve stays within ``llama_adaptive_timeout_*``).
+
+    LP-0MVV29Y1M004GAW0: the value is the *cumulative* wait of the turn, and
+    it doubles as the spent-wait marker the lease-active re-queue path reads
+    back (:func:`_queue_wait_spent_on_request`) to bound its own wait by the
+    remainder of one budget."""
     try:
         setattr(request, "_contention_queue_wait_seconds", float(elapsed or 0.0))
     except Exception:
         pass
+
+
+def _queue_wait_spent_on_request(request) -> float:
+    """Queue wait this request has already spent in this turn (else ``0.0``).
+
+    LP-0MVV29Y1M004GAW0 AC2: the lease-active retry re-enters the queue after
+    the request may already have waited at the concurrency gate. The marker is
+    written by :func:`_set_queue_wait_on_request` on every queue admission, so
+    reading it here charges the turn one budget rather than two. Best-effort:
+    a missing/unparsable marker means "nothing spent yet" (today's
+    behaviour).
+    """
+    try:
+        spent = float(
+            getattr(request, "_contention_queue_wait_seconds", 0.0) or 0.0
+        )
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+    return spent if spent > 0 else 0.0
 
 
 #: Request attribute holding the queued request's OWN priced new-token count,
@@ -8782,6 +10472,59 @@ def _set_queue_wait_on_request(request, elapsed: float) -> None:
 #: wait carry identical, own-request evidence and the conversion harness never
 #: has to join a wait to another request's admission.
 CONTENTION_QUEUE_NEW_TOKENS_ATTR = "_contention_queue_new_tokens"
+
+
+#: Request attribute holding the explicit abandon cause of the queue wait that
+#: just ended (LP-0MVV29X2E004INFL AC1): ``queue_wait_expired`` when the wait
+#: budget ran out, ``queue_depth_exceeded`` when the depth cap refused the
+#: enqueue. The ``contention_queue_fallback_after_queue`` line reads it back so
+#: the cause is *logged*, never inferred from ``queued_duration`` later.
+CONTENTION_QUEUE_CAUSE_ATTR = "_contention_queue_cause"
+
+
+#: Request attribute holding the entry path of a queue wait
+#: (``concurrency_limit`` | ``local_lease_active``, LP-0MVV29X2E004INFL AC2).
+#: Stamped so the enqueue and outcome lines of one wait agree even when the
+#: caller reads it back instead of threading the literal through.
+CONTENTION_QUEUE_TRIGGER_ATTR = "_contention_queue_trigger"
+
+
+def _stamp_queue_cause(request, cause: str | None) -> None:
+    """Best-effort stamp of :data:`CONTENTION_QUEUE_CAUSE_ATTR`."""
+    if cause is None:
+        return
+    try:
+        setattr(request, CONTENTION_QUEUE_CAUSE_ATTR, str(cause))
+    except Exception:
+        pass
+
+
+def _queue_cause_from_request(request) -> str | None:
+    """Read back the abandon cause stamped by the queue wait, if any."""
+    try:
+        value = getattr(request, CONTENTION_QUEUE_CAUSE_ATTR, None)
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _stamp_queue_trigger(request, trigger: str | None) -> None:
+    """Best-effort stamp of :data:`CONTENTION_QUEUE_TRIGGER_ATTR`."""
+    if trigger is None:
+        return
+    try:
+        setattr(request, CONTENTION_QUEUE_TRIGGER_ATTR, str(trigger))
+    except Exception:
+        pass
+
+
+def _queue_trigger_from_request(request) -> str | None:
+    """Read back the entry trigger stamped by the queue wait, if any."""
+    try:
+        value = getattr(request, CONTENTION_QUEUE_TRIGGER_ATTR, None)
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _queue_own_new_tokens(
@@ -8867,6 +10610,7 @@ def _stamp_local_admission_evidence(
     model_name: str | None = None,
     busy_slots: int | None = None,
     in_flight_prefills: int | None = None,
+    slot_id: int | None = None,
 ) -> None:
     """Stamp the routing/admission decision's pricing values on the request.
 
@@ -8884,6 +10628,13 @@ def _stamp_local_admission_evidence(
     admission-time co-residency snapshot: an occupied gate at admission marks
     the dispatch's future calibration sample as contended, which the router
     ORs with a first-byte-time live check before recording the sample.
+
+    *slot_id* (LP-0MW959RRO008AAH9 AC10a) is the candidate slot candidate-first
+    admission assigned **before** the verdict (LP-0MW959P9S005DJY7), so the
+    dispatch record can persist the slot the decision was measured against.
+    ``None`` (no candidate: the pool is unconfigured, exhausted, or the caller
+    is a legacy path) keeps the pre-change behaviour — the record's slot is
+    then resolved from the ownership registry at dispatch instead.
 
     Best-effort: a non-request object or a stamping failure is a no-op — a
     routing decision must never break on observability instrumentation.
@@ -8926,6 +10677,12 @@ def _stamp_local_admission_evidence(
                 if busy_slots is not None else None,
                 "in_flight_prefills": max(0, int(in_flight_prefills or 0))
                 if in_flight_prefills is not None else None,
+                # LP-0MW959RRO008AAH9 AC10a: the candidate slot assigned by
+                # candidate-first admission, persisted on the dispatch record
+                # so the request is attributable to a llama slot/task.
+                "slot_id": int(slot_id)
+                if isinstance(slot_id, int) and not isinstance(slot_id, bool)
+                and slot_id >= 0 else None,
             },
         )
     except Exception:
@@ -8943,6 +10700,9 @@ async def _maybe_queue_for_local_slot(
     session_id: str | None,
     endpoint: str | None = None,
     priority: str | None = None,
+    loss_reason: str = "fallback_after_queue",
+    trigger: str = "concurrency_limit",
+    already_waited_seconds: float = 0.0,
 ) -> tuple[str, str | None, float | None]:
     """Queue-wait for a local slot (low/medium priority, queue policy)
     instead of immediately falling back to the next remote provider.
@@ -8971,6 +10731,16 @@ async def _maybe_queue_for_local_slot(
         ``deferrable`` verdict: the caller must return the retryable 429
         admission response instead of falling back to a remote provider
         (LP-0MVIKPCSG002B0NL AC4).
+
+    *already_waited_seconds* is the queue wait this turn has already spent
+    (``_queue_wait_spent_on_request``). One turn may reach the queue twice —
+    at the ``local_concurrency_limit`` gate and again on the
+    ``local_lease_active`` retry — so the second wait is bounded by the
+    *remainder* of ``contention_queue_max_wait_seconds`` rather than a fresh
+    window (LP-0MVV29Y1M004GAW0 AC2). The default of ``0.0`` keeps every other
+    caller byte-for-byte on today's behaviour, and the returned elapsed wait
+    is cumulative for the turn so ``queued_duration=``/the adaptive-timeout
+    budget see the whole wait.
 
     ``remote-ok`` never waits (LP-0MVUH9OYZ007GMWF AC4 / parent AC20). The
     value means *"local allowed, remote acceptable"* — its name is historic,
@@ -9085,8 +10855,19 @@ async def _maybe_queue_for_local_slot(
         capacity_admitted=bool(
             getattr(request, LOCAL_CAPACITY_ADMISSION_ATTR, None)
         ),
+        last_resort_admitted=bool(
+            getattr(request, LOCAL_LAST_RESORT_ATTR, None)
+        ),
     )
     if _admission is not None and not _admission.admit:
+        # The queue's admission guard refused local: the candidate the bypass
+        # mirror above acquired (if any) has no dispatch to hand it to, so it is
+        # released with the refusing reason here — the contention-queue refusal
+        # rung of the release contract (LP-0MW959PWL001WYSM AC2c). Idempotent,
+        # so a request that never acquired one is unaffected.
+        _release_session_admission_candidate(
+            session_id, endpoint=endpoint, reason=_admission.reason
+        )
         try:
             setattr(request, "_local_admission_decision", _admission)
         except Exception:
@@ -9137,17 +10918,28 @@ async def _maybe_queue_for_local_slot(
         decision=_admission,
     )
     _stamp_queue_new_tokens(request, _enqueue_new_tokens)
+    _stamp_queue_trigger(request, trigger)
     _enqueue_rate_bucket = getattr(_admission, "rate_bucket", None) or "unknown"
+    # One queue budget per turn (LP-0MVV29Y1M004GAW0 AC2): whatever this turn
+    # already spent at an earlier gate is deducted from the window, so the
+    # cumulated wait of a turn can never exceed the configured cap.
+    _spent_wait_seconds = max(0.0, float(already_waited_seconds or 0.0))
+    _max_wait_seconds = _contention_queue_wait_budget_seconds(
+        config, _spent_wait_seconds
+    )
     logger.info(
         "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s "
-        "session=%s new_tokens=%s rate_bucket=%s trigger=%s",
-        cq["max_wait_seconds"],
+        "session=%s new_tokens=%s rate_bucket=%s trigger=%s "
+        "spent_wait=%.1fs budget=%.1fs",
+        float(cq["max_wait_seconds"]),
         cq["max_depth"],
         _saturation or "none",
         session_id or "unknown",
         _enqueue_new_tokens if _enqueue_new_tokens is not None else "unknown",
         _enqueue_rate_bucket,
-        _saturation or "concurrency_limit",
+        trigger,
+        _spent_wait_seconds,
+        _max_wait_seconds,
     )
 
     _wait_started = _time.monotonic()
@@ -9169,29 +10961,69 @@ async def _maybe_queue_for_local_slot(
         )
     except Exception:
         logger.debug("retention check failed; queueing as a newcomer", exc_info=True)
-    elapsed = await contention_queue.wait_for_local_slot(
-        max_wait_seconds=cq["max_wait_seconds"],
-        max_depth=cq["max_depth"],
-        slot_free_check=lambda: _local_slot_free(
-            config, max_local, endpoint=endpoint
-        ),
-        session_id=session_id,
-        retained=_retained,
-        # ETA-aware ordering (LP-0MVIQ0G2M0006QF6 AC1): the admission guard
-        # already costed this request's prefill, so the queue can admit the
-        # shortest projected prefill first within its retention class.
-        eta_seconds=(
-            float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0)
-            if _admission is not None
-            else None
-        ),
-        eta_ordering=bool(cq.get("eta_ordering", False)),
-        promote_after_seconds=float(cq.get("eta_promotion_seconds", 0) or 0),
-    )
+    _cause_out: list[str] = []
+    try:
+        elapsed = await contention_queue.wait_for_local_slot(
+            max_wait_seconds=_max_wait_seconds,
+            max_depth=cq["max_depth"],
+            slot_free_check=lambda: _local_slot_free(
+                config, max_local, endpoint=endpoint
+            ),
+            session_id=session_id,
+            retained=_retained,
+            # ETA-aware ordering (LP-0MVIQ0G2M0006QF6 AC1): the admission guard
+            # already costed this request's prefill, so the queue can admit the
+            # shortest projected prefill first within its retention class.
+            eta_seconds=(
+                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0)
+                if _admission is not None
+                else None
+            ),
+            eta_ordering=bool(cq.get("eta_ordering", False)),
+            promote_after_seconds=float(cq.get("eta_promotion_seconds", 0) or 0),
+            # LP-0MVWPJW2700966ZU: the queue records a loss on its own drop points
+            # (depth cap, wait expiry) with the canonical fall-through reason this
+            # call site reports. The default is ``fallback_after_queue``; the
+            # lease-protected call site passes ``local_lease_active``.
+            loss_reason=loss_reason,
+            cause_out=_cause_out,
+            # Cumulative bookkeeping (AC3): a second wait in the same turn reports
+            # the whole turn's wait, not just this gate's slice.
+            already_waited_seconds=_spent_wait_seconds,
+        )
+    except BaseException:
+        # A wait that raises (client disconnect / cancellation) ends the
+        # local route without a dispatch, so the candidate the bypass mirror
+        # acquired is released before the exception continues
+        # (LP-0MW959PWL001WYSM AC2c). Idempotent: never a double-free.
+        _release_session_admission_candidate(
+            session_id, endpoint=endpoint, reason="exception"
+        )
+        raise
     if elapsed is None:
+        # The wait expired or the depth cap refused the enqueue, so the request
+        # falls back to the next provider and its candidate is released with
+        # that reason (LP-0MW959PWL001WYSM AC2c).
+        _release_session_admission_candidate(
+            session_id, endpoint=endpoint, reason=loss_reason
+        )
+        # Explicit abandon cause (LP-0MVV29X2E004INFL AC1): the queue reports
+        # whether the depth cap refused the enqueue or the wait budget ran out.
+        # The fallback line logs it verbatim, so the analyser never infers the
+        # cause from ``queued_duration``.
+        _stamp_queue_cause(
+            request,
+            _cause_out[0] if _cause_out else "queue_wait_expired",
+        )
         # Caps exceeded — the caller falls back. Surface the measured wait so
         # the fallback-after-queue event can record elapsed wait time (F4 AC2).
-        return ("fallback", None, _time.monotonic() - _wait_started)
+        # It is cumulative for the turn (LP-0MVV29Y1M004GAW0 AC3), so the logged
+        # ``queued_duration=`` and the deferral remainder price the whole wait.
+        return (
+            "fallback",
+            None,
+            _spent_wait_seconds + (_time.monotonic() - _wait_started),
+        )
     return ("dispatch", None, elapsed)
 
 
@@ -9823,6 +11655,240 @@ def _is_account_rate_limit_error(response: Response, body_text: str) -> bool:
     return any(marker in lowered_body for marker in _ACCOUNT_QUOTA_MARKERS)
 
 
+# ---------------------------------------------------------------------------
+# Transient upstream overload vs genuine balance exhaustion
+# (LP-0MW46PBWL008T317)
+#
+# Once a ``use_balance: true`` account may dispatch on credit, two reactive
+# paths become live and must be told apart:
+#
+# - **Transient overload** — the upstream answers HTTP 429
+#   ``[overloaded] the server is overloaded; retry shortly`` with
+#   ``Retry-After: 2`` / ``retry-after-ms: 2000`` (live sampling alternated
+#   3 x 429 then 2 x 200). This is a SHORT retryable cooldown honouring the
+#   upstream's own wait (bounded), never a permanent domain failure and never
+#   an account quarantine.
+# - **Balance exhaustion** — the prepaid credit / usage is genuinely spent:
+#   ``/v1/usage`` carries no balance field, so the first signal is the
+#   upstream error itself (HTTP 402 or a usage-limit body). The ACCOUNT is
+#   quarantined with the existing reset-aware usage-limit quarantine (real
+#   reset timing), so the entry is not retried in a loop.
+# ---------------------------------------------------------------------------
+
+#: Default cooldown for an ``[overloaded]`` 429 when the upstream sends no
+#: ``Retry-After`` at all: still a short bounded retryable wait, never a long
+#: quarantine.
+_OVERLOADED_BASE_COOLDOWN_SECONDS = 1.0
+
+#: Upper bound for an ``[overloaded]`` 429 cooldown. The upstream's
+#: ``Retry-After`` is honoured but capped here so a wildly large value cannot
+#: park a transiently-overloaded entry for a long cooldown. Configurable via
+#: ``server.overloaded_cooldown_max_seconds``.
+_OVERLOADED_COOLDOWN_DEFAULT_MAX_SECONDS = 30.0
+
+
+def _overloaded_cooldown_max_seconds(config: dict | None = None) -> float:
+    """Return the cap on an ``[overloaded]`` 429 cooldown (seconds).
+
+    Reads ``server.overloaded_cooldown_max_seconds`` (accepting the flat form
+    for tests), defaulting to :data:`_OVERLOADED_COOLDOWN_DEFAULT_MAX_SECONDS`;
+    a missing, malformed or non-positive value falls through to the default so
+    the cap can never be accidentally disabled.
+    """
+    candidates: list[Any] = []
+    if isinstance(config, dict):
+        server_cfg = config.get("server", config)
+        if isinstance(server_cfg, dict):
+            candidates.append(server_cfg.get("overloaded_cooldown_max_seconds"))
+        candidates.append(config.get("overloaded_cooldown_max_seconds"))
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return float(_OVERLOADED_COOLDOWN_DEFAULT_MAX_SECONDS)
+
+
+def _overloaded_retry_after_seconds(response: Response) -> float | None:
+    """Return the upstream's requested wait for an ``[overloaded]`` 429.
+
+    Honours the standard ``Retry-After`` header first (the observed OpenCode
+    shape ``Retry-After: 2``), then the millisecond variant
+    ``retry-after-ms`` (``retry-after-ms: 2000``). Returns ``None`` when
+    neither header is present/parseable, so the caller falls back to the
+    base cooldown.
+    """
+    seconds = _parse_retry_after(response)
+    if seconds is not None:
+        return seconds
+    raw = response.headers.get("retry-after-ms") if response.headers else None
+    if raw is not None:
+        try:
+            ms = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if ms > 0:
+            return ms / 1000.0
+    return None
+
+
+def _overloaded_cooldown_seconds(
+    response: Response, config: dict | None = None
+) -> float:
+    """A bounded, short cooldown (seconds) for an ``[overloaded]`` 429.
+
+    Floors the upstream's ``Retry-After`` / ``retry-after-ms`` wait at the
+    1-second base (so a missing header cannot spin an instant retry loop) and
+    caps it at :func:`_overloaded_cooldown_max_seconds` (so a transient blip
+    is never parked for a long cooldown). Deliberately NOT exponential and
+    NOT counted by the sibling-fallback breaker: overload is transient and
+    must stay short (LP-0MW46PBWL008T317 AC1/AC5/AC10).
+    """
+    retry_after = _overloaded_retry_after_seconds(response)
+    if retry_after is None:
+        retry_after = _OVERLOADED_BASE_COOLDOWN_SECONDS
+    return min(
+        max(retry_after, _OVERLOADED_BASE_COOLDOWN_SECONDS),
+        _overloaded_cooldown_max_seconds(config),
+    )
+
+
+def _is_overloaded_error(response: Response, body_text: str) -> bool:
+    """Return True when a response is a transient upstream ``[overloaded]``.
+
+    Classifies the OpenCode Go overload shape — an HTTP 429 whose body
+    carries the ``[overloaded]`` marker (observed ``429 ... [overloaded] the
+    server is overloaded; retry shortly``), an ``error.type`` / ``code`` of
+    ``overloaded``, or the combined "server is overloaded" + "retry shortly"
+    wording. It is deliberately distinct from the quota / usage-limit
+    classifiers: the caller applies a SHORT retryable cooldown honouring
+    ``Retry-After`` (bounded), never an account quarantine and never a
+    permanent failure-domain exclusion (LP-0MW46PBWL008T317 AC1/AC10).
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 429:
+        return False
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    err_types: list[str] = []
+    codes: list[str] = []
+    messages: list[str] = []
+    if isinstance(payload, dict):
+        candidates = [payload]
+        error = payload.get("error")
+        if isinstance(error, dict):
+            candidates.append(error)
+        for cand in candidates:
+            err_types.append(str(cand.get("type", "")).strip().lower())
+            codes.append(str(cand.get("code", "")).strip().lower())
+            if isinstance(cand.get("message"), str):
+                messages.append(cand["message"].strip().lower())
+
+    for marker in (*err_types, *codes):
+        if marker in ("overloaded", "[overloaded]"):
+            return True
+
+    lowered_body = (body_text or "").strip().lower()
+    if "[overloaded]" in lowered_body:
+        return True
+    # Conservative wording fallback: the combined "server is overloaded" +
+    # "retry shortly" phrase names the same transient-overload event without
+    # the bracket marker.
+    if any("server is overloaded" in m for m in messages) or (
+        "server is overloaded" in lowered_body
+        and "retry shortly" in lowered_body
+    ):
+        return True
+    return False
+
+
+#: Body markers identifying a genuine balance-exhaustion response (an
+#: out-of-credit / usage-spent account) on a NON-429 error status. Mirrors the
+#: usage-limit vocabulary resolved by ``_usage_limit_reset_info``; a 429 never
+#: reaches this detector because the 429 quota / usage-limit paths own it.
+_BALANCE_EXHAUSTION_BODY_MARKERS = (
+    "insufficient_quota",
+    "free_daily_limit_exceeded",
+    "gousagelimiterror",
+    "freeusagelimiterror",
+    "usage_limit_reached",
+)
+
+
+def _is_balance_exhaustion_error(response: Response, body_text: str) -> bool:
+    """Return True when a response signals genuine credit/balance exhaustion.
+
+    Two shapes (LP-0MW46PBWL008T317 AC3):
+
+    - **HTTP 402 "Payment Required"** — the classic out-of-credit signal;
+      ``/v1/usage`` carries no balance field, so the 402 is the reactive proof
+      the prepaid credit is spent;
+    - **any other non-429 error status** whose body carries the usage-limit
+      markers (``insufficient_quota`` / ``free_daily_limit_exceeded`` /
+      ``GoUsageLimitError`` / ``FreeUsageLimitError`` / ``usage_limit_reached``)
+      — a usage-limit-shaped body on a status the 429 path does not own.
+
+    A 429 is deliberately NOT matched here: 429s route through the quota /
+    usage-limit reset path (``_usage_limit_reset_info``) and the per-account
+    rate-limit handling, never through the balance-quarantine branch.
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status == 429:
+        return False
+    if status == 402:
+        return True
+    if not _is_http_error_status(status):
+        return False
+    lowered_body = (body_text or "").strip().lower()
+    return any(marker in lowered_body for marker in _BALANCE_EXHAUSTION_BODY_MARKERS)
+
+
+def _balance_exhaustion_reset_info(
+    response: Response,
+    body_text: str,
+    config: dict | None = None,
+    provider_cfg: dict | None = None,
+) -> "_UsageLimitReset | None":
+    """Resolve the account quarantine for a balance-exhaustion response.
+
+    Reuses the reset-aware usage-limit resolution (:func:`_usage_limit_reset_info`,
+    now 402-capable) when the body carries usage-limit evidence; otherwise the
+    account's real ``/v1/usage`` snapshot reset is used (the authoritative
+    window reset, LP-0MVPAE77Z002VGIA), and a bounded guessed quarantine is
+    the last resort so an out-of-credit account is never re-probed in a tight
+    loop. Returns ``None`` only when even the guess cannot be computed
+    (defensive: the caller keeps the generic cooldown path then).
+    """
+    info = _usage_limit_reset_info(
+        response, body_text, config, provider_cfg=provider_cfg
+    )
+    if info is not None:
+        return info
+    if provider_cfg is not None:
+        snapshot_seconds = _quota_snapshot_reset_seconds(provider_cfg, config)
+        if snapshot_seconds is not None:
+            return _UsageLimitReset(
+                float(snapshot_seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                True,
+                None,
+                None,
+            )
+    guessed = _usage_limit_guess_cap_seconds(config)
+    if guessed > 0:
+        return _UsageLimitReset(
+            float(guessed) + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, None, None
+        )
+    return None
+
+
 def _parse_resets_in(message: str) -> float | None:
     """Parse a ``Resets in ...`` duration from an upstream error message.
 
@@ -10361,7 +12427,7 @@ def _usage_limit_reset_info(
     An absolute-timestamp reset names no quota *window*, so it is recorded
     without window metadata and revalidated as a legacy entry.
 
-    Returns ``None`` when the response is not a 429 usage-limit error or no
+    Returns ``None`` when the response is not a 429/402 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
     ``FreeUsageLimitError`` 3-hour cooldown / generic rate-limit handling.
 
@@ -10378,9 +12444,15 @@ def _usage_limit_reset_info(
               2026-10-30 00:00 UTC. Add credits to continue now.",
               "type": "insufficient_quota", "code":
               "free_daily_limit_exceeded"}}
+
+    HTTP 402 (``Payment Required``) is accepted as well as 429: a genuinely
+    exhausted prepaid balance surfaces as a 402 / usage-limit body, and the
+    balance-exhaustion path (``_balance_exhaustion_reset_info``) resolves the
+    SAME reset-aware quarantine from it (LP-0MW46PBWL008T317). Any other
+    status is never a usage-limit reset event.
     """
     status = int(getattr(response, "status_code", 0) or 0)
-    if status != 429:
+    if status not in (402, 429):
         return None
 
     try:
@@ -10565,8 +12637,29 @@ def _set_usage_limit_quarantine(
     clear it as soon as that window is reported lifted (LP-0MVPAE77Z002VGIA
     AC7); entries without a window (message durations, x-ratelimit headers,
     legacy state) carry no metadata and are revalidated as legacy entries.
+
+    The quarantine is **cumulative**: an existing quarantine is never cleared
+    or shortened by a later reset (LP-0MW46PBWL008T317 AC4). A fresh
+    balance-exhaustion signal arriving while a longer usage-limit quarantine
+    is already recorded leaves the recorded expiry and metadata untouched; a
+    longer new reset replaces it.
     """
-    _usage_reset_at[account] = time.time() + reset.seconds
+    existing = _usage_reset_at.get(account)
+    now = time.time()
+    if existing is not None and existing - now > reset.seconds:
+        # A longer quarantine is already recorded — never clear or shorten it
+        # (LP-0MW46PBWL008T317 AC4). The existing metadata (window,
+        # guessed/explicit marking) stays too, so the recorded state remains
+        # internally consistent.
+        logger.info(
+            "usage-limit quarantine kept for account=%s: existing longer "
+            "(%ds remaining) than the new reset (%ds)",
+            account,
+            int(existing - now),
+            int(reset.seconds),
+        )
+        return
+    _usage_reset_at[account] = now + reset.seconds
     if reset.explicit:
         _usage_reset_guessed.discard(account)
     else:
@@ -11281,6 +13374,22 @@ def _handle_connection_error_in_fallback(
                 error=str(type(exc).__name__),
             )
             return True
+        # LP-0MW42T6IJ006EQA3 AC1/AC3: a *refused* connection on a local
+        # dispatch is deterministic — the backend has no listener. The
+        # fail-fast inside ``_call_with_backend_retries`` already arms the
+        # routing skip; arming here too covers a cycle whose local dispatch
+        # surface raised directly (UI/direct ``proxy_to_local`` paths), so a
+        # chain-hold cycle restarts with local skipped, never re-dispatching
+        # the dead backend (no per-cycle retry storm).
+        if provider_type == "local" and _is_connection_refused(exc):
+            _arm_local_backend_unreachable(config)
+            logger.warning(
+                "backend_fail_fast provider=%s type=%s reason=connection_refused "
+                "→ failing over to next provider%s",
+                provider_name,
+                provider_type,
+                turn_field(),
+            )
         cooldown = cooldown_seconds
         if provider_type == "remote" and cooldown_seconds > 0:
             count = _provider_failure_count.get(provider_name, 0)
@@ -11805,6 +13914,12 @@ def _exhaustion_diagnostics(response: Response) -> str:
     of the exhausted 503 payload (built by ``_build_exhausted_response``) so
     the hold-feedback comment can tell the client which providers were
     unavailable and why. Returns "" when the body is not a JSON payload.
+
+    A planned-unavailable payload (LP-0MVWC9CZH004OZYN) additionally carries
+    the stable ``code``, the honest ``retry_at`` and the ``detail`` naming the
+    earliest reopening provider; those are surfaced on the streaming hold
+    comment too, so a held client sees the same story as the terminal body.
+    Other payloads keep the historical string exactly (AC9c).
     """
     try:
         body_text = _response_body_text(response)
@@ -11820,6 +13935,13 @@ def _exhaustion_diagnostics(response: Response) -> str:
             diag = payload.get("diagnostics")
             if isinstance(diag, list) and diag:
                 bits.append(f"attempts={len(diag)}")
+            if payload.get("code") == EXHAUSTION_CODE_TIME_WINDOW_BLOCKED:
+                bits.append(f"code={payload['code']}")
+                if payload.get("retry_at"):
+                    bits.append(f"retry_at={payload['retry_at']}")
+                detail = payload.get("detail")
+                if isinstance(detail, str) and detail:
+                    bits.append(detail)
             if bits:
                 return ", ".join(bits)[:512]
     except Exception:
@@ -12147,6 +14269,78 @@ def _attempt_is_terminal_request_scoped(attempt: Any) -> bool:
     return status_code not in _RETRYABLE_4XX_STATUSES
 
 
+@dataclass(frozen=True)
+class _ReopeningCandidate:
+    """One deterministically skipped entry's honest reopening instant.
+
+    *seconds* is the wait from now until the gate reopens; *provider* and
+    *reason* let the response ``detail`` and the chain-end ``blocked=[...]``
+    evidence name *which* entry reopens first and *why* it was closed
+    (LP-0MVWC9CZH004OZYN AC2/AC4/AC-O6).
+    """
+
+    provider: str
+    reason: str
+    seconds: float
+
+
+def _deterministic_reopening_candidates(
+    skips: dict[str, str],
+    model_config: dict | None,
+    config: dict | None = None,
+) -> list[_ReopeningCandidate]:
+    """Per-skip reopening instants for a deterministically skipped chain.
+
+    The single computation of "when does each blocked entry come back" — the
+    earliest-instant rule (AC2), the ``detail`` provider/gate naming (AC4) and
+    the ``blocked=[...]`` chain-end evidence (AC-O6) all read it, so there is
+    no second earliest-instant computation (LP-0MW0KZR7A003UFQK AC11).
+
+    Only honestly-derivable instants are emitted — a usage-limit reset
+    countdown, the next ``available_times`` window start, the soonest quota
+    window reset. A skip whose instant cannot be computed is omitted (the
+    caller fails open rather than guessing, AC8).
+    """
+    candidates: list[_ReopeningCandidate] = []
+    providers = [
+        p for p in ((model_config or {}).get("providers") or []) if isinstance(p, dict)
+    ]
+    by_name = {str(p.get("name", "")): p for p in providers}
+    for name, reason in skips.items():
+        provider_cfg = by_name.get(name)
+        if provider_cfg is None:
+            continue
+        waiters = {
+            "usage_limit_reset_pending": lambda: float(
+                _usage_reset_remaining(_usage_limit_account_key(provider_cfg))
+            ),
+            "outside_available_window": lambda: (
+                _seconds_until_next_window(provider_cfg, config=config) or 0.0
+            ),
+            "quota_hard_stop": lambda: _quota_hard_stop_wait_seconds(
+                provider_cfg, config
+            ),
+            # AC1 lists ``quota_exhausted`` as a known-until gate whose reset
+            # interval is known; it shares the quota-window rollover
+            # computation with the hard stop rather than adding a second one.
+            "quota_exhausted": lambda: _quota_hard_stop_wait_seconds(
+                provider_cfg, config
+            ),
+        }
+        compute = waiters.get(reason)
+        if compute is None:
+            continue
+        try:
+            seconds = float(compute())
+        except Exception:
+            continue
+        if seconds > 0:
+            candidates.append(
+                _ReopeningCandidate(provider=name, reason=reason, seconds=seconds)
+            )
+    return candidates
+
+
 def _earliest_deterministic_reset_seconds(
     skips: dict[str, str],
     model_config: dict | None,
@@ -12161,38 +14355,14 @@ def _earliest_deterministic_reset_seconds(
 
     Only honestly-derivable instants are considered — a usage-limit reset
     countdown, the next ``available_times`` window start, the soonest quota
-    window reset for a hard-stopped account. ``None`` when none is derivable
-    (the verdict still fails fast; the caller then keeps the exhaustion
-    payload's own timing).
+    window reset for a hard-stopped or quota-exhausted account. ``None`` when
+    none is derivable (the verdict still fails fast; the caller then keeps the
+    exhaustion payload's own timing).
     """
-    candidates: list[float] = []
-    providers = [
-        p for p in ((model_config or {}).get("providers") or []) if isinstance(p, dict)
-    ]
-    by_name = {str(p.get("name", "")): p for p in providers}
-    for name, reason in skips.items():
-        provider_cfg = by_name.get(name)
-        waiters = {
-            "usage_limit_reset_pending": lambda: float(
-                _usage_reset_remaining(_usage_limit_account_key(provider_cfg))
-            ),
-            "outside_available_window": lambda: (
-                _seconds_until_next_window(provider_cfg, config=config) or 0.0
-            ),
-            "quota_hard_stop": lambda: _quota_hard_stop_wait_seconds(provider_cfg, config),
-        }
-        compute = waiters.get(reason)
-        if compute is None or provider_cfg is None:
-            continue
-        try:
-            seconds = float(compute())
-        except Exception:
-            continue
-        if seconds > 0:
-            candidates.append(seconds)
+    candidates = _deterministic_reopening_candidates(skips, model_config, config)
     if not candidates:
         return None
-    return int(min(candidates))
+    return int(min(candidate.seconds for candidate in candidates))
 
 
 def _quota_hard_stop_wait_seconds(
@@ -12404,8 +14574,146 @@ def _with_retry_timing(
     )
 
 
+def _planned_unavailable_detail(
+    verdict: dict,
+    model_config: dict | None = None,
+    config: dict | None = None,
+) -> str:
+    """Name the earliest reopening provider and its gate (AC4).
+
+    The prose ``error`` deliberately stays ``All providers exhausted`` for
+    older clients; this ``detail`` is where a newer client learns *which*
+    entry reopens first and *what* closed it.
+    """
+    skips = verdict.get("skips") or {}
+    candidates = _deterministic_reopening_candidates(skips, model_config, config)
+    if candidates:
+        first = min(candidates, key=lambda candidate: candidate.seconds)
+        return (
+            "no provider is available now: the earliest reopening provider is "
+            f"{first.provider} (blocked by {first.reason}) at "
+            f"{_retry_at_isoformat(int(first.seconds))}"
+        )
+    # No computable instant, but the chain is still known-blocked: name a
+    # blocked entry without inventing a time (AC8 fail-open).
+    if skips:
+        name = sorted(skips)[0]
+        return (
+            "no provider is available now: every provider in the chain is "
+            f"blocked by a scheduled or account gate (first blocked: {name}, "
+            f"reason {skips[name]})"
+        )
+    return "no provider is available now: every provider in the chain is blocked"
+
+
+def _build_planned_unavailable_response(
+    verdict: dict | None,
+    config: dict | None = None,
+    model_config: dict | None = None,
+) -> Response | None:
+    """Build the planned-unavailable 503 from a residual-chain verdict.
+
+    The whole chain is blocked by *known-until* gates (AC1's classification
+    lives in :func:`_residual_chain_verdict`), so instead of the opaque
+    ``all_exhausted`` 503 the client gets a stable ``code``, the honest
+    **earliest** recovery instant and a truncation flag when the advertised
+    delay is capped (LP-0MVWC9CZH004OZYN AC2/AC3/AC4).
+
+    Returns ``None`` when the verdict carries no computable reopening instant
+    or that instant is already past — the caller then keeps the generic
+    exhausted response, so a stale or fabricated ``retry_at`` is never
+    advertised (AC8 fail-open).
+
+    ``retry_at`` is the **untruncated** instant: when the true wait exceeds
+    ``server.max_retry_after_seconds`` the advertised ``retry_after`` is capped
+    (as every other refusal is) but the body still carries ``retry_at`` and
+    ``retry_after_truncated: true`` so a client can sleep through the whole
+    window instead of polling every hour (AC3 — no silent cap).
+    """
+    if not isinstance(verdict, dict):
+        return None
+    true_wait = verdict.get("retry_after_seconds")
+    if true_wait is None:
+        return None
+    try:
+        true_wait = int(true_wait)
+    except (TypeError, ValueError):
+        return None
+    if true_wait <= 0:
+        # The earliest recovery is already past: the chain is available now,
+        # so no stale timer may be advertised (AC2 row c / AC8).
+        return None
+
+    capped = min(true_wait, _max_retry_after_seconds(config))
+    truncated = true_wait > capped
+    payload: dict[str, Any] = {
+        "error": "All providers exhausted",
+        "code": EXHAUSTION_CODE_TIME_WINDOW_BLOCKED,
+        "retryable": True,
+        "retry_after": capped,
+        "retry_at": _retry_at_isoformat(true_wait),
+        "detail": _planned_unavailable_detail(verdict, model_config, config),
+    }
+    if truncated:
+        payload["retry_after_truncated"] = True
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=503,
+        media_type="application/json",
+        headers={"Retry-After": str(capped), "Cache-Control": "no-store"},
+    )
+
+
+def _pinned_remote_planned_unavailable_response(
+    request,
+    model_config: dict | None,
+    attempts: list[dict[str, Any]] | None,
+    config: dict | None = None,
+) -> Response | None:
+    """Planned-unavailable response for a pinned refusal on a blocked chain (AC7).
+
+    A ``local-preferred`` request never consults the remote tiers for a
+    *service* decision (the pin is honoured), but its refusal should still be
+    honest about *when* the chain can serve: the 2026-10-31 08:16 incident
+    answered the pinned client with a bare ``429 Local admission refused`` and
+    an unrelated local-capacity timer while every remote entry was scheduled
+    off until 10:00 UTC.
+
+    The classification reuses the sanctioned seam rather than a second
+    classifier (LP-0MW0KZR7A003UFQK AC11): the request-scoped skip record that
+    chain resolution already filled (:func:`_chain_resolution_skips`), the
+    remote-only slice of the chain, and :func:`_residual_chain_verdict` — so
+    the verdict and its earliest reopening instant are the same computation as
+    the non-pinned path. Returns ``None`` when the request is not pinned, the
+    local route was not refused, or the remote chain is not deterministically
+    blocked (today's refusal then stands, AC-T7b scope).
+    """
+    if not _local_preference_pins_local(request):
+        return None
+    if _local_admission_reject_payload(attempts) is None:
+        return None
+    remotes = [
+        entry
+        for entry in ((model_config or {}).get("providers") or [])
+        if isinstance(entry, dict) and entry.get("type", "remote") != "local"
+    ]
+    if not remotes:
+        return None
+    remote_config = {"providers": remotes}
+    verdict = _residual_chain_verdict(request, remote_config, [], config)
+    if verdict is None:
+        return None
+    return _build_planned_unavailable_response(
+        verdict, config=config, model_config=remote_config
+    )
+
+
 def _log_chain_planned_unavailable(
-    path: str, verdict: dict, effect: str = "hold=skipped"
+    path: str,
+    verdict: dict,
+    effect: str = "hold=skipped",
+    model_config: dict | None = None,
+    config: dict | None = None,
 ) -> None:
     """Log the chain-end line that distinguishes fail-fast from a hold (AC3).
 
@@ -12414,20 +14722,47 @@ def _log_chain_planned_unavailable(
     its extension), so a fail-fast return is distinguished from
     ``Chain exhausted ... holding`` by the explicit ``hold=skipped
     reason=deterministic_residual_chain`` marker on the same line.
+
+    AC-O6 (LP-0MVWC9CZH004OZYN) extends the same line with the aggregate
+    ``retry_at`` and a ``blocked=[provider:gate@instant, ...]`` list, so the
+    condition is diagnosable without joining per-provider skip lines. One line
+    per request, never per entry.
     """
     try:
+        retry_after = verdict.get("retry_after_seconds")
+        retry_at = "unknown"
+        try:
+            if retry_after is not None and int(retry_after) > 0:
+                retry_at = _retry_at_isoformat(int(retry_after))
+        except (TypeError, ValueError):
+            retry_at = "unknown"
+        blocked = "none"
+        try:
+            candidates = _deterministic_reopening_candidates(
+                verdict.get("skips") or {}, model_config, config
+            )
+            if candidates:
+                blocked = "[" + ", ".join(
+                    f"{c.provider}:{c.reason}@{_retry_at_isoformat(int(c.seconds))}"
+                    for c in sorted(candidates, key=lambda c: c.seconds)
+                ) + "]"
+        except Exception:
+            blocked = "none"
         logger.info(
             "chain_planned_unavailable model=%s reason=%s %s "
-            "retry_after=%s providers=%d deterministic_skips=%s terminal=%s",
+            "retry_at=%s retry_after=%s providers=%d deterministic_skips=%s "
+            "blocked=%s terminal=%s",
             path,
             "deterministic_residual_chain",
             effect,
-            verdict.get("retry_after_seconds"),
+            retry_at,
+            retry_after,
             int(verdict.get("providers") or 0),
             ",".join(
                 f"{name}:{reason}" for name, reason in (verdict.get("skips") or {}).items()
             )
             or "none",
+            blocked,
             ",".join(verdict.get("terminal") or []) or "none",
         )
     except Exception:
@@ -12435,25 +14770,45 @@ def _log_chain_planned_unavailable(
 
 
 def _exhaustion_retry_after(response: Response) -> int | None:
-    """Return an exhaustion response's ``Retry-After`` in seconds.
+    """Return an exhaustion response's real wait in seconds (hold-side).
 
     Prefers the ``Retry-After`` header; falls back to the JSON
     ``retry_after`` field. Returns ``None`` when neither is present/parsable
     (unknown wait — the caller then preserves the legacy full hold).
+
+    When the payload carries ``retry_after_truncated: true`` the header is the
+    client-facing *capped* value while ``retry_at`` is the untruncated instant
+    (LP-0MVWC9CZH004OZYN AC3). The hold must bound itself by the **real** wait,
+    not the cap, or it would replay the chain before the window reopens
+    (AC9b); so a truncated payload's ``retry_at`` wins over the header. Every
+    other payload keeps the historical header-first behaviour byte-identically
+    (AC9c) — none of them set the flag.
     """
+    try:
+        body = _response_body_text(response)
+        payload = json.loads(body) if body else None
+    except Exception:
+        payload = None
+    if isinstance(payload, dict) and payload.get("retry_after_truncated") is True:
+        try:
+            retry_at = datetime.fromisoformat(str(payload["retry_at"]))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            return max(0, int((retry_at - datetime.now(UTC)).total_seconds()))
+        except Exception:
+            # Fall through to the header/field value rather than guessing.
+            pass
     try:
         header = response.headers.get("Retry-After")
         if header is not None:
             return max(0, int(float(header)))
     except Exception:
         pass
-    try:
-        body = _response_body_text(response)
-        payload = json.loads(body) if body else None
-        if isinstance(payload, dict) and "retry_after" in payload:
+    if isinstance(payload, dict) and "retry_after" in payload:
+        try:
             return max(0, int(float(payload["retry_after"])))
-    except Exception:
-        pass
+        except Exception:
+            pass
     return None
 
 
@@ -13135,6 +15490,84 @@ async def _proxy_with_remote_fallback_cycle(
                     all_slot_exhaustion = False
                     continue
 
+                # Transient upstream overload (LP-0MW46PBWL008T317): an OpenCode
+                # ``[overloaded]`` 429 is a SHORT retryable cooldown honouring
+                # ``Retry-After`` (bounded), NOT a failure-domain exclusion and
+                # NOT an account quarantine. Deliberately no
+                # ``attempted_domains.add`` and no cooldown on the failure
+                # domain here: a momentary blip on one key must not poison
+                # ``https://opencode.ai/zen/go`` for sibling accounts (AC1,
+                # AC10). The entry is re-tried by the next chain-hold cycle
+                # (AC2); a chain that keeps overloading falls through to the
+                # next provider after the bounded holds instead of exhausting
+                # or hanging (AC5).
+                if _is_overloaded_error(response, body_text):
+                    fallback_reason = "overloaded"
+                    prev_provider = provider_name
+                    _overload_retry = _overloaded_retry_after_seconds(response)
+                    _overload_cooldown = _overloaded_cooldown_seconds(
+                        response, config
+                    )
+                    mark_provider_unavailable(provider_name, _overload_cooldown)
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="overloaded",
+                        status_code=int(response.status_code),
+                        body_snippet=(body_text[:512] if body_text else None),
+                        cooldown_seconds=_overload_cooldown,
+                        retry_after_seconds=(
+                            _overload_retry if _overload_retry is not None else 0.0
+                        ),
+                    )
+                    logger.info(
+                        "provider=%s transient overloaded 429 "
+                        "(cooldown=%.1fs retry_after=%ss) reason=overloaded",
+                        provider_name,
+                        _overload_cooldown,
+                        (_overload_retry if _overload_retry is not None else 0.0),
+                    )
+                    all_slot_exhaustion = False
+                    continue
+
+                # Genuine balance exhaustion (LP-0MW46PBWL008T317 AC3): the
+                # prepaid credit / usage is spent — the upstream error itself
+                # (HTTP 402 or a usage-limit body) is the reactive proof. The
+                # ACCOUNT is quarantined with real reset timing via the same
+                # reset-aware usage-limit quarantine, so the entry is NOT
+                # retried in a loop and the quarantine is cumulative with an
+                # existing usage-limit quarantine (AC4). Same-account siblings
+                # on the gateway stay eligible (account-scoped poisoning).
+                if _is_balance_exhaustion_error(response, body_text):
+                    _balance_reset = _balance_exhaustion_reset_info(
+                        response, body_text, config, provider_cfg=provider_cfg
+                    )
+                    if _balance_reset is not None:
+                        _balance_account = _usage_limit_account_key(provider_cfg)
+                        _set_usage_limit_quarantine(_balance_account, _balance_reset)
+                        fallback_reason = "balance_exhaustion"
+                        prev_provider = provider_name
+                        attempted_domains.add(_balance_account)
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="balance_exhaustion",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                            reset_in_seconds=int(_balance_reset.seconds),
+                        )
+                        logger.info(
+                            "provider=%s balance_exhaustion account=%s "
+                            "reset_in=%ds reason=balance_exhaustion",
+                            provider_name,
+                            _balance_account,
+                            int(_balance_reset.seconds),
+                        )
+                        all_slot_exhaustion = False
+                        continue
+
                 # Shared primitive: HTTP error with cooldown
                 _handle_http_error_with_cooldown(
                     response, provider_name, provider_type,
@@ -13286,18 +15719,39 @@ async def _proxy_with_remote_fallback_cycle(
     _set_chain_fail_fast_verdict(request, _fail_fast)
     _fail_fast_retry = None
     if _fail_fast is not None:
-        _log_chain_planned_unavailable(path, _fail_fast)
+        _log_chain_planned_unavailable(
+            path, _fail_fast, model_config=model_config, config=config
+        )
         _fail_fast_retry = _fail_fast.get("retry_after_seconds")
 
     # Distinguishable exhaustion: when time windows are the *only* reason no
     # provider could be used, surface a specific message instead of the generic
-    # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
+    # "All providers exhausted" (LP-0MS4ETBNO0022QAC). Kept first so its
+    # sole-cause triggers keep their exact body (LP-0MVWC9CZH004OZYN AC5).
     time_window_exhausted = _build_time_window_exhausted_response(
         attempts, unavailable, any_provider_tried, model_config=model_config,
         config=config, earliest_retry_after=_fail_fast_retry,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
+
+    # Mixed-but-fully-planned chain (LP-0MVWC9CZH004OZYN AC1/AC2/AC3/AC4):
+    # every entry is blocked by a known-until scheduling gate, so advertise the
+    # honest earliest reopening instant instead of the opaque all_exhausted
+    # 503. A ``None`` return fails open to the generic fallbacks below (AC8).
+    planned_unavailable = _build_planned_unavailable_response(
+        _fail_fast, config=config, model_config=model_config,
+    )
+    if planned_unavailable is None:
+        # AC7 (LP-0MVWC9CZH004OZYN): a pinned request never consults the remote
+        # tiers, but when its local route is refused on a known-until-blocked
+        # remote chain its refusal must still name the reopening instant rather
+        # than a local-capacity timer.
+        planned_unavailable = _pinned_remote_planned_unavailable_response(
+            request, model_config, attempts, config,
+        )
+    if planned_unavailable is not None:
+        raise ChainExhaustedError(planned_unavailable)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
@@ -13727,6 +16181,12 @@ async def _proxy_with_fallback_cycle(
         if _refusal is not None:
             return _refusal
 
+        # The slot candidate this attempt's local admission acquired, if any
+        # (LP-0MW959PWL001WYSM). Reset per provider attempt and released by the
+        # ``finally`` below unless the admission kept it, so no exit path —
+        # refusal, exception, fall-through — can leave a fabricated occupancy
+        # in the slot registry.
+        _candidate_lease = _AdmissionCandidateLease()
         try:
             # Mark attempt
             any_provider_tried = True
@@ -13736,6 +16196,46 @@ async def _proxy_with_fallback_cycle(
                 # explicit ``endpoint`` the legacy default is used, keeping
                 # single-server deployments working without changes.
                 local_endpoint = _get_local_provider_endpoint(provider_cfg, config)
+                # LP-0MW42T6IJ006EQA3 AC2: skip local BEFORE dispatch when the
+                # backend is known unreachable — a deterministic
+                # connection-refused fail-fast armed the skip deadline, or the
+                # slots snapshot is older than the configured staleness bound.
+                # No connection is attempted: the chain falls to the next
+                # provider while the skip is armed. The state is TTL-bounded
+                # and cleared by a successful dispatch / fresh probe, so a
+                # recovered backend is re-tried immediately (AC3 — no
+                # permanent quarantine).
+                _backend_skip_remaining = _local_backend_unreachable_remaining_seconds(
+                    config
+                )
+                if _backend_skip_remaining > 0:
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="backend_unreachable_skip",
+                        reason="backend_unreachable",
+                        skip_remaining_seconds=round(_backend_skip_remaining, 1),
+                    )
+                    fallback_reason = "backend_unreachable"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _note_local_fallback_reason(
+                        request, "backend_unreachable", _backend_skip_remaining
+                    )
+                    logger.info(
+                        "routing_skip_local provider=%s model=%s session=%s "
+                        "preference=%s skip_remaining=%.0fs "
+                        "reason=backend_unreachable → skipping local, "
+                        "routing to next remote provider%s",
+                        provider_name,
+                        provider_cfg.get("llama_model") or "unknown",
+                        _session_id or "unknown",
+                        _preference,
+                        _backend_skip_remaining,
+                        turn_field(),
+                    )
+                    continue
                 # LP-0MVKUKFHH005UDWL: post-deadline prefill-thrash cooldown.
                 # A session whose last local dispatch was cancelled by the
                 # prefill deadline must not immediately re-dispatch the
@@ -13854,6 +16354,7 @@ async def _proxy_with_fallback_cycle(
                             model_config, provider_cfg, _session_id,
                             endpoint=local_endpoint,
                             priority=_priority,
+                            trigger="concurrency_limit",
                         )
                     )
                     if _cq_action == "dispatch":
@@ -13869,7 +16370,7 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
                             "queued_duration=%.2fs policy=queue depth=%d "
-                            "new_tokens=%s",
+                            "trigger=concurrency_limit new_tokens=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                             _cq_depth,
@@ -13909,10 +16410,11 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs preference=%s "
-                            "new_tokens=%s",
+                            "trigger=concurrency_limit cause=%s new_tokens=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                             _preference,
+                            _queue_cause_from_request(request) or "unknown",
                             _cq_new_tokens
                             if _cq_new_tokens is not None
                             else "unknown",
@@ -14175,8 +16677,41 @@ async def _proxy_with_fallback_cycle(
                 # medium uses the merged base config flag (absent — false).
                 _recover_economic = _economic_bypass_serves_local(config, _priority)
                 _resident_min_ratio = _effective_resident_prefix_min_ratio(config)
+                # The single unmeasured-cold rollback (LP-0MW81DJZ60049X5W),
+                # resolved once next to the ratio it modifies; the compaction
+                # re-check below reuses the same value.
+                _unmeasured_cold_enabled = _unmeasured_residency_cold_enabled(
+                    config
+                )
                 _session_tenants = _resolve_tenants(config)
                 _tenancy_idle = _resolve_tenancy_idle(config)
+                # Start the admission-overhead clock here, not inside the
+                # ladder, because the acquisition happens in this scope
+                # (LP-0MW959R5S009WDM8 AC4a): the reported figure is the cost
+                # of the work candidate-first admission added. ``None`` when the
+                # ladder is disabled — nothing is measured, nothing is
+                # fabricated.
+                _admission_overhead_clock = _admission_overhead_start(
+                    _resident_min_ratio > 0.0
+                )
+                # Candidate-first admission (LP-0MW959PWL001WYSM): the candidate
+                # is acquired **here**, at the admission decision point, and
+                # its lifecycle is owned by this branch's lease — kept when the
+                # request goes local, released with the refusing reason on every
+                # refusal (including the ETA-guard refusal below) and on any
+                # exception on the way out, so an acquired-but-refused candidate
+                # never lingers as fabricated occupancy (AC2a–AC2e). The single
+                # attempt is ``own_candidate=False`` for the ladder: a second,
+                # hidden acquisition behind the lease's back could never be
+                # released by it.
+                if _resident_min_ratio > 0.0:
+                    _candidate_lease = _AdmissionCandidateLease(
+                        _acquire_admission_candidate(
+                            _session_id,
+                            endpoint=local_endpoint,
+                            server_config=_server_section(config),
+                        )
+                    )
                 _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,
@@ -14186,9 +16721,14 @@ async def _proxy_with_fallback_cycle(
                     warm_cache_threshold=_warm_threshold,
                     economic_bypass_serves_local=_recover_economic,
                     resident_prefix_min_ratio=_resident_min_ratio,
+                    unmeasured_cold_enabled=_unmeasured_cold_enabled,
                     endpoint=local_endpoint,
                     session_tenants=_session_tenants,
                     tenancy_idle_seconds=_tenancy_idle,
+                    server_config=_server_section(config),
+                    candidate_slot=_candidate_lease.candidate,
+                    own_candidate=False,
+                    overhead_start=_admission_overhead_clock,
                 )
                 # LP-0MVODJ3P6000AIUM: initialised here so the admission-evidence
                 # stamp below can consult the idle-admit verdict even on the
@@ -14353,7 +16893,68 @@ async def _proxy_with_fallback_cycle(
                         )
                         _skip_local = False
                         _skip_reason = None
+
+                # Last-resort rung (LP-0MVWAMY8M001KE4W): the FINAL rung of the
+                # ladder, after every existing gate. When no remote provider
+                # could serve this request now AND the GPU has been idle for
+                # ``local_last_resort_idle_seconds``, serve it locally with a
+                # size-appropriate deadline instead of answering the retryable
+                # ``All providers exhausted`` 503. Narrow by construction (warm
+                # cap, measured-empty remote chain, provably idle GPU), and
+                # absent entirely when the knob is 0.
                 if _skip_local:
+                    _last_resort = _evaluate_last_resort_admission(
+                        config,
+                        provider_cfg,
+                        model_config,
+                        request,
+                        _estimated_tokens,
+                        _routing_cached_ratio,
+                    )
+                    if _last_resort is not None:
+                        # Stamp the accepted admission so the dispatch-time
+                        # prefill-ETA guard stays inert (this rung priced the
+                        # dispatch against an idle GPU) and the router uses the
+                        # rung's deadline instead of the normal one.
+                        try:
+                            setattr(
+                                request,
+                                LOCAL_LAST_RESORT_ATTR,
+                                dict(_last_resort),
+                            )
+                        except Exception:
+                            pass
+                        _log_last_resort_admit(
+                            _last_resort,
+                            provider_name,
+                            _llama_model,
+                            _session_id,
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="last_resort_admit",
+                            reason=_last_resort["reason"],
+                            estimated_tokens=_last_resort["estimated_tokens"],
+                            new_tokens=_last_resort["new_tokens"],
+                            idle_seconds=round(_last_resort["idle_seconds"], 1),
+                            threshold_seconds=_last_resort["threshold_seconds"],
+                            deadline_seconds=_last_resort["deadline_s"],
+                            remote_exhausted=True,
+                        )
+                        _skip_local = False
+                        _skip_reason = None
+
+                if _skip_local:
+                    # Every override above had its chance to re-admit; the
+                    # verdict is final, so the candidate acquired for this
+                    # admission is released with the refusing reason
+                    # (LP-0MW959PWL001WYSM AC2b/AC2c). The lease's ``finally``
+                    # safety net covers the exits below (compaction rescue keep
+                    # path, ETA-guard refusal, exceptions) without a second
+                    # release.
+                    _candidate_lease.note_refusal(_skip_reason)
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
@@ -14425,9 +17026,20 @@ async def _proxy_with_fallback_cycle(
                             warm_cache_threshold=_warm_threshold,
                             economic_bypass_serves_local=_recover_economic,
                             resident_prefix_min_ratio=_resident_min_ratio,
+                            unmeasured_cold_enabled=_unmeasured_cold_enabled,
                             endpoint=local_endpoint,
                             session_tenants=_session_tenants,
                             tenancy_idle_seconds=_tenancy_idle,
+                            server_config=_server_section(config),
+                            candidate_slot=_candidate_lease.candidate,
+                            own_candidate=False,
+                            # This re-check re-uses the lease's candidate, so
+                            # nothing is acquired here: a fresh clock measures
+                            # the residency resolution it actually pays for
+                            # (LP-0MW959R5S009WDM8 AC4a).
+                            overhead_start=_admission_overhead_start(
+                                _resident_min_ratio > 0.0
+                            ),
                         )
                         if _skip_after:
                             logger.info(
@@ -14598,6 +17210,9 @@ async def _proxy_with_fallback_cycle(
                     capacity_admitted=bool(
                         getattr(request, LOCAL_CAPACITY_ADMISSION_ATTR, None)
                     ),
+                    last_resort_admitted=bool(
+                        getattr(request, LOCAL_LAST_RESORT_ATTR, None)
+                    ),
                 )
                 if _direct_admission is not None and not _direct_admission.admit:
                     # Deadline refusal (LP-0MVKUKEU80022C3U) keeps its own
@@ -14617,6 +17232,12 @@ async def _proxy_with_fallback_cycle(
                         _direct_reason = str(_direct_admission.reason)
                     else:
                         _direct_reason = "eta_exceeds_budget_direct"
+                    # Record the refusing reason for the candidate release: the
+                    # ETA/capacity guard is the last admission refusal before
+                    # the dispatch, so it must name its reason on the
+                    # ``candidate_released`` line like every ladder rung
+                    # (LP-0MW959PWL001WYSM AC2b/AC2c).
+                    _candidate_lease.note_refusal(_direct_reason)
                     try:
                         setattr(request, "_local_admission_decision", _direct_admission)
                     except Exception:
@@ -14838,10 +17459,20 @@ async def _proxy_with_fallback_cycle(
                         model_name=_llama_model or provider_name,
                         busy_slots=_snapshot_busy,
                         in_flight_prefills=_snapshot_in_flight,
+                        # LP-0MW959RRO008AAH9 AC10a: the candidate slot this
+                        # admission was measured against, so the dispatch record
+                        # carries the association key.
+                        slot_id=getattr(_candidate_lease.candidate, "slot_id", None),
                     )
                 except Exception:
                     pass
 
+                # The admission is now certain to dispatch locally: the
+                # candidate is handed to the existing slot bookkeeping unchanged
+                # — no second assignment and no release (LP-0MW959PWL001WYSM
+                # AC2d). Every exit before this point has already released it
+                # through the lease's ``finally``.
+                _candidate_lease.keep()
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
                 # LP-0MTBOX45O005LD1S AC2: the cheap-mode compaction gate
@@ -15093,11 +17724,24 @@ async def _proxy_with_fallback_cycle(
                     _lease_cur, _lease_max = _local_concurrency_info(
                         config, endpoint=local_endpoint, session_id=_session_id
                     )
+                    # LP-0MVV29Y1M004GAW0: this retry is the *second* queue
+                    # entry of the turn, so it must carry the request's real
+                    # priority (``high`` never queues — the documented
+                    # contract this call site used to skip) and the wait the
+                    # turn already spent, so the budget is charged once.
+                    _lease_already_waited = _queue_wait_spent_on_request(request)
                     _lease_action, _lease_reason, _lease_elapsed = (
                         await _maybe_queue_for_local_slot(
                             config, _lease_cur, _lease_max, request, body_json,
                             model_config, provider_cfg, _session_id,
                             endpoint=local_endpoint,
+                            priority=_priority,
+                            # LP-0MVWPJW2700966ZU: a lease-protected slot that
+                            # does not free within the budget is a queue loss
+                            # with the canonical ``local_lease_active`` reason.
+                            loss_reason=SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                            trigger="local_lease_active",
+                            already_waited_seconds=_lease_already_waited,
                         )
                     )
                     if _lease_action == "dispatch":
@@ -15114,7 +17758,8 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
                             "queued_duration=%.2fs policy=queue depth=%d "
-                            "reason=local_lease_active new_tokens=%s",
+                            "reason=local_lease_active trigger=local_lease_active "
+                            "new_tokens=%s",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
@@ -15166,11 +17811,13 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs preference=%s "
-                            "reason=local_lease_active new_tokens=%s",
+                            "reason=local_lease_active trigger=local_lease_active "
+                            "cause=%s new_tokens=%s",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
                             _preference,
+                            _queue_cause_from_request(request) or "unknown",
                             _cq_new_tokens
                             if _cq_new_tokens is not None
                             else "unknown",
@@ -15564,6 +18211,75 @@ async def _proxy_with_fallback_cycle(
                         all_slot_exhaustion = False
                         continue
 
+                    # Transient upstream overload (LP-0MW46PBWL008T317): see the
+                    # identically-shaped branch in the remote-only cycle — a
+                    # short bounded retryable cooldown honouring ``Retry-After``,
+                    # never a failure-domain exclusion and never an account
+                    # quarantine (AC1/AC10).
+                    if _is_overloaded_error(response, body_text):
+                        fallback_reason = "overloaded"
+                        prev_provider = provider_name
+                        _overload_retry = _overloaded_retry_after_seconds(response)
+                        _overload_cooldown = _overloaded_cooldown_seconds(
+                            response, config
+                        )
+                        mark_provider_unavailable(provider_name, _overload_cooldown)
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="overloaded",
+                            status_code=int(response.status_code),
+                            body_snippet=(body_text[:512] if body_text else None),
+                            cooldown_seconds=_overload_cooldown,
+                            retry_after_seconds=(
+                                _overload_retry if _overload_retry is not None else 0.0
+                            ),
+                        )
+                        logger.info(
+                            "provider=%s transient overloaded 429 "
+                            "(cooldown=%.1fs retry_after=%ss) reason=overloaded",
+                            provider_name,
+                            _overload_cooldown,
+                            (_overload_retry if _overload_retry is not None else 0.0),
+                        )
+                        all_slot_exhaustion = False
+                        continue
+
+                    # Genuine balance exhaustion (LP-0MW46PBWL008T317 AC3): see
+                    # the identically-shaped branch in the remote-only cycle —
+                    # the ACCOUNT is quarantined with real reset timing via the
+                    # reset-aware usage-limit quarantine, cumulative with an
+                    # existing one (AC4).
+                    if _is_balance_exhaustion_error(response, body_text):
+                        _balance_reset = _balance_exhaustion_reset_info(
+                            response, body_text, config, provider_cfg=provider_cfg
+                        )
+                        if _balance_reset is not None:
+                            _balance_account = _usage_limit_account_key(provider_cfg)
+                            _set_usage_limit_quarantine(_balance_account, _balance_reset)
+                            fallback_reason = "balance_exhaustion"
+                            prev_provider = provider_name
+                            attempted_domains.add(_balance_account)
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="balance_exhaustion",
+                                status_code=int(response.status_code),
+                                body_snippet=(body_text[:512] if body_text else None),
+                                reset_in_seconds=int(_balance_reset.seconds),
+                            )
+                            logger.info(
+                                "provider=%s balance_exhaustion account=%s "
+                                "reset_in=%ds reason=balance_exhaustion",
+                                provider_name,
+                                _balance_account,
+                                int(_balance_reset.seconds),
+                            )
+                            all_slot_exhaustion = False
+                            continue
+
                     # Shared primitive: HTTP error with cooldown
                     _handle_http_error_with_cooldown(
                         response, provider_name, provider_type,
@@ -15828,6 +18544,15 @@ async def _proxy_with_fallback_cycle(
                 continue
             # Non-connection error — propagate
             raise
+        finally:
+            # The single safety release for this attempt (LP-0MW959PWL001WYSM
+            # AC2a/AC2e): a candidate acquired for a refused admission is handed
+            # back here on every exit this attempt can take — the ladder
+            # refusal, the compaction bail-out, the ETA/capacity guard refusal,
+            # any ``continue``/``return``/``raise`` above — unless the admission
+            # kept it for the dispatch (AC2d). Idempotent, so an explicit
+            # refusal release is never a double-free.
+            _candidate_lease.release()
 
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
@@ -15859,18 +18584,39 @@ async def _proxy_with_fallback_cycle(
     _set_chain_fail_fast_verdict(request, _fail_fast)
     _fail_fast_retry = None
     if _fail_fast is not None:
-        _log_chain_planned_unavailable(path, _fail_fast)
+        _log_chain_planned_unavailable(
+            path, _fail_fast, model_config=model_config, config=config
+        )
         _fail_fast_retry = _fail_fast.get("retry_after_seconds")
 
     # Distinguishable exhaustion: when time windows are the *only* reason no
     # provider could be used, surface a specific message instead of the generic
-    # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
+    # "All providers exhausted" (LP-0MS4ETBNO0022QAC). Kept first so its
+    # sole-cause triggers keep their exact body (LP-0MVWC9CZH004OZYN AC5).
     time_window_exhausted = _build_time_window_exhausted_response(
         attempts, unavailable, any_provider_tried, model_config=model_config,
         config=config, earliest_retry_after=_fail_fast_retry,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
+
+    # Mixed-but-fully-planned chain (LP-0MVWC9CZH004OZYN AC1/AC2/AC3/AC4):
+    # every entry is blocked by a known-until scheduling gate, so advertise the
+    # honest earliest reopening instant instead of the opaque all_exhausted
+    # 503. A ``None`` return fails open to the generic fallbacks below (AC8).
+    planned_unavailable = _build_planned_unavailable_response(
+        _fail_fast, config=config, model_config=model_config,
+    )
+    if planned_unavailable is None:
+        # AC7 (LP-0MVWC9CZH004OZYN): a pinned request never consults the remote
+        # tiers, but when its local route is refused on a known-until-blocked
+        # remote chain its refusal must still name the reopening instant rather
+        # than a local-capacity timer.
+        planned_unavailable = _pinned_remote_planned_unavailable_response(
+            request, model_config, attempts, config,
+        )
+    if planned_unavailable is not None:
+        raise ChainExhaustedError(planned_unavailable)
 
     if not any_provider_tried:
         raise ChainExhaustedError(

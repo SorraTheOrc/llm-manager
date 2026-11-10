@@ -197,6 +197,12 @@ When **every** provider of the residual chain is either
 the chain is **not held**: the error is returned immediately and no
 `chain_hold_cycle` is consumed.
 
+> **Balance-opted-in entries are not deterministically skipped.** With
+> `use_balance: true` (LP-0MW46PBD200249WK), a plan-exhausted entry whose
+> rolling/weekly windows still hold headroom keeps dispatching onto prepaid
+> balance — it is capacity, not a `quota_exhausted` state, so it cannot make a
+> chain provably dead.
+
 Evidence (2026-11-03 08:40–09:05): every remote provider was skipped
 deterministically (`munitoai-free` reset ~15.4 h away, `opencode-go-3`
 `quota_exhausted` ~14 days, four entries `outside_available_window`), yet the

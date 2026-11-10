@@ -15,6 +15,11 @@ LP-0MVF1FQJR000NH2I, which is the only item allowed to touch the file):
 - target chain shape: ``local-qwen3 → munitoai-free → opencode-go-3 →
   opencode-go-2 → opencode-go → munitoai → deepseek-flash`` (AC2, with the
   paid tail since LP-0MVY8REC80097HI0), with ``medium``/``high`` untouched.
+  Since LP-0MVWG4U7F0009LTH ``plan`` places its free tier *after* the three
+  opencode entries (``local-qwen3 → opencode-go-3 → opencode-go-2 →
+  opencode-go → munitoai-free → munitoai → deepseek-flash``) so free tokens
+  are spent in the opencode gap periods; ``author``/``code`` keep the order
+  above.
 - UTC window gating (AC1/AC3): the opencode entries are eligible inside
   ``available_times`` (e.g. 00:00–01:00, 04:00–06:00) and skipped outside
   them (e.g. 01:00–04:00, 06:00–10:00 gaps), falling through to the paid
@@ -61,11 +66,19 @@ from proxy.priority import (
 )
 
 # Target low chain (parent AC1). Kept as data so the per-model loop and the
-# mechanism assertions can never disagree.
+# mechanism assertions can never disagree. ``author``/``code`` lead with the
+# free tier; ``plan`` moved it behind the opencode entries so free tokens are
+# only spent in the opencode gap periods (LP-0MVWG4U7F0009LTH).
 LOCAL_TIER = "local-qwen3"
 FREE_TIER = "munitoai-free"
 OPENCODE_NAMES = ["opencode-go-3", "opencode-go-2", "opencode-go"]
-TARGET_LOW_CHAIN = [LOCAL_TIER, FREE_TIER, *OPENCODE_NAMES, "munitoai", "deepseek-flash"]
+FREE_TIER_AFTER_LOCAL = [LOCAL_TIER, FREE_TIER, *OPENCODE_NAMES, "munitoai", "deepseek-flash"]
+FREE_TIER_AFTER_OPENCODE = [LOCAL_TIER, *OPENCODE_NAMES, FREE_TIER, "munitoai", "deepseek-flash"]
+TARGET_LOW_CHAIN_BY_MODEL = {
+    "plan": FREE_TIER_AFTER_OPENCODE,
+    "author": FREE_TIER_AFTER_LOCAL,
+    "code": FREE_TIER_AFTER_LOCAL,
+}
 LOW_CHAIN_MODELS = ("plan", "author", "code")
 
 # The off-peak windows every opencode-go entry must keep (LP-0MSXPHTD9004DZ4P).
@@ -163,7 +176,7 @@ class TestTargetChainShape:
     @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
     def test_low_chain_is_local_free_then_opencode_then_paid_tail(self, model_name):
         names = [e["name"] for e in _target_chain_entries(model_name)]
-        assert names == TARGET_LOW_CHAIN
+        assert names == TARGET_LOW_CHAIN_BY_MODEL[model_name]
 
     @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
     def test_medium_and_high_chains_are_the_full_provider_list(self, model_name):
@@ -231,13 +244,13 @@ class TestLiveConfigInvariants:
 
     @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
     def test_live_low_chain_is_exactly_the_target_order(self, model_name):
-        # AC1 (parent): the shipped config's ``low`` chain is exactly
-        # ``[local-qwen3, munitoai-free, opencode-go-3, opencode-go-2,
-        # opencode-go, munitoai, deepseek-flash]`` — free tier ordered before
-        # any paid entry, the three keys in providers-list order, and the
+        # AC1 (parent): the shipped config's ``low`` chain is exactly the
+        # target order for that model — free tier ordered by LP-0MVWG4U7F0009LTH
+        # (behind the opencode entries for ``plan``, ahead of them for
+        # ``author``/``code``), the three keys in providers-list order, and the
         # paid tail last (LP-0MVY8REC80097HI0).
         names = [e["name"] for e in provider_chain_for_priority(_live_model(model_name), PRIORITY_LOW)]
-        assert names == TARGET_LOW_CHAIN
+        assert names == TARGET_LOW_CHAIN_BY_MODEL[model_name]
 
 
 # ---------------------------------------------------------------------------
@@ -303,15 +316,26 @@ class TestWindowGating:
         assert first is not None and first["name"] == LOCAL_TIER
         assert second is not None and second["name"] == FREE_TIER
 
-    @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
-    def test_free_tier_is_never_preempted_by_a_paid_tier(self, model_name):
-        # Behaviour neutrality: as long as the free tier has budget it is
-        # chosen ahead of every paid opencode entry, window or not.
+    @pytest.mark.parametrize(
+        ("model_name", "expected"),
+        [
+            # plan deliberately spends a costed account before free tokens
+            # (LP-0MVWG4U7F0009LTH): inside the window the first eligible
+            # opencode account absorbs the overflow, so the free allowance
+            # survives into the gap periods.
+            ("plan", OPENCODE_NAMES[0]),
+            # author/code keep the original order — the free tier is chosen
+            # ahead of every paid entry whenever it has budget.
+            ("author", FREE_TIER),
+            ("code", FREE_TIER),
+        ],
+    )
+    def test_local_overflow_lands_on_the_first_eligible_tier(self, model_name, expected):
         chain = _target_chain_entries(model_name)
         with _patch_utc_now(INSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER}, set())
         assert picked is not None
-        assert picked["name"] == FREE_TIER
+        assert picked["name"] == expected
 
 
 # ---------------------------------------------------------------------------

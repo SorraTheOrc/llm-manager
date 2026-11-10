@@ -46,7 +46,12 @@ GPU metrics come from a route that needs no unpublished binary:
 - [docs/systemd/gpu-metrics.service](gpu-metrics.service) — the 10 s sysfs
   sampler and its metric names.
 - [monitoring/gpu_compute_rules.yaml](../../monitoring/gpu_compute_rules.yaml) —
-  why utilisation is derived from power rather than `gpu_busy_percent`.
+  why utilisation is derived from power rather than `gpu_busy_percent` (a
+  two-state detector whose step sits at ~30 W, below the idle-with-display
+  band).
+- [monitoring/README.md](../../monitoring/README.md), *Why not `amd-smi`,
+  `rocm-smi` or `amdtop`?* — the canonical measurement of that step and the
+  PromQL recipe that recomputes it.
 
 ## If AMD ever publishes releases again
 

@@ -1,0 +1,66 @@
+000000000001c6b0 <_Z39ggml_backend_cpu_get_extra_buffer_typesv>:
+   1c6b0:	f3 0f 1e fa          	endbr64
+   1c6b4:	41 54                	push   %r12
+   1c6b6:	55                   	push   %rbp
+   1c6b7:	53                   	push   %rbx
+   1c6b8:	48 8d 1d 51 9d 15 00 	lea    0x159d51(%rip),%rbx        # 176410 <_ZZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts>
+   1c6bf:	48 83 ec 10          	sub    $0x10,%rsp
+   1c6c3:	64 48 8b 04 25 28 00 	mov    %fs:0x28,%rax
+   1c6ca:	00 00 
+   1c6cc:	48 89 44 24 08       	mov    %rax,0x8(%rsp)
+   1c6d1:	31 c0                	xor    %eax,%eax
+   1c6d3:	0f b6 05 2e 9d 15 00 	movzbl 0x159d2e(%rip),%eax        # 176408 <_ZGVZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts>
+   1c6da:	84 c0                	test   %al,%al
+   1c6dc:	74 22                	je     1c700 <_Z39ggml_backend_cpu_get_extra_buffer_typesv+0x50>
+   1c6de:	48 8b 44 24 08       	mov    0x8(%rsp),%rax
+   1c6e3:	64 48 2b 04 25 28 00 	sub    %fs:0x28,%rax
+   1c6ea:	00 00 
+   1c6ec:	0f 85 ab 00 00 00    	jne    1c79d <_Z39ggml_backend_cpu_get_extra_buffer_typesv+0xed>
+   1c6f2:	48 83 c4 10          	add    $0x10,%rsp
+   1c6f6:	48 89 d8             	mov    %rbx,%rax
+   1c6f9:	5b                   	pop    %rbx
+   1c6fa:	5d                   	pop    %rbp
+   1c6fb:	41 5c                	pop    %r12
+   1c6fd:	c3                   	ret
+   1c6fe:	66 90                	xchg   %ax,%ax
+   1c700:	48 8d 2d 01 9d 15 00 	lea    0x159d01(%rip),%rbp        # 176408 <_ZGVZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts>
+   1c707:	48 89 ef             	mov    %rbp,%rdi
+   1c70a:	e8 41 78 ff ff       	call   13f50 <__cxa_guard_acquire@plt>
+   1c70f:	85 c0                	test   %eax,%eax
+   1c711:	74 cb                	je     1c6de <_Z39ggml_backend_cpu_get_extra_buffer_typesv+0x2e>
+   1c713:	48 c7 05 f2 9c 15 00 	movq   $0x0,0x159cf2(%rip)        # 176410 <_ZZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts>
+   1c71a:	00 00 00 00 
+   1c71e:	48 c7 05 ef 9c 15 00 	movq   $0x0,0x159cef(%rip)        # 176418 <_ZZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts+0x8>
+   1c725:	00 00 00 00 
+   1c729:	48 c7 05 ec 9c 15 00 	movq   $0x0,0x159cec(%rip)        # 176420 <_ZZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts+0x10>
+   1c730:	00 00 00 00 
+   1c734:	e8 07 6a ff ff       	call   13140 <_Z35ggml_backend_cpu_repack_buffer_typev@plt>
+   1c739:	48 85 c0             	test   %rax,%rax
+   1c73c:	74 2e                	je     1c76c <_Z39ggml_backend_cpu_get_extra_buffer_typesv+0xbc>
+   1c73e:	48 8d 1d cb 9c 15 00 	lea    0x159ccb(%rip),%rbx        # 176410 <_ZZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts>
+   1c745:	e8 f6 69 ff ff       	call   13140 <_Z35ggml_backend_cpu_repack_buffer_typev@plt>
+   1c74a:	48 8b 35 c7 9c 15 00 	mov    0x159cc7(%rip),%rsi        # 176418 <_ZZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts+0x8>
+   1c751:	48 89 04 24          	mov    %rax,(%rsp)
+   1c755:	48 3b 35 c4 9c 15 00 	cmp    0x159cc4(%rip),%rsi        # 176420 <_ZZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts+0x10>
+   1c75c:	74 32                	je     1c790 <_Z39ggml_backend_cpu_get_extra_buffer_typesv+0xe0>
+   1c75e:	48 89 06             	mov    %rax,(%rsi)
+   1c761:	48 83 c6 08          	add    $0x8,%rsi
+   1c765:	48 89 35 ac 9c 15 00 	mov    %rsi,0x159cac(%rip)        # 176418 <_ZZ39ggml_backend_cpu_get_extra_buffer_typesvE5bufts+0x8>
+   1c76c:	48 8b 3d 35 48 11 00 	mov    0x114835(%rip),%rdi        # 130fa8 <_ZNSt6vectorIP24ggml_backend_buffer_typeSaIS1_EED1Ev@@Base+0x113028>
+   1c773:	48 8d 15 e6 54 11 00 	lea    0x1154e6(%rip),%rdx        # 131c60 <__dso_handle>
+   1c77a:	48 89 de             	mov    %rbx,%rsi
+   1c77d:	e8 9e 6b ff ff       	call   13320 <__cxa_atexit@plt>
+   1c782:	48 89 ef             	mov    %rbp,%rdi
+   1c785:	e8 56 68 ff ff       	call   12fe0 <__cxa_guard_release@plt>
+   1c78a:	e9 4f ff ff ff       	jmp    1c6de <_Z39ggml_backend_cpu_get_extra_buffer_typesv+0x2e>
+   1c78f:	90                   	nop
+   1c790:	48 89 e2             	mov    %rsp,%rdx
+   1c793:	48 89 df             	mov    %rbx,%rdi
+   1c796:	e8 f5 63 ff ff       	call   12b90 <_ZNSt6vectorIP24ggml_backend_buffer_typeSaIS1_EE17_M_realloc_insertIJS1_EEEvN9__gnu_cxx17__normal_iteratorIPS1_S3_EEDpOT_@plt>
+   1c79b:	eb cf                	jmp    1c76c <_Z39ggml_backend_cpu_get_extra_buffer_typesv+0xbc>
+   1c79d:	e8 de 6e ff ff       	call   13680 <__stack_chk_fail@plt>
+   1c7a2:	f3 0f 1e fa          	endbr64
+   1c7a6:	49 89 c4             	mov    %rax,%r12
+   1c7a9:	e9 45 7a ff ff       	jmp    141f3 <_Z39ggml_backend_cpu_get_extra_buffer_typesv.cold>
+
+Disassembly of section .fini:

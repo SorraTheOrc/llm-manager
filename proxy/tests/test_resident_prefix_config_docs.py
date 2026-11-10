@@ -38,7 +38,10 @@ from proxy.provider import (
     RESIDENCY_SOURCE_NON_RESIDENT,
     RESIDENCY_SOURCE_SESSION_SLOT,
     RESIDENCY_SOURCE_UNKNOWN,
+    SKIP_REASON_UNMEASURED_COLD,
+    THRESHOLD_APPLIED_VOCABULARY,
     _effective_resident_prefix_min_ratio,
+    _unmeasured_residency_cold_enabled,
 )
 from proxy.router_helpers import (
     DEFAULT_TENANCY_IDLE_SECONDS,
@@ -57,6 +60,10 @@ NEW_KNOBS = (
     "local_session_tenants",
     "local_session_tenancy_idle_seconds",
 )
+
+#: Single rollback switch for the unmeasured-cold enforcement
+#: (LP-0MW81DJZ60049X5W), documented beside the residency knobs above.
+UNMEASURED_COLD_KEY = "local_unmeasured_residency_cold_enabled"
 
 DOC_PATHS = (ROUTING_DOC, CACHED_RATIO_DOC, SLOT_DESIGN_DOC)
 
@@ -92,6 +99,34 @@ def test_ratio_zero_disables_the_gate_in_the_reader():
     assert _effective_resident_prefix_min_ratio(
         {"server": {"local_resident_prefix_min_ratio": 0}}
     ) == 0.0
+
+
+def test_unmeasured_cold_rollback_is_documented_and_shipped_enabled():
+    """AC1/AC3 (LP-0MW81DJZ60049X5W): the rollback ships documented and ON.
+
+    The unmeasured-cold enforcement's single rollback switch must be visible in
+    the shipped config (an operator reads ``proxy/config.yaml``, not the
+    source), its documented default must be the intended post-rollout
+    behaviour, and the reader must agree with the shipped value.
+    """
+    server = _server_config()
+    text = CONFIG_PATH.read_text()
+
+    assert server[UNMEASURED_COLD_KEY] is True
+    assert _unmeasured_residency_cold_enabled({"server": server}) is True
+    # The documented rollback is the reader's behaviour, not just a comment.
+    assert (
+        _unmeasured_residency_cold_enabled(
+            {"server": {UNMEASURED_COLD_KEY: False}}
+        )
+        is False
+    )
+    # The rollback statement sits in the knob's own comment block, so an
+    # operator looking at the key sees how to undo it (AC1).
+    index = text.index(f"{UNMEASURED_COLD_KEY}:")
+    block = text[max(0, index - 4000):index].lower()
+    assert "rollback" in block
+    assert "predicted" in block
 
 
 def test_tenancy_default_is_the_shipped_slot_count():
@@ -332,6 +367,27 @@ def test_measurement_vocabulary_is_documented_where_operators_look():
         assert missing == [], f"{path.name} does not document {missing}"
 
 
+def test_threshold_applied_fields_are_documented_as_an_additive_suffix():
+    """``threshold_applied``/``threshold_value`` (LP-0MW81DHPH00650NY).
+
+    The fields explain *which* threshold decided a >38k admission, so the
+    operator-facing grammar must show them — and must show them **after**
+    ``session=``, because appending is what keeps the existing positional
+    consumers of the line working (parent AC3).
+    """
+    line = _observability_grammar_line()
+
+    assert "threshold_applied=" in line
+    assert "threshold_value=" in line
+    assert (
+        line.index(" session=")
+        < line.index("threshold_applied=")
+        < line.index("threshold_value=")
+    )
+    for value in THRESHOLD_APPLIED_VOCABULARY:
+        assert value in line, f"threshold_applied={value} missing from the grammar"
+
+
 def test_rollout_doc_explains_what_to_read_and_the_residual_gap():
     """The runbook says what to grep and which limitation is expected."""
     text = ROLLOUT_DOC.read_text(encoding="utf-8")
@@ -360,8 +416,288 @@ def test_slot_design_doc_records_the_measured_last_dispatch_rung():
         < section.index(RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH)
         < section.index(RESIDENCY_SOURCE_SESSION_SLOT)
     )
-    for event in ("eviction", "slot release/reassignment", "model switch"):
+    # Candidate-first admission (LP-0MW959P9S005DJY7) superseded the old
+    # "slot release/reassignment" trigger: the measurement now survives the turn
+    # boundary, so what invalidates it is a change of hands (a different session
+    # taking the slot), eviction, session invalidation and a model switch.
+    for event in (
+        "eviction",
+        "different",
+        "session invalidation",
+        "model switch",
+    ):
         assert event in section, f"invalidation trigger {event!r} undocumented"
+    # The rule that replaced it: a plain release must NOT invalidate.
+    assert "A plain slot release" in section, (
+        "the design doc must state that a plain slot release keeps the measurement"
+    )
+    assert "**keeps** it" in section
     # Accuracy: the value is an upper bound, never a promise.
     assert "upper bound" in section
     assert "decode" in section
+
+
+# ---------------------------------------------------------------------------
+# Unmeasured is cold: the rule, its thresholds and its rollback
+# (LP-0MW81DUBK005QRFQ; rule LP-0MW81DFML006O5KL, rollback LP-0MW81DJZ60049X5W)
+# ---------------------------------------------------------------------------
+
+ROUTER_DOC = REPO_ROOT / "docs" / "llama-router.md"
+README_DOC = REPO_ROOT / "proxy" / "README.md"
+
+#: The skip reason the enforcement emits (``provider.SKIP_REASON_UNMEASURED_COLD``).
+UNMEASURED_COLD_DENIAL = SKIP_REASON_UNMEASURED_COLD
+
+ALL_RULE_DOCS = (ROUTING_DOC, ROUTER_DOC, README_DOC, ROLLOUT_DOC, CACHED_RATIO_DOC)
+
+#: Phrases that described the retired fail-open path. They must not come back:
+#: re-introducing one would tell an operator that an unmeasured prompt is still
+#: admitted on the predicted ratio, which is exactly the 2026-11-07 failure.
+RETIRED_FAIL_OPEN_CLAIMS = (
+    "degrades to the predicted ratio rather than denying local on absent data",
+    "degrade to the predicted-ratio decision",
+    "→ today's predicted-ratio decision",
+)
+
+
+def _threshold_forms(value: int) -> tuple[str, ...]:
+    """The ways a token count is written in the docs (plain, comma, spaced)."""
+    grouped = f"{value:,}"
+    return (str(value), grouped, grouped.replace(",", " "))
+
+
+def _documents_threshold(text: str, value: int) -> bool:
+    return any(form in text for form in _threshold_forms(value))
+
+
+def _shipped_thresholds() -> tuple[int, int]:
+    """The cold/warm token thresholds as the shipped config declares them."""
+    server = _server_config()
+    return (
+        int(server["local_large_context_cold_cache_threshold"]),
+        int(server["local_large_context_warm_cache_threshold"]),
+    )
+
+
+def test_config_documents_the_unmeasured_cold_rule_its_thresholds_and_rollback():
+    """AC1: the operator-facing config states the rule beside the flag."""
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    index = text.index(f"{UNMEASURED_COLD_KEY}:")
+    block = text[max(0, index - 4000):index]
+
+    assert UNMEASURED_COLD_DENIAL in block, (
+        "the flag's comment block must name the skip reason it produces"
+    )
+    assert "residency_source=unknown" in block, (
+        "the comment must state which residency basis counts as unmeasured"
+    )
+    assert "local_large_context_cold_cache_threshold" in block, (
+        "the comment must tie the rule to the cold threshold it applies"
+    )
+    assert "ROLLBACK" in block and "byte-for-byte" in block, (
+        "the comment must state the rollback and that it is byte-for-byte"
+    )
+
+
+def test_routing_doc_documents_the_unmeasured_cold_rule_and_rollback():
+    section = _routing_section()
+
+    assert UNMEASURED_COLD_DENIAL in section
+    assert UNMEASURED_COLD_KEY in section
+    assert "residency_source=unknown" in section
+    # The rule is stated against both shipped thresholds, so an operator can
+    # see which number governs a measured vs unmeasured prompt.
+    for value in _shipped_thresholds():
+        assert _documents_threshold(section, value), (
+            f"the ladder docs must state the {value}-token threshold"
+        )
+    # Not idle-overridable, and the final local override is named.
+    assert "IDLE_OVERRIDABLE_SKIP_REASONS" in section
+    assert "local_last_resort" in section
+
+
+def test_routing_doc_exit_table_carries_the_unmeasured_cold_denial():
+    """The client-visible exit token is documented, and as a refusal."""
+    text = ROUTING_DOC.read_text(encoding="utf-8")
+    rows: list[list[str]] = []
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 4:
+            continue
+        token = re.search(r"`([^`]+)`", cells[1])
+        if token and token.group(1) == UNMEASURED_COLD_DENIAL:
+            rows.append(cells)
+
+    assert len(rows) == 1, (
+        "routing.md's exit→token table must carry exactly one row for "
+        f"{UNMEASURED_COLD_DENIAL}; got {len(rows)}"
+    )
+    cells = rows[0]
+    assert cells[2].strip("*` ") == "refusing", (
+        "the unmeasured-cold denial is never idle-overridable, so its exit row "
+        f"must be a refusal; got {cells[2]!r}"
+    )
+    assert f"reason={UNMEASURED_COLD_DENIAL}" in cells[3], (
+        "the exit row must show the routing_skip_local line it produces"
+    )
+
+
+def test_router_doc_documents_the_unmeasured_cold_rule_and_rollback():
+    """docs/llama-router.md is the operator's cold/warm entry point."""
+    text = ROUTER_DOC.read_text(encoding="utf-8")
+
+    assert UNMEASURED_COLD_DENIAL in text
+    assert UNMEASURED_COLD_KEY in text
+    assert "residency_source=unknown" in text
+    for value in _shipped_thresholds():
+        assert _documents_threshold(text, value), (
+            f"llama-router.md must state the {value}-token threshold"
+        )
+    # The rollback is stated as a value the operator can set, not just named.
+    assert f"{UNMEASURED_COLD_KEY}:" in text.replace("`", ""), (
+        "the rollback must be shown as a settable key, not only mentioned"
+    )
+    assert "admit_predicted" in text and "skip_predicted" in text, (
+        "the rollback must state the decision values it restores"
+    )
+
+
+def test_readme_documents_the_unmeasured_cold_rule_and_rollback():
+    """README is where the cold/warm thresholds are explained to operators."""
+    text = README_DOC.read_text(encoding="utf-8")
+
+    assert UNMEASURED_COLD_DENIAL in text
+    assert UNMEASURED_COLD_KEY in text
+    assert "residency_source=unknown" in text
+    for value in _shipped_thresholds():
+        assert _documents_threshold(text, value), (
+            f"proxy/README.md must state the {value}-token threshold"
+        )
+
+
+def test_rollout_doc_documents_the_unmeasured_cold_rule_and_rollback():
+    """The rollout runbook is what an operator reads while the rule is armed."""
+    text = ROLLOUT_DOC.read_text(encoding="utf-8")
+
+    assert UNMEASURED_COLD_DENIAL in text
+    assert UNMEASURED_COLD_KEY in text
+    # It must not still claim the gate fail-opens on an unmeasured basis.
+    assert "the gate fails open" not in text
+
+
+def test_no_doc_reintroduces_a_retired_fail_open_claim():
+    """The fail-open wording the enforcement retired cannot drift back in."""
+    stale: list[str] = []
+    for path in ALL_RULE_DOCS:
+        text = path.read_text(encoding="utf-8")
+        for claim in RETIRED_FAIL_OPEN_CLAIMS:
+            if claim in text:
+                stale.append(f"{path.relative_to(REPO_ROOT)}: {claim!r}")
+
+    assert stale == [], (
+        "these passages still describe the retired fail-open path "
+        f"(LP-0MW81DFML006O5KL): {stale}"
+    )
+
+
+def test_admission_overhead_is_documented_as_an_additive_field():
+    """``admission_overhead_ms`` (LP-0MW959R5S009WDM8, parent AC4).
+
+    The figure is the operator's only view of the latency candidate-first
+    admission added, so the grammar must show it — and must show it appended,
+    after the threshold pair, because appending is what keeps every existing
+    positional consumer of the line working. The budget the figure is held to
+    (p95 ≤ 50 ms) is stated where an operator looks for it, not only in code.
+    """
+    from proxy import provider
+
+    line = _observability_grammar_line()
+
+    assert f" {provider.ADMISSION_OVERHEAD_FIELD}=" in line
+    assert line.index("threshold_value=") < line.index("admission_overhead_ms=")
+    assert "none" in line.split("admission_overhead_ms=")[1]
+
+    text = ROUTING_DOC.read_text(encoding="utf-8")
+    assert "p95" in text and "50 ms" in text, (
+        "routing.md must state the admission-overhead budget next to the field"
+    )
+    assert "prefill_thrash_replay_harness" in text, (
+        "routing.md must name the replay that aggregates the figure"
+    )
+
+
+def test_priced_new_tokens_is_the_documented_tail_of_the_decision_line():
+    """``new_tokens=`` (LP-0MW959SE30012HJJ, parent AC6c).
+
+    The priced uncached-token count is the field a wrong price is reconstructed
+    from, so the operator-facing grammar must show it — **last**, after
+    ``slot_candidate=``, because appending is what keeps every positional
+    consumer of the pre-change line working. What each rung reports (live
+    price, predicted price, or ``none``) is stated too, so the field cannot be
+    read as a fabricated ``0`` for an unpriced refusal.
+    """
+    line = _observability_grammar_line()
+
+    assert " new_tokens=<n|none>" in line
+    # The tail of the line: appended after the group's other additive fields.
+    assert line.index("admission_overhead_ms=") < line.index("slot_candidate=")
+    assert line.index("slot_candidate=") < line.index("new_tokens=")
+    assert line.rstrip("`.").endswith("new_tokens=<n|none>")
+
+    text = ROUTING_DOC.read_text(encoding="utf-8")
+    assert "estimated_tokens - min(n_past_actual, estimated_tokens)" in text, (
+        "routing.md must state the live-prefix price the measured rung reports"
+    )
+    assert "no rung priced the prompt" in text, (
+        "routing.md must explain the ``none`` value rather than leave it bare"
+    )
+
+
+def test_routing_doc_documents_the_candidate_first_ordering():
+    """Candidate-first ordering and the new ``no_slot`` meaning (AC6c).
+
+    An operator reading ``measurement=unavailable:no_slot`` must not conclude
+    "the probe ran too early" any more: the candidate is assigned *before* the
+    verdict, so the value now means the pool is exhausted. The release contract
+    is stated beside it, because an acquired-and-refused candidate that is not
+    released fabricates occupancy for the next request.
+    """
+    text = ROUTING_DOC.read_text(encoding="utf-8")
+
+    assert "### Candidate-first ordering" in text
+    assert "acquire_slot_candidate" in text and "release_slot_candidate" in text
+    assert "candidate_released reason=" in text
+    assert "now means the pool is exhausted" in text
+    # The ordering itself, in order: assign before measuring before pricing.
+    section = text.split("### Candidate-first ordering", 1)[1]
+    assert section.index("**Assign**") < section.index("**Measure**") < section.index(
+        "**Price**"
+    )
+    assert section.index("**Price**") < section.index("**Release**")
+
+
+def test_design_doc_records_the_audit_line_and_the_group_hand_off():
+    """``docs/dev/slot-management-design.md`` §11/§12 (AC6d, AC8a, AC9b).
+
+    The shipped behaviour must be discoverable from the design record: the
+    ordering change, the measurement ladder and the clean-release contract (as
+    the audit line's field table), plus the group hand-off — the single proxy
+    restart and the dated-title re-anchoring are owned by the validation item,
+    so this group's items restart nothing themselves.
+    """
+    text = SLOT_DESIGN_DOC.read_text(encoding="utf-8")
+
+    assert "## 11. The decision line is the audit trail" in text
+    assert "new_tokens=" in text
+    assert "LP-0MW959SE30012HJJ" in text
+    # The hand-off: who restarts, and who re-anchors the dated titles.
+    assert "## 12. Group hand-off" in text
+    hand_off = text.split("## 12. Group hand-off", 1)[1]
+    assert "LP-0MW7V0S6A006DKZ4" in hand_off
+    assert "/skill:start-proxy --restart" in hand_off
+    assert "no independent restart" in hand_off.lower()
+    assert "re-anchors" in hand_off and "**12**" in hand_off, (
+        "the hand-off must record the dated-title re-anchoring and its count"
+    )

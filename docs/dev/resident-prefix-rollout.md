@@ -8,14 +8,22 @@ rung-by-rung behaviour: `proxy/docs/routing.md` →
 
 | Knob (`server:`) | Shipped | `0` means | Notes |
 |---|---|---|---|
-| `local_resident_prefix_min_ratio` | `0.5` | residency gate disabled (predicted-ratio decision as before) | the rollback switch |
+| `local_resident_prefix_min_ratio` | `0.5` | residency gate disabled (predicted-ratio decision as before) | the broad rollback switch |
+| `local_unmeasured_residency_cold_enabled` | `true` | `false`/`0`/`off` restore the predicted-ratio fallback when nothing was measured | the narrow rollback switch (`LP-0MW81DFML006O5KL` / `LP-0MW81DJZ60049X5W`) |
 | `local_session_tenants` | `2` (= `session_slot_pool_size`) | tenancy bound disabled | same-session re-entry always allowed |
 | `local_session_tenancy_idle_seconds` | `30` (adaptive dispatch-lease base) | — (non-positive falls back to the default) | never ≥ the 180 s no-progress watchdog |
 
 The ladder runs **only** for prompts above
-`local_large_context_cold_cache_threshold`; everything below it routes exactly
-as before. `local_idle_admit_enabled` / `local_idle_admit_seconds` still apply
-and remain the **last** rung, so an idle GPU still serves cold work.
+`local_large_context_cold_cache_threshold` (38 000 in the base and fast
+profiles, 42 000 in cheap); everything below it routes exactly as before.
+Within that band a **measured-resident** basis keeps the warm cap
+(`local_large_context_warm_cache_threshold`, 120 000), while an **unmeasured**
+basis (`residency_source=unknown`) is treated as **cold**: above 38 000 tokens
+the prompt skips local with `unmeasured_residency_cold` and follows the remote
+chain (`LP-0MW81DFML006O5KL`). `local_idle_admit_enabled` /
+`local_idle_admit_seconds` still apply and remain the **last ECONOMIC** rung, so
+an idle GPU still serves cold work (`local_last_resort_*` stays the final rung,
+reached only when no remote can serve the request).
 `contention_queue_*` semantics are untouched: a request denied by the residency
 gate or the tenancy bound never enters the queue (same as today's
 `large_context_bypass`).
@@ -57,7 +65,7 @@ gate or the tenancy bound never enters the queue (same as today's
 | Signal | Where | Healthy | Investigate when |
 |---|---|---|---|
 | Resident admits vs evicted denials | `## Residency-aware admission` | resident admits dominate for multi-turn sessions | nearly all denials ⇒ either genuine churn or a residency-view bug (check `residency_source`) |
-| `residency_source=unknown` share | same section, per-decision lines | small | large ⇒ stale snapshot (the ~1 s poller is not refreshing) — the gate fails open, so local keeps working, but measurement is lost |
+| `residency_source=unknown` share | same section, per-decision lines | small | large ⇒ stale snapshot (the ~1 s poller is not refreshing) — unmeasured is **cold** (`LP-0MW81DFML006O5KL`), so these prompts are refused locally above 38 000 tokens (`unmeasured_residency_cold` denials, remote fallback); either restore the snapshot or roll back with `local_unmeasured_residency_cold_enabled: false` |
 | `residency_source=measured_last_dispatch` share | same section, per-decision lines | most resident decisions (the deployed b8782 build reports no per-slot `context_tokens`, so `measured` is rare) | `session_slot` dominating ⇒ no prior dispatch was captured (non-streaming clients, or `local_measured_cache_abort_enabled: 0`) |
 | `measurement=measured` share | same section | tracks the two measured sources | absent everywhere ⇒ neither measurement source is live |
 | `measurement=unavailable:*` breakdown | same section, per-decision lines | dominated by `no_prior_measurement` while the capture feature ramps up | `stale_view` large ⇒ the ~1 s `/slots` poller is not refreshing; `capture_disabled` large ⇒ the rollback switch is off (or the config cannot be read); `no_slot` large ⇒ genuine churn |
@@ -116,6 +124,19 @@ grep -o 'residency_source=[a-z_]* measurement=[a-z:_]*' proxy.log | sort | uniq 
   says why: `unavailable:no_prior_measurement` or
   `unavailable:capture_disabled`.
 
+**Which threshold decided it.** Each line also carries the additive
+`threshold_applied=<cold|warm|none>` and `threshold_value=<n|none>` fields
+(`LP-0MW81DHPH00650NY`), so an admission above the cold cap is attributable
+without reconstructing the ladder: `threshold_applied=cold` is a prompt with
+no measured residency (cold-priced, or denied for that reason), while
+`threshold_applied=warm` is a measured-resident prompt served under the
+120 000 warm cap. Grep them together with the basis:
+
+```bash
+grep -o 'residency_source=[a-z_]* measurement=[a-z:_]* threshold_applied=[a-z]*' \
+  proxy.log | sort | uniq -c
+```
+
 **Two expected unmeasured cases — neither is a regression.**
 
 1. **Buffered (non-streaming) dispatches.** `return_progress` is injected only
@@ -156,10 +177,16 @@ model. After an invalidation the next decision for that session reports
 `measurement=unavailable:no_prior_measurement` instead of a ratio — the
 honest non-measurement, not a fabricated one.
 
-**Rollback.** `local_resident_prefix_min_ratio: 0` restores the predicted-ratio
-decision (the gate off, this rung never consulted);
-`local_measured_cache_abort_enabled: 0` restores the pre-change
-`session_slot` behaviour while leaving the residency gate itself on.
+**Rollback.** Two switches, at different scopes.
+`local_unmeasured_residency_cold_enabled: false` is the **narrow** one: it
+restores only the unmeasured → predicted-ratio fallback (the pre-
+`LP-0MW81DFML006O5KL` decision, logged `decision=admit_predicted` /
+`skip_predicted` with `n_past_actual=none`) and leaves the residency gate itself
+on. `local_resident_prefix_min_ratio: 0` is the **broad** one: it restores the
+predicted-ratio decision everywhere (the gate off, so neither rung 2 nor the
+unmeasured-cold rule is consulted); `local_measured_cache_abort_enabled: 0`
+restores the pre-change `session_slot` behaviour while leaving the residency gate
+itself on.
 
 ## Unmeasured-reason vocabulary (LP-0MVT2Q1SD009JLKD)
 

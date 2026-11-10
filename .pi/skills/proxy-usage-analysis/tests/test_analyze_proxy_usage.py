@@ -4133,8 +4133,12 @@ class TestDispatchToFinishBusy:
         assert "GPU busy — power-based (hardware)" in section
         # 1800 s of 3600 s = 30m 00s (50.0%) via _busy_cell.
         assert "30m 00s (50.0%)" in section
-        # The hardware-method note is rendered too.
-        assert "avg_over_time(gpu:computing:bool" in section
+        # The hardware-method note describes the grid-honest coverage and the
+        # any-GPU-consumer scope, and the renormalising query is gone.
+        assert "gpu:computing:bool" in section
+        assert "computing, idle or" in section
+        assert "any GPU consumer" in section
+        assert "avg_over_time" not in section
 
     def test_gpu_busy_json_round_trip(self):
         """``summary_to_json`` exposes the GPU block under ``gpu_busy``."""
@@ -4153,6 +4157,14 @@ class TestDispatchToFinishBusy:
         assert block["computing_fraction"] == 0.25
         assert block["busy_pct"] == 25.0
         assert block["idle_pct"] == 75.0
+        # A fully observed constructed result reports zero unknown coverage.
+        assert block["unknown_pct"] == 0.0
+        assert block["coverage"]["unknown_samples"] == 0
+        assert block["shares_pct"] == {
+            "computing": 25.0,
+            "idle": 75.0,
+            "unknown": 0.0,
+        }
         assert block["smoothed_power"] == [{"timestamp": 1698766200, "power_watts": 93.2}]
 
 

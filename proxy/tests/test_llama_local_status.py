@@ -1060,6 +1060,7 @@ class _CapacityStatusHarness:
         counts_outcome=None,
         counts=None,
         llama_running=True,
+        detail_side_effect=None,
     ):
         """Issue /llama/local/status and return the parsed JSON body.
 
@@ -1083,7 +1084,10 @@ class _CapacityStatusHarness:
         async def fake_query():
             return {"llama_server_running": llama_running}
 
-        detail_mock = AsyncMock(return_value=slots_detail or [])
+        if detail_side_effect is not None:
+            detail_mock = AsyncMock(side_effect=detail_side_effect)
+        else:
+            detail_mock = AsyncMock(return_value=slots_detail or [])
         if counts_outcome is None:
             counts_mock = AsyncMock(return_value=counts or (0, 0))
         else:
@@ -1117,7 +1121,9 @@ class _CapacityStatusHarness:
                                             with patch.object(
                                                 server,
                                                 "local_dispatch_records",
-                                                dispatch_records or {},
+                                                dispatch_records
+                                                if dispatch_records is not None
+                                                else {},
                                             ):
                                                 with patch.object(
                                                     server,
@@ -1276,6 +1282,48 @@ async def test_available_slots_free_while_hint_saturated_for_leased_slot():
     )
     assert j["available_slots"] == 1
     assert [s["lease_state"] for s in j["slots"]] == ["generating", "idle_leased"]
+    assert j["capacity_hint"] == "saturated"
+
+
+@pytest.mark.asyncio
+async def test_live_work_attribution_sampled_after_the_slots_query():
+    """LP-0MVZ3V8UR003KCSZ AC1/AC3: a dispatch admitted *during* the slots query
+    is reflected in the same payload, so fresh busy detail is never paired with
+    a stale-empty attribution snapshot.
+
+    Pre-fix, ``local_in_flight_requests`` was sampled before the /slots read, so
+    a multi-second poll paired fresh ``saturated`` detail with
+    ``local_in_flight_requests=0`` (the 2026-11-02 05:31:18 residual).
+    """
+    import time
+
+    session = "admitted-during-poll"
+    records: dict = {}
+
+    async def _detail_with_mid_poll_admission(*_args, **_kwargs):
+        # A local dispatch is admitted while the /slots detail read is in
+        # flight — the exact window the pre-fix ordering missed.
+        records[session] = {
+            "backend": "local",
+            "started_at": time.monotonic(),
+            "active": True,
+            "expires_at": time.monotonic() + 60.0,
+        }
+        return [_slot(0, is_processing=True, n_decoded=5)]
+
+    j = await _CapacityStatusHarness().get(
+        counts=(0, 1),
+        dispatch_records=records,
+        detail_side_effect=_detail_with_mid_poll_admission,
+    )
+
+    assert j["local_in_flight_requests"] == 1, (
+        "a dispatch admitted during the slots query must be attributed in the "
+        "same payload"
+    )
+    assert j["local_owner_session_id"] == session
+    assert j["local_active_query"] is True
+    # AC2: the change only *adds* attribution — it never downgrades the hint.
     assert j["capacity_hint"] == "saturated"
 
 
@@ -1759,6 +1807,50 @@ async def test_stale_summary_never_asserts_availability(
     processing = sum(1 for s in j["slots"] if s.get("is_processing"))
     if processing and not j["availability_unknown"]:
         assert j["available_slots"] == 0
+
+
+@pytest.mark.asyncio
+async def test_counts_stale_with_fresh_detail_never_serves_cached_availability():
+    """AC1/AC2 (LP-0MVXSX0TZ00798KA): the 2026-10-30 06:01:20 shape — the
+    counts query fails and the last-known counts (1 of 2 available) are served
+    while the per-slot detail is fresh and shows both slots decoding.
+
+    The cached count must not be published as positive availability beside a
+    fresh-detail ``saturated`` hint: ``available_slots`` is withheld (0) with
+    ``availability_unknown`` true, and the two cache paths stay distinguishable
+    (``slot_counts_stale`` true, ``slots_detail_stale`` false).
+    """
+    import time as _time
+    from unittest.mock import patch as _patch
+
+    fresh_saturated_detail = [
+        _slot(0, is_processing=True, n_decoded=872),
+        _slot(1, is_processing=True, n_decoded=41),
+    ]
+    # A fresh last-known counts cache is (available, total, monotonic_ts).
+    with _patch(
+        "proxy.observability._last_slot_counts_cache",
+        (1, 2, _time.monotonic()),
+    ):
+        j = await _CapacityStatusHarness().get(
+            slots_detail=fresh_saturated_detail,
+            counts_outcome={"status": 500, "reason": "http_500"},
+        )
+
+    # Cache paths are disclosed independently and keep their meaning.
+    assert j["slot_counts_stale"] is True
+    assert j["slots_detail_stale"] is False
+    assert j["slots_stale"] is True
+
+    # The cached ``available_slots=1`` is not served: a cache-served counts
+    # pair cannot assert free capacity, so availability is withheld.
+    assert j["available_slots"] == 0
+    assert j["availability_unknown"] is True
+    # The hint is still derived from the fresh detail, so the pair is
+    # consistent (0 + saturated) rather than (cached 1 + saturated).
+    assert j["capacity_hint"] == "saturated"
+    assert j["total_slots"] == 2
+    assert len(j["slots"]) == 2
 
 
 @pytest.mark.asyncio

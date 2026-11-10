@@ -800,7 +800,9 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
   window, or any error after the window expires, is still quarantined
   normally so genuine local faults are never masked.
 - **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
-- **Usage-limit quarantine (LP-0MSLJPOCC0001ROJ, bounded by LP-0MUQTCMW2001VXH8, window-aware by LP-0MVPAE77Z002VGIA, absolute-timestamp aware by LP-0MVT8SAZE00570J5)**: A 429 usage-limit error (`GoUsageLimitError`, a `FreeUsageLimitError` carrying a reset time, or the `insufficient_quota` / `free_daily_limit_exceeded` markers MunitoAI sends for its daily free limit) quarantines only the failing **API-key account**, not the whole gateway. An **explicit** reset is honoured in full (plus a 2-minute margin): a `Resets in 22hr 43min` duration, or an **absolute** `It resets at 2026-10-30 00:00 UTC` instant (also `YYYY-MM-DD HH:MM[:SS] UTC`, ISO-8601 `Z` and explicit `±HH:MM` offsets — a bare timestamp with no timezone evidence is treated as unparseable). An absolute instant is hard evidence but **bounded to the period the payload names** (`free_daily_limit_exceeded` / "daily … limit" → 24 h), so a far-future or clock-skewed timestamp can never lock the account out indefinitely; a past or unparseable timestamp falls back to the guessed rules below. Because the daily-limit check runs *before* the generic HTTP-error handling, an advertised daily reset always beats the rolling `x-ratelimit-*` header window. For an `opencode-*` account with a fresh `/v1/usage` snapshot the quarantine follows the **quota window the 429 named** (`metadata.limitName`): a `weekly` limit returns after the weekly reset, never after the monthly one (previously every 429 was pinned to the monthly account-level reset, so a weekly-limited account could stay out for weeks — the 2026-10-24 incident). An absent/unknown `limitName` is bounded by the soonest still-open window instead of the monthly value, and a named window whose snapshot data is contradictory is capped at the guess cap. Window-derived quarantines are **revalidated on the quota-poll cadence**: as soon as a fresh poll shows that window reset, the quarantine is cleared and the account is routed to again without a restart. A **guessed** duration — derived from `metadata.limitName` / the payload's period wording alone when the gateway omits the reset time, which is the common opencode case — is capped at **24 hours** (`server.usage_limit_guess_cap_seconds`, or the `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` env override) and is **never persisted**, so a duration-less 429 can no longer lock a healthy account out for the full 7/30-day period. Guessed quarantines are also re-validated by a cheap self-healing probe (at most one probe per 5 minutes per account); the first successful probe clears the quarantine and the account is routed to within the same request cycle. An operator can clear any quarantine immediately with `POST /admin/clear-usage-limit`.
+- **Transient `[overloaded]` 429 (LP-0MW46PBWL008T317)**: An OpenCode Go 429 whose body carries the `[overloaded]` marker ("the server is overloaded; retry shortly", with `Retry-After: 2` / `retry-after-ms: 2000`) is a **short retryable cooldown** honouring the upstream wait (floored at 1 s, capped by `server.overloaded_cooldown_max_seconds`, default 30 s), never a failure-domain exclusion and never an account quarantine — sibling accounts on the same gateway stay eligible. The entry is retried by the next chain-hold cycle (429-then-200 succeeds with a ~2 s hold), and a chain that keeps overloading falls through to the next provider after the bounded holds. Logged with `reason=overloaded`. The standard `Retry-After` / `retry-after-ms` headers are honoured directly (no `respect_ratelimit_headers` opt-in needed for them).
+- **Genuine balance exhaustion (LP-0MW46PBWL008T317)**: Once a `use_balance: true` account may dispatch on credit, a genuine out-of-credit response — HTTP 402, or a usage-limit body on a non-429 status — quarantines the failing **API-key account** with the reset-aware usage-limit quarantine (real reset timing from the body / the `/v1/usage` snapshot, or the bounded guess), so the entry is not retried in a loop. The quarantine is **cumulative**: it never shortens an existing usage-limit quarantine. Keyed on `api_key_env@endpoint:model`, so paid siblings stay eligible. Logged with `reason=balance_exhaustion`.
+- **Usage-limit quarantine (LP-0MSLJPOCC0001ROJ, bounded by LP-0MUQTCMW2001VXH8, window-aware by LP-0MVPAE77Z002VGIA, absolute-timestamp aware by LP-0MVT8SAZE00570J5, balance-aware by LP-0MW46PBWL008T317)**: A 429 usage-limit error (`GoUsageLimitError`, a `FreeUsageLimitError` carrying a reset time, or the `insufficient_quota` / `free_daily_limit_exceeded` markers MunitoAI sends for its daily free limit) quarantines only the failing **API-key account**, not the whole gateway. An **explicit** reset is honoured in full (plus a 2-minute margin): a `Resets in 22hr 43min` duration, or an **absolute** `It resets at 2026-10-30 00:00 UTC` instant (also `YYYY-MM-DD HH:MM[:SS] UTC`, ISO-8601 `Z` and explicit `±HH:MM` offsets — a bare timestamp with no timezone evidence is treated as unparseable). An absolute instant is hard evidence but **bounded to the period the payload names** (`free_daily_limit_exceeded` / "daily … limit" → 24 h), so a far-future or clock-skewed timestamp can never lock the account out indefinitely; a past or unparseable timestamp falls back to the guessed rules below. Because the daily-limit check runs *before* the generic HTTP-error handling, an advertised daily reset always beats the rolling `x-ratelimit-*` header window. For an `opencode-*` account with a fresh `/v1/usage` snapshot the quarantine follows the **quota window the 429 named** (`metadata.limitName`): a `weekly` limit returns after the weekly reset, never after the monthly one (previously every 429 was pinned to the monthly account-level reset, so a weekly-limited account could stay out for weeks — the 2026-10-24 incident). An absent/unknown `limitName` is bounded by the soonest still-open window instead of the monthly value, and a named window whose snapshot data is contradictory is capped at the guess cap. Window-derived quarantines are **revalidated on the quota-poll cadence**: as soon as a fresh poll shows that window reset, the quarantine is cleared and the account is routed to again without a restart. A **guessed** duration — derived from `metadata.limitName` / the payload's period wording alone when the gateway omits the reset time, which is the common opencode case — is capped at **24 hours** (`server.usage_limit_guess_cap_seconds`, or the `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` env override) and is **never persisted**, so a duration-less 429 can no longer lock a healthy account out for the full 7/30-day period. Guessed quarantines are also re-validated by a cheap self-healing probe (at most one probe per 5 minutes per account); the first successful probe clears the quarantine and the account is routed to within the same request cycle. An operator can clear any quarantine immediately with `POST /admin/clear-usage-limit`.
 - **Reset-aware account quarantine (LP-0MVFA1VRT007T9HT)**: With `respect_ratelimit_headers` enabled, a **quota** 429 (body `rate_limit_error`/`rate_limit_exceeded`/`insufficient_quota`/`free_daily_limit_exceeded`, or `x-ratelimit-over-limit: yes`) that also carries a parseable `x-ratelimit-reset-*` duration quarantines the failing **API-key account** for the parsed reset **plus the 2-minute usage-limit margin** — distinct from the 2-second `ratelimit_cooldown_margin_seconds` applied to the provider-ENTRY cooldown. The quarantine is keyed on `api_key_env@endpoint:model`, so a paid sibling on the same gateway stays eligible; it is persisted to `provider-state.json`, survives restarts, and feeds the exhaustion `retry_after`. A 429 with no reset signal keeps the plain short cooldown and per-request account-key exclusion. See the account-scoped quarantine subsection in `docs/routing.md`.
 - **State**: Cooldown state is persisted across restarts (see Provider Availability Persistence below) — a cooldown set before a restart is still honoured after it.
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
@@ -1972,6 +1974,7 @@ curl -sf http://127.0.0.1:8000/health || tail -30 /tmp/proxy-startup.log
 | `--log-file <path>` | Where the detached server's stdout/stderr go. Default (no flag): a per-invocation file in `$LLAMA_PROXY_STARTUP_LOG_DIR` (default `/tmp`) plus a `proxy-startup.log` symlink to it. |
 | `--restart` | Kill any running proxy, llama-server and TTS processes first. |
 | `--keep-llama-server` | With `--restart`, preserve a warm llama-server (KV / prompt cache). |
+| `START_PROXY_PORT_KILL_DISABLED=1` | With `--restart`, skip the **port fallback** (`fuser -k 8080/8081`) only. Set it for any sandboxed/CI run of the script: that phase selects its victims by *port*, so it signals whatever holds 8080/8081 — including a live backend the caller does not supervise. Phases 1–2 (command-line selected) are unaffected. LP-0MW3PLEH8008O4I7: leaving it unset in `tests/test_start_proxy_self_kill.py` meant every suite run SIGKILLed the live TTS server and llama-server router ([evidence](../docs/death-attribution-class-a-LP-0MW3PLEH8008O4I7.md)). |
 
 > **NEVER start the proxy in the foreground under an agent tool call.**
 > A tool-call timeout SIGKILLs the entire process group, so a foreground uvicorn
@@ -2058,10 +2061,18 @@ backend together (~96.7 GiB of GPU-backed amdgpu GTT memory on a 124 GiB host,
 - **OOM ranking.** The proxy applies `server.oom_score_adj` (default `-900`) to
   itself and `server.llama_server_oom_score_adj` (default `+800`) to the spawned
   or adopted llama-server, so the kernel's `oom_badness` ranking sacrifices the
-  model backend before the front door. Raising a score is always permitted;
+  model backend before the front door. The score is written to the whole
+  process **tree** — the start-script wrapper at spawn time (so later forks
+  inherit it) plus every `llama-server` process already running, including the
+  router and the per-model children it forks — and re-asserted every ~30 s by
+  the backend watchdog (LP-0MW3K7XJ30027RV6: writing only to the wrapper left
+  the live router and its child at `0`). Raising a score is always permitted;
   lowering one below 0 needs `CAP_SYS_RESOURCE` (the systemd **system** unit sets
   `OOMScoreAdjust=-900`), and a refused lowering is logged with the remedy at
   startup. Verify with
+  `for p in $(pgrep -x llama-server); do cat /proc/$p/oom_score_adj; done` or
+  `python3 scripts/verify_oom_protection.py` (`--apply` to reapply), and the
+  proxy's own score with
   `cat /proc/$(pgrep -f 'uvicorn proxy\.server' | head -1)/oom_score_adj`.
 - **Supervision.** `scripts/systemd/llama-proxy.service` and
   `scripts/systemd/llama-podman-wrapper.service` use `Restart=always` with
@@ -2189,21 +2200,21 @@ Response:
 | Field                     | Type          | Description                                                                 |
 |---------------------------|---------------|-----------------------------------------------------------------------------|
 | `active_query`            | `bool`        | `true` while a request is being processed (at least one in-flight request). |
-| `local_active_query`      | `bool`        | `true` only while LOCAL model work is in flight, derived from live dispatch records (a retained post-stream lease or a leaked counter does not count); remote provider streams are excluded (LP-0MSL2ZLLS009RVKR, LP-0MVKSXR4P001V0CM). |
-| `local_in_flight_requests`| `int|null`    | Number of active local dispatch records (`null` in legacy mode without the registry). |
+| `local_active_query`      | `bool`        | `true` only while LOCAL model work is in flight, derived from live dispatch records (a retained post-stream lease or a leaked counter does not count); remote provider streams are excluded (LP-0MSL2ZLLS009RVKR, LP-0MVKSXR4P001V0CM). Reflects the in-flight dispatch from **admission through first byte** (the whole prefill), and a teardown applies only to the dispatch that owns it (LP-0MVYZEYZY003IQAH). |
+| `local_in_flight_requests`| `int|null`    | Number of active local dispatch records (`null` in legacy mode without the registry). Sampled after the `/slots` query in the same poll, so a dispatch admitted during a multi-second poll is attributed (LP-0MVZ3V8UR003KCSZ). |
 | `model_switch_in_progress`| `bool`        | `true` during a background model load or model switch.                     |
 | `current_model`           | `string|null` | Name of the currently loaded model, or `null` when no model is loaded.     |
 | `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |
-| `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing). When the served slot detail is stale and the proxy has no in-flight local work, reconciled upward to the pool size so a stale snapshot cannot close the dispatch gate. |
+| `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing), derived from the served `slots[]` when a detail list is available. When the served slot data is stale — the per-slot detail **or** the counts pair came from the last-known cache — no availability is asserted: the value is withheld as `0` with `availability_unknown: true`. In particular a cache-served counts pair is never published as a positive `available_slots`, even when the detail snapshot is fresh, so the payload cannot pair a fossil `available_slots>0` with a fresh-detail `saturated` / `abandoned_busy` hint (LP-0MVRMI5HK00558TB, LP-0MW1VDZIX0011D8M, LP-0MVXSX0TZ00798KA). |
 | `total_slots`             | `int`         | Total number of model-serving slots configured on the llama-server.         |
 | `capacity_hint`           | `string`      | `idle` \| `prefill_bound` \| `saturated` \| `abandoned_busy`, from the per-slot decision table; reconciled with live dispatch/activity state when slot detail is stale (LP-0MVGDUVGE0024YAI, LP-0MVKSXR4P001V0CM). `abandoned_busy` means the pool is occupied only by work the proxy has abandoned — busy, not ours (LP-0MVRMI5HK00558TB); **treat any unrecognised value as busy**. |
 | `slots_stale`             | `bool`        | The served slot counts **or** per-slot detail came from the last-known cache. |
 | `slots_detail_stale`      | `bool`        | The per-slot detail (and therefore `capacity_hint` input) is cached.       |
-| `slot_counts_stale`       | `bool`        | The `available_slots` / `total_slots` pair is cached.                      |
+| `slot_counts_stale`       | `bool`        | The `available_slots` / `total_slots` pair is cached. When true, the cached `available_slots` is withheld as `0` (with `availability_unknown: true`) rather than published beside a fresh-detail hint; `capacity_hint` and `slots[]` still come from the fresh detail (LP-0MVXSX0TZ00798KA). |
 | `local_abandoned_slots`   | `int`         | Slots annotated `abandoned` — dispatches the proxy gave up on that llama-server has not released yet (LP-0MVRMI5HK00558TB). The count is **endpoint-wide aware**: an abandonment recorded without a resolvable slot identity (or whose recorded id no longer matches the draining slot) is stored as one endpoint-wide registry entry and still counts once here, so no abandonment the proxy gave up on is invisible (LP-0MVUVHB1V006HA5I, LP-0MVUVHAQP001IRKK). |
 | `slots[].abandoned`      | `bool`        | `true` when the proxy gave up on the dispatch occupying this slot and llama-server has not released it yet; always paired with `abandonment_reason` (`prefill_deadline`, `session_evicted`, `no_progress_watchdog`, `client_disconnect`, `orphan_cleanup`, `measured_cache_deficit`), `abandoned_session_id` and `abandoned_at_seconds_ago` so a ghost is never a bare boolean (LP-0MVRMI5HK00558TB). |
 | `slots[].abandoned_scope` | `string \| null` | Which registry entry produced a slot's `abandoned` annotation: `"slot"` (the slot's own recorded identity matched), `"endpoint"` (an endpoint-wide entry applied to a processing slot that no lease **and** no live dispatch record owns — i.e. a draining ghost), or `null` when the slot is not abandoned. Additive within `status_schema_version` 4 (LP-0MVUVHB1V006HA5I). |
-| `status_schema_version`   | `int`         | Payload schema version (currently `5`; the abandonment fields in this table are additive within `4` and unchanged by the `5` bump, which added the `local_route_*` fields). |
+| `status_schema_version`   | `int`         | Payload schema version (currently `7`; every bump has been additive — `4` carried the abandonment fields in this table, `5` added the `local_route_*` fields, and `6`/`7` came with the `available_slots` derivation-from-`slots[]` change that also added `availability_unknown`, so no field is removed or reinterpreted). |
 
 **Performance:**
 
@@ -2238,6 +2249,23 @@ still refusing the re-dispatch it was armed for
 [docs/routing.md](docs/routing.md#post-deadline-prefill-thrash-cooldown-lp-0mvkukfhh005udwl-rescoped-by-lp-0mvt2ksxy002o75c)).
 
 This endpoint requires no authentication (internal) and is rate-unlimited.
+
+**Per-dispatch live-work attribution (LP-0MVYZEYZY003IQAH).** `local_in_flight_requests`,
+`local_owner_session_id` and `local_active_query` describe the in-flight dispatch
+from admission through first byte, not just generation. A `lease_renewed`
+retained lease (`active: false`, future `expires_at`) reserves the slot for the
+owning session but is **not** live work. A dispatch record is keyed
+`(endpoint, session_id)`, so back-to-back turns of one session share a key; each
+acquisition stamps a per-dispatch token and a teardown/release carrying a
+different token is a no-op, so a late turn-N teardown cannot clear turn-N+1's
+attribution (the 2026-11-01/02 residual class). The cache-served
+`available_slots` paired with a fresh `saturated` hint is a **separate** family
+tracked by LP-0MVXSX0TZ00798KA. The residual artifact
+`saturated_without_live_work_attribution.csv` carries the live-work evidence
+columns (`local_in_flight_requests`, `local_active_query`,
+`local_owner_session_id`, `slots_stale`, `slot_counts_stale`) after its original
+seven, so a residual poll is re-checkable from the artifact alone
+(LP-0MVZ3V96D007A825).
 
 ### Child-port discovery (why `/slots` bypasses the router)
 
@@ -2982,6 +3010,32 @@ contaminate another session's routing decisions:
 Cache-warm marking is tied to **slot-save success** (not just any HTTP response
 success). A response that does not save the slot (e.g., slot persistence
 disabled, non-streaming proxy-only mode) does **not** warm the cache.
+
+#### Measured residency: unmeasured is cold (`LP-0MW81DFML006O5KL`)
+
+For prompts above the cold threshold the threshold is chosen from the session's
+**measured** reusable prefix (the cached `/slots` snapshot plus the in-process
+slot-ownership registry), not from the predicted `cached_ratio` alone:
+
+| Basis at admission | Threshold applied |
+|---|---|
+| measured-resident (`residency_source` = `measured`, `measured_last_dispatch` or `session_slot`) | warm cap (`local_large_context_warm_cache_threshold`, 120 000) |
+| unmeasured (`residency_source=unknown`: no fresh snapshot *and* no slot ownership, or a probe that raised) | cold cap (`local_large_context_cold_cache_threshold`, 38 000 base/fast, 42 000 cheap) — above it the request skips local with reason `unmeasured_residency_cold` |
+
+Unmeasured used to fail open to the predicted ratio; that admitted a 55 492-token
+prompt priced `cached_ratio=1.00` on 2026-11-07 20:48:51, evicted 180.1 s later.
+The denial is not idle-overridable — it reports a missing measurement, not a
+price an idle GPU can beat; `local_last_resort_*` stays the final local
+override when no remote provider can serve the request. Design, rung order and
+the log grammar: `proxy/docs/routing.md` → *Residency-aware admission ladder*.
+
+**Rollback: one value, byte-for-byte.**
+`local_unmeasured_residency_cold_enabled: false` (`false` / `0` / `off`;
+missing or malformed keeps the shipped `true`) restores the pre-change
+behaviour exactly: an unmeasured basis degrades to the predicted ratio and logs
+`decision=admit_predicted` / `decision=skip_predicted` with
+`n_past_actual=none`. `local_resident_prefix_min_ratio: 0` is the broader
+switch that disables the whole residency ladder.
 
 #### Configuration
 

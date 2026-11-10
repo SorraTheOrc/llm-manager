@@ -17,6 +17,11 @@ baseline:
   re-parsing production logs.
 * :func:`replay_result_to_json` serialises a replay so a failure or a report
   can carry the numbers instead of an eyeball verdict (AC3).
+* :func:`measure_admission_overhead` replays the same fixture through the
+  **real local admission path** and aggregates the production
+  ``admission_overhead_ms=`` figure into p50/p95, with the budget verdict
+  (LP-0MW959R5S009WDM8, parent AC4). It reuses this fixture and this module's
+  replay discipline rather than standing up a second harness.
 
 Two documented modelling decisions:
 
@@ -43,7 +48,9 @@ This module is an analysis tool: no production module may import it (AC5).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+import logging
+import math
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -84,6 +91,22 @@ PINNED_PROFILE_REPEATS = 3
 FIXTURE_DEADLINE_SECONDS = 90.0
 
 MODEL = "Qwen3"
+
+#: Budget for the latency candidate-first admission adds to the request hot
+#: path (parent AC4): the p95 of the per-admission overhead, measured on a
+#: replay, must stay at or below this. The added work is one in-process
+#: registry lookup plus the residency resolution — no upstream query, no
+#: poller, no background task — so 50 ms is a generous ceiling.
+ADMISSION_OVERHEAD_BUDGET_MS: float = 50.0
+
+#: The production decision-line field this harness reads back. Production owns
+#: the name (``proxy.provider.ADMISSION_OVERHEAD_FIELD``); the F5 regression
+#: pin asserts the two agree, so a rename cannot leave the replay measuring a
+#: field nothing emits.
+ADMISSION_OVERHEAD_TOKEN = "admission_overhead_ms="
+
+#: Log line the per-admission overhead is attached to (the admission verdict).
+ADMISSION_DECISION_TOKEN = "routing_resident_prefix"
 
 
 def band_rate(prompt_tokens: int) -> float:
@@ -328,3 +351,169 @@ def replay_result_to_json(result: ReplayResult) -> dict[str, Any]:
             for a in result.attempts
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Admission-overhead replay (LP-0MW959R5S009WDM8, parent AC4)
+#
+# Candidate-first admission adds two steps to the request hot path: the slot
+# candidate acquisition and the residency resolution that prices the verdict
+# against it. The production decision line reports that cost per admission as
+# ``admission_overhead_ms=``; this section replays the checked-in fixture
+# through the real admission path and turns those per-admission figures into
+# the p50/p95 the budget is enforced against.
+#
+# The harness owns the fixture, the sampling and the percentile/budget maths;
+# the *caller* owns the ladder-specific fake pool state (it passes ``decide``),
+# so no second residency ladder is stood up here (F1 AC5c).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdmissionOverheadReport:
+    """Per-admission overhead samples plus the AC4 p50/p95 budget verdict.
+
+    ``p50_ms``/``p95_ms`` are ``None`` only when nothing was measured (no
+    sample carried the field) — never coerced to a fabricated zero, so a
+    silently missing measurement reads as *unmeasured* rather than *fast*.
+    """
+
+    samples_ms: tuple[float, ...]
+    attempts: int
+    measured: int
+    budget_ms: float = ADMISSION_OVERHEAD_BUDGET_MS
+    p50_ms: float | None = None
+    p95_ms: float | None = None
+    provenance: str = ""
+
+    @property
+    def over_budget(self) -> bool:
+        """True when the measured p95 exceeds the budget (the AC4 failure)."""
+        return self.p95_ms is not None and self.p95_ms > self.budget_ms
+
+    @property
+    def within_budget(self) -> bool:
+        """True only when the budget was **measured and met**.
+
+        Deliberately not the negation of :attr:`over_budget`: a report with no
+        measurement is neither — it is *unmeasured*, so a silently absent
+        figure can never read as a passed budget (LP-0MW959R5S009WDM8 AC4d).
+        """
+        return self.p95_ms is not None and self.p95_ms <= self.budget_ms
+
+    def to_json(self) -> dict[str, Any]:
+        """Machine-readable form (CLI/API convention)."""
+        return {
+            "attempts": self.attempts,
+            "measured": self.measured,
+            "p50_ms": self.p50_ms,
+            "p95_ms": self.p95_ms,
+            "max_ms": max(self.samples_ms) if self.samples_ms else None,
+            "budget_ms": self.budget_ms,
+            "over_budget": self.over_budget,
+            "within_budget": self.within_budget,
+            "provenance": self.provenance,
+        }
+
+
+def percentile(samples: Iterable[float], p: float) -> float | None:
+    """Nearest-rank *p*-th percentile of *samples*, or ``None`` when empty.
+
+    Nearest rank (``ceil(p/100 * n)``-th smallest) rather than interpolation: a
+    latency percentile is a *measured* sample, so the reported p95 is always a
+    duration the admission path actually paid rather than an average of two.
+    """
+    values = sorted(float(sample) for sample in samples)
+    if not values:
+        return None
+    if p <= 0:
+        return values[0]
+    rank = math.ceil((p / 100.0) * len(values)) - 1
+    return values[min(max(rank, 0), len(values) - 1)]
+
+
+def admission_overhead_report(
+    samples: Iterable[float],
+    *,
+    attempts: int | None = None,
+    budget_ms: float = ADMISSION_OVERHEAD_BUDGET_MS,
+    provenance: str = "",
+) -> AdmissionOverheadReport:
+    """Aggregate per-admission overhead samples into the AC4 budget verdict."""
+    values = tuple(float(sample) for sample in samples)
+    return AdmissionOverheadReport(
+        samples_ms=values,
+        attempts=len(values) if attempts is None else int(attempts),
+        measured=len(values),
+        budget_ms=float(budget_ms),
+        p50_ms=percentile(values, 50),
+        p95_ms=percentile(values, 95),
+        provenance=provenance,
+    )
+
+
+class _AdmissionOverheadCollector(logging.Handler):
+    """Collect the ``admission_overhead_ms=`` figures production emits."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.samples: list[float] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:  # pragma: no cover - malformed record
+            return
+        if ADMISSION_DECISION_TOKEN not in message:
+            return
+        index = message.find(ADMISSION_OVERHEAD_TOKEN)
+        if index < 0:
+            return
+        token = message[index + len(ADMISSION_OVERHEAD_TOKEN) :].split()
+        if not token or token[0] == "none":
+            return
+        try:
+            self.samples.append(float(token[0]))
+        except ValueError:  # pragma: no cover - production never emits this
+            return
+
+
+def measure_admission_overhead(
+    attempts: Iterable[Any],
+    decide: Callable[[Any], Any],
+    *,
+    budget_ms: float = ADMISSION_OVERHEAD_BUDGET_MS,
+    logger_name: str = "llama-proxy",
+    provenance: str = "",
+) -> AdmissionOverheadReport:
+    """Replay *attempts* through the real admission path; aggregate its cost.
+
+    *decide* runs **one** admission for a fixture record (the caller installs
+    the ladder-specific fake pool state, because that is the residency ladder's
+    surface, not this harness's). The per-admission figure is read back from the
+    production decision line itself, so the replay measures the same number the
+    operator sees — not a re-implementation of it
+    (LP-0MW959R5S009WDM8 AC4a/AC4c/AC4e).
+
+    Returns the p50/p95 report; ``over_budget`` is the AC4 failure and
+    ``p50_ms``/``p95_ms`` are ``None`` when no attempt reported a figure.
+    """
+    logger = logging.getLogger(logger_name)
+    collector = _AdmissionOverheadCollector()
+    previous_level = logger.level
+    logger.addHandler(collector)
+    logger.setLevel(logging.INFO)
+    count = 0
+    try:
+        for attempt in attempts:
+            decide(attempt)
+            count += 1
+    finally:
+        logger.removeHandler(collector)
+        logger.setLevel(previous_level)
+    return admission_overhead_report(
+        collector.samples,
+        attempts=count,
+        budget_ms=budget_ms,
+        provenance=provenance,
+    )

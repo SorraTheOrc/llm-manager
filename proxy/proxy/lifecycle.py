@@ -33,6 +33,13 @@ from fastapi.responses import JSONResponse
 
 import proxy.metrics as metrics
 from proxy import cold_start
+from proxy.backend_isolation import tracked_backend_pids
+from proxy.death_capture import decode_returncode
+from proxy.observability import (
+    _clear_local_backend_unreachable,
+    _is_connection_refused,
+    _record_connection_refused_fail_fast,
+)
 
 # ---------------------------------------------------------------------------
 # llama-server reuse across proxy-only restarts (LP-0MUCEFCL6001ZXYN)
@@ -252,6 +259,14 @@ def _apply_backend_oom_protection(proc) -> None:
     below 0 needs privileges), so this half of the protection works in an
     unprivileged deployment. The score is inherited by the backend's children
     and, best-effort, never blocks a model load.
+
+    LP-0MW3K7XJ30027RV6: applied as the spawner's ``on_spawn`` hook, i.e. right
+    after ``Popen`` and *before* the 3 s quick-exit probe. That ordering is the
+    point: ``start-llama.sh`` forks ``llama-server`` within milliseconds and the
+    kernel copies ``oom_score_adj`` at fork time, so a write issued after the
+    probe never reaches the backend (the live symptom: the wrapper scored 800,
+    the router and its model child stayed at 0). ``protect_backend_process``
+    scores the whole tree, so an already-forked backend is covered too.
     """
     if proc is None:
         return
@@ -266,6 +281,72 @@ def _apply_backend_oom_protection(proc) -> None:
         )
     except Exception:
         pass
+
+
+#: How often the watchdog re-asserts the backend OOM ranking (seconds). A router
+#: child forked by a model load inherits the router's score, so this only has to
+#: catch a backend that was already running when the score was written.
+BACKEND_OOM_RECONCILE_SECONDS = 30.0
+
+#: Timestamp of the last reconcile (throttle for the watchdog).
+_backend_oom_reconcile_at = 0.0
+
+
+def _reapply_backend_oom_protection(force: bool = False) -> dict | None:
+    """Re-assert and verify the backend OOM ranking on the running tree.
+
+    LP-0MW3K7XJ30027RV6: the spawn-time write can miss a backend the start script
+    had already forked, and an adopted backend predates this proxy entirely.
+    This walks from the tracked spawn handle **and** from the port discovery of
+    the live ``llama-server`` (the router; its model children are found through
+    the tree) and re-applies ``server.llama_server_oom_score_adj`` to each,
+    returning the :meth:`proxy.host_pressure.BackendOomReport.as_dict` report.
+
+    Best-effort and throttled to :data:`BACKEND_OOM_RECONCILE_SECONDS`; a gap is
+    logged once with the operator action instead of failing a request. Never
+    raises.
+    """
+    global _backend_oom_reconcile_at
+    now = time.time()
+    if not force and now - _backend_oom_reconcile_at < BACKEND_OOM_RECONCILE_SECONDS:
+        return None
+    _backend_oom_reconcile_at = now
+    try:
+        srv = _srv()
+        roots: list[int] = []
+        pid = getattr(getattr(srv, "llama_process", None), "pid", None)
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            roots.append(pid)
+        config = getattr(srv, "config", None)
+        port = 8080
+        if isinstance(config, dict):
+            section = config.get("server", {})
+            if isinstance(section, dict):
+                try:
+                    port = int(section.get("llama_server_port", 8080) or 8080)
+                except (TypeError, ValueError):
+                    port = 8080
+        try:
+            from proxy.backend_rss import discover_llama_pids
+
+            roots.extend(discover_llama_pids(port))
+        except Exception:
+            pass
+        from proxy.host_pressure import reapply_backend_oom_protection
+
+        report = reapply_backend_oom_protection(
+            roots,
+            config,
+            getattr(srv, "logger", None),
+            require_backend=bool(getattr(srv, "backend_ready", False)),
+        )
+        return report.as_dict()
+    except Exception:
+        return None
 
 
 def _resolve_llama_log_path(srv) -> Path:
@@ -329,6 +410,40 @@ def _log_has_live_writer(log_path: Path, exclude_pid: int | None = None) -> bool
     return False
 
 
+def _resolve_live_backend_log_path(srv) -> str | None:
+    """Resolve the file a running llama-server's stdout actually points at.
+
+    LP-0MVZ4UDF10029NDS AC4: when the watched ``llama-server.log`` has no live
+    writer, the backend may still be writing to a rotated sibling because a
+    restart renamed the file *after* the backend opened it. The backend's own
+    ``/proc/<pid>/fd/1`` (and fd 2) names the file its output really lands in,
+    so diagnostics can point at the live inode instead of only reporting a
+    boolean. Returns ``None`` when no backend fd resolves to a real file.
+    """
+    try:
+        server_config = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+        llama_port = int(server_config.get("llama_server_port", 8080) or 8080)
+    except Exception:
+        llama_port = 8080
+    try:
+        from proxy.backend_rss import discover_llama_pids
+
+        for pid in discover_llama_pids(llama_port):
+            for fd in (1, 2):
+                try:
+                    target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if not target.startswith("/"):
+                    continue
+                real = os.path.realpath(target)
+                if os.path.isfile(real):
+                    return real
+    except Exception:
+        pass
+    return None
+
+
 def _verify_adopted_log_relay(srv) -> None:
     """Verify the adopted backend's log relay is attached (LP-0MVECX47Z004LJAQ).
 
@@ -337,13 +452,17 @@ def _verify_adopted_log_relay(srv) -> None:
     holder keeps the log file open, the relay is healthy and nothing needs
     re-attaching.
 
-    If the log file exists but nobody holds it open for writing (the pre-fix
-    pipe-based backend whose reader thread died with the old proxy),
-    re-attachment is impossible: log a WARNING and mark the llama log source
-    unhealthy (visible in ``/health``) — AC2: no silent freeze. We deliberately
-    do NOT restart the backend here, which would discard the warm prompt cache
-    (AC5). When the log file is absent entirely we cannot judge and leave the
-    source unflagged (fail-safe).
+    If the log file exists but nobody holds it open for writing, either the
+    backend was spawned by a pre-fix proxy through a stdout pipe whose reader
+    thread died with the old proxy, or a restart rotated the log out from under
+    a preserved backend (LP-0MVZ4UDF10029NDS) so its output is landing in a
+    ``.N.log`` sibling. Re-attachment is impossible either way: log a WARNING
+    naming the watched path and the backend's real ``/proc/<pid>/fd/1`` target,
+    and mark the llama log source unhealthy (visible in ``/health``) — AC2/AC4:
+    no silent freeze, self-explaining diagnostics. We deliberately do NOT
+    restart the backend here, which would discard the warm prompt cache (AC5).
+    When the log file is absent entirely we cannot judge and leave the source
+    unflagged (fail-safe).
     """
     log_path = _resolve_llama_log_path(srv)
     if not log_path.exists():
@@ -366,15 +485,30 @@ def _verify_adopted_log_relay(srv) -> None:
         except Exception:
             pass
         return
+    # LP-0MVZ4UDF10029NDS AC4: name the file the backend's output is *actually*
+    # going to (typically a rotated sibling such as llama-server.1.log after a
+    # restart rotated the watched path out from under the preserved backend),
+    # so the frozen-path condition is self-explaining rather than only a
+    # ``/health`` boolean. Resolved via the backend's ``/proc/<pid>/fd/1``.
+    live_log_path = _resolve_live_backend_log_path(srv)
+    live_log_detail = (
+        live_log_path
+        if live_log_path
+        else "unresolved (no llama-server fd points at a regular file)"
+    )
     try:
         srv.logger.warning(
             "Adopted llama-server log relay is NOT attached — no live writer "
-            "on %s: the backend was likely spawned with a proxy-owned stdout "
-            "pipe whose reader died with the previous proxy. Re-attachment is "
-            "impossible; llama-server.log cannot receive new lines. Marking "
-            "llama log source unhealthy; restart llama-server to restore "
-            "logging (LP-0MVECX47Z004LJAQ).",
+            "on %s; the backend's output is actually going to %s. This happens "
+            "when a restart rotates llama-server.log while a preserved backend "
+            "still holds the pre-rotation inode. Re-attachment is impossible "
+            "without restarting llama-server; more importantly, do NOT restart "
+            "it merely to fix logging (the warm prompt cache is deliberate). "
+            "Read the live file named above for diagnostics, or resolve it with "
+            "readlink /proc/$(pgrep -f 'llama-server.*--models-preset' | head -1)/fd/1 "
+            "(LP-0MVZ4UDF10029NDS).",
             log_path,
+            live_log_detail,
         )
     except Exception:
         pass
@@ -440,8 +574,23 @@ def _forget_switched_model_measurements(
 
         if backend_restarted:
             reset_measured_prefill()
+            try:
+                from proxy.provider import reset_divergence_feedback
+
+                reset_divergence_feedback()
+            except Exception:
+                pass
             return
         clear_measured_prefill_for_other_models(requested_model, target_model)
+        # LP-0MW81DS4W008DKDV AC3 (model switch): a divergence correction is
+        # only meaningful while the model whose slots measured it is loaded, so
+        # it is forgotten by the same keep-only-the-target rule.
+        try:
+            from proxy.provider import clear_divergence_feedback_for_other_models
+
+            clear_divergence_feedback_for_other_models(requested_model, target_model)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -724,11 +873,20 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
 
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
-       try:
-           return await call_factory()
-       except Exception as exc:
-           last_exc = exc
-           if not srv._is_retryable_backend_exception(exc) or attempt >= max_attempts:
+        try:
+            result = await call_factory()
+            # A served dispatch proves the backend is reachable again: release
+            # any pre-dispatch routing skip (LP-0MW42T6IJ006EQA3 AC3).
+            _clear_local_backend_unreachable()
+            return result
+        except Exception as exc:
+            last_exc = exc
+            # Fail fast on a deterministic connection-refused backend
+            # (LP-0MW42T6IJ006EQA3 AC1): nothing in the backoff horizon can
+            # fix a refused connect, so retrying only burns ~28 s/request.
+            if _is_connection_refused(exc):
+                _record_connection_refused_fail_fast(path, stream, attempt, max_attempts, exc)
+            if not srv._is_retryable_backend_exception(exc) or attempt >= max_attempts:
                srv._record_backend_signal(srv._classify_backend_exception(exc))
                try:
                    srv.backend_ready = False
@@ -736,20 +894,20 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
                    pass
                raise
 
-           signal_name = srv._classify_backend_exception(exc)
-           srv._record_backend_signal(signal_name)
-           delay = srv._compute_retry_delay(attempt, base_delay, max_delay, jitter_ratio)
-           srv.logger.warning(
-               "backend_retry path=%s stream=%s attempt=%s/%s delay=%.3fs signal=%s error=%s",
-               path,
-               stream,
-               attempt,
-               max_attempts,
-               delay,
-               signal_name,
-               type(exc).__name__,
-           )
-           await asyncio.sleep(delay)
+            signal_name = srv._classify_backend_exception(exc)
+            srv._record_backend_signal(signal_name)
+            delay = srv._compute_retry_delay(attempt, base_delay, max_delay, jitter_ratio)
+            srv.logger.warning(
+                "backend_retry path=%s stream=%s attempt=%s/%s delay=%.3fs signal=%s error=%s",
+                path,
+                stream,
+                attempt,
+                max_attempts,
+                delay,
+                signal_name,
+                type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
 
     if last_exc is not None:
        raise last_exc
@@ -954,8 +1112,10 @@ async def wait_for_llama_server(timeout: int = 300) -> bool:
        while time.time() - start_time < timeout:
            # Check if llama process died
            if srv.llama_process is not None and srv.llama_process.poll() is not None:
-               exit_code = srv.llama_process.returncode
-               srv.logger.error(f"llama-server process exited with code {exit_code}")
+               death = decode_returncode(srv.llama_process.returncode)
+               srv.logger.error(
+                   "llama-server died during startup: %s", death.describe()
+               )
                return False
 
            try:
@@ -1220,7 +1380,13 @@ def _check_unload_lru_threshold(tracker: _UnloadLruTracker) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _kill_process_group(proc, logger, sigterm_timeout: int = 5, sigkill_wait: int = 2) -> bool:
+def _kill_process_group(
+    proc,
+    logger,
+    sigterm_timeout: int = 5,
+    sigkill_wait: int = 2,
+    forbidden_pids: list[int] | None = None,
+) -> bool:
     """Kill a process and all its children by sending SIGTERM to its process group.
 
     Uses ``os.killpg()`` to signal the entire process group (PID is used as PGID
@@ -1233,10 +1399,18 @@ def _kill_process_group(proc, logger, sigterm_timeout: int = 5, sigkill_wait: in
         logger: Logger for diagnostic messages.
         sigterm_timeout: Seconds to wait after SIGTERM before sending SIGKILL.
         sigkill_wait: Seconds to wait after SIGKILL before giving up.
+        forbidden_pids: Optional list of pids that must NOT be members of the
+            target process group (LP-0MW3K7YO1005C41X). The other GPU backend's
+            tree is passed here by the stop paths; when any live forbidden pid
+            resolves to the same PGID as the target, the kill is REFUSED
+            (returns False) so a fault in one backend cannot cascade into the
+            other. Fail-closed only on positive evidence of sharing — a
+            forbidden pid whose PGID cannot be resolved is skipped.
 
     Returns:
         ``True`` if the process was successfully stopped (or was already gone),
-        ``False`` if ``proc`` was ``None``.
+        ``False`` if ``proc`` was ``None`` or the kill was refused by the
+        isolation guard.
     """
     if proc is None:
         return False
@@ -1258,6 +1432,39 @@ def _kill_process_group(proc, logger, sigterm_timeout: int = 5, sigkill_wait: in
     # Check if already dead
     if proc.poll() is not None:
         return True
+
+    # GPU-backend isolation guard (LP-0MW3K7YO1005C41X): refuse the kill when
+    # a forbidden pid (the other GPU backend's tree) is a member of the target
+    # process group. A cross-backend kill is exactly how a fault in one backend
+    # would take down the other, and with ``start_new_session=True`` spawns the
+    # two groups are disjoint by construction — this is the fail-closed backstop
+    # for that invariant.
+    if forbidden_pids:
+        try:
+            target_pgid = os.getpgid(pid)
+        except (ProcessLookupError, OSError):
+            target_pgid = None
+        if target_pgid is not None:
+            for fpid in forbidden_pids:
+                if not isinstance(fpid, int) or isinstance(fpid, bool) or fpid <= 1:
+                    continue
+                try:
+                    f_pgid = os.getpgid(fpid)
+                except (ProcessLookupError, OSError):
+                    continue
+                if f_pgid == target_pgid:
+                    logger.error(
+                        "REFUSING to kill process group %s of PID %s: forbidden "
+                        "pid %s (the other GPU backend) is a member of it — a "
+                        "cross-backend kill would let one backend's fault take "
+                        "down both (LP-0MW3K7YO1005C41X). The isolation guard "
+                        "fails closed; investigate why the process groups "
+                        "collapsed before stopping either backend.",
+                        target_pgid,
+                        pid,
+                        fpid,
+                    )
+                    return False
 
     try:
         # Try process-group signalling first (handles child processes)
@@ -1353,6 +1560,7 @@ def spawn_and_capture(
     log_file,
     logger: logging.Logger,
     model_name: str = "unknown",
+    on_spawn=None,
 ) -> tuple:
     """Start a subprocess and capture immediate stderr/stdout if it exits quickly.
 
@@ -1375,6 +1583,12 @@ def spawn_and_capture(
             ``None`` falls back to the legacy pipe relay.
         logger: Logger instance.
         model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
+        on_spawn: Optional ``callable(proc)`` invoked immediately after
+            ``Popen`` succeeds, **before** the quick-exit probe below. A start
+            script forks the real backend within milliseconds and the kernel
+            copies ``oom_score_adj`` at fork time, so the OOM ranking has to be
+            written here rather than after the probe returns
+            (LP-0MW3K7XJ30027RV6). Best-effort: a failure is logged, never raised.
 
     Returns a tuple (Popen|None, captured_output_str|None).
     """
@@ -1395,6 +1609,23 @@ def spawn_and_capture(
         tb = traceback.format_exc()
         logger.error(f"Failed to spawn command {cmd}: {e}\n{tb}")
         return None, f"Spawn failed: {e}\n{tb}"
+
+    # LP-0MW3K7XJ30027RV6: run the spawn hook before the probe window. The child
+    # (the start script) forks llama-server almost immediately, and oom_score_adj
+    # is inherited at fork time only — a write after ``proc.wait(timeout=3)``
+    # reaches the wrapper, not the backend.
+    if on_spawn is not None:
+        try:
+            on_spawn(proc)
+        except Exception:
+            try:
+                logger.warning(
+                    "spawn hook failed for %s; continuing without it",
+                    cmd[0],
+                    exc_info=True,
+                )
+            except Exception:
+                pass
 
     try:
         if direct_to_file:
@@ -1801,8 +2032,15 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
     # Rotate llama-server logs (keep last 15)
     if srv.log_dir:
        llama_log_path = srv.log_dir / "llama-server.log"
-       srv.rotate_llama_logs(llama_log_path, keep=15)
-       srv.llama_log_file = open(llama_log_path, "w")
+       rotated = srv.rotate_llama_logs(llama_log_path, keep=15)
+       # LP-0MVZ4UDF10029NDS: when a preserved llama-server still holds
+       # llama-server.log open, rotation is deferred (``rotated is False``) and
+       # the sink must APPEND. Truncating with ``"w"`` would discard the live
+       # window in place, and rotating would strand the backend's output in a
+       # renamed sibling while the proxy watches this path. Appending keeps the
+       # backend's pre-rotation inode as the watched path (AC3).
+       append = rotated is False
+       srv.llama_log_file = open(llama_log_path, "a" if append else "w")
     else:
        srv.llama_log_file = subprocess.DEVNULL
 
@@ -1849,7 +2087,14 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
             host_cmd.append("router")
 
         srv.logger.info(f"Attempting host-first startup with: {' '.join(host_cmd)}")
-        host_proc, host_out = spawn_and_capture(host_cmd, env, srv.llama_log_file, srv.logger, model_name=_display)
+        host_proc, host_out = spawn_and_capture(
+            host_cmd,
+            env,
+            srv.llama_log_file,
+            srv.logger,
+            model_name=_display,
+            on_spawn=_apply_backend_oom_protection,
+        )
 
         if host_proc is not None:
             srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
@@ -1872,7 +2117,14 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
     tried_cmds = []
 
     for attempt in range(retries):
-       proc, out = spawn_and_capture(cmd, env, srv.llama_log_file, srv.logger, model_name=_display)
+       proc, out = spawn_and_capture(
+           cmd,
+           env,
+           srv.llama_log_file,
+           srv.logger,
+           model_name=_display,
+           on_spawn=_apply_backend_oom_protection,
+       )
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
@@ -1906,11 +2158,37 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
 
 
 
-def rotate_llama_logs(current_log: Path, keep: int = 15):
-    """Rotate llama-server logs, keeping the last N copies."""
+def rotate_llama_logs(current_log: Path, keep: int = 15) -> bool:
+    """Rotate llama-server logs, keeping the last N copies.
+
+    Returns ``True`` when the caller may safely create/truncate a fresh
+    ``current_log`` (nothing existed, or rotation completed), and ``False``
+    when rotation was deferred because a live writer still holds the file.
+
+    LP-0MVZ4UDF10029NDS: a llama-server preserved across a proxy restart keeps
+    the **pre-rotation** inode open on stdout/stderr. Renaming
+    ``llama-server.log`` moves that live stream into ``llama-server.1.log``
+    while the proxy watches (and later truncates) the fresh path, so the
+    watched log freezes and ``/health`` reports
+    ``llama_log_source_healthy=false``. Never rotate a file that a live writer
+    other than this proxy still holds — the backend owns the sink, and its
+    inode must remain the watched path.
+    """
     srv = _srv()
     if not current_log.exists():
-       return
+       return True
+
+    if _log_has_live_writer(current_log, exclude_pid=os.getpid()):
+       try:
+           srv.logger.info(
+               "Deferring llama-server log rotation: a live writer still "
+               "holds %s (preserved backend); rotating would strand its "
+               "output in a rotated sibling",
+               current_log,
+           )
+       except Exception:
+           pass
+       return False
 
     # Find existing rotated logs
     srv.log_dir = current_log.parent
@@ -1943,6 +2221,8 @@ def rotate_llama_logs(current_log: Path, keep: int = 15):
     # Rotate current log to .1
     if current_log.exists():
        current_log.rename(srv.log_dir / f"{base_name}.1{suffix}")
+
+    return True
 
 
 
@@ -2025,7 +2305,11 @@ def stop_llama_server():
            srv.logger.info("Adopted llama-server stopped (port killed)")
        elif is_real_process:
            previous_model = srv.current_model
-           _kill_process_group(srv.llama_process, srv.logger)
+           # LP-0MW3K7YO1005C41X: fail closed if the TTS tree ever lands in
+           # llama's process group — killing llama's group must not signal the
+           # TTS server.
+           _forbidden = tracked_backend_pids(srv)["tts"]
+           _kill_process_group(srv.llama_process, srv.logger, forbidden_pids=_forbidden)
            srv.llama_process = None
            try:
                if previous_model:
@@ -2314,9 +2598,9 @@ def start_tts_server() -> subprocess.Popen | None:
     try:
         proc.wait(timeout=0.5)
         # Process exited before timeout -> it failed
-        exit_code = proc.returncode
+        death = decode_returncode(proc.returncode)
         srv.logger.warning(
-            f"TTS server exited immediately with code {exit_code}"
+            "TTS server exited immediately: %s", death.describe()
         )
         return None
     except subprocess.TimeoutExpired:
@@ -2340,7 +2624,11 @@ def stop_tts_server():
         srv.logger.info(f"Stopping TTS server (PID: {pid})")
         is_real_process = hasattr(srv.tts_process, 'terminate') or hasattr(srv.tts_process, 'kill')
         if is_real_process:
-            _kill_process_group(srv.tts_process, srv.logger)
+            # LP-0MW3K7YO1005C41X: killing the TTS group must never reach the
+            # llama-server tree (the guard refuses when any llama pid shares
+            # the TTS process group).
+            _forbidden = tracked_backend_pids(srv)["llama"]
+            _kill_process_group(srv.tts_process, srv.logger, forbidden_pids=_forbidden)
             srv.tts_process = None
             # Reset recovery state since this is an intentional stop, not a failure
             srv.tts_recovery_state["attempt_timestamps"] = []
@@ -2364,8 +2652,10 @@ async def wait_for_tts_server(tts_port: int = 8081, timeout: int = 30) -> bool:
         while time.time() - start_time < timeout:
             # Check if tts process died
             if srv.tts_process is not None and hasattr(srv.tts_process, 'poll') and srv.tts_process.poll() is not None:
-                exit_code = srv.tts_process.returncode
-                srv.logger.error(f"TTS server process exited with code {exit_code}")
+                death = decode_returncode(srv.tts_process.returncode)
+                srv.logger.error(
+                    "TTS server died during startup: %s", death.describe()
+                )
                 return False
 
             try:

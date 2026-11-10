@@ -114,6 +114,7 @@ def _guard_line(
     rate_bucket: str | None = "solitary",
     contended_samples: int | None = 0,
     eta_occupancy: float | None = 0.0,
+    occupant_hold: float | None = None,
     ts: str = TS,
 ) -> str:
     """A ``local_admission_guard`` line in the post-change (contended) shape."""
@@ -126,9 +127,16 @@ def _guard_line(
     occupancy = (
         f" eta_occupancy_s={eta_occupancy:.1f}" if eta_occupancy is not None else ""
     )
+    # Measured blocker evidence (LP-0MVV29YDQ00437N6): absent on lines that
+    # predate the field, exactly like the other post-change additionals.
+    hold = (
+        f" occupant_hold_s={occupant_hold:.1f}"
+        if occupant_hold is not None
+        else ""
+    )
     return (
         f"{ts} - INFO - local_admission_guard decision={decision} reason={reason} "
-        f"enforced=true eta_prefill_s=41.2{occupancy} projected_wait_s=41.2 "
+        f"enforced=true eta_prefill_s=41.2{occupancy}{hold} projected_wait_s=41.2 "
         "budget_s=60.0 deadline_s=120.0 deadline_budget_s=114.0"
         f"{tokens} budget_tokens=40000{bucket} busy_slots=1 in_flight_prefills=0 "
         "free_slot=false priority=medium policy=reject model=Qwen3 samples=12 "
@@ -173,6 +181,29 @@ def _analyse(lines: list[str]):
 # ---------------------------------------------------------------------------
 # AC1 — the decision log's new fields are parsed
 # ---------------------------------------------------------------------------
+
+def test_guard_line_carries_the_measured_occupant_hold():
+    """LP-0MVV29YDQ00437N6 AC5: the measured occupant hold that raised the
+    occupancy term is on the parsed guard event, so a refusal can be attributed
+    to blocker evidence rather than inferred from ``eta_occupancy_s``.
+
+    Lines that predate the field keep ``None`` — an absence, never ``0.0``.
+    """
+    event = log_parser.parse_log_line(
+        _guard_line(
+            decision="reject",
+            reason="eta_exceeds_budget",
+            eta_occupancy=45.0,
+            occupant_hold=45.0,
+        )
+    )
+
+    assert event is not None
+    assert event.kind == "local_admission_guard"
+    assert event.occupant_hold_s == "45.0"
+    assert event.eta_occupancy_s == "45.0"
+    assert log_parser.parse_log_line(_guard_line()).occupant_hold_s is None
+
 
 def test_guard_line_carries_contended_pricing_fields():
     event = log_parser.parse_log_line(

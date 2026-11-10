@@ -93,6 +93,9 @@ def _reset_server_global_state(monkeypatch):
     server.local_dispatch_records = {}
     server.local_generating_sessions = set()
     server.local_prefill_in_flight = {}
+    # LP-0MW42T6IJ006EQA3: the local-backend routing skip deadline must not
+    # leak into tests that assert local routing.
+    server.local_backend_unreachable_until = 0.0
     # Don't rebind locks mid-test — they may be acquired by in-flight tasks.
     # Just ensure the containers pointed at by existing locks are empty.
     yield

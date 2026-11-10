@@ -444,6 +444,29 @@ the last-known cache); the per-source flags `slot_counts_stale` and
 on a stale wait estimate. `prefill_budget_seconds` is a configuration constant
 (not poll-derived) and stays truthful.
 
+### Counts-stale never asserts availability (LP-0MVXSX0TZ00798KA)
+
+The two `/slots` reads degrade independently, so a poll can serve a
+cache-served counts pair (`slot_counts_stale: true`) beside a *fresh* detail
+snapshot (`slots_detail_stale: false`). The 2026-10-30 06:01:20 poll is the
+canonical shape: `available_slots=1` from the cached counts while the fresh
+detail showed both slots decoding and `capacity_hint=saturated`.
+
+The rule is: a cache-served counts pair is **never** published as a positive
+`available_slots`. The value is withheld as `0` with
+`availability_unknown: true`; the fresh detail still drives `capacity_hint`
+and the served `slots[]`, and `slot_counts_stale` / `slots_detail_stale`
+disclose which half (or both) came from the cache. So the payload can never
+pair a fossil `available_slots>0` with a fresh-detail `saturated` or
+`abandoned_busy` hint.
+
+Consumer contract rule: when `slot_counts_stale` is `true`, treat
+`available_slots` as **unknown** (`0` is a withholding sentinel, not "no free
+slot") and gate on `capacity_hint` + `slots[]` instead. Only when both
+`slot_counts_stale` and `slots_detail_stale` are `false` may `available_slots`
+be read as a live free-slot count. Pinned by
+`test_counts_stale_with_fresh_detail_never_serves_cached_availability`.
+
 ## Truthful in-flight accounting (LP-0MVKSXR4P001V0CM AC1/AC2)
 
 - `local_active_query` is driven by **active dispatch records**, not the
@@ -456,6 +479,34 @@ on a stale wait estimate. `prefill_budget_seconds` is a configuration constant
 - The 10 s `_dispatch_cleanup_loop` now **clamps** `local_active_queries` to
   the active-record count instead of only resetting when no records are
   active, so a leak that coexists with real work cannot persist (AC2).
+
+### Per-dispatch attribution (LP-0MVYZEYZY003IQAH)
+
+`local_in_flight_requests`, `local_owner_session_id` and `local_active_query`
+reflect the in-flight dispatch from **admission through first byte** — the whole
+prefill — not only generation. A dispatch is live work while its record is
+`active`; a `lease_renewed` retained lease (`active: false` with a future
+`expires_at`) reserves the slot for the owning session (post-stream cooldown)
+but is **not** live work and never counts toward these fields. The attribution
+is sampled **after** the `/slots` query in the same poll, so fresh busy slot
+detail can never be paired with an attribution snapshot taken before a
+dispatch admitted during a multi-second poll (LP-0MVZ3V8UR003KCSZ).
+
+A dispatch record is keyed `(endpoint, session_id)`, so back-to-back turns of
+the same session share a key. Each acquisition stamps a per-dispatch token and a
+teardown/release carrying a different token is a no-op, so a late turn-N
+teardown cannot clear turn-N+1's live-work attribution
+(LP-0MVZ3V8J1006YGFN). This closed the 2026-11-01/02 residual class in which a
+prefilling slot read `saturated` with empty live-work fields. The cache-served
+`available_slots` paired with a fresh `saturated` hint is a **separate** family
+tracked by LP-0MVXSX0TZ00798KA and is not fixed here.
+
+`saturated_without_live_work_attribution.csv` carries the live-work evidence
+columns `local_in_flight_requests`, `local_active_query`,
+`local_owner_session_id`, `slots_stale` and `slot_counts_stale` after its
+original seven, so a residual poll is re-checkable from the artifact alone
+(LP-0MVZ3V96D007A825). The columns are empty when the poll's schema does not
+carry the field — never fabricated.
 
 ## Consumer contract — herdr `downtime-worker.ts` (AC6)
 
@@ -504,7 +555,10 @@ counts the slots llama-server reports as **not processing**; the hint classifies
 **admission capacity**, and a slot held by a post-stream lease is
 `idle_leased` — not capacity for a newcomer — while another slot decodes (626 of
 the 1,283 `saturated` polls in a direct scan of that window's status log; the
-tool's own filtered count is 1,307). A dispatcher that needs
+tool's own filtered count is 1,307). That pair is only possible while both
+reads are fresh: a cache-served counts pair withholds `available_slots` to `0`
+(see [Counts-stale never asserts availability](#counts-stale-never-asserts-availability-lp-0mvxsx0tz00798ka)).
+A dispatcher that needs
 the engine verdict reads `capacity_hint` (keyed on `lease_state`), not the raw
 slot count; `slot_counts_stale` additionally flags a count served from the
 last-known cache
@@ -741,10 +795,15 @@ change:
      `slot_counts_stale=true` — the counts were served from the last-known
      cache (89 of the 144 counts-stale polls that night reported
      `available_slots>0`, 54 of them `saturated`) while the hint came from fresh
-     detail. The handler reconciles `available_slots` only when *detail* is
-     stale, never when *counts* are, so the pair can disagree. Disclosed by
-     `slot_counts_stale`; recorded as `discovered-from:LP-0MVUTYHG7001S6BM` and
-     not changed here.
+     detail. At the time of that observation the handler reconciled
+     `available_slots` only when *detail* was stale, never when *counts* were,
+     so the pair could disagree. **Fixed since** by LP-0MVXSX0TZ00798KA: a
+     counts-stale pair is withheld (`available_slots: 0` +
+     `availability_unknown: true`) while the fresh detail keeps driving
+     `capacity_hint` and `slots[]` — see
+     [Counts-stale never asserts availability](#counts-stale-never-asserts-availability-lp-0mvxsx0tz00798ka)
+     and its pinned test. Recorded as
+     `discovered-from:LP-0MVUTYHG7001S6BM`.
 2. **`latency_ms=3355` with `slots_detail_stale=false` (06:57:36).**
    **Not reproduced as a distinct defect.** `latency_ms` is the whole poll, not
    the `/slots` detail budget: the handler issues up to three sequential bounded

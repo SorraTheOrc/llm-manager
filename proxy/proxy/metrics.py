@@ -35,6 +35,23 @@ Extended by LP-0MVT1O0VG00905EL (slot occupancy, parent LP-0MVNWUEY8008XM6W):
   last successful sample is queryable and a stalled sampler is not mistaken for
   idle slots
 
+Extended by LP-0MVWPK2VH008YWBD (prefix-reuse and slot-steal observability for
+slot thrash, E7 of ``docs/dev/single-slot-impact.md``):
+- llama_prefix_cache_reuse_total{outcome="reused|cold"} (counter) — one
+  increment per served local stream, classified from the measured
+  ``prompt_tokens_details.cached_tokens`` (``reused`` = at least one prompt
+  token served from the prefix cache, ``cold`` = none). This is the *cause*
+  half of E7 that used to be inferable only from a rising prefill-seconds
+  ratio.
+- llama_slot_steal_total{reason="..."} (counter) — slot steals/evictions, i.e.
+  a resident KV prefix discarded when the slot changes hands, labelled with the
+  same eviction reason the save/restore path already uses
+  (``proxy.admission_events.EVICTION_REASONS``). Both counters carry only a
+  closed-vocabulary label, so a restarted backend cannot leave a ghost series
+  (contrast ``llama_slot_busy{slot}``, whose label set is reconciled on every
+  publish). ``reset_slot_occupancy_gauges()`` also clears their label tracking
+  so the restart lifecycle is exercised by tests.
+
 Extended by LP-0MVF7KQED005TG9Z (quota observability surface):
 - quota_rolling_percent{account,entry} (gauge)
 - quota_weekly_percent{account,entry} (gauge)
@@ -63,6 +80,16 @@ functions are no-ops and generate_metrics() returns an explanatory payload.
 Quota labels never carry an API key **value**: ``account`` is the account key
 derived from the provider entry's ``api_key_env`` name (e.g.
 ``OPENCODE_2_API_KEY``) and ``entry`` is the configured provider entry name.
+
+Extended by LP-0MVWPJW2700966ZU (contention-queue observability, uncovered gap
+E6 of LP-0MVTV6GA8002P7QU):
+- proxy_contention_queue_depth (gauge) — requests currently waiting in the
+  bounded local contention queue
+- proxy_contention_queue_wait_seconds (histogram) — elapsed wait per completed
+  queue wait, admitted and timed-out alike
+- proxy_contention_queue_loss_total{reason="..."} (counter) — requests the
+  queue dropped (depth cap / wait-budget expiry) by canonical fall-through
+  reason (``fallback_after_queue`` / ``local_lease_active``)
 """
 
 from collections.abc import Iterable
@@ -126,6 +153,16 @@ llama_slots_busy = None
 llama_slot_busy = None
 llama_slots_in_flight_tasks = None
 llama_slots_sample_timestamp_seconds = None
+# Prefix-cache reuse outcomes (LP-0MVWPK2VH008YWBD). One increment per served
+# local stream, so a single-slot regime (every session on slot 0) shows up as a
+# collapse in the ``reused`` share instead of being inferred from a rising
+# prefill-seconds ratio.
+llama_prefix_cache_reuse_total = None
+# Slot steals/evictions (LP-0MVWPK2VH008YWBD): a resident KV prefix discarded
+# when a slot changes hands, labelled with the eviction reason the save/restore
+# path already uses. Together with the reuse counter this separates "more
+# re-prefill because of thrash" from "more re-prefill because prompts grew".
+llama_slot_steal_total = None
 # Remote-stream watchdog terminations (LP-0MSVP7ZML003XZTJ): a remote
 # stream terminated by the max-duration or activity-timeout watchdog (a
 # "connected but idle" upstream that never goes silent). Counts by reason
@@ -164,6 +201,27 @@ llama_host_memory_sample_timestamp_seconds = None
 #: so the protection is verifiable from a scrape instead of from ps.
 llama_oom_score_adj = None
 
+# Contention-queue observability (LP-0MVWPJW2700966ZU, uncovered gap E6 of
+# LP-0MVTV6GA8002P7QU). ``docs/dev/single-slot-impact.md`` §6 recorded that the
+# bounded local contention queue was only visible after the fact, from the
+# nightly usage-analysis report (``queue_wait_ms`` / ``fallback_after_queue``),
+# so a queue filling up at one slot could not alert. These three series make
+# depth, wait and loss live:
+#
+# - ``proxy_contention_queue_depth`` (gauge) — waiters currently queued
+# - ``proxy_contention_queue_wait_seconds`` (histogram) — elapsed wait per
+#   completed wait, including timed-out waits (so the loss latency is in the
+#   distribution, not only the wins)
+# - ``proxy_contention_queue_loss_total{reason}`` (counter) — requests the
+#   queue dropped (depth cap or wait-budget expiry), labelled with the
+#   canonical fall-through reason token (``fallback_after_queue`` /
+#   ``local_lease_active``)
+#
+# Observability only: no queue behaviour, cap or config value changes.
+proxy_contention_queue_depth = None
+proxy_contention_queue_wait_seconds = None
+proxy_contention_queue_loss_total = None
+
 # Post-acceptance local evictions (LP-0MVN4LCED00661MX, parent AC7): an accepted
 # local dispatch released before producing a first byte is a defect signal, so
 # it is counted by reason and alertable (>0 for a within-budget prompt). The
@@ -196,6 +254,36 @@ if _enabled:
         llama_local_evictions_after_acceptance_total = Counter(
             'llama_local_evictions_after_acceptance_total',
             'Accepted local dispatches evicted before their first byte, by reason',
+            ['reason'],
+        )
+        # Contention-queue observability (LP-0MVWPJW2700966ZU). One unlabelled
+        # depth gauge and one unlabelled wait histogram keep cardinality flat;
+        # the loss counter is the only labelled series and its ``reason``
+        # values come from the canonical fall-through vocabulary. The histogram
+        # buckets span a sub-100 ms win through the shipped 30 s wait budget
+        # (and the clamped ceiling), so a queue whose waits creep past the
+        # budget is visible before it starts dropping requests.
+        proxy_contention_queue_depth = Gauge(
+            'proxy_contention_queue_depth',
+            'Requests currently waiting in the bounded local contention queue',
+        )
+        if Histogram is not None:
+            try:
+                proxy_contention_queue_wait_seconds = Histogram(
+                    'proxy_contention_queue_wait_seconds',
+                    'Elapsed wait of a request in the bounded local contention '
+                    'queue (observed for admitted and timed-out waits alike)',
+                    buckets=(
+                        0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                        10.0, 20.0, 30.0, 60.0, 120.0,
+                    ),
+                )
+            except Exception:
+                proxy_contention_queue_wait_seconds = None
+        proxy_contention_queue_loss_total = Counter(
+            'proxy_contention_queue_loss_total',
+            'Requests dropped by the local contention queue (depth cap or wait '
+            'budget expiry) by canonical fall-through reason',
             ['reason'],
         )
         # Token-rate metrics: gauge for current tokens/sec, histogram for distribution
@@ -260,6 +348,24 @@ if _enabled:
             'Unix timestamp of the last *successful* /slots occupancy sample '
             '(its age makes a stalled sampler visible; a failed query does not '
             'advance it)',
+        )
+        # Prefix-cache reuse and slot steals (LP-0MVWPK2VH008YWBD). Defined next
+        # to the slot gauges on purpose: the same lifecycle owns them, and both
+        # carry only a closed-vocabulary label so a restarted backend cannot
+        # leave a ghost series.
+        llama_prefix_cache_reuse_total = Counter(
+            'llama_prefix_cache_reuse_total',
+            'Served local streams by measured prefix-cache reuse outcome '
+            '(reused = at least one prompt token served from the prefix cache, '
+            'cold = none)',
+            ['outcome'],
+        )
+        llama_slot_steal_total = Counter(
+            'llama_slot_steal_total',
+            'Slot steals/evictions: a resident KV prefix discarded when the '
+            'slot changes hands, by the eviction reason the save/restore path '
+            'uses',
+            ['reason'],
         )
         llama_remote_stream_terminated_total = Counter(
             'llama_remote_stream_terminated_total',
@@ -453,6 +559,60 @@ def record_local_eviction_after_acceptance(reason: str):
         pass
 
 
+def record_contention_queue_depth(depth: int):
+    """Set ``proxy_contention_queue_depth`` to the current waiter count.
+
+    Called on every mutation of the contention queue's waiter set (enqueue and
+    dequeue), so a scrape never reads a value stale by more than one admission
+    decision (LP-0MVWPJW2700966ZU AC2). Best-effort no-op when
+    prometheus_client is unavailable.
+    """
+    if not _enabled or proxy_contention_queue_depth is None:
+        return
+    try:
+        proxy_contention_queue_depth.set(max(0, int(depth)))
+    except Exception:
+        pass
+
+
+def observe_contention_queue_wait(seconds: float):
+    """Observe one completed contention-queue wait on the histogram.
+
+    Observed for admitted **and** timed-out waits, so the loss latency (the
+    budget that was spent before the fall-through) is part of the distribution
+    rather than only the successful wins. Best-effort no-op when
+    prometheus_client is unavailable.
+    """
+    if not _enabled or proxy_contention_queue_wait_seconds is None:
+        return
+    try:
+        proxy_contention_queue_wait_seconds.observe(max(0.0, float(seconds)))
+    except Exception:
+        pass
+
+
+def record_contention_queue_loss(reason: str):
+    """Increment ``proxy_contention_queue_loss_total{reason}``.
+
+    Args:
+        reason: The canonical fall-through reason token recorded by the
+            router/provider for this loss — ``fallback_after_queue`` (the wait
+            budget expired or the depth cap refused to enqueue) or
+            ``local_lease_active`` (a lease-protected slot did not free within
+            the budget). Never a free-form cause string: the label values are
+            the vocabulary the usage-analysis report already uses, so a live
+            alert and the nightly report speak the same language.
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or proxy_contention_queue_loss_total is None:
+        return
+    try:
+        proxy_contention_queue_loss_total.labels(reason=reason).inc()
+    except Exception:
+        pass
+
+
 def record_slots_query_failure(reason: str):
     """Increment llama_slots_query_failures_total with the given reason.
 
@@ -534,6 +694,113 @@ def record_slots_child_port_skipped(reason: str):
 #: ghost ``slot="3"`` reporting its final value forever. Tracking the published
 #: values lets :func:`record_slot_occupancy` remove the ones that disappeared.
 _slot_busy_labelvalues: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# Prefix-cache reuse outcomes and slot steals (LP-0MVWPK2VH008YWBD)
+# ---------------------------------------------------------------------------
+#
+# E7 of ``docs/dev/single-slot-impact.md``: at one slot every session maps to
+# slot 0, so each session switch evicts the previous prefix (the 95 % steal rate
+# the report demands be re-measured). Before these counters the *cause* of a
+# rising ``prefill_slot_seconds`` per served turn was invisible — a decode-side
+# or prompt-size change could mimic it. The counters carry only a closed
+# vocabulary so a restarted backend cannot leave a ghost series.
+
+PREFIX_CACHE_REUSE_REUSED = "reused"
+"""A served local stream used at least one prompt token from the prefix cache."""
+
+PREFIX_CACHE_REUSE_COLD = "cold"
+"""A served local stream reused no prompt tokens (a full re-prefill)."""
+
+PREFIX_CACHE_REUSE_OUTCOMES: tuple[str, ...] = (
+    PREFIX_CACHE_REUSE_REUSED,
+    PREFIX_CACHE_REUSE_COLD,
+)
+"""The closed ``outcome`` label vocabulary of ``llama_prefix_cache_reuse_total``."""
+
+#: ``outcome`` values already published on the reuse counter, so a restart/test
+#: lifecycle reset can retire them and the counter's label set is provably
+#: cleaned up (AC3).
+_prefix_reuse_labelvalues: set[str] = set()
+
+#: ``reason`` values already published on the steal counter, for the same
+#: restart-lifecycle cleanup.
+_slot_steal_labelvalues: set[str] = set()
+
+
+def classify_prefix_cache_reuse(
+    cached_tokens: int | float | None, prompt_tokens: int | float | None
+) -> str | None:
+    """Return the reuse outcome for a measured local stream, or ``None``.
+
+    ``outcome`` is ``"reused"`` when the served stream reported at least one
+    ``prompt_tokens_details.cached_tokens``, else ``"cold"``. ``None`` means the
+    stream carried no usable prompt measurement (missing/zero prompt tokens), so
+    the caller must not count it — an unmeasured stream is not evidence of a
+    cold prefix (that would bias the reuse ratio toward thrash).
+    """
+    try:
+        prompt = int(prompt_tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    if prompt <= 0:
+        return None
+    try:
+        cached = int(cached_tokens or 0)
+    except (TypeError, ValueError):
+        cached = 0
+    return PREFIX_CACHE_REUSE_REUSED if cached > 0 else PREFIX_CACHE_REUSE_COLD
+
+
+def record_prefix_cache_reuse(
+    cached_tokens: int | float | None, prompt_tokens: int | float | None
+) -> str | None:
+    """Count one served local stream's prefix-cache reuse outcome.
+
+    Args:
+        cached_tokens: ``prompt_tokens_details.cached_tokens`` from the local
+            response's measured ``usage`` block.
+        prompt_tokens: The response's ``prompt_tokens``.
+
+    Returns:
+        The recorded outcome (``"reused"``/``"cold"``), or ``None`` when the
+        stream was unmeasured (nothing counted). Best-effort no-op when
+        prometheus_client is unavailable, matching the other recorders here.
+    """
+    outcome = classify_prefix_cache_reuse(cached_tokens, prompt_tokens)
+    if outcome is None:
+        return None
+    _prefix_reuse_labelvalues.add(outcome)
+    if not _enabled or llama_prefix_cache_reuse_total is None:
+        return outcome
+    try:
+        llama_prefix_cache_reuse_total.labels(outcome=outcome).inc()
+    except Exception:
+        pass
+    return outcome
+
+
+def record_slot_steal(reason: str) -> None:
+    """Count one slot steal/eviction under its eviction ``reason``.
+
+    A steal is a resident KV prefix discarded when a slot changes hands. Every
+    tenancy/lease reclaim funnels through ``router_helpers._record_local_eviction``
+    (the same chokepoint that plans the KV snapshot save), and its ``reason`` is
+    already the vocabulary the save/restore path receives, so the live counter
+    and the ``local_eviction`` log records speak the same language.
+
+    Best-effort no-op when prometheus_client is unavailable. An empty reason is
+    recorded as ``"unknown"`` so a caller bug is visible rather than dropped.
+    """
+    label = str(reason or "unknown")
+    _slot_steal_labelvalues.add(label)
+    if not _enabled or llama_slot_steal_total is None:
+        return
+    try:
+        llama_slot_steal_total.labels(reason=label).inc()
+    except Exception:
+        pass
+
 
 
 def summarise_slot_occupancy(payload: list, *, sampled_at: float) -> dict:
@@ -677,16 +944,37 @@ def reset_slot_occupancy_gauges() -> None:
     0..3 would otherwise look like a slot disappearance to the next case.
     Mirrors ``observability.reset_slots_poll_cache()``; nothing in production
     calls it — the proxy only ever publishes forward for its lifetime.
+
+    LP-0MVWPK2VH008YWBD AC2/AC3: the prefix-reuse and slot-steal counters share
+    the slot-metrics lifecycle, so their tracked label sets are cleared here too
+    and every published series is removed. That makes "the label set is cleaned
+    up on restart" directly assertable instead of an unverified claim.
     """
-    global _slot_busy_labelvalues
+    global _slot_busy_labelvalues, _prefix_reuse_labelvalues, _slot_steal_labelvalues
     tracked = _slot_busy_labelvalues
+    tracked_reuse = _prefix_reuse_labelvalues
+    tracked_steal = _slot_steal_labelvalues
     _slot_busy_labelvalues = set()
+    _prefix_reuse_labelvalues = set()
+    _slot_steal_labelvalues = set()
     if not _enabled:
         return
     if llama_slot_busy is not None:
         for label in tracked:
             try:
                 llama_slot_busy.remove(label)
+            except Exception:
+                pass
+    if llama_prefix_cache_reuse_total is not None:
+        for label in tracked_reuse:
+            try:
+                llama_prefix_cache_reuse_total.remove(label)
+            except Exception:
+                pass
+    if llama_slot_steal_total is not None:
+        for label in tracked_steal:
+            try:
+                llama_slot_steal_total.remove(label)
             except Exception:
                 pass
     for gauge in (

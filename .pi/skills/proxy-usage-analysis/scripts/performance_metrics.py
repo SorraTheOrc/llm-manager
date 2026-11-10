@@ -138,10 +138,10 @@ class Metric:
 METRIC_REGISTRY: tuple[Metric, ...] = (
     Metric(
         id="gpu_busy",
-        label="GPU busy / local utilisation",
+        label="GPU activity — power-based, any consumer",
         unit="%",
         direction=HIGHER,
-        source="GPU telemetry sampler power samples",
+        source="GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer)",
     ),
     Metric(
         id="fallback_rate",

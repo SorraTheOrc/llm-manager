@@ -213,6 +213,12 @@ RE_GUARD_FREE_SLOT = re.compile(r"\bfree_slot=(true|false)")
 RE_GUARD_RATE_BUCKET = re.compile(r"\brate_bucket=([A-Za-z_]+)")
 RE_GUARD_CONTENDED_SAMPLES = re.compile(r"\bcontended_samples=(\d+)")
 RE_GUARD_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
+#: The measured occupant hold priced into that occupancy term
+#: (LP-0MVV29YDQ00437N6): the live prefilling occupants' remaining prefill
+#: service or dispatch-lease hold, whichever is larger. ``0.0`` means the guard
+#: had no usable occupant evidence (the fail-open path); ``None`` on lines that
+#: predate the field, never a fabricated value.
+RE_GUARD_OCCUPANT_HOLD = re.compile(r"\boccupant_hold_s=([\d.]+)")
 RE_GUARD_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
 
 # Status-poll payload (LP-0MVGR2OXT0096OGK M3): ``status_request`` lines carry
@@ -355,15 +361,20 @@ ROUTING_IDLE_ADMIT = "routing_idle_admit"
 # Residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5): the proxy emits
 # ``routing_resident_prefix provider=local model=... decision=<verdict>
 # n_past_actual=<n|none> estimated_tokens=<n> reuse_ratio=<f|none>
-# slot_owner_session=<id|none> residency_source=<measured|session_slot|
-# non_resident|unknown> measurement=<measured|unavailable:<reason>>
-# min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
+# slot_owner_session=<id|none> residency_source=<measured|measured_last_dispatch|
+# session_slot|non_resident|unknown> measurement=<measured|unavailable:<reason>>
+# min_ratio=<f> tenants=<n> occupants=<n> session=<id>
+# threshold_applied=<cold|warm|none> threshold_value=<n|none>``
 # once per admission decision. ``decision`` is one of ``admit``,
-# ``resident_prefix_insufficient``, ``tenant_limit`` (plus
-# ``large_context_bypass`` for a live-priced cold miss). The fail-open path
-# (unmeasured view — no fresh snapshot, no ownership) logs
-# ``admit_predicted`` / ``skip_predicted`` with ``n_past_actual=none`` so
-# residency-blind decisions stay observable (LP-0MVN4LANP0069QQM AC5).
+# ``resident_prefix_insufficient``, ``tenant_limit``, ``large_context_bypass``
+# (a live-priced cold miss) or ``unmeasured_residency_cold`` (an unmeasured
+# basis held to the cold threshold). Since LP-0MW81DFML006O5KL an unmeasured
+# basis above the cold threshold is DENIED as ``unmeasured_residency_cold``;
+# the retired fail-open path logged ``admit_predicted`` / ``skip_predicted``
+# with ``n_past_actual=none`` (LP-0MVN4LANP0069QQM AC5). Those two values are
+# kept in the vocabulary so historical lines and their parses keep their
+# meaning, and they reappear verbatim when the documented rollback
+# (``local_unmeasured_residency_cold_enabled: false``) is in force.
 ROUTING_RESIDENT_PREFIX = "routing_resident_prefix"
 # Shared post-acceptance eviction event (LP-0MVN1IQTF0037WTG AC6,
 # LP-0MVN3KMGI009BZ0D AC7): ``local_eviction session=... reason=<vocab>
@@ -745,6 +756,9 @@ class LogEvent:
     rate_bucket: str | None = None
     contended_samples: int | None = None
     eta_occupancy_s: str | None = None
+    #: The measured occupant hold taken into the occupancy term
+    #: (LP-0MVV29YDQ00437N6). ``None`` on lines that predate the field.
+    occupant_hold_s: str | None = None
     # Measured pool state on the ``local_admission_guard`` record
     # (LP-0MVGR2OXT0096OGK M1, ``local_admission_guard`` kind): the number of
     # slots decoding, the number of prefills in flight, and whether a slot was
@@ -1306,6 +1320,11 @@ def parse_log_line(line: str) -> LogEvent | None:
             rate_bucket=_first(RE_GUARD_RATE_BUCKET, msg),
             contended_samples=_int(RE_GUARD_CONTENDED_SAMPLES, msg),
             eta_occupancy_s=_first(RE_GUARD_ETA_OCCUPANCY, msg),
+            # Measured blocker evidence (LP-0MVV29YDQ00437N6 AC5): additive and
+            # absent on earlier lines, so a refusal can be attributed to the
+            # measured occupant hold instead of inferred from the aggregate
+            # ``eta_occupancy_s``.
+            occupant_hold_s=_first(RE_GUARD_OCCUPANT_HOLD, msg),
             new_tokens=_int(RE_GUARD_NEW_TOKENS, msg),
             # The pricing policy on the decision line (``reject`` / ``observe``
             # / ``off``): the matched prefill-ETA accuracy splits a rollout

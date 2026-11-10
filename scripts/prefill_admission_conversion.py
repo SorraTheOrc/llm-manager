@@ -20,7 +20,10 @@ Per band the report carries:
   that later emit ``dispatch_first_byte_ms`` (a first byte *without* an admit
   is reported separately, never silently joined),
 - **abandoned queue waits**: ``contention_queue_fallback_after_queue`` count
-  and its share of the band's queued waits,
+  and its share of the band's queued waits, split by **entry path**
+  (``trigger=concurrency_limit|local_lease_active``) and by **explicit abandon
+  cause** (``cause=queue_wait_expired|queue_depth_exceeded``)
+  (LP-0MVV29X2E004INFL: logged, never inferred from the wait duration),
 - queue-wait seconds.
 
 Queue waits are banded **only from evidence belonging to that wait's own
@@ -36,8 +39,9 @@ abandoned-share denominator is auditable, and ``queue_banding`` records how
 many waits were banded from each evidence class.
 
 The parser tolerates pre-change log shapes (no ``rate_bucket`` /
-``contended_samples``) and degrades a missing field to ``unknown`` rather than
-dropping the event, so the tool runs unchanged against today's log format and
+``contended_samples`` / ``trigger=`` / ``cause=``) and degrades a missing field
+to ``unknown`` rather than dropping the event, so the tool runs unchanged
+against today's log format and
 the post-change format.
 
 ``local_eviction_after_acceptance`` events are counted too (AC4's second
@@ -112,6 +116,22 @@ _KV_RATE_BUCKET = re.compile(r"\brate_bucket=([A-Za-z_]+)")
 _KV_CONTENDED_SAMPLES = re.compile(r"\bcontended_samples=(\d+)")
 _KV_QUEUED = re.compile(r"\bqueued_duration=([\d.]+)s")
 _KV_TRIGGER = re.compile(r"\btrigger=([A-Za-z_]+)")
+_KV_CAUSE = re.compile(r"\bcause=([A-Za-z_]+)")
+#: Guard-projection vocabulary (LP-0MVV29XPT003OXI5). Read here so the per-wait
+#: diagnosis reuses one parser instead of growing a second one. ``\bbudget_s=``
+#: never matches ``deadline_budget_s=`` (no word boundary inside
+#: ``deadline_budget_s``) nor ``budget_tokens=``.
+_KV_PROJECTED_WAIT = re.compile(r"\bprojected_wait_s=([\d.]+)")
+_KV_ETA_PREFILL = re.compile(r"\beta_prefill_s=([\d.]+)")
+_KV_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
+#: The measured occupant hold priced into the occupancy term
+#: (LP-0MVV29YDQ00437N6): the live prefilling occupants' remaining prefill
+#: service or dispatch-lease hold, whichever is larger. ``0.0`` means no usable
+#: occupant evidence (the fail-open path), never "the occupant owed nothing".
+_KV_OCCUPANT_HOLD = re.compile(r"\boccupant_hold_s=([\d.]+)")
+_KV_BUSY_SLOTS = re.compile(r"\bbusy_slots=(\d+)")
+_KV_IN_FLIGHT_PREFILLS = re.compile(r"\bin_flight_prefills=(\d+)")
+_KV_BUDGET_S = re.compile(r"\bbudget_s=([\d.]+)")
 
 _TS_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
@@ -152,6 +172,26 @@ def _message_starts_with(line: str, marker: str) -> bool:
 def _first(pattern: re.Pattern[str], line: str) -> str | None:
     match = pattern.search(line)
     return match.group(1) if match else None
+
+
+def _queue_outcome_trigger(
+    explicit: str | None, reason: str | None
+) -> str | None:
+    """Resolve the entry path of a queue *outcome* line, or ``None``.
+
+    Post-fix lines carry an explicit ``trigger=`` (LP-0MVV29X2E004INFL AC1).
+    Pre-change lines carry none, but the lease-active path is the only entry
+    that stamps ``reason=local_lease_active`` on its outcome line, so that
+    reason is unambiguous legacy evidence. Every other pre-change outcome is
+    ``unknown``: the harness never guesses the concurrency-limit path from the
+    *absence* of the lease reason (AC4), and it never infers a cause from the
+    wait duration (AC3).
+    """
+    if explicit:
+        return explicit
+    if reason == "local_lease_active":
+        return "local_lease_active"
+    return None
 
 
 def _int(pattern: re.Pattern[str], line: str) -> int | None:
@@ -206,9 +246,28 @@ class Event:
     rate_bucket: str | None = None
     contended_samples: int | None = None
     queued_seconds: float | None = None
-    #: Which local gate the request waited on (``generating`` | ``prefill`` |
-    #: ``concurrency_limit``), as logged by the enqueue line.
+    #: Entry path of a queue wait (``concurrency_limit`` |
+    #: ``local_lease_active``), logged on the enqueue line and on both outcome
+    #: lines. Pre-change lines carry none and degrade to ``unknown``; a legacy
+    #: ``reason=local_lease_active`` is treated as unambiguous trigger evidence.
     trigger: str | None = None
+    #: Explicit abandon cause of a queue outcome (``queue_wait_expired`` |
+    #: ``queue_depth_exceeded``), logged by the fallback line. Never inferred
+    #: from the duration (LP-0MVV29X2E004INFL AC1/AC3).
+    cause: str | None = None
+    #: The occupancy terms the admission guard priced the request with
+    #: (LP-0MVV29XPT003OXI5). Parsed here, consumed by
+    #: ``scripts/queue_wait_diagnosis.py``; every other consumer ignores them.
+    projected_wait_s: float | None = None
+    eta_prefill_s: float | None = None
+    eta_occupancy_s: float | None = None
+    #: Measured occupant hold taken into the occupancy term
+    #: (LP-0MVV29YDQ00437N6); ``None`` on lines emitted before the field
+    #: existed, ``0.0`` when the guard had no usable occupant evidence.
+    occupant_hold_s: float | None = None
+    busy_slots: int | None = None
+    in_flight_prefills: int | None = None
+    budget_s: float | None = None
 
 
 def parse_event(line: str, ts: datetime) -> Event | None:
@@ -238,6 +297,13 @@ def parse_event(line: str, ts: datetime) -> Event | None:
             reason=_first(_KV_REASON, line),
             rate_bucket=_first(_KV_RATE_BUCKET, line),
             contended_samples=_int(_KV_CONTENDED_SAMPLES, line),
+            projected_wait_s=_float(_KV_PROJECTED_WAIT, line),
+            eta_prefill_s=_float(_KV_ETA_PREFILL, line),
+            eta_occupancy_s=_float(_KV_ETA_OCCUPANCY, line),
+            occupant_hold_s=_float(_KV_OCCUPANT_HOLD, line),
+            busy_slots=_int(_KV_BUSY_SLOTS, line),
+            in_flight_prefills=_int(_KV_IN_FLIGHT_PREFILLS, line),
+            budget_s=_float(_KV_BUDGET_S, line),
         )
     if "dispatch_first_byte_ms=" in line:
         return Event(
@@ -260,21 +326,26 @@ def parse_event(line: str, ts: datetime) -> Event | None:
             trigger=_first(_KV_TRIGGER, line),
         )
     if _message_starts_with(line, "contention_queue_fallback_after_queue"):
+        reason = _first(_KV_REASON, line)
         return Event(
             kind="queue_fallback",
             ts=ts,
             session=_first(_KV_SESSION, line),
             new_tokens=_int(_KV_NEW_TOKENS, line),
-            reason=_first(_KV_REASON, line),
+            reason=reason,
             queued_seconds=_float(_KV_QUEUED, line),
+            trigger=_queue_outcome_trigger(_first(_KV_TRIGGER, line), reason),
+            cause=_first(_KV_CAUSE, line),
         )
     if _message_starts_with(line, "contention_queue_dispatch"):
+        reason = _first(_KV_REASON, line)
         return Event(
             kind="queue_dispatch",
             ts=ts,
             session=_first(_KV_SESSION, line),
             new_tokens=_int(_KV_NEW_TOKENS, line),
             queued_seconds=_float(_KV_QUEUED, line),
+            trigger=_queue_outcome_trigger(_first(_KV_TRIGGER, line), reason),
         )
     return None
 
@@ -295,6 +366,13 @@ class BandStats:
     queue_wait_seconds: float = 0.0
     rate_buckets: dict[str, int] = field(default_factory=dict)
     evictions: int = 0
+    #: Queue waits split by entry path and by abandon cause
+    #: (LP-0MVV29X2E004INFL AC3). ``unknown`` collects pre-change line shapes
+    #: that carry no positive evidence; they are counted, never dropped.
+    queue_enqueued_by_trigger: dict[str, int] = field(default_factory=dict)
+    queue_dispatched_by_trigger: dict[str, int] = field(default_factory=dict)
+    queue_abandoned_by_trigger: dict[str, int] = field(default_factory=dict)
+    queue_abandoned_by_cause: dict[str, int] = field(default_factory=dict)
 
     @property
     def queued_waits(self) -> int:
@@ -308,6 +386,25 @@ class BandStats:
     @property
     def abandoned_share(self) -> float:
         return (self.queue_abandoned / self.queued_waits) if self.queued_waits else 0.0
+
+    def abandoned_share_by_trigger(self) -> dict[str, float]:
+        """Abandoned share per entry path, from outcome-line evidence only.
+
+        The denominator is the per-trigger outcome count (dispatched +
+        abandoned) so a pre-change window, whose enqueue lines predate the
+        ``trigger=`` field, still reports a self-consistent share for the
+        triggers that carry evidence (``local_lease_active``).
+        """
+        result: dict[str, float] = {}
+        triggers = set(self.queue_dispatched_by_trigger) | set(
+            self.queue_abandoned_by_trigger
+        )
+        for trigger in sorted(triggers):
+            dispatched = self.queue_dispatched_by_trigger.get(trigger, 0)
+            abandoned = self.queue_abandoned_by_trigger.get(trigger, 0)
+            total = dispatched + abandoned
+            result[trigger] = round(abandoned / total, 4) if total else 0.0
+        return result
 
     def to_dict(self) -> dict:
         return {
@@ -323,6 +420,19 @@ class BandStats:
             "queue_abandoned": self.queue_abandoned,
             "queue_enqueued": self.queue_enqueued,
             "abandoned_share": round(self.abandoned_share, 4),
+            "queue_enqueued_by_trigger": dict(
+                sorted(self.queue_enqueued_by_trigger.items())
+            ),
+            "queue_dispatched_by_trigger": dict(
+                sorted(self.queue_dispatched_by_trigger.items())
+            ),
+            "queue_abandoned_by_trigger": dict(
+                sorted(self.queue_abandoned_by_trigger.items())
+            ),
+            "queue_abandoned_by_cause": dict(
+                sorted(self.queue_abandoned_by_cause.items())
+            ),
+            "abandoned_share_by_trigger": self.abandoned_share_by_trigger(),
             "queue_wait_seconds": round(self.queue_wait_seconds, 2),
             "evictions": self.evictions,
         }
@@ -455,10 +565,19 @@ def build_report(events: list[Event], *, files: list[str]) -> dict:
         if event.kind != "queue_wait":
             continue
         enqueued += 1
+        trigger = event.trigger or "unknown"
         if event.new_tokens is None:
             enqueued_unbanded += 1
+            entry = stats[UNKNOWN_BAND]
+            entry.queue_enqueued_by_trigger[trigger] = (
+                entry.queue_enqueued_by_trigger.get(trigger, 0) + 1
+            )
             continue
-        band_stats(event.new_tokens).queue_enqueued += 1
+        entry = band_stats(event.new_tokens)
+        entry.queue_enqueued += 1
+        entry.queue_enqueued_by_trigger[trigger] = (
+            entry.queue_enqueued_by_trigger.get(trigger, 0) + 1
+        )
 
     evictions_by_reason: dict[str, int] = {}
     for event in events:
@@ -472,10 +591,21 @@ def build_report(events: list[Event], *, files: list[str]) -> dict:
         if event.kind not in ("queue_dispatch", "queue_fallback"):
             continue
         entry = stats[queue_band.get(id(event), UNKNOWN_BAND)]
+        trigger = event.trigger or "unknown"
         if event.kind == "queue_dispatch":
             entry.queue_dispatched += 1
+            entry.queue_dispatched_by_trigger[trigger] = (
+                entry.queue_dispatched_by_trigger.get(trigger, 0) + 1
+            )
         else:
             entry.queue_abandoned += 1
+            entry.queue_abandoned_by_trigger[trigger] = (
+                entry.queue_abandoned_by_trigger.get(trigger, 0) + 1
+            )
+            cause = event.cause or "unknown"
+            entry.queue_abandoned_by_cause[cause] = (
+                entry.queue_abandoned_by_cause.get(cause, 0) + 1
+            )
         entry.queue_wait_seconds += event.queued_seconds or 0.0
 
     return {
@@ -523,6 +653,11 @@ def _band_has_data(entry: BandStats) -> bool:
 
 def _totals(stats: dict[str, BandStats]) -> dict:
     total = BandStats()
+
+    def _merge(target: dict[str, int], source: dict[str, int]) -> None:
+        for key, value in source.items():
+            target[key] = target.get(key, 0) + value
+
     for entry in stats.values():
         total.admits += entry.admits
         total.rejects += entry.rejects
@@ -534,6 +669,14 @@ def _totals(stats: dict[str, BandStats]) -> dict:
         total.queue_enqueued += entry.queue_enqueued
         total.queue_wait_seconds += entry.queue_wait_seconds
         total.evictions += entry.evictions
+        _merge(total.queue_enqueued_by_trigger, entry.queue_enqueued_by_trigger)
+        _merge(
+            total.queue_dispatched_by_trigger, entry.queue_dispatched_by_trigger
+        )
+        _merge(
+            total.queue_abandoned_by_trigger, entry.queue_abandoned_by_trigger
+        )
+        _merge(total.queue_abandoned_by_cause, entry.queue_abandoned_by_cause)
     return total.to_dict()
 
 
@@ -602,6 +745,18 @@ def render_text(report: dict) -> str:
         f"Queued waits enqueued: {report.get('queued_waits_enqueued', 0)} "
         f"(enqueue line carried no pricing: "
         f"{report.get('queued_waits_enqueued_unbanded', 0)})"
+    )
+    totals = report.get("totals") or {}
+    lines.append(
+        "Abandoned waits by trigger: "
+        f"enqueued={totals.get('queue_enqueued_by_trigger') or {}} "
+        f"dispatched={totals.get('queue_dispatched_by_trigger') or {}} "
+        f"abandoned={totals.get('queue_abandoned_by_trigger') or {}} "
+        f"share={totals.get('abandoned_share_by_trigger') or {}}"
+    )
+    lines.append(
+        "Abandoned waits by cause: "
+        f"{totals.get('queue_abandoned_by_cause') or {}}"
     )
     banding = {
         "own_outcome": 0,

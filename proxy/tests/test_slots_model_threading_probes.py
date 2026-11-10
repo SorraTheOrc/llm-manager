@@ -241,7 +241,8 @@ class TestProbeLocalSlotCapacity:
 class TestProbeGpuWedge:
     @pytest.fixture(autouse=True)
     def _gpu_sensors(self, monkeypatch):
-        monkeypatch.setattr(llama_backend, "_read_gpu_busy_percent", lambda: 100.0)
+        # LP-0MW5K8ZW3005SEA8: the probe reads power only; the busy counter
+        # is gone from the module.
         monkeypatch.setattr(llama_backend, "_read_gpu_power_draw", lambda: 54.0)
 
     @pytest.mark.asyncio
@@ -249,11 +250,11 @@ class TestProbeGpuWedge:
         responder = RouterResponder(slots=[{"id": 0, "is_processing": False}])
         _install_async_transport(monkeypatch, responder, llama_backend)
 
-        busy, slots_idle, power = await llama_backend._probe_gpu_wedge(
+        power, slots_idle = await llama_backend._probe_gpu_wedge(
             "127.0.0.1", CHILD_PORT, model=KNOWN_MODEL
         )
 
-        assert (busy, slots_idle, power) == (100.0, True, 54.0)
+        assert (power, slots_idle) == (54.0, True)
         assert responder.models_sent == [KNOWN_MODEL]
 
     @pytest.mark.asyncio
@@ -261,11 +262,11 @@ class TestProbeGpuWedge:
         responder = RouterResponder()
         _install_async_transport(monkeypatch, responder, llama_backend)
 
-        busy, slots_idle, power = await llama_backend._probe_gpu_wedge(
+        power, slots_idle = await llama_backend._probe_gpu_wedge(
             "127.0.0.1", CHILD_PORT
         )
 
-        assert (busy, slots_idle, power) == (100.0, False, 54.0)
+        assert (power, slots_idle) == (54.0, False)
         assert responder.requests == []
 
     @pytest.mark.asyncio
@@ -273,11 +274,11 @@ class TestProbeGpuWedge:
         responder = RouterResponder()
         _install_async_transport(monkeypatch, responder, llama_backend)
 
-        busy, slots_idle, power = await llama_backend._probe_gpu_wedge(
+        power, slots_idle = await llama_backend._probe_gpu_wedge(
             "127.0.0.1", CHILD_PORT, model=UNKNOWN_MODEL
         )
 
-        assert (busy, slots_idle, power) == (100.0, False, 54.0)
+        assert (power, slots_idle) == (54.0, False)
         assert responder.models_sent == [UNKNOWN_MODEL]
         assert len(responder.slots_requests) == 1
 
