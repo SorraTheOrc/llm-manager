@@ -600,3 +600,29 @@ def test_no_doc_reintroduces_a_retired_fail_open_claim():
         "these passages still describe the retired fail-open path "
         f"(LP-0MW81DFML006O5KL): {stale}"
     )
+
+
+def test_admission_overhead_is_documented_as_the_last_additive_field():
+    """``admission_overhead_ms`` (LP-0MW959R5S009WDM8, parent AC4).
+
+    The figure is the operator's only view of the latency candidate-first
+    admission added, so the grammar must show it — and must show it **last**,
+    after the threshold pair, because appending is what keeps every existing
+    positional consumer of the line working. The budget the figure is held to
+    (p95 ≤ 50 ms) is stated where an operator looks for it, not only in code.
+    """
+    from proxy import provider
+
+    line = _observability_grammar_line()
+
+    assert f" {provider.ADMISSION_OVERHEAD_FIELD}=" in line
+    assert line.index("threshold_value=") < line.index("admission_overhead_ms=")
+    assert "none" in line.split("admission_overhead_ms=")[1]
+
+    text = ROUTING_DOC.read_text(encoding="utf-8")
+    assert "p95" in text and "50 ms" in text, (
+        "routing.md must state the admission-overhead budget next to the field"
+    )
+    assert "prefill_thrash_replay_harness" in text, (
+        "routing.md must name the replay that aggregates the figure"
+    )

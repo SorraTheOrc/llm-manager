@@ -1345,7 +1345,7 @@ client restores warm instead of prefilling cold, and the shared
 ### Observability
 
 Every decision logs
-`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass|unmeasured_residency_cold> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=… threshold_applied=<cold|warm|none> threshold_value=<n|none>`.
+`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass|unmeasured_residency_cold> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=… threshold_applied=<cold|warm|none> threshold_value=<n|none> admission_overhead_ms=<ms|none>`.
 
 `measurement=` is the additive provenance field (immediately after
 `residency_source=`, before `min_ratio=`) that distinguishes a real measurement
@@ -1393,6 +1393,21 @@ So a local admission of a >38 000-token prompt is attributable from the line
 alone: `threshold_applied=cold` with a small `n_past_actual` is a cold-priced
 admission, while `threshold_applied=warm` is a measured-resident prompt that
 would otherwise have been refused by the cold cap.
+
+**How much latency the admission added (`LP-0MW959R5S009WDM8`).**
+Candidate-first admission put two steps on the request hot path — the slot
+candidate acquisition and the residency resolution priced against it — so the
+line carries their measured cost as `admission_overhead_ms=`, **appended last**
+(after `threshold_value=`), in milliseconds with three decimals. It covers only
+the added work: the clock starts at the candidate acquisition (in the router's
+scope) and stops the moment the residency resolution returns, so it never
+includes the rest of the ladder or the upstream request. `none` means *not
+measured* (the ladder is disabled: `local_resident_prefix_min_ratio: 0`) and is
+never reported as `0.000`. The budget is **p95 ≤ 50 ms**, enforced by replaying
+the checked-in 2026-10-24 thrash fixture through the real admission path
+(`proxy/tests/prefill_thrash_replay_harness.py`,
+`measure_admission_overhead`), which aggregates this same field — the replay
+and the operator therefore read one measurement, not two implementations.
 
 **Measurement sources** (rung order): `measured` is the live `/slots`
 `context_tokens`; when the deployed build does not report it (llama.cpp b8782

@@ -1046,3 +1046,54 @@ registry pop for the same reason; the churn and pool-exhaustion pins assert the
 aggregate invariants (one owner per slot, one slot per session, no leaked
 occupancy) under a hard join timeout, and `test_scenario2_*` pins the
 deterministic busy-pool reason.
+
+## 10. The added admission latency is measured and bounded (LP-0MW959R5S009WDM8)
+
+Sections 7–9 put two steps on the request hot path: the slot candidate
+acquisition and the residency resolution priced against that candidate. Admission
+runs for *every* local request, so an unmeasured addition is a regression risk
+the whole chain pays for. This section makes the added cost measurable per
+admission and bounds it.
+
+1. **Measured per admission, on the line the operator already reads.** The
+   ``routing_resident_prefix`` decision line gains one additive suffix,
+   ``admission_overhead_ms=<ms|none>``, appended **last** (after
+   ``threshold_value=``) so every pre-existing key keeps its position and the
+   shipped ``proxy-usage-analysis`` parser reads the line unchanged. The clock
+   is started in the router immediately **before** the candidate is acquired and
+   stopped the moment ``resolve_resident_prefix`` returns, so the figure is the
+   added work — not the ladder, not the upstream request. A disabled ladder
+   measures nothing and reports ``none``; a fabricated ``0.000`` would be
+   averaged in as an impossibly fast admission.
+2. **Bounded at p95 ≤ 50 ms, enforced by a replay of real traffic.** The
+   checked-in 2026-10-24 thrash fixture (1 978 captured admission attempts from
+   38 sessions) is replayed through the **real** admission path, and the
+   production field is read back and aggregated by
+   ``proxy/tests/prefill_thrash_replay_harness.py``
+   (``measure_admission_overhead`` → ``AdmissionOverheadReport``, nearest-rank
+   p50/p95, ``over_budget``/``within_budget``). The harness owns the fixture,
+   the sampling and the percentile maths; the ladder-specific fake pool state is
+   injected by the caller, so no second residency ladder is stood up.
+3. **The guard is itself tested.** A synthetic slow probe (60 ms in the
+   residency resolution) must trip the budget, so the check cannot pass on a
+   degraded or absent measurement: an unmeasured report is neither over budget
+   nor within it.
+4. **In-process only.** No new poller, task, thread or config knob: the measured
+   work is one atomic registry lookup plus the residency resolution, both over
+   already-cached state. A pin patches both ``/slots`` query helpers to raise
+   while a measured admission runs, so a synchronous upstream query on the hot
+   path — the >15 s hold this item must not regress
+   (``LP-0MUXTW4MD003TVIC``) — fails the suite.
+
+Measured on this host (fixture replay, 1 960 of 1 978 attempts priced by the
+ladder; the rest are below the cold threshold and take the early return):
+**p50 0.017 ms, p95 0.020 ms, max 1.65 ms** — three orders of magnitude inside
+the 50 ms budget. The figures are *fixture-derived*: the parent item's open
+question about whether a production-window measurement is additionally required
+is recorded on the child item.
+
+Regression pins: ``proxy/tests/test_local_resident_prefix_admission.py`` (F5
+section: the field on the line, no fabricated figure, no upstream query, the
+fixture replay's budget verdict and the slow-probe failure) and
+``proxy/tests/test_threshold_decision_logging.py`` (the field is appended, never
+interleaved).

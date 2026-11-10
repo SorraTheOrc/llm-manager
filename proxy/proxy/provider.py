@@ -3822,6 +3822,53 @@ def _evaluate_local_tenancy(
         return None
 
 
+#: Name of the additive per-admission latency field on the decision line
+#: (LP-0MW959R5S009WDM8 AC4e). One figure per local admission decision, so a
+#: later regression is visible from the log without a replay.
+ADMISSION_OVERHEAD_FIELD: str = "admission_overhead_ms"
+
+#: Budget for the work candidate-first admission adds to the hot path
+#: (LP-0MW959R5S009WDM8 AC4): the p95 of ``ADMISSION_OVERHEAD_FIELD`` over a
+#: replay must stay at or below this, or the slice is a regression. The added
+#: work is one in-process registry lookup plus the residency resolution — no
+#: upstream query, no poller, no task — so 50 ms is a generous ceiling.
+ADMISSION_OVERHEAD_BUDGET_MS: float = 50.0
+
+
+def _admission_overhead_start(enabled: bool) -> float | None:
+    """Start the admission-overhead clock, or ``None`` when unmeasured.
+
+    Candidate-first admission adds exactly two steps to the request hot path:
+    the slot-candidate acquisition and the residency resolution that prices the
+    verdict against that candidate (LP-0MW959R5S009WDM8 AC4a). The clock is
+    started **before** the acquisition and stopped immediately after the
+    resolution, so the figure covers the added work and not the rest of the
+    ladder. ``None`` (ladder disabled) means *no measurement is taken* — never a
+    fabricated zero.
+    """
+    if not enabled:
+        return None
+    try:
+        return time.perf_counter()
+    except Exception:  # pragma: no cover - perf_counter does not raise
+        return None
+
+
+def _admission_overhead_ms(start: float | None) -> float | None:
+    """Milliseconds elapsed since *start*; ``None`` when unstarted (never raises).
+
+    Measurement is observability only: any failure reads as *not measured*
+    rather than becoming an admission error, exactly like every other field on
+    the decision line.
+    """
+    if start is None:
+        return None
+    try:
+        return max(0.0, (time.perf_counter() - start) * 1000.0)
+    except Exception:  # pragma: no cover - perf_counter does not raise
+        return None
+
+
 def _log_residency_decision(
     *,
     session_id: str | None,
@@ -3833,6 +3880,7 @@ def _log_residency_decision(
     tenancy=None,
     cold_cache_threshold: int | None = None,
     warm_cache_threshold: int | None = None,
+    admission_overhead_ms: float | None = None,
 ) -> None:
     """Emit the residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5).
 
@@ -3849,6 +3897,14 @@ def _log_residency_decision(
     ``none``) with its configured ``threshold_value``. The two threshold fields
     are appended after ``session=`` so every pre-existing key keeps its
     relative order and deployed parsers are unaffected.
+
+    The last field, ``admission_overhead_ms=`` (LP-0MW959R5S009WDM8 AC4e), is
+    the measured cost of the *added* work this admission paid for — candidate
+    acquisition plus residency resolution — in milliseconds, or ``none`` when
+    the residency ladder is disabled and nothing is measured. Appended after
+    every pre-existing key (additive suffix) so positional consumers keep
+    working, and it is the operator-visible figure a latency regression shows
+    up in without a replay.
 
     Never raises: logging must not become an admission failure mode.
     """
@@ -3890,12 +3946,21 @@ def _log_residency_decision(
             cold_cache_threshold=cold_cache_threshold,
             warm_cache_threshold=warm_cache_threshold,
         )
+        # ``admission_overhead_ms=`` is a *measurement*, so an unmeasured
+        # admission reports ``none`` — never 0.000, which the usage report
+        # would average in as a measured latency (same discipline as
+        # ``reuse_ratio`` above).
+        overhead_field = (
+            f"{admission_overhead_ms:.3f}"
+            if isinstance(admission_overhead_ms, (int, float))
+            else "none"
+        )
         logger.info(
             "routing_resident_prefix provider=local model=%s decision=%s "
             "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
             "slot_owner_session=%s residency_source=%s measurement=%s min_ratio=%s "
             "tenants=%s occupants=%d session=%s "
-            "threshold_applied=%s threshold_value=%s",
+            "threshold_applied=%s threshold_value=%s admission_overhead_ms=%s",
             model_name or "unknown",
             decision,
             n_past if n_past is not None else "none",
@@ -3910,6 +3975,7 @@ def _log_residency_decision(
             session_id or "unknown",
             threshold_applied,
             threshold_value if threshold_value is not None else "none",
+            overhead_field,
         )
     except Exception:
         pass
@@ -3932,6 +3998,7 @@ def _should_skip_local(
     server_config: dict | None = None,
     candidate_slot=None,
     own_candidate: bool | None = None,
+    overhead_start: float | None = None,
 ) -> tuple[bool, str | None]:
     """The local admission ladder, owning its slot candidate's lifecycle.
 
@@ -3960,10 +4027,20 @@ def _should_skip_local(
     (``resident_prefix_min_ratio`` > 0), the cold threshold being enabled and
     the pool being configured, so a deployment without slot bookkeeping keeps
     its pre-change behaviour with no registry side effect.
+
+    *overhead_start* is the admission-overhead clock (LP-0MW959R5S009WDM8). A
+    caller that already acquired the candidate itself (the router's lease) times
+    that acquisition in its own scope and passes the start here, so the reported
+    figure covers the added work from the caller's acquisition through this
+    ladder's residency resolution. When omitted the clock starts here, before
+    this function's own acquisition.
     """
     if own_candidate is None:
         own_candidate = candidate_slot is None
-    if own_candidate and resident_prefix_min_ratio > 0.0 and cold_cache_threshold > 0:
+    ladder_engaged = resident_prefix_min_ratio > 0.0 and cold_cache_threshold > 0
+    if overhead_start is None:
+        overhead_start = _admission_overhead_start(ladder_engaged)
+    if own_candidate and ladder_engaged:
         candidate_slot = _acquire_admission_candidate(
             session_id, endpoint=endpoint, server_config=server_config
         )
@@ -3984,6 +4061,7 @@ def _should_skip_local(
             unmeasured_cold_enabled=unmeasured_cold_enabled,
             server_config=server_config,
             candidate_slot=candidate_slot,
+            overhead_start=overhead_start,
         )
     except BaseException:
         # An exception inside the decision never leaves the candidate behind
@@ -4012,6 +4090,7 @@ def _should_skip_local_verdict(
     unmeasured_cold_enabled: bool = True,
     server_config: dict | None = None,
     candidate_slot=None,
+    overhead_start: float | None = None,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -4128,6 +4207,11 @@ def _should_skip_local_verdict(
             one; ``None`` means no candidate could be assigned (no session, no
             slot bookkeeping, or an exhausted pool) and keeps the pre-change
             behaviour.
+        overhead_start: The ``time.perf_counter()`` value the admission's added
+            work started at (candidate acquisition), or ``None`` when the
+            ladder is disabled. The duration between it and the end of the
+            residency resolution is logged as ``admission_overhead_ms=`` on the
+            decision line (LP-0MW959R5S009WDM8).
 
     Returns:
         A tuple ``(skip, reason)`` where:
@@ -4169,6 +4253,13 @@ def _should_skip_local_verdict(
     # vanishing (AC5 — LP-0MVN4LANP0069QQM).
     unmeasured_facts = None
 
+    # Measured cost of the *added* work (candidate acquisition, started by the
+    # caller, plus the residency resolution below), in milliseconds. Stays
+    # ``None`` while the ladder is disabled, so an unmeasured admission reports
+    # ``admission_overhead_ms=none`` instead of fabricating a figure
+    # (LP-0MW959R5S009WDM8 AC4e).
+    overhead_ms: float | None = None
+
     # Every rung logs through the same decision line, carrying both token
     # thresholds so the *applied* one is auditable (LP-0MW81DHPH00650NY AC1):
     # a cold-priced admission, a measured-resident (warm) admission and an
@@ -4185,6 +4276,7 @@ def _should_skip_local_verdict(
             tenancy=tenancy,
             cold_cache_threshold=cold_cache_threshold,
             warm_cache_threshold=warm_cache_threshold,
+            admission_overhead_ms=overhead_ms,
         )
 
     if resident_prefix_min_ratio > 0.0:
@@ -4218,6 +4310,11 @@ def _should_skip_local_verdict(
             endpoint=endpoint,
             model_name=model_name,
         )
+        # Stop the overhead clock the moment the added work is done: the figure
+        # then covers candidate acquisition + residency resolution and *not* the
+        # rest of the ladder or the upstream request
+        # (LP-0MW959R5S009WDM8 AC4a).
+        overhead_ms = _admission_overhead_ms(overhead_start)
         if facts.source == RESIDENCY_SOURCE_UNKNOWN:
             if unmeasured_cold_enabled:
                 # Unmeasured is COLD (LP-0MW81DFML006O5KL). With no
@@ -16512,6 +16609,15 @@ async def _proxy_with_fallback_cycle(
                 )
                 _session_tenants = _resolve_tenants(config)
                 _tenancy_idle = _resolve_tenancy_idle(config)
+                # Start the admission-overhead clock here, not inside the
+                # ladder, because the acquisition happens in this scope
+                # (LP-0MW959R5S009WDM8 AC4a): the reported figure is the cost
+                # of the work candidate-first admission added. ``None`` when the
+                # ladder is disabled — nothing is measured, nothing is
+                # fabricated.
+                _admission_overhead_clock = _admission_overhead_start(
+                    _resident_min_ratio > 0.0
+                )
                 # Candidate-first admission (LP-0MW959PWL001WYSM): the candidate
                 # is acquired **here**, at the admission decision point, and
                 # its lifecycle is owned by this branch's lease — kept when the
@@ -16546,6 +16652,7 @@ async def _proxy_with_fallback_cycle(
                     server_config=_server_section(config),
                     candidate_slot=_candidate_lease.candidate,
                     own_candidate=False,
+                    overhead_start=_admission_overhead_clock,
                 )
                 # LP-0MVODJ3P6000AIUM: initialised here so the admission-evidence
                 # stamp below can consult the idle-admit verdict even on the
@@ -16850,6 +16957,13 @@ async def _proxy_with_fallback_cycle(
                             server_config=_server_section(config),
                             candidate_slot=_candidate_lease.candidate,
                             own_candidate=False,
+                            # This re-check re-uses the lease's candidate, so
+                            # nothing is acquired here: a fresh clock measures
+                            # the residency resolution it actually pays for
+                            # (LP-0MW959R5S009WDM8 AC4a).
+                            overhead_start=_admission_overhead_start(
+                                _resident_min_ratio > 0.0
+                            ),
                         )
                         if _skip_after:
                             logger.info(

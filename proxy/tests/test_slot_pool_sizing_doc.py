@@ -222,7 +222,7 @@ class TestCitationsStillResolve:
         ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
         ("proxy/proxy/router.py", 1611, "_try_acquire_local_dispatch"),
         ("proxy/proxy/router_helpers.py", 4354, "async def _try_acquire_local_dispatch"),
-        ("proxy/proxy/provider.py", 7982, "def _get_local_concurrency_info"),
+        ("proxy/proxy/provider.py", 8079, "def _get_local_concurrency_info"),
         # 6 — slot-ID space
         ("proxy/proxy/session.py", 1210, "def _slot_id_for_session"),
         # 7 — persistence on/off gate + eviction planner

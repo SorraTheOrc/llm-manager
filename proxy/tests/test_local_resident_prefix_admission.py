@@ -38,6 +38,7 @@ from __future__ import annotations
 import re
 import time
 
+import prefill_thrash_replay_harness as replay_harness
 import proxy.measured_prefill as measured_prefill
 import proxy.observability as observability
 import proxy.provider as provider
@@ -4038,3 +4039,234 @@ def test_concurrent_release_of_one_candidate_frees_it_once(monkeypatch):
         f"exactly one release may free the slot, got {outcomes}"
     )
     assert dict(registry) == {}
+
+
+# ---------------------------------------------------------------------------
+# F5 — the added admission latency is measured and bounded
+# (LP-0MW959R5S009WDM8, parent AC4)
+#
+# Candidate-first admission (F2) put two steps on the request hot path: the slot
+# candidate acquisition and the residency resolution that prices the verdict
+# against it. F3/F4 made those safe; this slice makes them *bounded*. The
+# production decision line carries the measured cost per admission
+# (``admission_overhead_ms=``), and the checked-in 2026-10-24 thrash fixture is
+# replayed through the real admission path to aggregate that figure into the
+# p50/p95 the budget is enforced against.
+#
+# Budget: p95 <= 50 ms. The added work is one in-process registry lookup plus
+# the residency resolution — no upstream ``/slots`` query (llama-server holds it
+# >15 s under prefill, LP-0MUXTW4MD003TVIC), no new poller and no background
+# task, so the guards below are the only new moving parts on the hot path.
+# ---------------------------------------------------------------------------
+
+#: The added work's latency budget (parent AC4), owned by the replay harness.
+BUDGET_MS = replay_harness.ADMISSION_OVERHEAD_BUDGET_MS
+
+#: Delay injected by the synthetic slow probe (AC4d): comfortably above the
+#: budget, small enough that the bounded replay stays fast.
+SLOW_PROBE_SECONDS = 0.06
+
+
+def _overhead_field(caplog, needle: str = "routing_resident_prefix") -> str:
+    """The raw ``admission_overhead_ms=`` token on the first decision line."""
+    record = next(r for r in caplog.records if needle in r.getMessage())
+    match = re.search(r"\badmission_overhead_ms=(\S+)", record.getMessage())
+    assert match is not None, record.getMessage()
+    return match.group(1)
+
+
+def _replay_admission(monkeypatch, record, server_config):
+    """Run **one** fixture attempt through the real candidate-first admission.
+
+    One admission against an empty 2-slot pool is exactly the case
+    candidate-first admission exists for (no slot at decision → assign →
+    measure), and it is the path whose added cost the budget bounds.
+    """
+    _install_slot_state(monkeypatch, slots=_free_slots([0, 1]), owners={})
+    _prime_measurement(MEASURED_TOTAL, session=str(record["session"]))
+    return provider._should_skip_local(
+        MODEL,
+        str(record["session"]),
+        {"messages": []},
+        COLD_THRESHOLD,
+        estimated_tokens=int(record["estimated_tokens"]),
+        warm_cache_threshold=0,
+        resident_prefix_min_ratio=0.5,
+        endpoint="",
+        server_config=server_config,
+    )
+
+
+def test_candidate_first_admission_logs_its_measured_overhead(
+    caplog, monkeypatch, tmp_path
+):
+    """AC4a/AC4e — a measured admission reports its added cost on the line.
+
+    The figure is the operator's only view of this latency without a replay, so
+    it must be present, numeric and non-negative on the ordinary measured path —
+    and it must be the *added* work (candidate acquisition + residency
+    resolution), which on this host is far below the 50 ms budget.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_pool(server_config=_candidate_config(tmp_path))
+
+    assert (skip, reason) == (False, None)
+    token = _overhead_field(caplog)
+    assert token != "none", "a measured admission must report its overhead"
+    value = float(token)
+    assert 0.0 <= value < BUDGET_MS
+    # The replay reads this exact token back (AC4a), so the harness and the
+    # production field name cannot drift apart silently.
+    assert (
+        f"{provider.ADMISSION_OVERHEAD_FIELD}=" == replay_harness.ADMISSION_OVERHEAD_TOKEN
+    )
+
+
+def test_disabled_ladder_logs_no_overhead_figure(caplog, monkeypatch):
+    """AC4e — an unmeasured admission reports ``none``, never a fabricated 0.
+
+    With the residency gate disabled nothing is acquired or resolved, so there
+    is no figure to report: a ``0.000`` would be a fabricated measurement the
+    usage report could average in as a real (impossibly fast) admission.
+    """
+    import logging
+
+    _install_tenancy(["sess-a", "sess-b"])
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate_with_tenancy(
+            session_id="sess-c",
+            view=_view(slots=[], owners={}, monkeypatch=monkeypatch),
+            min_ratio=0.0,
+            monkeypatch=monkeypatch,
+        )
+
+    assert (skip, reason) == (True, SKIP_TENANT_LIMIT)
+    assert _overhead_field(caplog) == "none"
+
+
+def test_measured_admission_issues_no_upstream_slots_query(
+    caplog, monkeypatch, tmp_path
+):
+    """AC4c — the measured path is in-process: no ``/slots`` call.
+
+    Both upstream query helpers raise, so a synchronous ``/slots`` query on the
+    admission path — the >15 s hold this item must not regress
+    (LP-0MUXTW4MD003TVIC) — fails the test instead of slowing it down. The
+    admission still measures its overhead from cached state.
+    """
+    import logging
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("/slots must not be queried on the admission path")
+
+    _prime_measurement(MEASURED_TOTAL)
+    _install_slot_state(monkeypatch, slots=_free_slots([0]), owners={})
+    monkeypatch.setattr(observability, "_query_slots_detail", _boom)
+    monkeypatch.setattr(observability, "_query_slots_progress", _boom)
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _decide_with_pool(server_config=_candidate_config(tmp_path))
+
+    assert (skip, reason) == (False, None)
+    assert _overhead_field(caplog) != "none"
+
+
+def test_replayed_admission_overhead_is_within_budget(monkeypatch, tmp_path):
+    """AC4a/AC4b — the fixture replay's p50/p95 stay inside the 50 ms budget.
+
+    The 2026-10-24 thrash capture (1 978 real admission attempts, 38 sessions)
+    is replayed through the **real** admission path; every attempt's own
+    ``admission_overhead_ms=`` figure is aggregated into the p50/p95 the AC is
+    held to. The figures are fixture-derived (the parent item's open question
+    about production representativeness is recorded on the work item), so the
+    report carries its provenance.
+    """
+    _meta, records = replay_harness.load_fixture()
+    assert records, "the fixture must carry the captured attempts"
+    server_config = _candidate_config(tmp_path)
+    sessions = {str(record["session"]) for record in records}
+
+    report = replay_harness.measure_admission_overhead(
+        records,
+        lambda record: _replay_admission(monkeypatch, record, server_config),
+        provenance=(
+            "prefill_thrash_2026_10_24.jsonl "
+            f"({len(records)} attempts, {len(sessions)} sessions)"
+        ),
+    )
+
+    assert report.measured > 0, report.to_json()
+    assert report.p50_ms is not None and report.p95_ms is not None
+    assert 0.0 <= report.p50_ms <= report.p95_ms
+    assert report.within_budget, report.to_json()
+    assert not report.over_budget
+
+
+def test_synthetic_slow_probe_trips_the_latency_budget(monkeypatch, tmp_path):
+    """AC4d — a synthetic slow probe trips the > 50 ms failure.
+
+    The probe delays the residency resolution by 60 ms, so the measured p95 must
+    exceed the budget and the report must say so. Without this pin the budget
+    could pass on a degraded measurement and silently drop the guard.
+    """
+    _meta, records = replay_harness.load_fixture()
+    measurable = [
+        record
+        for record in records
+        if int(record["estimated_tokens"]) > COLD_THRESHOLD
+    ][:3]
+    assert measurable, "the fixture must carry admissions the ladder prices"
+    server_config = _candidate_config(tmp_path)
+    real_resolve = provider.resolve_resident_prefix
+
+    def _slow_resolve(*args, **kwargs):
+        time.sleep(SLOW_PROBE_SECONDS)
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(provider, "resolve_resident_prefix", _slow_resolve)
+
+    report = replay_harness.measure_admission_overhead(
+        measurable,
+        lambda record: _replay_admission(monkeypatch, record, server_config),
+        provenance="synthetic slow probe (AC4d)",
+    )
+
+    assert report.measured == len(measurable), report.to_json()
+    assert report.p95_ms > BUDGET_MS, report.to_json()
+    assert report.over_budget is True
+    assert report.within_budget is False
+
+
+def test_overhead_budget_verdict_uses_the_measured_p95():
+    """AC4d — the verdict reads the nearest-rank p95, and never an absent one.
+
+    An unmeasured report is neither over budget nor within it: a missing figure
+    must fail closed rather than read as a passed budget.
+    """
+    assert replay_harness.percentile([], 95) is None
+    assert replay_harness.percentile([4.0], 95) == 4.0
+    samples = [1.0, 2.0, 3.0, 4.0, 100.0]
+    # Nearest rank: the reported percentile is a duration the path really paid,
+    # never an interpolation of two samples.
+    assert replay_harness.percentile(samples, 50) == 3.0
+    assert replay_harness.percentile(samples, 95) == 100.0
+
+    inside = replay_harness.admission_overhead_report(samples[:4], attempts=4)
+    assert (inside.p50_ms, inside.p95_ms) == (2.0, 4.0)
+    assert inside.within_budget is True
+    assert inside.over_budget is False
+
+    breached = replay_harness.admission_overhead_report(samples, attempts=5)
+    assert breached.over_budget is True
+    assert breached.within_budget is False
+
+    unmeasured = replay_harness.admission_overhead_report([], attempts=7)
+    assert unmeasured.p95_ms is None
+    assert unmeasured.over_budget is False
+    assert unmeasured.within_budget is False, "an absent figure is not a pass"

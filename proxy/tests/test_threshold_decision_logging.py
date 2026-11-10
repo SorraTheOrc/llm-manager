@@ -354,7 +354,13 @@ LEGACY_KEY_ORDER = (
 def test_existing_keys_keep_their_order_and_new_keys_are_appended(
     caplog, monkeypatch
 ):
-    """AC3: the additive suffix cannot disturb a positional consumer."""
+    """AC3: the additive suffix cannot disturb a positional consumer.
+
+    Two additive groups are appended, in order: the threshold pair
+    (``LP-0MW81DHPH00650NY``) and the per-admission latency figure
+    (``LP-0MW959R5S009WDM8``). Nothing may be interleaved into the pre-change
+    keys, which is what this pin is for.
+    """
     _arrange("measured")
 
     line = _decision_line(caplog, monkeypatch, predicted_ratio=0.0)
@@ -366,6 +372,7 @@ def test_existing_keys_keep_their_order_and_new_keys_are_appended(
     assert keys[len(LEGACY_KEY_ORDER) :] == [
         "threshold_applied",
         "threshold_value",
+        "admission_overhead_ms",
     ], line
 
 
