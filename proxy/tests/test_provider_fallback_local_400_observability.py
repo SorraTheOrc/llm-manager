@@ -693,3 +693,130 @@ def test_fingerprint_backoff_state_reports_the_verdict_for_a_request_body():
 
     # No conversation history -> nothing to report.
     assert provider.fingerprint_backoff_state("sess", {"model": "test"}) is None
+
+
+# =====================================================================
+# LP-0MW95BDJQ002DSVI — typed deterministic client error, before fallback
+#
+# Parent AC1: a deterministic local 400 returns immediately with a
+# machine-readable ``deterministic_client_error`` (reason=identical_history)
+# and a short ``Retry-After``; no chain-hold cycle is consumed and no remote
+# dispatch happens. The full contract (chain-hold skip, single-400 fallback,
+# unchanged observability) is T2's scope; these tests pin the *wiring* — the
+# local-4xx branch must answer an identical resend instead of falling through.
+# =====================================================================
+
+
+def _reject_body(message: str = "reject") -> str:
+    return json.dumps({"error": {"message": message, "type": "invalid_request_error"}})
+
+
+@pytest.mark.asyncio
+async def test_identical_history_resend_returns_typed_deterministic_client_error(
+    mixed_model_config,
+):
+    """The second identical local 400 is answered, not routed remote again."""
+    from proxy import fingerprint_backoff as fb
+
+    body = _chat_body("poisoned", "history")
+    _mock_local, _mock_remote, call_log = _make_mocks(
+        [_local_400_body("reject"), _local_400_body("reject")]
+    )
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        first = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+        assert first.status_code == 200, "a single 400 must still fall back"
+        assert first.headers.get("X-Provider") == "remote-fallback"
+
+        second = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+
+    assert second.status_code == 400
+    payload = json.loads(second.body)
+    assert payload["error"] == "deterministic_client_error"
+    assert payload["reason"] == "identical_history"
+    assert isinstance(payload["retry_after"], int)
+    assert payload["retry_after"] > 0
+    assert payload["body_snippet"] == _reject_body("reject")
+    assert second.headers["Retry-After"] == str(payload["retry_after"]), (
+        "the header and the body must advertise the same wait"
+    )
+    assert (
+        second.headers[provider.DETERMINISTIC_CLIENT_ERROR_HEADER]
+        == "identical_history"
+    )
+    assert call_log == ["local", "remote", "local"], (
+        "the typed 400 must terminate the request — no remote dispatch: "
+        f"{call_log}"
+    )
+    # The ladder still advanced: the typed error reports the *current* verdict.
+    entry = fb.get_backoff_entry(fb.compute_prompt_fingerprint(json.loads(body)["messages"]))
+    assert entry["resend_count"] == 2
+    assert payload["retry_after"] == pytest.approx(300, abs=1), (
+        "the second rung of the ladder is advertised"
+    )
+
+
+@pytest.mark.asyncio
+async def test_changed_history_resend_does_not_return_typed_error(
+    mixed_model_config,
+):
+    """A session repeating 400s with a *changed* history is not 'identical'."""
+    _mock_local, _mock_remote, call_log = _make_mocks(
+        [_local_400_body("a"), _local_400_body("b")]
+    )
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        for body in (
+            _chat_body("first history"),
+            _chat_body("rewritten", "history"),
+        ):
+            result = await provider.proxy_with_fallback(
+                _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+                "v1/chat/completions", mixed_model_config, cfg,
+            )
+            assert result.status_code == 200, (
+                "a changed history is not a deterministic repeat — it must fall back"
+            )
+            assert result.headers.get("X-Provider") == "remote-fallback"
+
+    assert call_log == ["local", "remote", "local", "remote"]
+
+
+@pytest.mark.asyncio
+async def test_typed_400_increments_the_deterministic_client_error_metric(
+    mixed_model_config,
+):
+    """The typed error is observable as its own metric reason (parent AC1)."""
+    body = _chat_body("poisoned", "history")
+    _mock_local, _mock_remote, _ = _make_mocks([_local_400_body(), _local_400_body()])
+    cfg = {"provider_cooldown_seconds": 60}
+    before = _metric_value("v1/chat/completions", "400", "deterministic_client_error")
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        for _ in range(2):
+            await provider.proxy_with_fallback(
+                _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+                "v1/chat/completions", mixed_model_config, cfg,
+            )
+
+    after = _metric_value("v1/chat/completions", "400", "deterministic_client_error")
+    assert after == before + 1, (
+        f"expected one typed error (before={before}, after={after})"
+    )

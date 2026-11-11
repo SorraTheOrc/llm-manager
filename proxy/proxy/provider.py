@@ -13821,6 +13821,144 @@ def _observe_local_http_error_400(
         pass
 
 
+#: Typed deterministic-client-error contract (LP-0MW95BDJQ002DSVI, parent AC1).
+#:
+#: A history llama-server rejects byte-identically is not a provider-health
+#: failure: retrying it — locally or on a remote — cannot succeed, so the
+#: CLIENT has to act (compact, then resend a *changed* history). The proxy
+#: therefore stops routing and says exactly that, in machine-readable form.
+DETERMINISTIC_CLIENT_ERROR = "deterministic_client_error"
+DETERMINISTIC_CLIENT_ERROR_REASON_IDENTICAL_HISTORY = "identical_history"
+#: Response header that lets a client detect the typed error without parsing
+#: the body (parent AC1's machine-readable contract).
+DETERMINISTIC_CLIENT_ERROR_HEADER = "X-Deterministic-Client-Error"
+
+
+def _deterministic_client_error_verdict(
+    session_id: str | None,
+    provider_name: str,
+    body_json: Any,
+    *,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Return the fingerprint verdict when this resend is provably identical.
+
+    The typed error may only be returned when *this exact history* is known to
+    be rejected, which needs both halves of the evidence:
+
+    1. the per-(session, provider) streak has reached
+       ``_DETERMINISTIC_LOCAL_400_THRESHOLD`` — this session's local 400s are
+       not a one-off (LP-0MTXEBQ4E001BMI2), and
+    2. the per-prompt-fingerprint entry's ``resend_count`` has reached the
+       same threshold — the *history* itself was rejected before. A session
+       can repeat 400s with a *changed* history (the streak is per session,
+       not per history); claiming ``identical_history`` for that would be
+       wrong, and the fresh fingerprint's count of 1 filters it out.
+
+    Returns ``None`` when either half is missing (no conversation history, no
+    streak, or a history seen only once) — i.e. when normal fallback must still
+    run. Read-only: the write side is
+    :func:`_observe_local_http_error_400`, which has already recorded this
+    occurrence before the caller asks.
+    """
+    streak = _local_http_400_streaks.get((session_id or "unknown", provider_name))
+    if streak is None or int(streak.get("count", 0) or 0) < _DETERMINISTIC_LOCAL_400_THRESHOLD:
+        return None
+    state = fingerprint_backoff_state(session_id, body_json, now=now)
+    if state is None:
+        return None
+    if int(state["entry"].get("resend_count", 0) or 0) < _DETERMINISTIC_LOCAL_400_THRESHOLD:
+        return None
+    return state
+
+
+def _deterministic_client_error_retry_after_seconds(state: dict[str, Any]) -> int:
+    """Return the ``Retry-After`` seconds advertised on the typed 400.
+
+    The value is the fingerprint ladder's remaining window, so the header and
+    the body always agree with the backoff the proxy actually enforces. When
+    the window has already expired the resend continues the ladder, so the
+    entry's *next* rung is advertised instead of a meaningless ``0``.
+    """
+    remaining = float(state.get("remaining_seconds") or 0.0)
+    if remaining <= 0.0:
+        remaining = float(
+            state["entry"].get("retry_after")
+            or fingerprint_backoff.BACKOFF_INITIAL_SECONDS
+        )
+    return max(1, int(math.ceil(remaining)))
+
+
+def _build_typed_400_response(
+    path: str,
+    provider_name: str,
+    body_text: str,
+    session_id: str | None,
+    body_json: Any,
+    *,
+    now: float | None = None,
+) -> Response | None:
+    """Build the typed ``deterministic_client_error`` 400 for an identical resend.
+
+    Returns ``None`` when this local 400 is not a byte-identical resend of a
+    history already known to be rejected, so the caller keeps its unchanged
+    fallback behaviour (parent AC1's "single 400 falls back normally").
+
+    The response is a plain ``Response`` (not a raise): the caller returns it
+    directly from the local-4xx branch, i.e. **before** any remote dispatch or
+    chain-hold cycle can run, so a wedged session can never starve the rest of
+    the proxy. Best-effort: any failure returns ``None`` rather than turning a
+    routing edge case into an error.
+    """
+    try:
+        state = _deterministic_client_error_verdict(
+            session_id, provider_name, body_json, now=now
+        )
+        if state is None:
+            return None
+        retry_after = _deterministic_client_error_retry_after_seconds(state)
+        entry = state["entry"]
+        snippet = (body_text or "")[:512]
+        logger.warning(
+            "Deterministic client error: provider=%s model=%s session=%s "
+            "fingerprint=%s resend_count=%s retry_after=%ss — returning typed "
+            "HTTP 400 without remote fallback or chain hold (this exact "
+            "history is rejected every time; compaction may help)",
+            provider_name,
+            path,
+            session_id or "unknown",
+            (state.get("fingerprint") or "unknown")[:12],
+            entry.get("resend_count"),
+            retry_after,
+        )
+        try:
+            from proxy.metrics import record_http_error
+
+            record_http_error(path, "400", DETERMINISTIC_CLIENT_ERROR)
+        except Exception:
+            pass
+        payload = {
+            "error": DETERMINISTIC_CLIENT_ERROR,
+            "reason": DETERMINISTIC_CLIENT_ERROR_REASON_IDENTICAL_HISTORY,
+            "retry_after": retry_after,
+            "body_snippet": snippet,
+        }
+        return Response(
+            content=json.dumps(payload),
+            status_code=400,
+            media_type="application/json",
+            headers={
+                "Retry-After": str(retry_after),
+                "X-Provider": provider_name,
+                DETERMINISTIC_CLIENT_ERROR_HEADER: (
+                    DETERMINISTIC_CLIENT_ERROR_REASON_IDENTICAL_HISTORY
+                ),
+            },
+        )
+    except Exception:
+        return None
+
+
 def _handle_empty_response_with_cooldown(
     response: Response,
     provider_name: str,
@@ -18271,6 +18409,22 @@ async def _proxy_with_fallback_cycle(
                                 _session_id,
                                 body_json,
                             )
+                            # LP-0MW95BDJQ002DSVI (parent AC1): a
+                            # byte-identical resend of a history local
+                            # rejects every time is answered HERE, before any
+                            # remote dispatch and before the chain-hold
+                            # wrapper can consume a cycle — the error is
+                            # deterministic, so retrying it cannot help and
+                            # holding it would starve every other session.
+                            _typed_400 = _build_typed_400_response(
+                                path,
+                                provider_name,
+                                body_text,
+                                _session_id,
+                                body_json,
+                            )
+                            if _typed_400 is not None:
+                                return _typed_400
                         continue
 
                     # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /

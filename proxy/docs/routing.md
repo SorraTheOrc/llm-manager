@@ -4332,3 +4332,61 @@ Wiring in `provider.py`:
 
 Bodies without a `messages` array record no verdict: there is no conversation
 to fingerprint.
+
+## Typed deterministic client error before fallback (LP-0MW95BDJQ002DSVI)
+
+Backoff alone still leaves the wedged session waiting on a remote fallback for
+a request the local model rejects *every* time. The typed error closes that
+loop: when the same history is provably rejected (see the section above), the
+local-400 path answers the client directly instead of routing on.
+
+**When it fires.** Both halves of the evidence are required, and the pair is
+what keeps the error honest:
+
+- the per-`(session, provider)` streak has reached
+  `_DETERMINISTIC_LOCAL_400_THRESHOLD` — these are not one-off 400s, and
+- the per-prompt-fingerprint entry's `resend_count` has reached the same
+  threshold — *this history* was already rejected. The streak alone is not
+  enough: a session can repeat 400s with a changed history (a compaction
+  rewrite, a new user turn), and calling that `identical_history` would be a
+  lie, so the fresh fingerprint's count of 1 filters it out.
+
+A body without a `messages` array has no fingerprint and therefore never
+produces the typed error.
+
+**What the client gets.** HTTP `400` with
+
+```json
+{
+  "error": "deterministic_client_error",
+  "reason": "identical_history",
+  "retry_after": 300,
+  "body_snippet": "<first 512 chars of the llama-server rejection>"
+}
+```
+
+plus a `Retry-After` header carrying the same seconds, `X-Provider` naming the
+local provider that rejected it, and
+`X-Deterministic-Client-Error: identical_history` so a client can branch
+without parsing the body. `retry_after` is the fingerprint ladder's remaining
+window (or its next rung when the window has just expired), so the header, the
+body and the enforced backoff always agree. The error also increments
+`proxy_http_errors_total{status="400", reason="deterministic_client_error"}`
+as a distinct reason from `local_http_400` and `local_http_400_deterministic`.
+
+**Why before fallback matters.** The response is returned from the local-4xx
+branch *before* the `continue` that would move to the next provider, so:
+
+- no remote dispatch happens (a remote cannot fix a request-shape rejection
+  that is deterministic for this history; routing remote only spends quota),
+- no `chain_hold_cycle` is consumed — the request never reaches the
+  `ChainExhaustedError` path the hold wrapper reacts to, so a wedged session
+  cannot hold the chain and starve audit or other sessions (the 2026-11-03
+  incident shape), and
+- the local provider is still not cooled down: the next request — with a
+  compacted or otherwise changed history — dispatches local normally.
+
+**Single 400s are unchanged.** A first local 400 still logs the body snippet,
+increments `local_http_400` and falls back to the next provider exactly as
+before. Only a repeat of a history already known to be rejected is answered
+with the typed error.
