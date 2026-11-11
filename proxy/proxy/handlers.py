@@ -1284,6 +1284,29 @@ async def get_llama_local_status(request: Request):
         if isinstance(_slot, dict) and _slot.get("abandoned") is True:
             abandoned_slots += 1
 
+    # -- measured backend occupancy (LP-0MW8VP0XR007UGQF, parent AC3) ------
+    # The second slot's occupancy must be visible from the SAME measured
+    # progress path that drives the lease, even when /slots times out under a
+    # long prefill (that is what made 51 of 60 deadline events read as
+    # ``available_slots=0`` with no attribution). ``slots`` may be the fresh
+    # detail or the last-known cache; the log-derived ``_slot_progress_cache``
+    # supplies the per-slot occupancy the /slots read could not. Refreshing the
+    # tail here (off the event loop) makes the status poll self-contained and
+    # keeps the analyser and the availability checker on the same data.
+    measured_in_flight_requests = None
+    try:
+        import asyncio as _asyncio
+
+        from proxy.observability import (
+            _update_slot_progress_from_log,
+            count_measured_occupancy,
+        )
+
+        await _asyncio.to_thread(_update_slot_progress_from_log)
+        measured_in_flight_requests = count_measured_occupancy(slots)
+    except Exception:
+        measured_in_flight_requests = None
+
     # -- local-route availability (LP-0MVWFKIKJ005XHAY, parent AC10) -------
     # READ-ONLY observability: the routing decision never reads these values
     # (AC10c). ``available_slots``/``capacity_hint`` say whether the ENGINE is
@@ -1446,6 +1469,12 @@ async def get_llama_local_status(request: Request):
         "local_idle_seconds": published_idle_seconds,
         "capacity_hint": capacity_hint,
         "local_in_flight_requests": live_local_requests,
+        # LP-0MW8VP0XR007UGQF AC2/AC3: backend slots the measured signals report
+        # as occupied (union of /slots is_processing and fresh log progress).
+        # Additive: an older analyser ignores it; the residual analyser takes
+        # max(local_in_flight_requests, measured_in_flight_requests) so a busy
+        # second slot is no longer under-counted.
+        "measured_in_flight_requests": measured_in_flight_requests,
         "local_abandoned_slots": abandoned_slots,
         "slots_detail_stale": detail_stale,
         # LP-0MVWFKIKJ005XHAY AC10: the same route-availability evidence the
@@ -1512,6 +1541,10 @@ async def get_llama_local_status(request: Request):
         # records (``None`` in legacy mode with no record registry).
         # ``local_active_query`` mirrors ``> 0``; ``Null`` is never emitted.
         "local_in_flight_requests": live_local_requests,
+        # LP-0MW8VP0XR007UGQF: measured backend occupancy (same source as the
+        # status_request log line) so the analyser and the availability check
+        # cannot drift.
+        "measured_in_flight_requests": measured_in_flight_requests,
         # Per-slot details (LP-0MSORPUMX002LLIA): compact slot dicts from
         # llama-server's /slots endpoint, falling back to the last-known
         # detail cache on a transient failure (LP-0MUFSVXID0039ZAQ); empty

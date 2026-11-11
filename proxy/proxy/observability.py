@@ -2826,6 +2826,53 @@ def compute_capacity_hint(slots: list[dict]) -> str:
     return CAPACITY_IDLE
 
 
+def measured_occupied_slot_ids(slots: list[dict] | None = None) -> set[int]:
+    """Return the slot ids the measured signals report as occupied.
+
+    LP-0MW8VP0XR007UGQF AC1/AC3 (parent AC3): the second slot's occupancy
+    must be derivable from the *same* measured progress path that drives the
+    dispatch lease, not from a ``/slots`` read that times out under a long
+    prefill. The union of two measured sources is used:
+
+    - ``slots`` — the served (possibly cached) per-slot detail; a slot with
+      ``is_processing`` True is occupied.
+    - ``_slot_progress_cache`` — the log-derived per-slot progress parsed from
+      llama-server's ``slot update_slots`` lines; a slot with a fresh entry is
+      occupied even when ``/slots`` could not answer.
+
+    Union, not max: the two sources can each miss a slot the other sees (a
+    slot whose last ``/slots`` detail is stale but whose log line is fresh, or
+    vice-versa), so the union is the honest count. A slot id of ``None`` from
+    a malformed detail entry is ignored.
+    """
+    occupied: set[int] = set()
+    for slot in slots or []:
+        if not isinstance(slot, dict):
+            continue
+        sid = slot.get("slot_id", slot.get("id"))
+        if (
+            isinstance(sid, int)
+            and not isinstance(sid, bool)
+            and slot.get("is_processing")
+        ):
+            occupied.add(sid)
+    now = time.time()
+    for sid, entry in _slot_progress_cache.items():
+        if isinstance(sid, int) and _slot_progress_is_fresh(entry, now):
+            occupied.add(sid)
+    return occupied
+
+
+def count_measured_occupancy(slots: list[dict] | None = None) -> int:
+    """Number of slots the measured signals report as occupied.
+
+    Single derivation behind ``measured_in_flight_requests`` so the status
+    surface and the residual analyser cannot drift on how many backend slots
+    are busy (LP-0MW8VP0XR007UGQF AC2/AC3).
+    """
+    return len(measured_occupied_slot_ids(slots))
+
+
 def count_available_slots(slots: list[dict]) -> int:
     """Number of slots the served detail reports as *not* processing.
 

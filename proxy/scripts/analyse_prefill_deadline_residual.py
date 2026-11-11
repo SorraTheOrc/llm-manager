@@ -271,6 +271,10 @@ class StatusPoll:
     in_flight_requests: int
     available_slots: int | None
     capacity_hint: str
+    #: LP-0MW8VP0XR007UGQF: backend slots the measured signals reported as
+    #: occupied (union of ``/slots`` ``is_processing`` and fresh log-derived
+    #: progress). ``None`` in a window captured before the field existed.
+    measured_in_flight_requests: int | None = None
 
 
 @dataclass
@@ -524,6 +528,16 @@ def _parse_line(log: WindowLog, ts: datetime, line: str) -> None:
                     else None
                 ),
                 capacity_hint=fields.get("capacity_hint") or "unknown",
+                # LP-0MW8VP0XR007UGQF AC2/AC3: the measured backend occupancy is
+                # the same value the availability surface publishes, so the
+                # analyser no longer under-counts a busy second slot. ``None``
+                # for pre-field windows keeps the fallback to the dispatch
+                # count (and so the two reports stay comparable).
+                measured_in_flight_requests=(
+                    _int(fields.get("measured_in_flight_requests"))
+                    if fields.get("measured_in_flight_requests")
+                    else None
+                ),
             )
         )
 
@@ -1186,7 +1200,20 @@ def occupancy_evidence(log: WindowLog, event: EvictionEvent) -> dict:
         }
     )
     polls = [p for p in log.status_polls if start <= p.ts <= end]
-    max_in_flight = max((p.in_flight_requests for p in polls), default=0)
+    # LP-0MW8VP0XR007UGQF AC2: take the larger of the dispatch-record count and
+    # the measured backend occupancy. Under a long prefill the dispatch count
+    # can stay at 1 while a second slot is genuinely busy (the 2026-11-06
+    # window attributed occupancy in only 9 of 60 deadline events); the
+    # measured count is the one that sees it. ``None`` measured values (older
+    # windows) fall back to the dispatch count, so the two reports stay
+    # comparable.
+    def _in_flight(p: StatusPoll) -> int:
+        measured = p.measured_in_flight_requests
+        if measured is None:
+            return p.in_flight_requests
+        return max(p.in_flight_requests, measured)
+
+    max_in_flight = max((_in_flight(p) for p in polls), default=0)
     own_signatures = [s for s in log.progress_signatures if s.session == event.session and start <= s.ts <= end]
     zero_progress = [s for s in own_signatures if s.progress in ("None", "0", "unknown")]
     min_available = min((p.available_slots for p in polls if p.available_slots is not None), default=None)
