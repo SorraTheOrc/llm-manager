@@ -191,6 +191,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _decrement_active_queries,
     _decrement_local_active_queries,
     _decrement_per_model_query,
+    _dispatch_credit_tokens,
     _dispatch_lease_key,
     _estimate_tokens_sent,
     _extend_lease_during_prefill,
@@ -909,7 +910,21 @@ async def _cleanup_after_request(
                     async with lock:
                         records = getattr(srv, "local_dispatch_records", {})
                         record_key = _dispatch_lease_key(backend, session_id)
-                        if record_key in records:
+                        # LP-0MW0TLPOR002TAFO: a non-explicit session has no
+                        # cooldown lease to keep, so its record is dropped at
+                        # completion — but ONLY once this request's decrement
+                        # left no outstanding credits on it. A record shared by
+                        # overlapping dispatches of one session (a queued
+                        # sibling already holds a credit) is the live-work
+                        # evidence the recovery loops rely on; popping it while
+                        # a sibling is in flight stranded that sibling's
+                        # counter/record attribution and made the next tick
+                        # reclaim live work as stale (the measured
+                        # ``local_generating_queries`` / ``local_active_queries``
+                        # / ``active_queries`` recoveries).
+                        if record_key in records and not _dispatch_credit_tokens(
+                            records.get(record_key)
+                        ):
                             removed_record = records.pop(record_key, None)
                             try:
                                 srv.logger.info(
@@ -966,7 +981,13 @@ async def _cleanup_after_request(
                 async with lock:
                     records = getattr(srv, "local_dispatch_records", {})
                     record_key = _dispatch_lease_key(backend, session_id)
-                    if record_key in records:
+                    # LP-0MW0TLPOR002TAFO: same credit guard as the
+                    # non-explicit pop above — a disconnect must not delete a
+                    # record another in-flight dispatch of this session still
+                    # owns.
+                    if record_key in records and not _dispatch_credit_tokens(
+                        records.get(record_key)
+                    ):
                         removed_record = records.pop(record_key, None)
                         try:
                             srv.logger.info(

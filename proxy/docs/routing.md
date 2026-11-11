@@ -161,30 +161,53 @@ logged once as `local_dispatch_completed_record_reaped
 reason=completed_record_in_sweep`, so a missed completion release is
 diagnosable from the log alone.
 
-#### Counter/record contention invariant (LP-0MVYWKX7200880QX)
+#### Counter/credit contention invariant (LP-0MVYWKX7200880QX, LP-0MW0TLPOR002TAFO)
 
-`local_active_queries` must equal the number of `active` dispatch records at
-every step of a contended local workload — admission, first byte, per chunk,
-a measured cache-deficit eviction, a client cancel and completion. That
-equality is the definition of done for exactly-once release accounting, and
-it is the condition under which the self-healing clamp
+`local_active_queries` must equal the number of **outstanding dispatch
+credits** at every step of a contended local workload — admission, first byte,
+per chunk, a measured cache-deficit eviction, a client cancel and completion.
+That equality is the definition of done for exactly-once release accounting,
+and it is the condition under which the self-healing clamp
 (`_recover_stuck_local_active_queries`) has nothing to repair: an over-count
 is what makes `/llama/local/status` report a busy GPU that is idle
 (LP-0MVKSXR4P001V0CM).
 
+A dispatch record is keyed `(endpoint, session)` and holds one credit per
+in-flight dispatch in `dispatch_credits` (LP-0MVWF78QK0060TZH), so the
+counter counts **credits**, not records: two overlapping dispatches of one
+session are legitimately `counter == 2` with **one** active record. Every
+consumer must therefore use `_outstanding_dispatch_credits`, never
+`_count_active_local_dispatch_records` (they are equal only for one-credit
+records).
+
+LP-0MW0TLPOR002TAFO closed the last three record-count assumptions:
+
+- `_increment_local_active_queries` (the anonymous/non-explicit increment
+  path) **appends** a credit to a live record instead of overwriting it — the
+  explicit path (`_try_acquire_local_dispatch`) already did. Overwriting
+  dropped a sibling's credit from the record set, so `counter (2)` no longer
+  matched the record's credits `(1)`.
+- `_cleanup_after_request` drops a non-explicit (or disconnected) session's
+  record only when it holds **no** remaining credits; a record shared with a
+  still-in-flight sibling is kept, because it is the live-work evidence the
+  recovery loops read.
+- `_recover_stuck_local_active_queries` clamps to the outstanding-credit count,
+  not the active-record count.
+
+Without these, the recovery loop *destroyed live state* during a healthy
+burst — the measured `local_active_queries 2→1` / `1→0`, `active_queries 1→0`
+and `local_generating_queries reclaimed 1 stale session` recoveries, while the
+dispatch was still running.
+
 `proxy/tests/test_local_active_queries_invariant.py` drives three concurrent
 local streams with distinct outcomes through the real `proxy_to_local`
 (paced SSE success, measured-deficit abort, pre-first-byte client cancel) and
-samples `local_active_queries == _count_active_local_dispatch_records(srv)`
+samples `local_active_queries == _outstanding_dispatch_credits(srv)`
 at each quiescent checkpoint under the production
 `local_active_queries_lock` → `local_dispatch_records_lock` order, then runs
-the real clamp and asserts zero `counter recovered` warnings. Adding a
-duplicate fan-out of an in-flight prompt (the audited leak: the streaming
-single-flight detour runs `_cleanup_after_request(decrement_local=False)`
-after the lease was re-acquired) is expected to fail both assertions until
-the exactly-once fix lands — encoded `xfail(strict=True)` naming
-LP-0MVYWLBV70018ZZB, so the assertion is pinned and the marker cannot be
-forgotten.
+the real clamp and asserts zero `counter recovered` warnings.
+`proxy/tests/test_local_dispatch_counter_credit_accounting.py` pins the
+credit-aware behaviour per exit path and for a same-session burst.
 
 #### The recovery WARNING names the request it could not account for
 

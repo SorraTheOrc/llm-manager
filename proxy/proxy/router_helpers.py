@@ -3564,6 +3564,17 @@ async def _increment_local_active_queries(
     the lease) hold their lease for the full prefill duration. This
     applies the adaptive lease to anonymous/non-explicit sessions, not
     just explicit ones (LP-0MSEHMMBK0062ZPI).
+
+    LP-0MW0TLPOR002TAFO: when a live record already exists for the same
+    ``(endpoint, session_key)`` — an overlapping dispatch of the same
+    non-explicit session — this **appends** a credit to it instead of
+    overwriting it. Overwriting dropped the in-flight sibling's credit from the
+    record set, so the counter (2) no longer matched the record's credits (1)
+    and the next recovery tick treated the still-running dispatch as stale: the
+    measured ``local_active_queries 2→1`` / ``1→0`` and ``active_queries 1→0``
+    / ``local_generating_queries reclaimed 1`` recoveries. The explicit-session
+    path (``_try_acquire_local_dispatch``) already preserved the record and
+    appended its credit; this anonymous path was the missing counterpart.
     """
     try:
         async with srv.local_active_queries_lock:
@@ -3580,46 +3591,72 @@ async def _increment_local_active_queries(
                 async with lock:
                     record_key = _dispatch_lease_key(backend, session_key)
                     dispatch_token = _new_dispatch_token()
+                    now = time.monotonic()
 
-                    srv.local_dispatch_records[record_key] = {
-                        "backend": backend,
-                        "started_at": time.monotonic(),
-                        "active": True,
-                        "expires_at": time.monotonic() + lease_timeout,
-                        "model_name": model_name,
-                        "endpoint": backend,
-                        # LP-0MVYWLHNI000AQ7X AC1: the dispatch identity the
-                        # self-healing clamp reports (it runs outside any
-                        # request context, so the turn cannot be read there).
-                        "session": session_key,
-                        "turn": get_turn_id() or "",
-                        # LP-0MVYZEYZY003IQAH: per-dispatch identity so a
-                        # late teardown/release can be scoped to its own
-                        # dispatch instead of the shared session record.
-                        "dispatch_token": dispatch_token,
-                        # LP-0MVWF78QK0060TZH AC1/AC2: the outstanding counter
-                        # credits this record holds (this anonymous dispatch is
-                        # one), so an overwritten record's leftover credit is
-                        # still releasable by the counter-vs-outstanding rule.
-                        "dispatch_credits": [dispatch_token],
-                        # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
-                        # A record that never makes progress is bounded by
-                        # ``local_dispatch_no_progress_timeout_seconds`` from
-                        # creation (no waiting on an unobservable signal).
-                        "last_progress": 0,
-                        "last_progress_ts": time.monotonic(),
-                        # LP-0MVN4LCED00661MX AC2: the admission evidence the
-                        # post-acceptance eviction ERROR reports.
-                        # LP-0MVODJ3P6000AIUM AC1/AC4: verbatim admission-time
-                        # snapshot when one was threaded; explicit ``None``
-                        # markers (never a recompute) otherwise.
-                        **_dispatch_evidence(
-                            body_json,
-                            model_name,
-                            session_key,
-                            admission_evidence=admission_evidence,
-                        ),
-                    }
+                    existing = srv.local_dispatch_records.get(record_key)
+                    existing_credits = (
+                        _dispatch_credit_tokens(existing)
+                        if isinstance(existing, dict)
+                        and existing.get("active")
+                        else None
+                    )
+                    if existing_credits is not None:
+                        # A sibling dispatch of this session is still in
+                        # flight: keep the record (it is the live-work
+                        # evidence the recovery loops read) and append this
+                        # dispatch's credit. Its attribution moves to this
+                        # dispatch; the live fields (started_at, stream_cm,
+                        # progress baseline, evidence) are preserved.
+                        existing["dispatch_credits"] = [
+                            *existing_credits,
+                            dispatch_token,
+                        ]
+                        existing["dispatch_token"] = dispatch_token
+                        existing["expires_at"] = now + lease_timeout
+                        existing["turn"] = get_turn_id() or ""
+                    else:
+                        # No live sibling, or a legacy record that cannot
+                        # express a second credit: create a fresh record (the
+                        # pre-change behaviour).
+                        srv.local_dispatch_records[record_key] = {
+                            "backend": backend,
+                            "started_at": now,
+                            "active": True,
+                            "expires_at": now + lease_timeout,
+                            "model_name": model_name,
+                            "endpoint": backend,
+                            # LP-0MVYWLHNI000AQ7X AC1: the dispatch identity the
+                            # self-healing clamp reports (it runs outside any
+                            # request context, so the turn cannot be read there).
+                            "session": session_key,
+                            "turn": get_turn_id() or "",
+                            # LP-0MVYZEYZY003IQAH: per-dispatch identity so a
+                            # late teardown/release can be scoped to its own
+                            # dispatch instead of the shared session record.
+                            "dispatch_token": dispatch_token,
+                            # LP-0MVWF78QK0060TZH AC1/AC2: the outstanding counter
+                            # credits this record holds (this anonymous dispatch is
+                            # one), so an overwritten record's leftover credit is
+                            # still releasable by the counter-vs-outstanding rule.
+                            "dispatch_credits": [dispatch_token],
+                            # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                            # A record that never makes progress is bounded by
+                            # ``local_dispatch_no_progress_timeout_seconds`` from
+                            # creation (no waiting on an unobservable signal).
+                            "last_progress": 0,
+                            "last_progress_ts": now,
+                            # LP-0MVN4LCED00661MX AC2: the admission evidence the
+                            # post-acceptance eviction ERROR reports.
+                            # LP-0MVODJ3P6000AIUM AC1/AC4: verbatim admission-time
+                            # snapshot when one was threaded; explicit ``None``
+                            # markers (never a recompute) otherwise.
+                            **_dispatch_evidence(
+                                body_json,
+                                model_name,
+                                session_key,
+                                admission_evidence=admission_evidence,
+                            ),
+                        }
                     _pin_dispatch_slot(
                         srv, record_key, session_key, backend
                     )
@@ -7367,14 +7404,27 @@ async def _recover_stuck_local_active_queries(srv) -> None:
     """Detect and repair a stuck ``local_active_queries`` counter.
 
     The counter can only be as large as the number of truly in-flight local
-    requests (LP-0MVKSXR4P001V0CM AC2). A leak that outlives the request —
+    dispatches (LP-0MVKSXR4P001V0CM AC2). A leak that outlives the request —
     e.g. a swallowed exception in ``_decrement_local_active_queries`` — is
-    repaired by clamping the counter to the number of **active** dispatch
-    records at every tick, rather than only resetting to 0 when *no* active
+    repaired by clamping the counter to the number of **outstanding dispatch
+    credits** at every tick, rather than only resetting to 0 when *no* active
     records exist. Without the clamp, a leak that coexists with any in-flight
     request (``has_active`` true) survived indefinitely and made
     ``/llama/local/status`` report busy while the GPU was idle (2026-10-22
     night: 66 consecutive ``freeSlots: 0`` refusals).
+
+    LP-0MW0TLPOR002TAFO: the authoritative quantity is the *credit* count, not
+    the record count. A dispatch record is keyed ``(endpoint, session)`` and
+    now holds one credit per in-flight dispatch (``dispatch_credits``,
+    LP-0MVWF78QK0060TZH), so two overlapping dispatches of one session are
+    legitimately ``counter == 2`` with **one** active record. Clamping to the
+    record count consumed a live credit (the measured ``2→1 (1 active
+    dispatch records)`` recovery) and cascaded into the ``1→0`` and global
+    ``active_queries`` recoveries once the stranded record was reaped.
+    :func:`_outstanding_dispatch_credits` is the record-set counterpart that
+    matches what the counter actually counts (and still equals the record
+    count for one-credit records, so the pre-existing leak shapes are
+    unchanged).
 
     In legacy mode (no ``local_dispatch_records`` attribute), the counter
     is reset whenever it is > 0, since there is no dispatch-record-based
@@ -7388,17 +7438,23 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                     # Read the records snapshot (not holding records_lock).
                     # This is a self-correcting check that runs every 10s,
                     # so a slightly stale snapshot is acceptable.
+                    # LP-0MW0TLPOR002TAFO: clamp to the outstanding credits,
+                    # never the record count (one record can carry several
+                    # credits for overlapping dispatches of one session).
+                    outstanding_credits = _outstanding_dispatch_credits(srv)
                     active_count = _count_active_local_dispatch_records(srv)
                     active_count = active_count if active_count is not None else 0
-                    if srv.local_active_queries > active_count:
+                    if srv.local_active_queries > outstanding_credits:
                         prev = srv.local_active_queries
-                        srv.local_active_queries = active_count
+                        srv.local_active_queries = outstanding_credits
                         # LP-0MVYWLHNI000AQ7X AC1: name the requests this
                         # recovery could not account for, so a recurrence is
                         # diagnosable from this line alone. Read-only and
                         # lock-free: the clamp's own snapshot plus the bounded
-                        # release history (AC2). AC4: only the payload grows —
-                        # ``prev``/``active_count`` are untouched.
+                        # release history (AC2). LP-0MW0TLPOR002TAFO: the
+                        # reset target is now the outstanding-credit count;
+                        # the parenthetical still reports the active *record*
+                        # count (equal to it for one-credit records).
                         identity = _local_dispatch_recovery_identifying_fields(srv)
                         try:
                             srv.logger.warning(
@@ -7407,7 +7463,7 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                                 "records) session=%s turn=%s record=%s "
                                 "release_reason=%s release_age_s=%s",
                                 prev,
-                                active_count,
+                                outstanding_credits,
                                 active_count,
                                 identity["session"],
                                 identity["turn"],
