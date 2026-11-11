@@ -1,0 +1,807 @@
+{
+  "schema_version": 1,
+  "work_item": "LP-0MWCEHYOO002TRGD",
+  "parent_work_item": "LP-0MVXY8ZBZ0003042",
+  "purpose": "Cost the model-weight quantisation lever (Q5_K_M -> Q4_K_M / Q4_K_S) for the spike's AC1 comparison table: weight/VRAM effect, bounded prefill and decode throughput effect, and the resulting local-share arithmetic.",
+  "read_only": true,
+  "generated_at": "2026-11-11",
+  "provenance_classes": {
+    "measured": "Read from a GGUF tensor table or a measured production llama-server/proxy log window. Not re-derived here.",
+    "derived-estimate": "Arithmetic over measured figures registered in this file. Labelled an estimate everywhere it is quoted.",
+    "config-derived": "Taken from the shipped configuration (models.ini, proxy/config.yaml) with its defining key recorded."
+  },
+  "engine": {
+    "arch": "qwen35moe",
+    "block_count": 40,
+    "expert_count": 256,
+    "expert_used_count": 8,
+    "ubatch_tokens": 1024,
+    "ubatch_source": "models.ini:ubatch-size = 1024",
+    "shipped_preset": "UD-Q5_K_M",
+    "source": "models.ini [Qwen3] hf-repo suffix and the GGUF tensor table"
+  },
+  "layouts": {
+    "shipped_ud_q5_k_m": {
+      "label": "shipped UD-Q5_K_M (unsloth dynamic quant)",
+      "provenance": "measured",
+      "source": "Qwen3.6-35B-A3B-UD-Q5_K_M.gguf",
+      "tensors": 733,
+      "params": 34660610688,
+      "weight_bytes": 26445203968,
+      "gib": 24.629,
+      "bits_per_weight": 6.1038,
+      "type_bytes": {
+        "F32": 104581632,
+        "Q5_K": 14763950080,
+        "Q6_K": 8147435520,
+        "Q8_0": 3429236736
+      },
+      "role_bytes": {
+        "expert_down": {
+          "params": 10737418240,
+          "bytes": 9003073536,
+          "gib": 8.3848,
+          "share_pct": 34.044
+        },
+        "expert_gate": {
+          "params": 10737418240,
+          "bytes": 7381975040,
+          "gib": 6.875,
+          "share_pct": 27.914
+        },
+        "expert_up": {
+          "params": 10737418240,
+          "bytes": 7381975040,
+          "gib": 6.875,
+          "share_pct": 27.914
+        },
+        "attention": {
+          "params": 1027604480,
+          "bytes": 1091829760,
+          "gib": 1.0168,
+          "share_pct": 4.129
+        },
+        "output": {
+          "params": 508559360,
+          "bytes": 540344320,
+          "gib": 0.5032,
+          "share_pct": 2.043
+        },
+        "token_embd": {
+          "params": 508559360,
+          "bytes": 540344320,
+          "gib": 0.5032,
+          "share_pct": 2.043
+        },
+        "ssm": {
+          "params": 256575360,
+          "bytes": 287055360,
+          "gib": 0.2673,
+          "share_pct": 1.085
+        },
+        "shared_expert": {
+          "params": 125911040,
+          "bytes": 134021120,
+          "gib": 0.1248,
+          "share_pct": 0.507
+        },
+        "ffn_other": {
+          "params": 20971520,
+          "bytes": 83886080,
+          "gib": 0.0781,
+          "share_pct": 0.317
+        },
+        "norm": {
+          "params": 174848,
+          "bytes": 699392,
+          "gib": 0.0007,
+          "share_pct": 0.003
+        }
+      }
+    },
+    "measured_ud_q4_k_s_base": {
+      "label": "UD-Q4_K_S, base-model weights (MTP nextn block excluded)",
+      "provenance": "measured",
+      "source": "Qwen3.6-35B-A3B-UD-Q4_K_S.gguf",
+      "tensors": 733,
+      "params": 34660610688,
+      "weight_bytes": 20882024960,
+      "gib": 19.4479,
+      "bits_per_weight": 4.8198,
+      "type_bytes": {
+        "F32": 104581632,
+        "Q4_K": 17666408448,
+        "Q6_K": 1077780480,
+        "Q8_0": 2033254400
+      },
+      "role_bytes": {
+        "expert_down": {
+          "params": 10737418240,
+          "bytes": 6247415808,
+          "gib": 5.8184,
+          "share_pct": 29.918
+        },
+        "expert_gate": {
+          "params": 10737418240,
+          "bytes": 6039797760,
+          "gib": 5.625,
+          "share_pct": 28.923
+        },
+        "expert_up": {
+          "params": 10737418240,
+          "bytes": 6039797760,
+          "gib": 5.625,
+          "share_pct": 28.923
+        },
+        "attention": {
+          "params": 1027604480,
+          "bytes": 1091829760,
+          "gib": 1.0168,
+          "share_pct": 5.229
+        },
+        "token_embd": {
+          "params": 508559360,
+          "bytes": 540344320,
+          "gib": 0.5032,
+          "share_pct": 2.588
+        },
+        "output": {
+          "params": 508559360,
+          "bytes": 417177600,
+          "gib": 0.3885,
+          "share_pct": 1.998
+        },
+        "ssm": {
+          "params": 256575360,
+          "bytes": 287055360,
+          "gib": 0.2673,
+          "share_pct": 1.375
+        },
+        "shared_expert": {
+          "params": 125911040,
+          "bytes": 134021120,
+          "gib": 0.1248,
+          "share_pct": 0.642
+        },
+        "ffn_other": {
+          "params": 20971520,
+          "bytes": 83886080,
+          "gib": 0.0781,
+          "share_pct": 0.402
+        },
+        "norm": {
+          "params": 174848,
+          "bytes": 699392,
+          "gib": 0.0007,
+          "share_pct": 0.003
+        }
+      }
+    },
+    "measured_ud_q4_k_s_file": {
+      "label": "UD-Q4_K_S as shipped in the MTP preset GGUF (whole file)",
+      "provenance": "measured",
+      "source": "Qwen3.6-35B-A3B-UD-Q4_K_S.gguf",
+      "tensors": 753,
+      "params": 35505251456,
+      "weight_bytes": 21377327616,
+      "gib": 19.9092,
+      "bits_per_weight": 4.8167,
+      "type_bytes": {
+        "BF16": 1052672,
+        "F32": 104624640,
+        "Q4_K": 18119393280,
+        "Q6_K": 1077780480,
+        "Q8_0": 2074476544
+      },
+      "role_bytes": {
+        "expert_down": {
+          "params": 11005853696,
+          "bytes": 6398410752,
+          "gib": 5.959,
+          "share_pct": 29.931
+        },
+        "expert_gate": {
+          "params": 11005853696,
+          "bytes": 6190792704,
+          "gib": 5.7656,
+          "share_pct": 28.96
+        },
+        "expert_up": {
+          "params": 11005853696,
+          "bytes": 6190792704,
+          "gib": 5.7656,
+          "share_pct": 28.96
+        },
+        "attention": {
+          "params": 1054867456,
+          "bytes": 1120796672,
+          "gib": 1.0438,
+          "share_pct": 5.243
+        },
+        "token_embd": {
+          "params": 508559360,
+          "bytes": 540344320,
+          "gib": 0.5032,
+          "share_pct": 2.528
+        },
+        "output": {
+          "params": 508559360,
+          "bytes": 417177600,
+          "gib": 0.3885,
+          "share_pct": 1.951
+        },
+        "ssm": {
+          "params": 256575360,
+          "bytes": 287055360,
+          "gib": 0.2673,
+          "share_pct": 1.343
+        },
+        "shared_expert": {
+          "params": 129058816,
+          "bytes": 137367552,
+          "gib": 0.1279,
+          "share_pct": 0.643
+        },
+        "ffn_other": {
+          "params": 21495808,
+          "bytes": 84934656,
+          "gib": 0.0791,
+          "share_pct": 0.397
+        },
+        "norm": {
+          "params": 8574208,
+          "bytes": 9655296,
+          "gib": 0.009,
+          "share_pct": 0.045
+        }
+      }
+    },
+    "predicted_plain": {
+      "label": "llama-quantize plain presets applied to the shipped tensor table",
+      "provenance": "derived-estimate",
+      "rules": "llama.cpp src/llama-quant.cpp: tensor_allows_quantization, tensor_get_category, use_more_bits, llama_tensor_get_type_impl",
+      "q5_k_m": {
+        "preset": "q5_k_m",
+        "params": 34660610688,
+        "weight_bytes": 24731167232,
+        "gib": 23.0327,
+        "bits_per_weight": 5.7082,
+        "type_bytes": {
+          "F32": 104581632,
+          "Q5_K": 19590348800,
+          "Q6_K": 5036236800
+        }
+      },
+      "q4_k_m": {
+        "preset": "q4_k_m",
+        "params": 34660610688,
+        "weight_bytes": 21169285632,
+        "gib": 19.7154,
+        "bits_per_weight": 4.8861,
+        "type_bytes": {
+          "F32": 104581632,
+          "Q4_K": 16028467200,
+          "Q6_K": 5036236800
+        }
+      },
+      "q4_k_s": {
+        "preset": "q4_k_s",
+        "params": 34660610688,
+        "weight_bytes": 20060858880,
+        "gib": 18.6831,
+        "bits_per_weight": 4.6302,
+        "type_bytes": {
+          "F32": 104581632,
+          "Q4_K": 17651073024,
+          "Q5_K": 1888026624,
+          "Q6_K": 417177600
+        }
+      }
+    }
+  },
+  "inputs": {
+    "prefill": {
+      "provenance": "measured",
+      "source": "scripts/prefill_throughput_report.py",
+      "window": {
+        "files": [
+          "/var/log/llama-proxy/llama-server.log",
+          "/var/log/llama-proxy/llama-server.log-2026-11-11"
+        ],
+        "start": "2026-11-10T00:00:00+00:00",
+        "end": "2026-11-11T20:55:44.048136+00:00"
+      },
+      "totals": {
+        "requests": 4669,
+        "prompt_tokens": 9610484,
+        "aggregate_tokens_per_second": 159.2,
+        "per_request": {
+          "p50": 107.5,
+          "p90": 267.2,
+          "min": 0.8,
+          "max": 754.6
+        }
+      },
+      "buckets": [
+        {
+          "bucket": "lt8k",
+          "requests": 4302,
+          "prompt_tokens": 4781993,
+          "prompt_ms": 35742881.3,
+          "mean_prompt_tokens": 1111.574,
+          "aggregate_tokens_per_second": 133.8,
+          "measured_tokens_per_second": 133.8,
+          "micro_batches": 2,
+          "pass_seconds": 7.6532,
+          "request_prefill_seconds": 8.308,
+          "weight_ms_per_pass": 299.042,
+          "weight_share_pct": 7.199,
+          "weight_stream_bytes_per_second": 3455437784.1
+        },
+        {
+          "bucket": "8k-20k",
+          "requests": 333,
+          "prompt_tokens": 3866078,
+          "prompt_ms": 19491176.1,
+          "mean_prompt_tokens": 11609.844,
+          "aggregate_tokens_per_second": 198.4,
+          "measured_tokens_per_second": 198.4,
+          "micro_batches": 12,
+          "pass_seconds": 5.1613,
+          "request_prefill_seconds": 58.517,
+          "weight_ms_per_pass": 299.042,
+          "weight_share_pct": 6.132,
+          "weight_stream_bytes_per_second": 5123758268.8
+        },
+        {
+          "bucket": "20k-40k",
+          "requests": 25,
+          "prompt_tokens": 559483,
+          "prompt_ms": 2309409.7,
+          "mean_prompt_tokens": 22379.32,
+          "aggregate_tokens_per_second": 242.3,
+          "measured_tokens_per_second": 242.3,
+          "micro_batches": 22,
+          "pass_seconds": 4.2262,
+          "request_prefill_seconds": 92.362,
+          "weight_ms_per_pass": 299.042,
+          "weight_share_pct": 7.123,
+          "weight_stream_bytes_per_second": 6257493087.4
+        },
+        {
+          "bucket": "40k-80k",
+          "requests": 9,
+          "prompt_tokens": 402930,
+          "prompt_ms": 2822954.9,
+          "mean_prompt_tokens": 44770.0,
+          "aggregate_tokens_per_second": 142.7,
+          "measured_tokens_per_second": 142.7,
+          "micro_batches": 44,
+          "pass_seconds": 7.1759,
+          "request_prefill_seconds": 313.735,
+          "weight_ms_per_pass": 299.042,
+          "weight_share_pct": 4.194,
+          "weight_stream_bytes_per_second": 3685283795.1
+        }
+      ]
+    },
+    "decode": {
+      "provenance": "measured",
+      "tokens_per_second": 30.7,
+      "provenance_note": "measured production decode rate, p50, docs/dev/single-slot-impact.md W1 (2026-10-23/24); 37.7 tok/s in W2 is quoted in the report as the sensitivity",
+      "active_bytes_per_token": {
+        "routed_expert_bytes": 742719488,
+        "shared_expert_bytes": 134021120,
+        "other_bytes": 2003814912,
+        "active_bytes": 2880555520,
+        "active_gib": 2.6827,
+        "expert_used": 8,
+        "expert_count": 256,
+        "weight_bytes": 26445203968
+      },
+      "implied_bytes_per_second": 88433054464.0
+    },
+    "capacity": {
+      "provenance": "measured",
+      "provenance_note": "measured, docs/dev/local-share-baseline-2026-11-01.json (2026-11-01 13:12:48 -> 14:00:03)",
+      "local_busy_seconds": 1223.0,
+      "local_completion_tokens": 5027,
+      "local_prompt_tokens": 877908,
+      "offered_prompt_tokens": 125577780,
+      "local_token_share_pct": 0.6991,
+      "local_stream_share_pct": 2.5727,
+      "decode_slot_seconds": 163.7,
+      "decode_slot_share_pct": 13.389
+    },
+    "per_slot_resources": {
+      "provenance": "config-derived",
+      "session_slot_pool_size": 2,
+      "local_model_ctx_size": 262144,
+      "per_slot_ctx": 131072,
+      "cache_ram_mib": 40960,
+      "ctx_checkpoints": 32,
+      "checkpoint_mib": 62.8,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "note": "Only the shared weights term moves with the weight quant; cache-ram, the per-prompt checkpoint cost (~2.0 GiB) and the q8_0 KV cache are weight-independent.",
+      "sources": [
+        "models.ini",
+        "proxy/config.yaml"
+      ]
+    }
+  },
+  "candidates": {
+    "ud_q4_k_m_estimated": {
+      "weight_bytes": 22035823770,
+      "gib": 20.5225,
+      "delta_vs_shipped_gib": -4.1066,
+      "byte_ratio": 0.8333,
+      "prefill": {
+        "lt8k": {
+          "weight_share_pct": 7.199,
+          "prefill_gain_ceiling_pct": 20.01,
+          "prefill_gain_measured_share_pct": 1.441,
+          "prefill_tokens_per_second_measured": 133.8,
+          "prefill_tokens_per_second_ceiling": 160.57,
+          "prefill_tokens_per_second_measured_share": 135.73
+        },
+        "8k-20k": {
+          "weight_share_pct": 6.132,
+          "prefill_gain_ceiling_pct": 20.01,
+          "prefill_gain_measured_share_pct": 1.227,
+          "prefill_tokens_per_second_measured": 198.4,
+          "prefill_tokens_per_second_ceiling": 238.1,
+          "prefill_tokens_per_second_measured_share": 200.83
+        },
+        "20k-40k": {
+          "weight_share_pct": 7.123,
+          "prefill_gain_ceiling_pct": 20.01,
+          "prefill_gain_measured_share_pct": 1.425,
+          "prefill_tokens_per_second_measured": 242.3,
+          "prefill_tokens_per_second_ceiling": 290.78,
+          "prefill_tokens_per_second_measured_share": 245.75
+        },
+        "40k-80k": {
+          "weight_share_pct": 4.194,
+          "prefill_gain_ceiling_pct": 20.01,
+          "prefill_gain_measured_share_pct": 0.839,
+          "prefill_tokens_per_second_measured": 142.7,
+          "prefill_tokens_per_second_ceiling": 171.25,
+          "prefill_tokens_per_second_measured_share": 143.9
+        }
+      },
+      "decode": {
+        "byte_ratio_bound_pct": 20.01,
+        "measured_tokens_per_second": 30.7,
+        "tokens_per_second_ceiling": 36.84,
+        "slot_seconds_freed": 27.3,
+        "slot_seconds_share_of_busy_pct": 13.389
+      },
+      "capacity": {
+        "free_slot_seconds_gain_pct": 2.232,
+        "local_token_share_before_pct": 0.6991,
+        "local_token_share_after_pct": 0.7147,
+        "local_stream_share_before_pct": 2.5727,
+        "local_stream_share_after_pct": 2.6301
+      },
+      "provenance": "derived-estimate",
+      "derivation": "measured UD-Q4_K_S base weights x (plain Q4_K_M / plain Q4_K_S)"
+    },
+    "ud_q4_k_s_measured": {
+      "weight_bytes": 20882024960,
+      "gib": 19.4479,
+      "delta_vs_shipped_gib": -5.1811,
+      "byte_ratio": 0.7896,
+      "prefill": {
+        "lt8k": {
+          "weight_share_pct": 7.199,
+          "prefill_gain_ceiling_pct": 26.641,
+          "prefill_gain_measured_share_pct": 1.918,
+          "prefill_tokens_per_second_measured": 133.8,
+          "prefill_tokens_per_second_ceiling": 169.45,
+          "prefill_tokens_per_second_measured_share": 136.37
+        },
+        "8k-20k": {
+          "weight_share_pct": 6.132,
+          "prefill_gain_ceiling_pct": 26.641,
+          "prefill_gain_measured_share_pct": 1.634,
+          "prefill_tokens_per_second_measured": 198.4,
+          "prefill_tokens_per_second_ceiling": 251.26,
+          "prefill_tokens_per_second_measured_share": 201.64
+        },
+        "20k-40k": {
+          "weight_share_pct": 7.123,
+          "prefill_gain_ceiling_pct": 26.641,
+          "prefill_gain_measured_share_pct": 1.898,
+          "prefill_tokens_per_second_measured": 242.3,
+          "prefill_tokens_per_second_ceiling": 306.85,
+          "prefill_tokens_per_second_measured_share": 246.9
+        },
+        "40k-80k": {
+          "weight_share_pct": 4.194,
+          "prefill_gain_ceiling_pct": 26.641,
+          "prefill_gain_measured_share_pct": 1.117,
+          "prefill_tokens_per_second_measured": 142.7,
+          "prefill_tokens_per_second_ceiling": 180.72,
+          "prefill_tokens_per_second_measured_share": 144.29
+        }
+      },
+      "decode": {
+        "byte_ratio_bound_pct": 26.641,
+        "measured_tokens_per_second": 30.7,
+        "tokens_per_second_ceiling": 38.88,
+        "slot_seconds_freed": 34.4,
+        "slot_seconds_share_of_busy_pct": 13.389
+      },
+      "capacity": {
+        "free_slot_seconds_gain_pct": 2.817,
+        "local_token_share_before_pct": 0.6991,
+        "local_token_share_after_pct": 0.7188,
+        "local_stream_share_before_pct": 2.5727,
+        "local_stream_share_after_pct": 2.6452
+      },
+      "provenance": "measured"
+    }
+  },
+  "checks": [
+    {
+      "claim": "measured Q4_K_S base weights have the shipped parameter count",
+      "published": 34660610688,
+      "reproduced": 34660610688,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "shipped bits-per-weight",
+      "published": 6.1038,
+      "reproduced": 6.1038,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "UD-Q4_K_M estimate from UD-Q4_K_S x plain Q4_K_M/Q4_K_S",
+      "published": 22035823770,
+      "reproduced": 22035823770,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "UD-Q4_K_S candidate is the measured base layout",
+      "published": 20882024960,
+      "reproduced": 20882024960,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: byte ratio",
+      "published": 0.8333,
+      "reproduced": 0.8333,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: VRAM delta (GiB)",
+      "published": -4.1066,
+      "reproduced": -4.1066,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: byte ratio",
+      "published": 0.7896,
+      "reproduced": 0.7896,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: VRAM delta (GiB)",
+      "published": -5.1811,
+      "reproduced": -5.1811,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "decode anchor implies the registered bytes/second",
+      "published": 88433054464.0,
+      "reproduced": 88433054464.0,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prefill bucket lt8k: weight share (%)",
+      "published": 7.199,
+      "reproduced": 7.199,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prefill bucket lt8k: weight-stream bytes/second",
+      "published": 3455437784.1,
+      "reproduced": 3455437784.1,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prefill bucket 8k-20k: weight share (%)",
+      "published": 6.132,
+      "reproduced": 6.132,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prefill bucket 8k-20k: weight-stream bytes/second",
+      "published": 5123758268.8,
+      "reproduced": 5123758268.8,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prefill bucket 20k-40k: weight share (%)",
+      "published": 7.123,
+      "reproduced": 7.123,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prefill bucket 20k-40k: weight-stream bytes/second",
+      "published": 6257493087.4,
+      "reproduced": 6257493087.4,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prefill bucket 40k-80k: weight share (%)",
+      "published": 4.194,
+      "reproduced": 4.194,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prefill bucket 40k-80k: weight-stream bytes/second",
+      "published": 3685283795.1,
+      "reproduced": 3685283795.1,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: prefill ceiling gain (%) at lt8k",
+      "published": 20.01,
+      "reproduced": 20.01,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: prefill measured-share gain (%) at lt8k",
+      "published": 1.441,
+      "reproduced": 1.441,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: prefill ceiling gain (%) at 8k-20k",
+      "published": 20.01,
+      "reproduced": 20.01,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: prefill measured-share gain (%) at 8k-20k",
+      "published": 1.227,
+      "reproduced": 1.227,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: prefill ceiling gain (%) at 20k-40k",
+      "published": 20.01,
+      "reproduced": 20.01,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: prefill measured-share gain (%) at 20k-40k",
+      "published": 1.425,
+      "reproduced": 1.425,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: prefill ceiling gain (%) at 40k-80k",
+      "published": 20.01,
+      "reproduced": 20.01,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: prefill measured-share gain (%) at 40k-80k",
+      "published": 0.839,
+      "reproduced": 0.839,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_m_estimated: decode byte-ratio gain (%)",
+      "published": 20.01,
+      "reproduced": 20.01,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: prefill ceiling gain (%) at lt8k",
+      "published": 26.641,
+      "reproduced": 26.641,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: prefill measured-share gain (%) at lt8k",
+      "published": 1.918,
+      "reproduced": 1.918,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: prefill ceiling gain (%) at 8k-20k",
+      "published": 26.641,
+      "reproduced": 26.641,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: prefill measured-share gain (%) at 8k-20k",
+      "published": 1.634,
+      "reproduced": 1.634,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: prefill ceiling gain (%) at 20k-40k",
+      "published": 26.641,
+      "reproduced": 26.641,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: prefill measured-share gain (%) at 20k-40k",
+      "published": 1.898,
+      "reproduced": 1.898,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: prefill ceiling gain (%) at 40k-80k",
+      "published": 26.641,
+      "reproduced": 26.641,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: prefill measured-share gain (%) at 40k-80k",
+      "published": 1.117,
+      "reproduced": 1.117,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "ud_q4_k_s_measured: decode byte-ratio gain (%)",
+      "published": 26.641,
+      "reproduced": 26.641,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "decode slot-seconds",
+      "published": 163.7,
+      "reproduced": 163.7,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "decode slot-share of local busy (%)",
+      "published": 13.389,
+      "reproduced": 13.389,
+      "ok": true,
+      "verdict": "reproduces"
+    }
+  ]
+}
