@@ -820,3 +820,226 @@ async def test_typed_400_increments_the_deterministic_client_error_metric(
     assert after == before + 1, (
         f"expected one typed error (before={before}, after={after})"
     )
+
+
+# =====================================================================
+# LP-0MW959GMC0042J7O (T2) — typed deterministic client error contract
+#
+# Parent AC1: a deterministic local 400 returns HTTP 400 with a
+# machine-readable ``deterministic_client_error`` body and a ``Retry-After``
+# header, consumes no chain-hold cycle, and leaves the pre-existing local-400
+# observability untouched. I2 (LP-0MW95BDJQ002DSVI) owns the wiring; these
+# tests pin the *contract* the wedged client (and the taxonomy in I4) depends
+# on.
+# =====================================================================
+
+
+def _typed_error_payload(response) -> dict:
+    """Decode a typed-400 response body, asserting it is JSON first."""
+    assert response.headers["content-type"].startswith("application/json"), (
+        "the typed error must be a JSON document, not SSE: "
+        f"{response.headers.get('content-type')!r}"
+    )
+    return json.loads(response.body)
+
+
+@pytest.mark.asyncio
+async def test_typed_400_body_and_retry_after_header_match_the_contract(
+    mixed_model_config,
+):
+    """TAC1 + TAC2: exact machine-readable body shape and a Retry-After header."""
+    body = _chat_body("compacted", "poisoned history")
+    _mock_local, _mock_remote, _ = _make_mocks(
+        [_local_400_body("reject-a"), _local_400_body("reject-b")]
+    )
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        first = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+        assert first.status_code == 200
+        typed = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+
+    assert typed.status_code == 400, "TAC1: the deterministic repeat is a 400"
+    payload = _typed_error_payload(typed)
+    assert set(payload) == {"error", "reason", "retry_after", "body_snippet"}, (
+        f"TAC1: the body is a fixed contract, got keys {sorted(payload)}"
+    )
+    assert payload["error"] == "deterministic_client_error"
+    assert payload["reason"] == "identical_history"
+    assert isinstance(payload["retry_after"], int), (
+        "TAC1: retry_after is an integer number of seconds"
+    )
+    assert 1 <= payload["retry_after"] <= fb.BACKOFF_MAX_SECONDS, (
+        f"TAC1: retry_after must stay inside the ladder, got {payload['retry_after']}"
+    )
+    assert payload["body_snippet"] == _reject_body("reject-b"), (
+        "TAC1: the snippet carries the upstream rejection that caused it"
+    )
+    assert len(payload["body_snippet"]) <= 512
+    # TAC2: the header and the body must not disagree.
+    assert typed.headers["Retry-After"] == str(payload["retry_after"])
+
+
+@pytest.mark.asyncio
+async def test_typed_400_consumes_no_chain_hold_cycle(
+    mixed_model_config, caplog
+):
+    """TAC3: the typed error is returned before fallback routing / chain hold."""
+    body = _chat_body("compacted", "poisoned history")
+    _mock_local, _mock_remote, call_log = _make_mocks(
+        [_local_400_body(), _local_400_body()]
+    )
+    # Chain hold is deliberately ENABLED: if the typed error ever fell through
+    # to the exhaustion path, this config would hold and replay the cycle.
+    cfg = {
+        "provider_cooldown_seconds": 60,
+        "chain_hold_seconds": 5,
+        "chain_hold_max_cycles": 2,
+    }
+    hold_events: list[tuple] = []
+
+    def _record_hold(*args, **kwargs):
+        hold_events.append(args)
+
+    second_request = {}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+        patch("proxy.provider._log_chain_hold_start", _record_hold),
+        caplog.at_level(logging.INFO, logger="llama-proxy.provider"),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+        second_request["request"] = _DummyRequest(body=body, headers=dict(SESSION_HEADERS))
+        typed = await provider.proxy_with_fallback(
+            second_request["request"],
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+
+    assert typed.status_code == 400
+    assert hold_events == [], "TAC3: no chain-hold cycle may be started"
+    request = second_request["request"]
+    assert provider._get_chain_hold_cycle(request) == 0, (
+        "TAC3: the typed error must not advance the chain-hold cycle"
+    )
+    assert provider._get_chain_hold_consumed(request) == 0.0, (
+        "TAC3: no hold budget may be consumed"
+    )
+    assert "chain_hold_cycle=1" not in caplog.text
+    assert call_log == ["local", "remote", "local"], (
+        f"TAC3: no dispatch may follow the typed 400, got {call_log}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_local_400_falls_back_without_typed_error(
+    mixed_model_config,
+):
+    """TAC4: a single (non-deterministic) local 400 still falls back normally."""
+    body = _chat_body("only", "one rejection")
+    _mock_local, _mock_remote, _ = _make_mocks([_local_400_body()])
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Provider") == "remote-fallback"
+    assert provider.DETERMINISTIC_CLIENT_ERROR_HEADER not in result.headers
+    assert b"deterministic_client_error" not in result.body
+
+
+@pytest.mark.asyncio
+async def test_typed_400_keeps_existing_local_400_observability(
+    mixed_model_config, caplog
+):
+    """TAC5: the LP-0MTXEBQ4E001BMI2 INFO log + metrics still fire."""
+    body = _chat_body("compacted", "poisoned history")
+    _mock_local, _mock_remote, _ = _make_mocks(
+        [_local_400_body("first-reject"), _local_400_body("second-reject")]
+    )
+    cfg = {"provider_cooldown_seconds": 60}
+    info_before = _metric_value("v1/chat/completions", "400", "local_http_400")
+    deterministic_before = _metric_value(
+        "v1/chat/completions", "400", "local_http_400_deterministic"
+    )
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+        caplog.at_level(logging.INFO, logger="llama-proxy.provider"),
+    ):
+        for _ in range(2):
+            await provider.proxy_with_fallback(
+                _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+                "v1/chat/completions", mixed_model_config, cfg,
+            )
+
+    assert _metric_value(
+        "v1/chat/completions", "400", "local_http_400"
+    ) == info_before + 2, "TAC5: each occurrence still increments local_http_400"
+    assert _metric_value(
+        "v1/chat/completions", "400", "local_http_400_deterministic"
+    ) == deterministic_before + 1, "TAC5: the repeat still escalates its metric"
+    assert "Local HTTP 400 from provider=local-qwen3" in caplog.text
+    assert "first-reject" in caplog.text and "second-reject" in caplog.text, (
+        "TAC5: the per-occurrence body snippet log must be unchanged"
+    )
+    assert "Deterministic local HTTP 400" in caplog.text, (
+        "TAC5: the WARNING escalation must be unchanged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_typed_400_is_a_json_error_even_for_a_streaming_request(
+    mixed_model_config,
+):
+    """A wedged streaming session gets the typed JSON error, not an SSE hang."""
+    body = json.dumps(
+        {
+            "model": "test",
+            "messages": [{"role": "user", "content": "streaming poisoned history"}],
+            "stream": True,
+        }
+    ).encode()
+    _mock_local, _mock_remote, call_log = _make_mocks(
+        [_local_400_body("reject"), _local_400_body("reject")]
+    )
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        first = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+        assert first.status_code == 200
+        typed = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+
+    assert typed.status_code == 400
+    payload = _typed_error_payload(typed)
+    assert payload["error"] == "deterministic_client_error"
+    assert call_log == ["local", "remote", "local"]
