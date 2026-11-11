@@ -35,6 +35,8 @@ import proxy.provider as provider
 import pytest
 from fastapi.responses import Response
 
+from proxy import fingerprint_backoff as fb
+
 
 class _DummyRequest:
     """Minimal request stub with optional session headers."""
@@ -57,6 +59,7 @@ def reset_state():
     provider._usage_reset_at.clear()
     provider._usage_reset_window.clear()
     provider._local_http_400_streaks.clear()
+    fb.reset()
     yield
 
 
@@ -441,3 +444,252 @@ async def test_compacted_history_within_target_routes_local_without_fallback(
     assert call_log == ["local"], (
         f"Compacted-within-target must dispatch local only, got: {call_log}"
     )
+
+
+# =====================================================================
+# LP-0MW95BCVV004LO0K — per-prompt-fingerprint backoff wiring
+#
+# Parent AC2: repeat requests with the same prompt fingerprint are backed off
+# on an exponential schedule (1 -> 5 -> 15 min cap), reset by a successful
+# local stream or by a changed history. The module's own contract lives in
+# ``test_provider_fingerprint_backoff.py``; these tests pin the *wiring* — the
+# local-400 path must feed that state from the real request body, and the local
+# success path must clear it.
+# =====================================================================
+
+
+def _chat_body(*contents: str, model: str = "test") -> bytes:
+    """A chat-completions body whose history is ``contents``."""
+    return json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": content} for content in contents],
+        }
+    ).encode()
+
+
+def _fingerprint_of(body: bytes) -> str:
+    return fb.compute_prompt_fingerprint(json.loads(body)["messages"])
+
+
+@pytest.mark.asyncio
+async def test_local_400_records_a_fingerprint_backoff_entry(mixed_model_config):
+    """A local 400 must open the 1-minute rung for the request's history."""
+    body = _chat_body("poisoned history")
+    _mock_local, _mock_remote, _ = _make_mocks([_local_400_body()])
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+
+    assert result.status_code == 200
+    entry = fb.get_backoff_entry(_fingerprint_of(body))
+    assert entry is not None, "a local 400 must record a per-fingerprint backoff entry"
+    assert entry["session_id"] == "sess-compacted-400"
+    assert entry["resend_count"] == 1
+    assert entry["retry_after"] == 60.0, "the first rung is 1 minute"
+    assert fb.check_backoff_expired(_fingerprint_of(body)) is False
+
+
+@pytest.mark.asyncio
+async def test_repeated_local_400_escalates_the_shared_fingerprint_ladder(
+    mixed_model_config,
+):
+    """Two sessions resending the same history share one 1 -> 5 -> 15 min ladder."""
+    body = _chat_body("identical", "bad history")
+    _mock_local, _mock_remote, _ = _make_mocks([_local_400_body(), _local_400_body()])
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        for session in ("sess-a", "sess-b"):
+            result = await provider.proxy_with_fallback(
+                _DummyRequest(body=body, headers={"x-session-id": session}),
+                "v1/chat/completions", mixed_model_config, cfg,
+            )
+            assert result.status_code == 200
+
+    fingerprint = _fingerprint_of(body)
+    entry = fb.get_backoff_entry(fingerprint)
+    assert entry["resend_count"] == 2, "the same history must continue the shared ladder"
+    assert entry["retry_after"] == 300.0
+    assert entry["session_id"] == "sess-b", "the entry records the last session that sent it"
+
+
+@pytest.mark.asyncio
+async def test_changed_history_clears_the_previous_fingerprint_backoff(
+    mixed_model_config,
+):
+    """A compaction rewrite must drop the old history's verdict (parent AC2)."""
+    old_body = _chat_body("old compacted history")
+    new_body = _chat_body("rewritten after compaction")
+    _mock_local, _mock_remote, _ = _make_mocks([_local_400_body(), _local_400_body()])
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        for body in (old_body, new_body):
+            result = await provider.proxy_with_fallback(
+                _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+                "v1/chat/completions", mixed_model_config, cfg,
+            )
+            assert result.status_code == 200
+
+    assert fb.get_backoff_entry(_fingerprint_of(old_body)) is None, (
+        "the session moved to a different history, so the old verdict must be dropped"
+    )
+    assert fb.get_backoff_entry(_fingerprint_of(new_body))["resend_count"] == 1, (
+        "the rewritten history must start at the bottom of the ladder"
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_success_clears_the_fingerprint_backoff(mixed_model_config):
+    """A successful local stream resets the history's ladder (parent AC2)."""
+    body = _chat_body("recovering history")
+    local_ok = Response(
+        content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+        status_code=200,
+        media_type="application/json",
+    )
+    _mock_local, _mock_remote, _ = _make_mocks([_local_400_body(), local_ok])
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        first = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+        assert first.headers.get("X-Provider") == "remote-fallback"
+        assert fb.get_backoff_entry(_fingerprint_of(body)) is not None
+
+        second = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+        assert second.headers.get("X-Provider") == "local-qwen3"
+
+    assert fb.get_backoff_entry(_fingerprint_of(body)) is None, (
+        "a local success must clear the backoff for the history it served"
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_local_success_clears_the_fingerprint_backoff(
+    mixed_model_config,
+):
+    """Production local traffic streams; the streaming success must reset too."""
+    from starlette.responses import StreamingResponse
+
+    async def _gen():
+        yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        yield b'data: [DONE]\n\n'
+
+    body = _chat_body("recovering stream")
+    _mock_local, _mock_remote, _ = _make_mocks(
+        [
+            _local_400_body(),
+            StreamingResponse(content=_gen(), status_code=200, media_type="text/event-stream"),
+        ]
+    )
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+        assert fb.get_backoff_entry(_fingerprint_of(body)) is not None
+
+        streamed = await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+        assert streamed.headers.get("X-Provider") == "local-qwen3"
+
+    assert fb.get_backoff_entry(_fingerprint_of(body)) is None
+
+
+@pytest.mark.asyncio
+async def test_streak_entry_carries_the_fingerprint_information(mixed_model_config):
+    """IAC7: the existing streak tracking is extended, not replaced."""
+    body = _chat_body("poisoned history")
+    _mock_local, _mock_remote, _ = _make_mocks([_local_400_body()])
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+
+    streak = provider._local_http_400_streaks[("sess-compacted-400", "local-qwen3")]
+    assert streak["count"] == 1, "the pre-existing streak semantics are unchanged"
+    assert streak["fingerprint"] == _fingerprint_of(body)
+    assert streak["backoff_resend_count"] == 1
+    assert streak["backoff_retry_after"] == 60.0
+    assert streak["backoff_until"] > streak["start"]
+
+
+@pytest.mark.asyncio
+async def test_local_400_without_messages_records_no_fingerprint_verdict(
+    mixed_model_config,
+):
+    """A body with no conversation has nothing to fingerprint — no verdict."""
+    _mock_local, _mock_remote, _ = _make_mocks([_local_400_body()])
+    cfg = {"provider_cooldown_seconds": 60}
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers=dict(SESSION_HEADERS)),
+            "v1/chat/completions", mixed_model_config, cfg,
+        )
+
+    assert result.status_code == 200
+    assert provider._local_http_400_streaks[("sess-compacted-400", "local-qwen3")]["count"] == 1
+    assert fb.get_backoff_entry(fb.compute_prompt_fingerprint([])) is None
+
+
+def test_fingerprint_backoff_state_reports_the_verdict_for_a_request_body():
+    """The read-side helper the typed-error layer consumes (I2 contract)."""
+    body = json.loads(_chat_body("bad"))
+    fingerprint = _fingerprint_of(_chat_body("bad"))
+    assert provider.fingerprint_backoff_state("sess", body) is None
+
+    fb.record_backoff(fingerprint, "sess", now=100.0)
+
+    state = provider.fingerprint_backoff_state("sess", body, now=130.0)
+    assert state["fingerprint"] == fingerprint
+    assert state["expired"] is False
+    assert state["remaining_seconds"] == pytest.approx(30.0)
+    assert state["entry"]["resend_count"] == 1
+
+    later = provider.fingerprint_backoff_state("sess", body, now=160.0)
+    assert later["expired"] is True
+    assert later["remaining_seconds"] == 0.0
+    assert later["entry"]["resend_count"] == 1, "an expired entry survives for the next rung"
+
+    # No conversation history -> nothing to report.
+    assert provider.fingerprint_backoff_state("sess", {"model": "test"}) is None

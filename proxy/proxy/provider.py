@@ -44,6 +44,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from proxy import (
     admission_reserve,
     cold_start,
+    fingerprint_backoff,
     local_deferral,
     quota_pacing,
     quota_state,
@@ -584,6 +585,17 @@ _DETERMINISTIC_LOCAL_400_WINDOW_SECONDS = 600.0  # 10 minutes
 # Upper bound on tracked (session, provider) streak entries before pruning
 # stale ones (avoids unbounded growth on many short sessions).
 _MAX_LOCAL_HTTP_400_STREAK_ENTRIES = 1000
+
+# Per-prompt-fingerprint backoff ladder (LP-0MW95BCVV004LO0K): a local 400
+# that repeats on a byte-identical history backs *that history* off
+# exponentially (1 min -> 5 min -> 15 min cap) instead of being re-dispatched
+# every turn. The ladder itself lives in ``proxy.fingerprint_backoff`` so there
+# is one source of truth; these aliases are the names the 400 path reads.
+# Deliberately NOT called ``_BACKOFF_MAX_SECONDS``: that name already caps
+# *provider* cooldown at 45 s above, and reusing it would silently stretch
+# cooldowns to 15 minutes.
+_FINGERPRINT_BACKOFF_INITIAL_SECONDS = fingerprint_backoff.BACKOFF_INITIAL_SECONDS
+_FINGERPRINT_BACKOFF_MAX_SECONDS = fingerprint_backoff.BACKOFF_MAX_SECONDS
 
 # ---------------------------------------------------------------------------
 # Timed access to models (LP-0MS4ETBNO0022QAC)
@@ -13605,7 +13617,69 @@ def _observe_http_error_400(
         pass
 
 
-def _reset_local_http_400_streak(session_id: str | None, provider_name: str) -> None:
+def _request_messages(body_json: Any) -> list[Any] | None:
+    """Return the request's non-empty ``messages`` array, else ``None``.
+
+    The fingerprint is only defined for a conversation, so a body without
+    ``messages`` (health probes, model-listing style calls, tests) records no
+    verdict at all rather than one for an empty history.
+    """
+    if not isinstance(body_json, dict):
+        return None
+    messages = body_json.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    return messages
+
+
+def fingerprint_backoff_state(
+    session_id: str | None,
+    body_json: Any,
+    *,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Return the per-prompt-fingerprint backoff verdict for this request.
+
+    Read-side entry point for the typed-error layer (LP-0MW95BDJQ002DSVI) and
+    the terminal breaker (LP-0MW95BE7X00574OL): they ask "is *this history* in
+    a backoff window?" without touching fingerprint internals.
+
+    Returns ``None`` when the request carries no conversation history (nothing
+    to fingerprint) or the history has no recorded verdict; otherwise a dict
+    with ``fingerprint``, ``entry`` (see
+    :func:`proxy.fingerprint_backoff.get_backoff_entry`), ``expired`` and
+    ``remaining_seconds``. An expired entry is still reported (``expired:
+    True``, ``remaining_seconds: 0.0``) because the resend that follows it
+    continues the ladder rather than restarting it.
+
+    Cheap on the hot path: the fingerprint comes from the per-session hash
+    chain (only appended messages are hashed, and a byte-identical resend
+    hashes nothing), and a session that moved to a different history drops its
+    previous entry as a side effect of resolving the new one (parent AC2's
+    "changed history resets the backoff").
+    """
+    messages = _request_messages(body_json)
+    if messages is None:
+        return None
+    fingerprint = fingerprint_backoff.fingerprint_for_session(session_id, messages)
+    entry = fingerprint_backoff.get_backoff_entry(fingerprint)
+    if entry is None:
+        return None
+    return {
+        "fingerprint": fingerprint,
+        "entry": entry,
+        "expired": fingerprint_backoff.check_backoff_expired(fingerprint, now=now),
+        "remaining_seconds": fingerprint_backoff.remaining_backoff_seconds(
+            fingerprint, now=now
+        ),
+    }
+
+
+def _reset_local_http_400_streak(
+    session_id: str | None,
+    provider_name: str,
+    body_json: Any | None = None,
+) -> None:
     """Reset the deterministic local-400 streak after a successful dispatch.
 
     A session whose local 400s are interspersed with successful local
@@ -13613,9 +13687,21 @@ def _reset_local_http_400_streak(session_id: str | None, provider_name: str) -> 
     400s escalates (LP-0MTXEBQ4E001BMI2, mirroring the sibling-failure
     streak semantics). Called from the local success paths of
     ``_proxy_with_fallback_cycle``.
+
+    LP-0MW95BCVV004LO0K: a local success also clears the per-prompt-fingerprint
+    backoff for the history that just succeeded, so a session that recovers
+    (or a history compacted into something llama-server accepts) restarts at
+    the bottom of the ladder — parent AC2's "resets on any successful stream".
+    Only a *local* success counts: the loop this guards is local 400 -> remote
+    success -> local 400, so treating the remote success as recovery would stop
+    the ladder ever advancing.
     """
     key = (session_id or "unknown", provider_name)
     _local_http_400_streaks.pop(key, None)
+    messages = _request_messages(body_json)
+    if messages is not None:
+        fingerprint = fingerprint_backoff.fingerprint_for_session(session_id, messages)
+        fingerprint_backoff.clear_backoff(fingerprint)
 
 
 def _prune_local_http_400_streaks(now: float) -> None:
@@ -13636,6 +13722,7 @@ def _observe_local_http_error_400(
     path: str,
     body_text: str,
     session_id: str | None = None,
+    body_json: Any | None = None,
 ) -> None:
     """Observability for local HTTP 400 fallbacks (LP-0MTXEBQ4E001BMI2).
 
@@ -13690,16 +13777,38 @@ def _observe_local_http_error_400(
             if len(_local_http_400_streaks) > _MAX_LOCAL_HTTP_400_STREAK_ENTRIES:
                 _prune_local_http_400_streaks(now)
         entry["count"] = int(entry.get("count", 0) or 0) + 1
+
+        # Per-prompt-fingerprint backoff (LP-0MW95BCVV004LO0K, parent AC2).
+        # The streak above is per (session, provider) and only makes the loop
+        # *visible*; the verdict that must actually throttle the request is
+        # keyed by the history itself, so two sessions resending the same bad
+        # conversation share one ladder (1 min -> 5 min -> 15 min cap). The
+        # entry is recorded on the first rejection — the typed-error layer
+        # (LP-0MW95BDJQ002DSVI) decides which resend it answers, and the
+        # terminal breaker (LP-0MW95BE7X00574OL) counts these resends.
+        messages = _request_messages(body_json)
+        if messages is not None:
+            fingerprint = fingerprint_backoff.fingerprint_for_session(session_id, messages)
+            backoff = fingerprint_backoff.record_backoff(fingerprint, session_id)
+            entry["fingerprint"] = fingerprint
+            entry["backoff_resend_count"] = int(backoff["resend_count"])
+            entry["backoff_retry_after"] = float(backoff["retry_after"])
+            entry["backoff_until"] = float(backoff["until"])
+
         if int(entry["count"]) >= _DETERMINISTIC_LOCAL_400_THRESHOLD:
             logger.warning(
                 "Deterministic local HTTP 400: provider=%s model=%s session=%s "
-                "consecutive=%d threshold=%d body_snippet=%s — local rejects this "
+                "consecutive=%d threshold=%d fingerprint=%s resend_count=%s "
+                "retry_after=%s body_snippet=%s — local rejects this "
                 "history every turn; inspect llama-server for the request-shape cause",
                 provider_name,
                 path,
                 session_id or "unknown",
                 int(entry["count"]),
                 _DETERMINISTIC_LOCAL_400_THRESHOLD,
+                (entry.get("fingerprint") or "unknown")[:12],
+                entry.get("backoff_resend_count"),
+                entry.get("backoff_retry_after"),
                 snippet,
             )
             try:
@@ -17657,8 +17766,9 @@ async def _proxy_with_fallback_cycle(
             if stream_result is not None:
                 # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
                 # local-400 streak (only unbroken same-session 400 runs escalate).
+                # LP-0MW95BCVV004LO0K: and clears this history's backoff.
                 if provider_type == "local":
-                    _reset_local_http_400_streak(_session_id, provider_name)
+                    _reset_local_http_400_streak(_session_id, provider_name, body_json)
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
                 if _pending_reroute:
@@ -18159,6 +18269,7 @@ async def _proxy_with_fallback_cycle(
                                 path,
                                 body_text,
                                 _session_id,
+                                body_json,
                             )
                         continue
 
@@ -18432,8 +18543,9 @@ async def _proxy_with_fallback_cycle(
             )
             # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
             # local-400 streak (only unbroken same-session 400 runs escalate).
+            # LP-0MW95BCVV004LO0K: and clears this history's backoff.
             if provider_type == "local":
-                _reset_local_http_400_streak(_session_id, provider_name)
+                _reset_local_http_400_streak(_session_id, provider_name, body_json)
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
             return result

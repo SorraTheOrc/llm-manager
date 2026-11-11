@@ -4279,3 +4279,56 @@ Adding an always-on remote provider to cover the scheduled gaps was
 windows some requests *must* be deferred; this response makes that deferral
 honest and actionable rather than appearing as a failure. Do not re-time a
 provider's `available_times` to hide a gap either — the gap is the design.
+
+## Per-prompt-fingerprint backoff for deterministic local 400s (LP-0MW95BCVV004LO0K)
+
+A local 400 is a request-shape incompatibility, so it falls back to the next
+provider *without* cooling the local entry down. That is right for a one-off,
+but wrong for a history llama-server rejects every time (the compacted-pointer
+shape from LP-0MTXEBQ4E001BMI2): the client re-sends a byte-identical
+conversation, gets the same 400, and the proxy routes remote again — forever,
+with no state that says "this exact history is provably rejected".
+
+`proxy/fingerprint_backoff.py` supplies the missing identity and throttle:
+
+- **Fingerprint.** `compute_prompt_fingerprint(messages)` is a SHA-256 hash
+  chain over the canonical message array with the per-send fields
+  (`timestamp`, `request_id`, `id`) stripped at every depth, so a resend of
+  the same history fingerprints identically across processes and sessions.
+- **Backoff keyed by the fingerprint, not the session.** Two sessions looping
+  on the same bad conversation share one verdict
+  (`{fingerprint, session_id, retry_after, resend_count}`); the ladder is
+  1 min → 5 min → 15 min, capped at 15 min.
+- **Reset rules.** A successful **local** stream clears the verdict for the
+  history it served; a session that sends a *different* history drops its
+  previous verdict and starts at the bottom of the ladder. A remote success
+  deliberately does **not** reset: the wedged loop is local 400 → remote
+  success → local 400, so counting the remote success as recovery would stop
+  the ladder advancing.
+- **Hot path.** The fingerprint is cached per session as a hash chain: a
+  byte-identical resend hashes nothing, an appended turn hashes only the new
+  messages, and a rewritten history (compaction) is re-hashed from scratch.
+- **In-memory and bounded.** Both the verdict table and the session cache are
+  capped and pruned, like the sibling cooldown and streak state. A proxy
+  restart loses them — acceptable, because a restart also loses the wedged
+  client's in-flight request.
+
+Wiring in `provider.py`:
+
+- `_observe_local_http_error_400` records the verdict on every local 400 and
+  **extends** the pre-existing `_local_http_400_streaks` entry with
+  `fingerprint`, `backoff_resend_count`, `backoff_retry_after` and
+  `backoff_until` (the per-(session, provider) streak semantics are unchanged,
+  LP-0MTXEBQ4E001BMI2). The deterministic-repeat WARNING carries the
+  fingerprint prefix, the resend count and the current `retry_after`.
+- `_reset_local_http_400_streak` clears the verdict on the same two local
+  success paths that reset the streak.
+- `fingerprint_backoff_state(session_id, body_json)` is the read side the
+  typed-error layer (LP-0MW95BDJQ002DSVI) and the terminal breaker
+  (LP-0MW95BE7X00574OL) consume: it reports `{fingerprint, entry, expired,
+  remaining_seconds}` (or `None` when the request carries no history), and it
+  reports an expired entry too, because the resend that follows continues the
+  ladder rather than restarting it.
+
+Bodies without a `messages` array record no verdict: there is no conversation
+to fingerprint.
