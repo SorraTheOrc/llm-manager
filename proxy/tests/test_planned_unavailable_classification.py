@@ -1,9 +1,4 @@
 
-# <!-- REFACTOR-LP-0MW305AJ80085AEK
-# smell: unused_import
-# severity: critical
-# description: Local variable `response` is assigned to but never used
-# -->
 """Contract tests for the planned-unavailable chain classifier (LP-0MVWC9CZH004OZYN).
 
 Drives AC1-AC4, AC8. Written test-first so the classifier function,
