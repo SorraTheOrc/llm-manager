@@ -30,6 +30,19 @@ the previously hashed prefix is reused. A rewritten history (compaction: same
 length, different head or tail) is detected by the sample and re-hashed from
 scratch.
 
+Terminal breaker
+----------------
+A history that keeps being resent *after* its windows expire is not merely
+slow, it is wedged: the client will never succeed until it changes the
+conversation. When the shared ``resend_count`` for a fingerprint reaches
+:data:`DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD` (configurable via
+``deterministic_client_error_escalation_threshold``), :func:`session_wedged_error`
+reports the terminal verdict the caller must answer with. The count resets on
+exactly the two events that end the loop — a successful stream
+(:func:`clear_backoff`) and a changed history
+(:func:`note_prompt_fingerprint`) — so the breaker can only fire on an
+unbroken run of rejections of the *same* history.
+
 State is in-memory only and bounded (stale backoff entries are pruned, the
 session cache is FIFO-evicted), consistent with the sibling cooldown and
 streak mechanisms. A proxy restart loses the state: acceptable, because a
@@ -40,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -59,6 +73,25 @@ VOLATILE_KEYS = frozenset({"timestamp", "request_id", "id"})
 BACKOFF_INITIAL_SECONDS = 60.0
 BACKOFF_SCHEDULE_SECONDS: tuple[float, ...] = (BACKOFF_INITIAL_SECONDS, 300.0, 900.0)
 BACKOFF_MAX_SECONDS = BACKOFF_SCHEDULE_SECONDS[-1]
+
+#: Terminal circuit breaker (LP-0MW959H72003PF67 / LP-0MW95BE7X00574OL,
+#: parent AC3): after this many consecutive rejections of the same history the
+#: client is told the session is wedged instead of being handed another
+#: typed 400 it has already ignored.
+DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD = 5
+
+#: Proxy-config key overriding the threshold above (read at the top level or
+#: inside the ``server`` section, like the other proxy knobs).
+ESCALATION_THRESHOLD_CONFIG_KEY = "deterministic_client_error_escalation_threshold"
+
+#: Terminal error vocabulary returned once the breaker trips.
+SESSION_WEDGED = "session_wedged"
+SESSION_WEDGED_CAUSE = "repeated_deterministic_400"
+SESSION_WEDGED_HINT = "compaction may help"
+
+#: The terminal error's advertised wait is never shorter than this: a wedged
+#: session must not be retried immediately, even when the last window lapsed.
+SESSION_WEDGED_MIN_RETRY_AFTER_SECONDS = 60.0
 
 #: Upper bounds keeping the module's in-memory state finite.
 MAX_BACKOFF_ENTRIES = 1000
@@ -286,6 +319,89 @@ def note_prompt_fingerprint(session_id: str | None, fingerprint: str) -> str | N
         return None
     clear_backoff(previous)
     return previous
+
+
+# ---------------------------------------------------------------------------
+# Terminal breaker
+# ---------------------------------------------------------------------------
+
+
+def get_resend_count(fingerprint: str) -> int:
+    """Return the consecutive rejections recorded for ``fingerprint``.
+
+    Shared across sessions by design (the verdict belongs to the history, see
+    the module docstring), and ``0`` for a history with no live entry — a
+    fingerprint that was cleared by a success or a changed history starts
+    again from zero.
+    """
+    entry = _backoff_entries.get(fingerprint)
+    if entry is None:
+        return 0
+    return max(0, int(entry.get("resend_count", 0) or 0))
+
+
+def escalation_threshold(config: Mapping[str, Any] | None = None) -> int:
+    """Return the escalation threshold configured in ``config``.
+
+    Reads :data:`ESCALATION_THRESHOLD_CONFIG_KEY` at the top level and, like
+    the other proxy knobs, inside a ``server`` section. Anything that is not a
+    positive integer falls back to
+    :data:`DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD`: a mistyped knob
+    must neither disable the breaker nor wedge a session on its first 400.
+    """
+    raw: Any = None
+    if isinstance(config, Mapping):
+        raw = config.get(ESCALATION_THRESHOLD_CONFIG_KEY)
+        if raw is None:
+            server = config.get("server")
+            if isinstance(server, Mapping):
+                raw = server.get(ESCALATION_THRESHOLD_CONFIG_KEY)
+    if raw is None or isinstance(raw, bool):
+        return DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD
+    if value < 1:
+        return DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD
+    return value
+
+
+def session_wedged_error(
+    fingerprint: str,
+    *,
+    config: Mapping[str, Any] | None = None,
+    threshold: int | None = None,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Return the terminal ``session_wedged`` payload, or ``None``.
+
+    ``None`` means the breaker has not tripped: the caller keeps its existing
+    behaviour (the typed 400 / normal fallback). The payload is a superset of
+    the documented contract — ``error``/``cause``/``hint`` plus the
+    ``retry_after`` the caller turns into a ``Retry-After`` header and the
+    ``resend_count``/``fingerprint`` used for logging. ``threshold`` wins over
+    ``config`` when both are given, so a caller that already resolved the knob
+    does not read it twice.
+    """
+    limit = int(threshold) if threshold is not None else escalation_threshold(config)
+    if limit < 1:
+        limit = DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD
+    count = get_resend_count(fingerprint)
+    if count < limit:
+        return None
+    retry_after = max(
+        SESSION_WEDGED_MIN_RETRY_AFTER_SECONDS,
+        remaining_backoff_seconds(fingerprint, now=now),
+    )
+    return {
+        "error": SESSION_WEDGED,
+        "cause": SESSION_WEDGED_CAUSE,
+        "hint": SESSION_WEDGED_HINT,
+        "retry_after": int(math.ceil(retry_after)),
+        "resend_count": count,
+        "fingerprint": fingerprint,
+    }
 
 
 def _prune_backoff_entries(now: float) -> None:

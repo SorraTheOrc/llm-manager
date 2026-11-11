@@ -373,3 +373,188 @@ def test_module_state_is_json_serialisable():
     entry = fb.record_backoff(fingerprint, "sess", now=5.0)
 
     assert json.loads(json.dumps(entry)) == entry
+
+
+# =====================================================================
+# LP-0MW959H72003PF67 (T3) — terminal circuit breaker (session_wedged)
+#
+# Parent AC3: after N consecutive identical resends (configurable via
+# ``deterministic_client_error_escalation_threshold``, default 5) the client is
+# told the session is wedged — ``{error: "session_wedged", cause:
+# "repeated_deterministic_400", hint: "compaction may help"}`` — instead of
+# being throttled forever. The counter resets on a successful stream and on a
+# changed history, so the breaker can only fire on an unbroken run of
+# rejections of the *same* history.
+#
+# These tests pin ``proxy.fingerprint_backoff``'s half of that contract: the
+# verdict and the configurable threshold. Wiring the verdict into the typed-400
+# response (HTTP status, ``Retry-After`` header, metric) belongs to
+# LP-0MW95BE7X00574OL.
+# =====================================================================
+
+_ESCALATION_KEY = fb.ESCALATION_THRESHOLD_CONFIG_KEY
+
+
+def _reject(fingerprint: str, times: int, session: str = "sess-wedged", start: float = 1_000.0):
+    """Record ``times`` consecutive rejections of ``fingerprint``."""
+    entry = None
+    for index in range(times):
+        entry = fb.record_backoff(fingerprint, session, now=start + index)
+    return entry
+
+
+def test_no_terminal_verdict_without_any_recorded_rejection():
+    fingerprint = fb.compute_prompt_fingerprint(_history("untried history"))
+
+    assert fb.get_resend_count(fingerprint) == 0
+    assert fb.session_wedged_error(fingerprint) is None
+
+
+def test_five_consecutive_identical_resends_escalate_to_session_wedged():
+    """TAC1: the 5th identical resend is terminal, the 4th is not."""
+    session = "sess-wedged"
+    fingerprint = fb.fingerprint_for_session(session, _history("poisoned", "history"))
+
+    for attempt in range(1, 5):
+        _reject(fingerprint, 1, session, start=1_000.0 + attempt)
+        assert fb.session_wedged_error(fingerprint) is None, (
+            f"resend {attempt} must still be a typed 400, not a terminal verdict"
+        )
+
+    _reject(fingerprint, 1, session, start=1_005.0)
+    payload = fb.session_wedged_error(fingerprint)
+
+    assert payload is not None
+    assert payload["error"] == "session_wedged"
+    assert payload["cause"] == "repeated_deterministic_400"
+    assert payload["hint"] == "compaction may help"
+    # Extra fields feed the response header and the log line; the documented
+    # contract above is what clients match on.
+    assert payload["resend_count"] == 5
+    assert payload["fingerprint"] == fingerprint
+    assert payload["retry_after"] >= 1
+
+
+def test_escalation_threshold_defaults_to_five():
+    """TAC2: the shipped default is 5 (parent AC3's N)."""
+    assert fb.DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD == 5
+    assert _ESCALATION_KEY == "deterministic_client_error_escalation_threshold"
+    assert fb.escalation_threshold() == 5
+    assert fb.escalation_threshold({}) == 5
+
+
+def test_escalation_threshold_is_configurable_from_proxy_config():
+    """TAC2: the knob is honoured at the top level and inside ``server``."""
+    assert fb.escalation_threshold({_ESCALATION_KEY: 3}) == 3
+    assert fb.escalation_threshold({_ESCALATION_KEY: "7"}) == 7
+    assert fb.escalation_threshold({"server": {_ESCALATION_KEY: 2}}) == 2
+    # A top-level value wins over the section, matching the other knobs.
+    assert fb.escalation_threshold({_ESCALATION_KEY: 4, "server": {_ESCALATION_KEY: 9}}) == 4
+    # An explicit threshold wins over the config (a caller that already resolved it).
+    fingerprint = fb.compute_prompt_fingerprint(_history("bad"))
+    _reject(fingerprint, 2)
+    assert fb.session_wedged_error(fingerprint, config={_ESCALATION_KEY: 2}) is not None
+    assert fb.session_wedged_error(fingerprint, config={_ESCALATION_KEY: 9}) is None
+    assert fb.session_wedged_error(fingerprint, threshold=2, config={_ESCALATION_KEY: 9}) is not None
+
+
+def test_invalid_escalation_threshold_falls_back_to_the_default():
+    """A mistyped knob must neither disable the breaker nor wedge on resend 1."""
+    for invalid in ("many", 0, -1, True, [], {}, 0.4):
+        assert fb.escalation_threshold({_ESCALATION_KEY: invalid}) == 5, (
+            f"{invalid!r} must fall back to the default threshold"
+        )
+
+
+def test_configured_threshold_escalates_at_its_own_count():
+    """TAC2: lowering the knob trips the breaker earlier."""
+    session = "sess-tuned"
+    fingerprint = fb.fingerprint_for_session(session, _history("poisoned"))
+    config = {_ESCALATION_KEY: 3}
+
+    _reject(fingerprint, 2, session)
+    assert fb.session_wedged_error(fingerprint, config=config) is None
+
+    _reject(fingerprint, 1, session, start=1_010.0)
+    payload = fb.session_wedged_error(fingerprint, config=config)
+
+    assert payload is not None
+    assert payload["resend_count"] == 3, "the default of 5 would still be throttling here"
+
+
+def test_successful_stream_between_resends_resets_the_terminal_counter():
+    """TAC3: a success clears the count, so the breaker cannot fire later."""
+    session = "sess-recovers"
+    fingerprint = fb.fingerprint_for_session(session, _history("bad", "history"))
+    _reject(fingerprint, 4, session)
+
+    assert fb.clear_backoff(fingerprint) is True  # the successful stream
+    assert fb.get_resend_count(fingerprint) == 0
+
+    _reject(fingerprint, 1, session, start=1_010.0)
+
+    assert fb.get_resend_count(fingerprint) == 1
+    assert fb.session_wedged_error(fingerprint) is None, (
+        "one rejection after a success is a fresh ladder, not a wedged session"
+    )
+
+
+def test_changed_fingerprint_between_resends_resets_the_terminal_counter():
+    """TAC4: a rewritten (compacted) history is a fresh count."""
+    session = "sess-compacts"
+    old_fingerprint = fb.fingerprint_for_session(session, _history("old", "compacted"))
+    _reject(old_fingerprint, 4, session)
+
+    new_fingerprint = fb.fingerprint_for_session(session, _history("rebuilt", "history"))
+    assert new_fingerprint != old_fingerprint
+    assert fb.get_resend_count(old_fingerprint) == 0, "the previous verdict is dropped"
+    _reject(new_fingerprint, 1, session, start=1_010.0)
+
+    assert fb.get_resend_count(new_fingerprint) == 1
+    assert fb.session_wedged_error(old_fingerprint) is None
+    assert fb.session_wedged_error(new_fingerprint) is None
+
+
+def test_backoff_expired_resends_still_accumulate_toward_escalation():
+    """The breaker counts resends, not wall-clock: expiry is not a reset."""
+    fingerprint = fb.compute_prompt_fingerprint(_history("bad"))
+
+    for round_index in range(5):
+        now = 1_000.0 + round_index * 3_600.0  # each window long expired
+        fb.record_backoff(fingerprint, "sess", now=now)
+
+    assert fb.check_backoff_expired(fingerprint, now=100_000.0) is True
+    payload = fb.session_wedged_error(fingerprint, now=100_000.0)
+
+    assert payload is not None
+    assert payload["resend_count"] == 5
+    assert payload["retry_after"] >= int(fb.SESSION_WEDGED_MIN_RETRY_AFTER_SECONDS), (
+        "an expired window must not advertise an immediate retry"
+    )
+
+
+def test_terminal_verdict_is_shared_by_every_session_on_the_same_history():
+    """The verdict belongs to the history, so a second session sees it too."""
+    history = _history("identical", "bad history")
+    fingerprint_a = fb.fingerprint_for_session("sess-a", history)
+    fingerprint_b = fb.fingerprint_for_session("sess-b", history)
+    _reject(fingerprint_a, 4, "sess-a")
+
+    assert fb.session_wedged_error(fingerprint_b) is None
+
+    _reject(fingerprint_b, 1, "sess-b", start=1_010.0)
+
+    payload = fb.session_wedged_error(fingerprint_a)
+    assert payload is not None
+    assert payload["resend_count"] == 5, "the ladder is shared across sessions"
+
+
+def test_terminal_payload_is_json_serialisable():
+    """The payload is returned to the client, so it must serialise cleanly."""
+    fingerprint = fb.compute_prompt_fingerprint(_history("bad"))
+    _reject(fingerprint, 5)
+
+    payload = fb.session_wedged_error(fingerprint)
+
+    assert payload is not None
+    assert json.loads(json.dumps(payload)) == payload
