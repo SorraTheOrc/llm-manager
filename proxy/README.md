@@ -900,6 +900,17 @@ every turn) routed remote invisibly turn after turn.
   successful local dispatch resets the streak (only unbroken same-session 400
   runs escalate). No cooldown is applied either way — the local provider
   stays eligible for the next request.
+- **Typed error, then a terminal breaker
+  (LP-0MW95BDJQ002DSVI / LP-0MW95BE7X00574OL):** a resend of a history already
+  rejected is answered immediately with the typed `deterministic_client_error`
+  (HTTP 400, `Retry-After`, `X-Deterministic-Client-Error: identical_history`),
+  and after `deterministic_client_error_escalation_threshold` resends (default
+  `5`, read top-level or inside `server`) with the terminal `session_wedged`
+  error (`X-Session-Wedged`, `Retry-After` >= 60 s,
+  `proxy_http_errors_total{reason="session_wedged"}`). Neither consumes a
+  chain-hold cycle nor dispatches remote. A successful local stream or a
+  changed history resets the count. See
+  [`docs/routing.md`](docs/routing.md#terminal-breaker-session_wedged-lp-0mw95be7x00574ol).
 
 #### All Providers Exhausted
 

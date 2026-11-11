@@ -1043,3 +1043,242 @@ async def test_typed_400_is_a_json_error_even_for_a_streaming_request(
     payload = _typed_error_payload(typed)
     assert payload["error"] == "deterministic_client_error"
     assert call_log == ["local", "remote", "local"]
+
+
+# =====================================================================
+# LP-0MW95BE7X00574OL (I3) — terminal breaker: ``session_wedged``
+#
+# Parent AC3: after ``deterministic_client_error_escalation_threshold``
+# (default 5) consecutive backoff-expired identical resends the client is told
+# the session is wedged — ``{error: "session_wedged", cause:
+# "repeated_deterministic_400", hint: "compaction may help"}`` — instead of
+# being handed yet another typed 400 it has already ignored. I3 owns the
+# *wiring* into the typed-400 path; the mechanism's own contract is pinned in
+# ``test_provider_fingerprint_backoff.py`` (T3, LP-0MW959H72003PF67).
+# =====================================================================
+
+
+def _json_error_payload(response) -> dict:
+    """Decode a JSON error response body, asserting it is JSON first."""
+    assert response.headers["content-type"].startswith("application/json"), (
+        "a terminal error must be a JSON document, not SSE: "
+        f"{response.headers.get('content-type')!r}"
+    )
+    return json.loads(response.body)
+
+
+async def _send_identical_resends(
+    body: bytes,
+    count: int,
+    model_config: dict,
+    cfg: dict | None = None,
+    *,
+    session: str = "sess-wedged",
+    local_responses=None,
+):
+    """Dispatch ``count`` byte-identical resends, collecting every response.
+
+    The local mock rejects with a 400 unless ``local_responses`` overrides the
+    sequence (used to interleave a successful local stream); the remote mock
+    always succeeds, so a request that falls back is visible as a 200.
+    """
+    responses = (
+        list(local_responses)
+        if local_responses is not None
+        else [_local_400_body() for _ in range(count)]
+    )
+    _mock_local, _mock_remote, call_log = _make_mocks(responses)
+    results = []
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        for _ in range(count):
+            results.append(
+                await provider.proxy_with_fallback(
+                    _DummyRequest(body=body, headers={"x-session-id": session}),
+                    "v1/chat/completions", model_config, cfg or {"provider_cooldown_seconds": 60},
+                )
+            )
+    return results, call_log
+
+
+@pytest.mark.asyncio
+async def test_fifth_identical_resend_returns_terminal_session_wedged(
+    mixed_model_config,
+):
+    """IAC1 + IAC4: the 5th identical resend is terminal, 400, Retry-After >= 60."""
+    body = _chat_body("wedged", "history")
+    wedged_before = _metric_value("v1/chat/completions", "400", "session_wedged")
+    typed_before = _metric_value("v1/chat/completions", "400", "deterministic_client_error")
+
+    results, call_log = await _send_identical_resends(body, 5, mixed_model_config)
+
+    assert [r.status_code for r in results] == [200, 400, 400, 400, 400], (
+        "the first 400 falls back; resends 2-4 are typed 400s; the 5th is terminal"
+    )
+    for earlier in results[1:4]:
+        assert _json_error_payload(earlier)["error"] == "deterministic_client_error", (
+            "only the resend that reaches the escalation threshold is terminal"
+        )
+
+    terminal = results[4]
+    payload = _json_error_payload(terminal)
+    assert payload["error"] == "session_wedged"
+    assert payload["cause"] == "repeated_deterministic_400"
+    assert payload["hint"] == "compaction may help"
+    assert isinstance(payload["retry_after"], int)
+    assert payload["retry_after"] >= 60, (
+        f"IAC4: a wedged session must not be told to retry soon, got {payload['retry_after']}"
+    )
+    assert terminal.headers["Retry-After"] == str(payload["retry_after"]), (
+        "IAC4: the header and the body must advertise the same wait"
+    )
+    assert call_log == ["local", "remote"] + ["local"] * 4, (
+        f"the terminal error must terminate the request — no remote dispatch: {call_log}"
+    )
+    assert _metric_value(
+        "v1/chat/completions", "400", "session_wedged"
+    ) == wedged_before + 1, "the terminal error has its own metric reason"
+    assert _metric_value(
+        "v1/chat/completions", "400", "deterministic_client_error"
+    ) == typed_before + 3, (
+        "the three typed 400s before the threshold keep their own metric reason"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_wedged_is_distinguishable_from_the_typed_error(
+    mixed_model_config,
+):
+    """IAC5: herdr can tell the terminal error from the typed one by headers."""
+    body = _chat_body("distinguishable", "history")
+
+    results, _ = await _send_identical_resends(body, 5, mixed_model_config)
+
+    typed, terminal = results[3], results[4]
+    assert (
+        typed.headers[provider.DETERMINISTIC_CLIENT_ERROR_HEADER]
+        == "identical_history"
+    ), "the typed 400 keeps its documented header value"
+    assert provider.SESSION_WEDGED_HEADER not in typed.headers, (
+        "the typed error must not be mistaken for a terminal one"
+    )
+    assert terminal.headers[provider.SESSION_WEDGED_HEADER] == "repeated_deterministic_400"
+    assert (
+        terminal.headers[provider.DETERMINISTIC_CLIENT_ERROR_HEADER]
+        == "session_wedged"
+    ), "the shared header carries a distinct value on the terminal error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {fb.ESCALATION_THRESHOLD_CONFIG_KEY: 3},
+        {"server": {fb.ESCALATION_THRESHOLD_CONFIG_KEY: 3}},
+    ],
+    ids=["top-level", "server-section"],
+)
+async def test_session_wedged_threshold_is_configurable(mixed_model_config, overrides):
+    """IAC2: ``deterministic_client_error_escalation_threshold`` moves the trip point."""
+    body = _chat_body("configured", "threshold")
+
+    results, _ = await _send_identical_resends(
+        body, 3, mixed_model_config, {"provider_cooldown_seconds": 60, **overrides}
+    )
+
+    assert _json_error_payload(results[1])["error"] == "deterministic_client_error", (
+        "below the configured threshold the typed error is still the answer"
+    )
+    assert _json_error_payload(results[2])["error"] == "session_wedged"
+
+
+@pytest.mark.asyncio
+async def test_terminal_breaker_never_fires_on_a_lone_local_400(
+    mixed_model_config,
+):
+    """A degenerate threshold (1) must still not convict a single 400."""
+    body = _chat_body("lone", "rejection")
+
+    results, _ = await _send_identical_resends(
+        body,
+        1,
+        mixed_model_config,
+        {
+            "provider_cooldown_seconds": 60,
+            fb.ESCALATION_THRESHOLD_CONFIG_KEY: 1,
+        },
+    )
+
+    assert results[0].status_code == 200
+    assert results[0].headers.get("X-Provider") == "remote-fallback"
+    assert provider.SESSION_WEDGED_HEADER not in results[0].headers
+
+
+@pytest.mark.asyncio
+async def test_local_success_resets_the_terminal_breaker(mixed_model_config):
+    """IAC3: a successful stream resets the counter (no terminal error after)."""
+    body = _chat_body("recovering", "history")
+    local_ok = Response(
+        content=json.dumps({"choices": [{"message": {"content": "ok-local"}}]}),
+        status_code=200,
+        media_type="application/json",
+    )
+    # Four rejections (one short of the threshold), a successful local stream,
+    # then four more rejections: without the reset the second run would trip.
+    responses = [_local_400_body()] * 4 + [local_ok] + [_local_400_body()] * 4
+
+    results, _ = await _send_identical_resends(
+        body, 9, mixed_model_config, local_responses=responses
+    )
+
+    assert results[4].status_code == 200
+    assert results[4].headers.get("X-Provider") == "local-qwen3", (
+        "the interleaved success must actually be served locally"
+    )
+    for result in results:
+        if result.status_code == 400:
+            assert _json_error_payload(result)["error"] == "deterministic_client_error", (
+                "IAC3: a success between rejections resets the counter"
+            )
+    assert _json_error_payload(results[8])["error"] == "deterministic_client_error"
+
+
+@pytest.mark.asyncio
+async def test_changed_history_does_not_trip_the_terminal_breaker(
+    mixed_model_config,
+):
+    """IAC3: a different fingerprint restarts the ladder, so 5 rejections total
+    across two histories never escalate."""
+    first_body = _chat_body("first", "history")
+    second_body = _chat_body("second", "history")
+    responses = [_local_400_body()] * 8
+
+    _mock_local, _mock_remote, _ = _make_mocks(responses)
+    results = []
+    with (
+        patch("proxy.router.proxy_to_local", _mock_local),
+        patch("proxy.server.proxy_to_remote", _mock_remote),
+    ):
+        for body in [first_body] * 4 + [second_body] * 4:
+            results.append(
+                await provider.proxy_with_fallback(
+                    _DummyRequest(body=body, headers=dict(SESSION_HEADERS)),
+                    "v1/chat/completions",
+                    mixed_model_config,
+                    {"provider_cooldown_seconds": 60},
+                )
+            )
+
+    errors = [
+        _json_error_payload(r)["error"]
+        for r in results
+        if r.status_code == 400
+    ]
+    assert "session_wedged" not in errors, (
+        f"IAC3: a changed history restarts the count, got {errors}"
+    )
+    assert errors.count("deterministic_client_error") == 6, (
+        "each history contributes three typed 400s (its first 400 falls back)"
+    )

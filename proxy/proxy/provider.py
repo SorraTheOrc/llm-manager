@@ -13833,6 +13833,15 @@ DETERMINISTIC_CLIENT_ERROR_REASON_IDENTICAL_HISTORY = "identical_history"
 #: the body (parent AC1's machine-readable contract).
 DETERMINISTIC_CLIENT_ERROR_HEADER = "X-Deterministic-Client-Error"
 
+#: Terminal breaker vocabulary (LP-0MW95BE7X00574OL, parent AC3/AC5). The
+#: values live beside the mechanism in ``fingerprint_backoff`` so the payload
+#: contract is stated once.
+SESSION_WEDGED = fingerprint_backoff.SESSION_WEDGED
+SESSION_WEDGED_CAUSE = fingerprint_backoff.SESSION_WEDGED_CAUSE
+#: Response header that distinguishes the terminal error from the typed one
+#: (parent AC5) for clients that branch on headers instead of parsing JSON.
+SESSION_WEDGED_HEADER = "X-Session-Wedged"
+
 
 def _deterministic_client_error_verdict(
     session_id: str | None,
@@ -13889,12 +13898,94 @@ def _deterministic_client_error_retry_after_seconds(state: dict[str, Any]) -> in
     return max(1, int(math.ceil(remaining)))
 
 
+def _build_session_wedged_response(
+    path: str,
+    provider_name: str,
+    session_id: str | None,
+    state: dict[str, Any],
+    config: dict | None = None,
+    *,
+    now: float | None = None,
+) -> Response | None:
+    """Build the terminal ``session_wedged`` 400 once the breaker trips.
+
+    The typed ``deterministic_client_error`` (parent AC1) tells the client to
+    compact; this terminal error (parent AC3) is the answer when the client
+    ignored that and kept resending the *same* history after every backoff
+    window — ``deterministic_client_error_escalation_threshold`` resends
+    (default 5, read top-level or inside the ``server`` section).
+
+    Both are HTTP 400, so they are made distinguishable without parsing the
+    body (parent AC5): the terminal response carries
+    ``X-Session-Wedged: repeated_deterministic_400`` and
+    ``X-Deterministic-Client-Error: session_wedged`` rather than
+    ``identical_history``.
+
+    Returns ``None`` below the threshold, so the caller answers with the typed
+    error instead. The caller only reaches here with the typed error's
+    evidence in hand (this history was already rejected), so even a degenerate
+    threshold of 1 can never convict a lone 400 as wedged.
+
+    ``Retry-After`` is the ladder's remaining window floored at
+    :data:`proxy.fingerprint_backoff.SESSION_WEDGED_MIN_RETRY_AFTER_SECONDS`
+    (60 s): a wedged session must not be retried immediately. Best-effort like
+    its typed sibling: any failure returns ``None``.
+    """
+    try:
+        wedged = fingerprint_backoff.session_wedged_error(
+            state["fingerprint"], config=config, now=now
+        )
+        if wedged is None:
+            return None
+        retry_after = max(1, int(wedged.get("retry_after") or 0))
+        resend_count = int(wedged.get("resend_count") or 0)
+        logger.warning(
+            "Session wedged: provider=%s model=%s session=%s fingerprint=%s "
+            "resend_count=%s retry_after=%ss — this history has been resent "
+            "after every backoff window; returning the terminal "
+            "session_wedged error (compaction is the only way forward)",
+            provider_name,
+            path,
+            session_id or "unknown",
+            (state.get("fingerprint") or "unknown")[:12],
+            resend_count,
+            retry_after,
+        )
+        try:
+            from proxy.metrics import record_http_error
+
+            record_http_error(path, "400", SESSION_WEDGED)
+        except Exception:
+            pass
+        payload = {
+            "error": SESSION_WEDGED,
+            "cause": SESSION_WEDGED_CAUSE,
+            "hint": fingerprint_backoff.SESSION_WEDGED_HINT,
+            "retry_after": retry_after,
+            "resend_count": resend_count,
+        }
+        return Response(
+            content=json.dumps(payload),
+            status_code=400,
+            media_type="application/json",
+            headers={
+                "Retry-After": str(retry_after),
+                "X-Provider": provider_name,
+                SESSION_WEDGED_HEADER: SESSION_WEDGED_CAUSE,
+                DETERMINISTIC_CLIENT_ERROR_HEADER: SESSION_WEDGED,
+            },
+        )
+    except Exception:
+        return None
+
+
 def _build_typed_400_response(
     path: str,
     provider_name: str,
     body_text: str,
     session_id: str | None,
     body_json: Any,
+    config: dict | None = None,
     *,
     now: float | None = None,
 ) -> Response | None:
@@ -13903,6 +13994,12 @@ def _build_typed_400_response(
     Returns ``None`` when this local 400 is not a byte-identical resend of a
     history already known to be rejected, so the caller keeps its unchanged
     fallback behaviour (parent AC1's "single 400 falls back normally").
+
+    This is also the terminal breaker's entry point
+    (LP-0MW95BE7X00574OL): once this identical resend reaches
+    ``deterministic_client_error_escalation_threshold`` resends the client
+    gets the terminal ``session_wedged`` payload instead of another typed 400
+    it has already ignored.
 
     The response is a plain ``Response`` (not a raise): the caller returns it
     directly from the local-4xx branch, i.e. **before** any remote dispatch or
@@ -13916,6 +14013,13 @@ def _build_typed_400_response(
         )
         if state is None:
             return None
+        # Parent AC3: a client that ignored the typed error and resent the same
+        # history this many times gets the terminal verdict instead.
+        wedged = _build_session_wedged_response(
+            path, provider_name, session_id, state, config, now=now
+        )
+        if wedged is not None:
+            return wedged
         retry_after = _deterministic_client_error_retry_after_seconds(state)
         entry = state["entry"]
         snippet = (body_text or "")[:512]
@@ -18422,6 +18526,7 @@ async def _proxy_with_fallback_cycle(
                                 body_text,
                                 _session_id,
                                 body_json,
+                                config,
                             )
                             if _typed_400 is not None:
                                 return _typed_400

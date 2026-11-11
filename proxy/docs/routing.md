@@ -4390,3 +4390,63 @@ branch *before* the `continue` that would move to the next provider, so:
 increments `local_http_400` and falls back to the next provider exactly as
 before. Only a repeat of a history already known to be rejected is answered
 with the typed error.
+
+## Terminal breaker: `session_wedged` (LP-0MW95BE7X00574OL)
+
+The typed error tells a client its history is provably rejected; a client that
+ignores it and keeps resending the *same* bytes has no path left, so the proxy
+stops answering with a retryable verdict and says the session is wedged
+(parent AC3).
+
+**When it fires.** The terminal error is checked on the same evidence as the
+typed error (it is reached from `_build_typed_400_response`, before the typed
+response is built) and needs one thing more: the history's shared
+`resend_count` must reach
+`deterministic_client_error_escalation_threshold` — default `5`, read at the
+top level of the proxy config or inside its `server` section, exactly like the
+other proxy knobs. A non-positive, non-integer or boolean value falls back to
+the default, so a mistyped knob can neither disable the breaker nor convict a
+fresh session. Because the typed evidence is a prerequisite, even a threshold
+of `1` never convicts a lone 400.
+
+**What the client gets.** HTTP `400` with
+
+```json
+{
+  "error": "session_wedged",
+  "cause": "repeated_deterministic_400",
+  "hint": "compaction may help",
+  "retry_after": 900,
+  "resend_count": 5
+}
+```
+
+plus a `Retry-After` header carrying the same seconds, `X-Provider` naming the
+local provider, and — so a client can tell the two errors apart **without
+parsing the body** (parent AC5) —
+`X-Session-Wedged: repeated_deterministic_400` alongside
+`X-Deterministic-Client-Error: session_wedged` (the typed error's value there
+is `identical_history`). It also increments
+`proxy_http_errors_total{status="400", reason="session_wedged"}`, distinct
+from `local_http_400`, `local_http_400_deterministic` and
+`deterministic_client_error`.
+
+**How long it asks the client to wait.** `retry_after` is the ladder's
+remaining window, floored at `SESSION_WEDGED_MIN_RETRY_AFTER_SECONDS` (60 s)
+and capped by the ladder's 15-minute ceiling (900 s): a wedged session must
+not be told to retry immediately, and the number always agrees between the
+header and the body.
+
+**What resets it.** Exactly the events that end the loop: a successful **local**
+stream (which also clears the backoff) and a **different** history (compaction,
+truncation, a new conversation). The counter is shared by fingerprint across
+sessions — two workers resending the same bad history trip one breaker — and
+is in-memory only, so a proxy restart clears it along with the backoff state.
+Until it fires, resends keep receiving the typed `deterministic_client_error`,
+and the request still never reaches the fallback chain or a chain-hold cycle.
+
+**Wiring.** `provider._build_session_wedged_response` builds the terminal
+response from `fingerprint_backoff.session_wedged_error`; the threshold and
+key live in `proxy/fingerprint_backoff.py`
+(`DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD`,
+`ESCALATION_THRESHOLD_CONFIG_KEY`).
