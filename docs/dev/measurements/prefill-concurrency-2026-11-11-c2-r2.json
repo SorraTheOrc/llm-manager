@@ -1,0 +1,71 @@
+{
+  "label": "prefill-concurrency-2026-11-11-c2-r2",
+  "base_url": "http://127.0.0.1:8080",
+  "model": "Qwen3",
+  "concurrency": 2,
+  "generated_at": "2026-11-11T19:12:53Z",
+  "sizes": [
+    40960
+  ],
+  "reps": 1,
+  "rows": [
+    {
+      "prompt_tokens": 44770,
+      "prompt_ms": 353751.2,
+      "prompt_per_second": 126.6,
+      "wall_seconds": 595.46,
+      "request_index": 0,
+      "started_offset_s": 0.001,
+      "ended_offset_s": 595.465,
+      "requested_tokens": 40960,
+      "rep": 0
+    },
+    {
+      "prompt_tokens": 44770,
+      "prompt_ms": 353661.8,
+      "prompt_per_second": 126.6,
+      "wall_seconds": 354.15,
+      "request_index": 1,
+      "started_offset_s": 0.0,
+      "ended_offset_s": 354.153,
+      "requested_tokens": 40960,
+      "rep": 0
+    }
+  ],
+  "rounds": [
+    {
+      "requested_tokens": 40960,
+      "rep": 0,
+      "concurrency": 2,
+      "prompt_tokens": 89540,
+      "window_seconds": 595.465,
+      "tokens_per_second": 150.4
+    }
+  ],
+  "per_size": {
+    "40960": {
+      "n": 2,
+      "p50": 126.6,
+      "p90": 126.6,
+      "max": 126.6,
+      "aggregate": {
+        "n_rounds": 1,
+        "p50": 150.4,
+        "p90": 150.4,
+        "max": 150.4
+      }
+    }
+  },
+  "overall_20k_plus": {
+    "n": 2,
+    "p50": 126.6,
+    "p90": 126.6,
+    "min": 126.6
+  },
+  "overall_20k_plus_aggregate": {
+    "n_rounds": 1,
+    "p50": 150.4,
+    "p90": 150.4,
+    "min": 150.4
+  }
+}

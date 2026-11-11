@@ -1,0 +1,82 @@
+{
+  "requests": 2238,
+  "prompt_tokens": 4689123,
+  "prompt_ms": 30687004.6,
+  "aggregate_tokens_per_second": 152.8,
+  "per_request": {
+    "p50": 105.7,
+    "p90": 266.6,
+    "min": 0.8,
+    "max": 754.6
+  },
+  "buckets": {
+    "lt8k": {
+      "requests": 2047,
+      "prompt_tokens": 2282224,
+      "prompt_ms": 17850750.2,
+      "aggregate_tokens_per_second": 127.9,
+      "per_request": {
+        "p50": 99.8,
+        "p90": 233.4,
+        "min": 0.8,
+        "max": 754.6
+      }
+    },
+    "8k-20k": {
+      "requests": 179,
+      "prompt_tokens": 2129550,
+      "prompt_ms": 11685588.5,
+      "aggregate_tokens_per_second": 182.2,
+      "per_request": {
+        "p50": 222.8,
+        "p90": 477.3,
+        "min": 49.8,
+        "max": 518.8
+      }
+    },
+    "20k-40k": {
+      "requests": 12,
+      "prompt_tokens": 277349,
+      "prompt_ms": 1150665.8,
+      "aggregate_tokens_per_second": 241.0,
+      "per_request": {
+        "p50": 258.0,
+        "p90": 287.5,
+        "min": 128.3,
+        "max": 296.0
+      }
+    },
+    "40k-80k": {
+      "requests": 0,
+      "prompt_tokens": 0,
+      "prompt_ms": 0,
+      "aggregate_tokens_per_second": 0.0,
+      "per_request": {
+        "p50": 0.0,
+        "p90": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      }
+    },
+    "ge80k": {
+      "requests": 0,
+      "prompt_tokens": 0,
+      "prompt_ms": 0,
+      "aggregate_tokens_per_second": 0.0,
+      "per_request": {
+        "p50": 0.0,
+        "p90": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      }
+    }
+  },
+  "window": {
+    "files": [
+      "/var/log/llama-proxy/llama-server.log-2026-11-11"
+    ],
+    "start": "2026-11-10T00:00:00+00:00",
+    "end": "2026-11-11T00:00:00+00:00"
+  },
+  "generated_at": "2026-11-11T18:48:32Z"
+}

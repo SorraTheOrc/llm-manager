@@ -1277,6 +1277,17 @@ backend. Measured 2026-10-19 → 10-20 over 460 paired local dispatches:
 throughput stayed flat (~254 tok/s) — i.e. concurrency added latency, not
 capacity, and inflated total prefill wall time 2.3×.
 
+**Re-measured 2026-11-11 (LP-0MWCEHDRV000B7HD).** With the gate closed, the
+20k–40k production bucket sustained 241.0–243.5 tok/s aggregate (per-request p50
+258.0–273.2 tok/s, 12 and 13 requests over two windows) — the recorded ceiling,
+reproduced. Forcing two concurrent prefills at the engine (gate bypassed, unique
+44,770-token prompts, three interleaved rounds) gave aggregate **156.1 tok/s**
+vs **156.2 tok/s** serial: ratio 1.00, wall window 2.00×, slowest request 0.81×.
+So the flat aggregate is a property of the GPU, not of serialisation —
+concurrency remains a latency expense and not a throughput lever. Record:
+`docs/dev/prefill-concurrency-2026-11-11.md`,
+`docs/dev/prefill-concurrency-baseline-2026-11-11.json`.
+
 At most `server.local_max_concurrent_prefills` prefills now run at once:
 
 ```yaml

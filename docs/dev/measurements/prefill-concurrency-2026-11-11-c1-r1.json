@@ -1,0 +1,60 @@
+{
+  "label": "prefill-concurrency-2026-11-11-c1-r1",
+  "base_url": "http://127.0.0.1:8080",
+  "model": "Qwen3",
+  "concurrency": 1,
+  "generated_at": "2026-11-11T18:48:37Z",
+  "sizes": [
+    40960
+  ],
+  "reps": 1,
+  "rows": [
+    {
+      "prompt_tokens": 44770,
+      "prompt_ms": 286479.6,
+      "prompt_per_second": 156.3,
+      "wall_seconds": 286.67,
+      "request_index": 0,
+      "started_offset_s": 0.0,
+      "ended_offset_s": 286.668,
+      "requested_tokens": 40960,
+      "rep": 0
+    }
+  ],
+  "rounds": [
+    {
+      "requested_tokens": 40960,
+      "rep": 0,
+      "concurrency": 1,
+      "prompt_tokens": 44770,
+      "window_seconds": 286.668,
+      "tokens_per_second": 156.2
+    }
+  ],
+  "per_size": {
+    "40960": {
+      "n": 1,
+      "p50": 156.3,
+      "p90": 156.3,
+      "max": 156.3,
+      "aggregate": {
+        "n_rounds": 1,
+        "p50": 156.2,
+        "p90": 156.2,
+        "max": 156.2
+      }
+    }
+  },
+  "overall_20k_plus": {
+    "n": 1,
+    "p50": 156.3,
+    "p90": 156.3,
+    "min": 156.3
+  },
+  "overall_20k_plus_aggregate": {
+    "n_rounds": 1,
+    "p50": 156.2,
+    "p90": 156.2,
+    "min": 156.2
+  }
+}

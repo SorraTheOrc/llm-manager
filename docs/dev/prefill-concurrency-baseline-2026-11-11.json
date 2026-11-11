@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "work_item": "LP-0MWCEHDRV000B7HD",
+  "parent_work_item": "LP-0MVXY8ZBZ0003042",
+  "title": "Serialised vs parallel local prefill: re-measurement and parallel-prefill test",
+  "generated_at": "2026-11-11",
+  "purpose": "Register every figure quoted by docs/dev/prefill-concurrency-2026-11-11.md with its window, source artefact and provenance class, so the re-measurement, the parallel-prefill test and the adopt/reject verdict stay auditable after the host logs rotate away.",
+  "provenance_classes": {
+    "measured": "Copied verbatim from a named source artefact (a benchmark-results/*.json produced by scripts/ubatch_ab_benchmark.py or scripts/prefill_throughput_report.py).",
+    "derived": "Arithmetic over measured figures registered here. The formula and inputs are recorded and recomputed by tests/test_prefill_concurrency_measurement_doc.py.",
+    "config-derived": "Read from the shipped configuration at the cited file:line (no measurement)."
+  },
+  "shipped_config": {
+    "session_slot_pool_size": 2,
+    "local_max_concurrent_prefills": 1,
+    "local_model_ctx_size": 262144,
+    "per_slot_ctx": 131072,
+    "ubatch_size": 1024,
+    "source": "proxy/config.yaml:1935 (session_slot_pool_size), proxy/config.yaml:1967 (local_max_concurrent_prefills), proxy/config.yaml:1636 (local_model_ctx_size), models.ini:78 (ubatch-size); --parallel follows session_slot_pool_size (start-llama.sh:252). Unchanged since 2026-11-09 (git log --since=2026-11-09 -- proxy/config.yaml models.ini start-llama.sh)."
+  },
+  "windows": {
+    "P1": {
+      "label": "prior production day, live local traffic under the shipped serialised gate",
+      "start": "2026-11-10T00:00:00+00:00",
+      "end": "2026-11-11T00:00:00+00:00",
+      "hours": 24.0,
+      "artefact": "docs/dev/measurements/prefill-concurrency-2026-11-11-production-2026-11-10.json",
+      "reproduce": "python3 scripts/prefill_throughput_report.py --files /var/log/llama-proxy/llama-server.log-2026-11-11 --json",
+      "note": "llama-server.log lines carry no timestamps; rotation is dateext, so the file named with the 2026-11-11 rotation instant holds 2026-11-10's content. The rotation file has since aged out of retention, so the committed artefact is the record."
+    },
+    "P2": {
+      "label": "current production day up to the start of this item's probe",
+      "start": "2026-11-11T00:00:00+00:00",
+      "end": "2026-11-11T18:50:36+00:00",
+      "hours": 18.8,
+      "artefact": "docs/dev/measurements/prefill-concurrency-2026-11-11-production-2026-11-11.json",
+      "reproduce": "python3 scripts/prefill_throughput_report.py --files /var/log/llama-proxy/llama-server.log --start '2026-11-11 00:00:00' --json",
+      "note": "Snapshot taken immediately before the probe finished its first round; it therefore contains exactly one probe row (44,770 prompt tokens) in the 40-80k bucket, identified below. Re-running against the live log now yields a later window end and the probe's remaining rows."
+    },
+    "E1": {
+      "label": "interleaved engine probe: serial (concurrency 1) vs parallel (concurrency 2) prefill",
+      "start": "2026-11-11T18:43:51+00:00",
+      "end": "2026-11-11T19:27:12+00:00",
+      "hours": 0.72,
+      "artefacts": [
+        "docs/dev/measurements/prefill-concurrency-2026-11-11-c1-r1.json",
+        "docs/dev/measurements/prefill-concurrency-2026-11-11-c2-r1.json",
+        "docs/dev/measurements/prefill-concurrency-2026-11-11-c1-r2.json",
+        "docs/dev/measurements/prefill-concurrency-2026-11-11-c2-r2.json",
+        "docs/dev/measurements/prefill-concurrency-2026-11-11-c1-r3.json",
+        "docs/dev/measurements/prefill-concurrency-2026-11-11-c2-r3.json"
+      ],
+      "reproduce": "for r in 1 2 3; do for c in 1 2; do python3 scripts/ubatch_ab_benchmark.py --base-url http://127.0.0.1:8080 --model Qwen3 --sizes 40960 --reps 1 --concurrency \"$c\" --timeout 1800 --label \"prefill-concurrency-2026-11-11-c${c}-r${r}\" --out \"docs/dev/measurements/prefill-concurrency-2026-11-11-c${c}-r${r}.json\"; done; done",
+      "note": "Rounds are interleaved c=1, c=2 so drift in the shared GPU's load affects both arms. Each round sends unique cache-defeating text with cache_prompt=false; larger --concurrency values send more unique prompts at once and measure the aggregate over the round window."
+    }
+  },
+  "figures": {
+    "config.session_slot_pool_size": {"value": 2, "unit": "slots", "provenance": "config-derived", "source": "proxy/config.yaml:1935", "rendered": "2"},
+    "config.local_max_concurrent_prefills": {"value": 1, "unit": "concurrent prefills", "provenance": "config-derived", "source": "proxy/config.yaml:1967", "rendered": "1"},
+    "config.per_slot_ctx": {"value": 131072, "unit": "tokens per slot", "provenance": "config-derived", "source": "proxy/config.yaml:1636 local_model_ctx_size // proxy/config.yaml:1935 session_slot_pool_size", "rendered": "131,072"},
+    "config.ubatch_size": {"value": 1024, "unit": "tokens per micro-batch", "provenance": "config-derived", "source": "models.ini:78", "rendered": "1,024"},
+
+    "P1.requests": {"value": 2238, "unit": "prefill measurements", "provenance": "measured", "source": "windows.P1 artefact .requests", "rendered": "2,238"},
+    "P1.prompt_tokens": {"value": 4689123, "unit": "tokens", "provenance": "measured", "source": "windows.P1 artefact .prompt_tokens", "rendered": "4,689,123"},
+    "P1.aggregate_tps": {"value": 152.8, "unit": "tokens/second", "provenance": "measured", "source": "windows.P1 artefact .aggregate_tokens_per_second", "rendered": "152.8"},
+    "P1.per_request_p50": {"value": 105.7, "unit": "tokens/second", "provenance": "measured", "source": "windows.P1 artefact .per_request.p50", "rendered": "105.7"},
+    "P1.per_request_p90": {"value": 266.6, "unit": "tokens/second", "provenance": "measured", "source": "windows.P1 artefact .per_request.p90", "rendered": "266.6"},
+    "P1.bucket_20_40k_requests": {"value": 12, "unit": "requests", "provenance": "measured", "source": "windows.P1 artefact .buckets.20k-40k.requests", "rendered": "12"},
+    "P1.bucket_20_40k_aggregate_tps": {"value": 241.0, "unit": "tokens/second", "provenance": "measured", "source": "windows.P1 artefact .buckets.20k-40k.aggregate_tokens_per_second", "rendered": "241.0"},
+    "P1.bucket_20_40k_per_request_p50": {"value": 258.0, "unit": "tokens/second", "provenance": "measured", "source": "windows.P1 artefact .buckets.20k-40k.per_request.p50", "rendered": "258.0"},
+    "P1.bucket_20_40k_per_request_p90": {"value": 287.5, "unit": "tokens/second", "provenance": "measured", "source": "windows.P1 artefact .buckets.20k-40k.per_request.p90", "rendered": "287.5"},
+    "P1.bucket_40_80k_requests": {"value": 0, "unit": "requests", "provenance": "measured", "source": "windows.P1 artefact .buckets.40k-80k.requests", "rendered": "0"},
+
+    "P2.requests": {"value": 2377, "unit": "prefill measurements", "provenance": "measured", "source": "windows.P2 artefact .requests", "rendered": "2,377"},
+    "P2.prompt_tokens": {"value": 4447277, "unit": "tokens", "provenance": "measured", "source": "windows.P2 artefact .prompt_tokens", "rendered": "4,447,277"},
+    "P2.aggregate_tps": {"value": 166.9, "unit": "tokens/second", "provenance": "measured", "source": "windows.P2 artefact .aggregate_tokens_per_second", "rendered": "166.9"},
+    "P2.per_request_p50": {"value": 109.4, "unit": "tokens/second", "provenance": "measured", "source": "windows.P2 artefact .per_request.p50", "rendered": "109.4"},
+    "P2.per_request_p90": {"value": 266.6, "unit": "tokens/second", "provenance": "measured", "source": "windows.P2 artefact .per_request.p90", "rendered": "266.6"},
+    "P2.bucket_20_40k_requests": {"value": 13, "unit": "requests", "provenance": "measured", "source": "windows.P2 artefact .buckets.20k-40k.requests", "rendered": "13"},
+    "P2.bucket_20_40k_aggregate_tps": {"value": 243.5, "unit": "tokens/second", "provenance": "measured", "source": "windows.P2 artefact .buckets.20k-40k.aggregate_tokens_per_second", "rendered": "243.5"},
+    "P2.bucket_20_40k_per_request_p50": {"value": 273.2, "unit": "tokens/second", "provenance": "measured", "source": "windows.P2 artefact .buckets.20k-40k.per_request.p50", "rendered": "273.2"},
+    "P2.bucket_20_40k_per_request_p90": {"value": 293.0, "unit": "tokens/second", "provenance": "measured", "source": "windows.P2 artefact .buckets.20k-40k.per_request.p90", "rendered": "293.0"},
+    "P2.bucket_40_80k_requests": {"value": 1, "unit": "requests", "provenance": "measured", "source": "windows.P2 artefact .buckets.40k-80k.requests (this item's own probe)", "rendered": "1"},
+    "P2.bucket_40_80k_aggregate_tps": {"value": 156.3, "unit": "tokens/second", "provenance": "measured", "source": "windows.P2 artefact .buckets.40k-80k.aggregate_tokens_per_second", "rendered": "156.3"},
+
+    "E1.prompt_tokens": {"value": 44770, "unit": "tokens per request", "provenance": "measured", "source": "windows.E1 artefacts .rounds[0].prompt_tokens (both arms)", "rendered": "44,770"},
+    "E1.c1_window_s_median": {"value": 286.6, "unit": "seconds", "provenance": "measured", "source": "windows.E1 c1 artefacts .rounds[0].window_seconds: 286.668, 286.581, 285.803", "rendered": "286.6"},
+    "E1.c1_aggregate_tps_median": {"value": 156.2, "unit": "tokens/second", "provenance": "measured", "source": "windows.E1 c1 artefacts .rounds[0].tokens_per_second: 156.2, 156.2, 156.6", "rendered": "156.2"},
+    "E1.c1_aggregate_tps_max": {"value": 156.6, "unit": "tokens/second", "provenance": "measured", "source": "windows.E1 c1 artefacts .rounds[0].tokens_per_second (max)", "rendered": "156.6"},
+    "E1.c1_per_request_p50_median": {"value": 156.5, "unit": "tokens/second", "provenance": "measured", "source": "windows.E1 c1 artefacts .rows[0].prompt_per_second: 156.3, 156.5, 156.8", "rendered": "156.5"},
+    "E1.c2_window_s_median": {"value": 573.8, "unit": "seconds", "provenance": "measured", "source": "windows.E1 c2 artefacts .rounds[0].window_seconds: 573.763, 595.465, 572.855", "rendered": "573.8"},
+    "E1.c2_aggregate_tps_median": {"value": 156.1, "unit": "tokens/second", "provenance": "measured", "source": "windows.E1 c2 artefacts .rounds[0].tokens_per_second: 156.1, 150.4, 156.3", "rendered": "156.1"},
+    "E1.c2_aggregate_tps_min": {"value": 150.4, "unit": "tokens/second", "provenance": "measured", "source": "windows.E1 c2 artefacts .rounds[0].tokens_per_second (min)", "rendered": "150.4"},
+    "E1.c2_per_request_min_median": {"value": 126.6, "unit": "tokens/second", "provenance": "measured", "source": "windows.E1 c2 artefacts, slowest request per round: 126.5, 126.6, 156.3", "rendered": "126.6"},
+    "E1.scheduling_cost_live_local_first_byte_s": {"value": 183.2, "unit": "seconds", "provenance": "measured", "source": "the single proxy local dispatch inside 18:43:51-19:27:12 (proxy.log dispatch_first_byte_ms=183240.7); the 17:00-18:43 baseline p50 was 6.3 s over 189 dispatches", "rendered": "183.2"},
+    "E1.per_checkpoint_mib": {"value": 62.813, "unit": "MiB", "provenance": "measured", "source": "/var/log/llama-proxy/llama-server.log 'created context checkpoint N of 32 (... size = 62.813 MiB)'", "rendered": "62.813"}
+  },
+  "derived": {
+    "D1.aggregate_ratio_median": {"value": 1.0, "unit": "ratio (c=2 / c=1)", "provenance": "derived", "formula": "E1.c2_aggregate_tps_median / E1.c1_aggregate_tps_median, rounded to 2 dp", "inputs": ["E1.c2_aggregate_tps_median", "E1.c1_aggregate_tps_median"], "rendered": "1.00"},
+    "D2.window_factor_median": {"value": 2.0, "unit": "ratio (c=2 / c=1)", "provenance": "derived", "formula": "E1.c2_window_s_median / E1.c1_window_s_median, rounded to 2 dp", "inputs": ["E1.c2_window_s_median", "E1.c1_window_s_median"], "rendered": "2.00"},
+    "D3.per_request_ratio_median": {"value": 0.81, "unit": "ratio (c=2 slowest / c=1)", "provenance": "derived", "formula": "E1.c2_per_request_min_median / E1.c1_per_request_p50_median, rounded to 2 dp", "inputs": ["E1.c2_per_request_min_median", "E1.c1_per_request_p50_median"], "rendered": "0.81"},
+    "D4.single_gate_daily_tokens_at_40k": {"value": 13495680, "unit": "tokens/day (one prefill stream, 40-80k prompts)", "provenance": "derived", "formula": "86400 * E1.c1_aggregate_tps_median", "inputs": ["E1.c1_aggregate_tps_median"], "rendered": "13.5M"},
+    "D5.parallel_daily_tokens_measured_at_40k": {"value": 13487040, "unit": "tokens/day (two prefill streams, measured)", "provenance": "derived", "formula": "86400 * E1.c2_aggregate_tps_median", "inputs": ["E1.c2_aggregate_tps_median"], "rendered": "13.5M"},
+    "D6.daily_tokens_at_20_40k": {"value": 21038400, "unit": "tokens/day (one prefill stream, 20-40k prompts)", "provenance": "derived", "formula": "86400 * P2.bucket_20_40k_aggregate_tps", "inputs": ["P2.bucket_20_40k_aggregate_tps"], "rendered": "21.0M"},
+    "D7.per_slot_checkpoint_gib": {"value": 2.0, "unit": "GiB per prefilling slot (context checkpoints)", "provenance": "derived", "formula": "32 checkpoints * E1.per_checkpoint_mib / 1024, rounded to 1 dp", "inputs": ["E1.per_checkpoint_mib"], "rendered": "2.0"}
+  },
+  "verdict": {
+    "decision": "reject",
+    "lever": "parallel prefill (local_max_concurrent_prefills > 1, i.e. the two-slot pool prefilling concurrently)",
+    "measurement": "aggregate prefill throughput does not rise with concurrency: 156.1 tok/s at concurrency 2 vs 156.2 tok/s at concurrency 1 on the same 44,770-token prompt (ratio 1.00), while the wall window doubles (2.00x) and the slowest request in a round drops to 126.6 tok/s (0.81x).",
+    "rollback_value": "the shipped serialised gate (local_max_concurrent_prefills: 1) keeps per-request first byte at the full single-stream rate; the lever would be re-enabled by setting the key to 0 (router_helpers._max_concurrent_prefills: 0 = cap disabled) with no code change, so a future adoption is a one-key config edit and its rollback the same."
+  }
+}
