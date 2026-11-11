@@ -2877,6 +2877,10 @@ async def _query_prefill_progress(
         pass
 
     if not alive:
+        # LP-0MW8VPH2Q007XPHQ AC2/AC3: count every unobservable poll (a
+        # countable rate, not only the throttled log line) and then emit the
+        # throttled WARNING so both logging and observability capture it.
+        _count_prefill_progress_unobservable()
         _warn_prefill_progress_unobservable(srv)
     return None, alive
 
@@ -2891,6 +2895,22 @@ cadence (LP-0MSUO5Z0K007HBSS AC2).
 
 _PREFILL_WARN_INTERVAL = 60.0
 """Seconds between repeated 'prefill progress unobservable' warnings."""
+
+
+def _count_prefill_progress_unobservable() -> None:
+    """Increment ``proxy_prefill_progress_unobservable_total`` (fail-soft).
+
+    LP-0MW8VPH2Q007XPHQ AC2: the metric counts every unobservable lease poll;
+    the WARNING stays throttled. Imported lazily so ``router_helpers`` stays
+    free of a module-level ``proxy.metrics`` dependency and a missing
+    prometheus_client can never break the lease path.
+    """
+    try:
+        from proxy.metrics import record_prefill_progress_unobservable
+
+        record_prefill_progress_unobservable()
+    except Exception:
+        pass
 
 
 def _warn_prefill_progress_unobservable(srv) -> None:
