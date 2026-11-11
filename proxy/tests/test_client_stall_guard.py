@@ -26,14 +26,13 @@ import asyncio
 import logging
 
 import pytest
-
 from proxy.client_stall_guard import (
     CLIENT_STALL_SIGNAL,
     CLIENT_STALL_TIMEOUT_CONFIG_KEY,
     DEFAULT_CLIENT_STALL_TIMEOUT_SECONDS,
     STALL_SCOPE_KEY,
     STREAM_IDLE_TIMEOUT_CONFIG_KEY,
-    ClientStallAbort,
+    ClientStallError,
     ClientStallGuardMiddleware,
     ClientStallState,
     client_stall_observed,
@@ -194,7 +193,7 @@ class TestStallAbort:
             await send({"type": "http.response.start", "status": 200, "headers": []})
             try:
                 await send({"type": "http.response.body", "body": BODY, "more_body": True})
-            except ClientStallAbort:
+            except ClientStallError:
                 for _ in range(3):
                     await send(
                         {"type": "http.response.body", "body": BODY, "more_body": True}
@@ -336,6 +335,7 @@ class TestRealTransport:
     async def test_a_reader_that_stops_reading_is_disconnected(self, caplog):
         import contextlib
         import socket
+
         import uvicorn
 
         stall_seconds = 0.3
