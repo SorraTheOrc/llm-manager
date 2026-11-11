@@ -2767,7 +2767,13 @@ async def _query_prefill_progress(
     1. Per-slot: ``/slots`` -> per-slot state from ``_query_slots_progress``
        (``n_past`` / ``n_prompt_tokens_processed`` when the build reports
        them, plus the ``is_processing`` liveness flag).
-    2. Aggregate: ``query_llama_status()`` -> ``kv_cache_tokens`` (or
+    2. Per-slot log tail: ``get_slot_prefill_progress()`` -> the
+       ``n_tokens`` parsed from llama-server's ``slot update_slots … prompt
+       processing progress, n_tokens = N`` stderr lines. This is the
+       measured source on llama.cpp b8782, which removed the numeric
+       ``/slots`` fields but still emits the progress line
+       (LP-0MW8VO2HT007Y1VQ, LP-0MW8VPXNZ007T0J2).
+    3. Aggregate: ``query_llama_status()`` -> ``kv_cache_tokens`` (or
        ``n_past`` if present).
 
     Returns ``(progress, alive)``:
@@ -2775,10 +2781,11 @@ async def _query_prefill_progress(
     - *progress* is the latest observed prefill progress (``None`` when no
       numeric progress can be observed).
     - *alive* is True when the slot is observed actively processing
-      (``is_processing``), even when the llama.cpp build exposes no numeric
-      progress fields (b8782 removed ``n_past``/``n_prompt_tokens_processed``
-      from ``/slots``; LP-0MSUO5Z0K007HBSS). This lets the caller extend the
-      lease on liveness rather than progress advance alone.
+      (``is_processing`` or a fresh log progress line), even when the
+      llama.cpp build exposes no numeric progress fields (b8782 removed
+      ``n_past``/``n_prompt_tokens_processed`` from ``/slots``;
+      LP-0MSUO5Z0K007HBSS). This lets the caller extend the lease on
+      liveness rather than progress advance alone.
 
     When progress is unobservable AND the slot is not observed processing,
     a throttled warning is logged so silent query failures are visible in
@@ -2797,7 +2804,7 @@ async def _query_prefill_progress(
             # LP-0MVWBXEAI008YZ7B: a definitively unloaded model has nothing
             # to probe — the resolver's (None, None) skip sentinel means no
             # /slots request and no router traversal; fall through to the
-            # /status aggregation below.
+            # log-derived and /status sources below.
             _slots_endpoint, _slots_port = _resolve_local_slots_target(
                 srv, model=model_name, endpoint=endpoint, router_port=llama_port
             )
@@ -2815,6 +2822,24 @@ async def _query_prefill_progress(
                     value = state.get("progress")
                     if isinstance(value, (int, float)) and value >= 0:
                         return int(value), alive
+        except Exception:
+            pass
+
+        # LP-0MW8VO2HT007Y1VQ / LP-0MW8VPXNZ007T0J2: log-derived per-slot
+        # progress. On llama.cpp b8782 ``/slots`` omits n_past/context_tokens,
+        # so the measured signal is the ``slot update_slots … n_tokens = N``
+        # stderr line. The proxy tails it into ``_slot_progress_cache``;
+        # reading it here is what turns the lease extension from an estimate
+        # into a measurement. Run the (small, 64 KiB) tail read off the event
+        # loop so a slow disk cannot stall the stream loop (AC4).
+        try:
+            from proxy.observability import get_slot_prefill_progress
+
+            entry = await asyncio.to_thread(get_slot_prefill_progress, slot_id)
+            if isinstance(entry, dict):
+                n_tokens = entry.get("n_tokens")
+                if isinstance(n_tokens, (int, float)) and n_tokens >= 0:
+                    return int(n_tokens), True
         except Exception:
             pass
 

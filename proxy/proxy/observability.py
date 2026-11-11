@@ -2453,6 +2453,41 @@ def _slot_progress_is_fresh(prog: dict | None, now: float | None = None) -> bool
     return (now - ts) <= SLOT_PROGRESS_MAX_AGE_SECONDS
 
 
+def get_slot_prefill_progress(slot_id: int | None) -> dict | None:
+    """Return the freshest log-derived prefill progress for *slot_id*.
+
+    This is the measured progress source used by the dispatch lease
+    extension when ``/slots`` exposes no numeric prefill field
+    (llama.cpp b8782 removes ``n_past`` / ``n_prompt_tokens_processed`` /
+    ``context_tokens``; LP-0MW8VO2HT007Y1VQ, LP-0MW8VPXNZ007T0J2).
+
+    llama-server always writes ``slot update_slots: id S | task T | prompt
+    processing progress, n_tokens = N, … progress = P`` to stderr, which is
+    redirected into ``llama-server.log`` and parsed by
+    :func:`_update_slot_progress_from_log` into ``_slot_progress_cache``.
+    The cache is refreshed here (throttled by the caller's poll cadence) so a
+    caller does not depend on the UI broadcast loop having run.
+
+    Returns the cache entry (``{"n_tokens": int, "progress": float,
+    "timestamp": float}``) when fresh, else ``None``.
+
+    ``slot_id`` of ``None`` (slot unknown) returns ``None``: progress cannot
+    be attributed to a slot without the slot id, and fabricating an aggregate
+    would misattribute one slot's tokens to another.
+    """
+    if not isinstance(slot_id, int) or isinstance(slot_id, bool):
+        return None
+    try:
+        _update_slot_progress_from_log()
+    except Exception:
+        pass
+    entry = _slot_progress_cache.get(slot_id)
+    if not _slot_progress_is_fresh(entry):
+        return None
+    return dict(entry)
+
+
+
 def _update_processing_slot_assignments(srv, slot_details=None) -> None:
     """Update ``_processing_slot_assignments`` by matching active dispatch
     leases against slots that are processing (from progress cache OR

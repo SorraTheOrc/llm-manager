@@ -83,6 +83,24 @@ def _reset_slot_details_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_slot_progress_cache():
+    """Reset the log-derived per-slot progress cache before every test.
+
+    ``_slot_progress_cache`` is parsed from ``llama-server.log`` and is now
+    read by the dispatch lease-extension progress probe
+    (:func:`proxy.observability.get_slot_prefill_progress`,
+    LP-0MW8VO2HT007Y1VQ). A leftover entry from another test would make a
+    stubbed ``/slots``/aggregate failure look like measured log progress, so
+    the cache must not leak between tests.
+    """
+    import proxy.observability as obs
+
+    obs._slot_progress_cache = {}
+    yield
+    obs._slot_progress_cache = {}
+
+
+@pytest.fixture(autouse=True)
 def _reset_server_global_state(monkeypatch):
     """Reset global server counters that leak across tests.
 
