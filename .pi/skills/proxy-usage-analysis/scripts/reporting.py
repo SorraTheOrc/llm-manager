@@ -274,6 +274,11 @@ ERROR_TYPE_LABELS = {
     "slot_save_error": "slot_save failed",
     "backend_retry": "backend_retry",
     "upstream_http_error": "upstream HTTP error",
+    # Typed deterministic-400 errors (LP-0MW959HRZ00231FN, parent AC5): labelled
+    # for what they are — a client resending a rejected history — so the row is
+    # never read as a provider outage.
+    "deterministic_client_error": "deterministic client error (identical history)",
+    "session_wedged": "session wedged (terminal)",
 }
 
 

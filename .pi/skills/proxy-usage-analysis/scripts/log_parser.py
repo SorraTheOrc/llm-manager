@@ -476,6 +476,21 @@ SLOT_SAVE_FAILED = "slot_save failed"
 BACKEND_RETRY = "backend_retry"
 UPSTREAM_ERROR = "[remote] upstream error"
 
+# Typed deterministic-400 errors (LP-0MW95BDJQ002DSVI, LP-0MW95BE7X00574OL).
+# An identical resend of a history the local provider has already rejected is
+# answered with a typed ``deterministic_client_error`` 400 instead of a remote
+# fallback; once the backoff ladder is exhausted the answer becomes the
+# terminal ``session_wedged`` 400. Each response logs exactly one WARNING line,
+# which is the only evidence the usage report has (the Prometheus counters are
+# not part of the analysed logs), so each gets its own taxonomy kind. They are
+# deliberately *not* folded into ``provider_exhausted``: a client resending a
+# rejected history is a client-side problem, and reporting it as a provider
+# outage would hide the wedge behind the chain-exhaustion signal it causes
+# (LP-0MW959HRZ00231FN, parent AC5).
+DETERMINISTIC_CLIENT_ERROR = "Deterministic client error:"
+RE_DETERMINISTIC_RETRY_AFTER = re.compile(r"\bretry_after=(\d+)s")
+SESSION_WEDGED = "Session wedged:"
+
 # Operating-mode switch lines (LP-0MSM5K4TX004MICX): the proxy logs each
 # applied mode transition as ``Mode scheduler: applied scheduled mode
 # <mode>``. These reconstruct the mode active during the analysis window so
@@ -606,8 +621,9 @@ class LogEvent:
     ``restart``,
     ``compaction_event``, ``compaction_backstop``, ``compaction_churn``, or an
     error kind (``stream_error``, ``stream_finish_error``, ``slot_save_error``,
-    ``backend_retry``, ``upstream_http_error``). Only the fields relevant to
-    each kind are populated.
+    ``backend_retry``, ``upstream_http_error``,
+    ``deterministic_client_error``, ``session_wedged``). Only the fields
+    relevant to each kind are populated.
     """
 
     kind: str
@@ -1650,6 +1666,33 @@ def parse_log_line(line: str) -> LogEvent | None:
             error=_first(RE_ERROR_DETAIL, msg),
             attempt=_first(RE_BACKEND_ATTEMPT, msg),
             signal=_first(RE_BACKEND_SIGNAL, msg),
+            raw=line,
+        )
+    if msg.startswith(DETERMINISTIC_CLIENT_ERROR):
+        # "Deterministic client error: provider=<p> model=<path> session=<id>
+        #  fingerprint=<12ch> resend_count=<n> retry_after=<n>s — returning
+        #  typed HTTP 400 without remote fallback or chain hold (...)"
+        return LogEvent(
+            "deterministic_client_error",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            model=_first(RE_MODEL, msg),
+            session=_session_from(msg),
+            retry_after=_int(RE_DETERMINISTIC_RETRY_AFTER, msg),
+            raw=line,
+        )
+    if msg.startswith(SESSION_WEDGED):
+        # "Session wedged: provider=<p> model=<path> session=<id>
+        #  fingerprint=<12ch> resend_count=<n> retry_after=<n>s — this history
+        #  has been resent after every backoff window; returning the terminal
+        #  session_wedged error (compaction is the only way forward)"
+        return LogEvent(
+            "session_wedged",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            model=_first(RE_MODEL, msg),
+            session=_session_from(msg),
+            retry_after=_int(RE_DETERMINISTIC_RETRY_AFTER, msg),
             raw=line,
         )
     if msg.startswith(UPSTREAM_ERROR):

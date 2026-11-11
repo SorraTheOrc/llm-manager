@@ -28,6 +28,7 @@ ACs covered:
 
 import json
 import logging
+import re
 from unittest.mock import patch
 
 import proxy.metrics as metrics
@@ -1281,4 +1282,96 @@ async def test_changed_history_does_not_trip_the_terminal_breaker(
     )
     assert errors.count("deterministic_client_error") == 6, (
         "each history contributes three typed 400s (its first 400 falls back)"
+    )
+
+
+# =====================================================================
+# LP-0MW959HRZ00231FN (T4) — the usage-report taxonomy contract
+#
+# Parent AC5: the proxy-usage-analysis taxonomy reports
+# ``deterministic_client_error`` and ``session_wedged`` as their own
+# categories. The report reads *log lines*, not Prometheus counters, so the
+# WARNING each response emits is that contract: its exact prefix is what
+# ``.pi/skills/proxy-usage-analysis/scripts/log_parser.py`` classifies (pinned
+# from the parser side by
+# ``tests/test_error_taxonomy_deterministic_client_error.py``).
+#
+# Pinned here so a reworded log line fails a test instead of silently
+# dropping the category from the daily report. The counter reasons themselves
+# are already pinned by
+# ``test_typed_400_increments_the_deterministic_client_error_metric`` and
+# ``test_fifth_identical_resend_returns_terminal_session_wedged``.
+# =====================================================================
+
+TYPED_LOG_PREFIX = "Deterministic client error: "
+WEDGED_LOG_PREFIX = "Session wedged: "
+
+
+def _provider_messages_starting_with(caplog, prefix: str) -> list[str]:
+    """Every ``llama-proxy.provider`` message that starts with ``prefix``."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "llama-proxy.provider"
+        and record.getMessage().startswith(prefix)
+    ]
+
+
+def _assert_taxonomy_fields(message: str, resend_count: int) -> None:
+    """The attribution fields the taxonomy parses off the line."""
+    assert "provider=local-qwen3" in message, message
+    assert "model=v1/chat/completions" in message, message
+    assert f"session={SESSION_HEADERS['x-session-id']}" in message, message
+    assert f"resend_count={resend_count}" in message, message
+    assert re.search(r"\bretry_after=\d+s\b", message), message
+
+
+@pytest.mark.asyncio
+async def test_typed_400_logs_the_taxonomy_line(mixed_model_config, caplog):
+    """TAC1: the typed error emits the line the taxonomy classifies."""
+    body = _chat_body("taxonomy", "typed")
+    with caplog.at_level(logging.WARNING, logger="llama-proxy.provider"):
+        results, _ = await _send_identical_resends(
+            body,
+            2,
+            mixed_model_config,
+            {"provider_cooldown_seconds": 60},
+            session=SESSION_HEADERS["x-session-id"],
+        )
+
+    assert _json_error_payload(results[1])["error"] == "deterministic_client_error"
+    lines = _provider_messages_starting_with(caplog, TYPED_LOG_PREFIX)
+    assert len(lines) == 1, (
+        "one typed 400 must log exactly one taxonomy line, got "
+        f"{len(lines)}: {lines}"
+    )
+    _assert_taxonomy_fields(lines[0], resend_count=2)
+
+
+@pytest.mark.asyncio
+async def test_terminal_breaker_logs_the_taxonomy_line(mixed_model_config, caplog):
+    """TAC2: the terminal error emits the line the taxonomy classifies."""
+    body = _chat_body("taxonomy", "wedged")
+    with caplog.at_level(logging.WARNING, logger="llama-proxy.provider"):
+        results, _ = await _send_identical_resends(
+            body,
+            5,
+            mixed_model_config,
+            {"provider_cooldown_seconds": 60},
+            session=SESSION_HEADERS["x-session-id"],
+        )
+
+    assert _json_error_payload(results[4])["error"] == "session_wedged"
+    lines = _provider_messages_starting_with(caplog, WEDGED_LOG_PREFIX)
+    assert len(lines) == 1, (
+        "the terminal error must log exactly one taxonomy line, got "
+        f"{len(lines)}: {lines}"
+    )
+    _assert_taxonomy_fields(lines[0], resend_count=5)
+    # The terminal error replaces the typed one on that resend: the ladder's
+    # three earlier typed 400s are the only typed lines.
+    typed_lines = _provider_messages_starting_with(caplog, TYPED_LOG_PREFIX)
+    assert len(typed_lines) == 3, (
+        "resends 2-4 are typed errors; the 5th is terminal, got "
+        f"{len(typed_lines)} typed lines"
     )

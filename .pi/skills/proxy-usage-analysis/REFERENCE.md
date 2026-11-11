@@ -1455,8 +1455,10 @@ entry is a local runtime edit, not a committed artifact.
    advice and the documentation.
 8. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
-   error`) are parsed in the same streaming pass, collected per window, and
-   rendered into the report's **Error analysis** section (taxonomy table
+   error`, and the typed deterministic-400 lines `Deterministic client
+   error:` / `Session wedged:`) are parsed in the same streaming pass,
+   collected per window, and rendered into the report's **Error analysis**
+   section (taxonomy table
    **with a Status column** for upstream HTTP errors, plus a
    **Root-cause breakdown** table for stream errors, an
    **Upstream HTTP error breakdown by status** table, and a
@@ -1469,8 +1471,13 @@ entry is a local runtime edit, not a committed artifact.
    `opencode-go`, `opencode.ai/zen` → `opencode`, `api.deepseek.com` →
    `deepseek`, `models.inference.ai.azure.com` → `github`; unknown endpoints
    fall back to the bare hostname) and the model is unknown; `backend_retry`
-   carries neither. Undetermined values render as `-` in the report and
-   `(unknown)` in JSON. Upstream HTTP errors are **broken out by HTTP status
+   carries neither. The typed deterministic-400 lines carry
+   `provider=`/`model=`/`session=` directly and are counted as their own
+   categories: a `Deterministic client error:` or `Session wedged:` line
+   never increments the provider-exhaustion count, and an `All providers
+   exhausted` line never appears in either category
+   (LP-0MW959HRZ00231FN AC3). Undetermined values render as `-` in the
+   report and `(unknown)` in JSON. Upstream HTTP errors are **broken out by HTTP status
    code** (one taxonomy row per status, one recommendation per status) so
    429 rate-limit events and 402 balance events are never conflated. The
    `errors.json` artifact includes `upstream_by_status` and
@@ -2002,6 +2009,18 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   - `upstream error` (HTTP 5xx) — server-side upstream error; monitor for
     clustering (provider outage). Other 4xx codes carry the specific error
     message in the `errors.csv` evidence column.
+  - `Deterministic client error:` — the typed 400 the proxy returns when a
+    byte-identical resend of a history the local provider has already
+    rejected arrives again (LP-0MW95BDJQ002DSVI). It is its own taxonomy
+    category, **never** provider exhaustion: this history is rejected every
+    time, so the fix is client-side compaction, not a provider
+    investigation. The evidence column carries the advertised
+    `retry_after=<n>s` and the `provider=`/`session=` attribution.
+  - `Session wedged:` — the terminal 400 that ends a session which kept
+    resending that same rejected history after every backoff window
+    (LP-0MW95BE7X00574OL). Also its own category: its presence means a
+    client ignored the typed error, and compaction (the error's `hint`) is
+    the only way forward.
 
   <a id="root-cause-taxonomy"></a>
   **Root-cause taxonomy for stream errors (LP-0MUQO82LJ008F1FS / LP-0MUQO862C004UT7T):**

@@ -2583,6 +2583,12 @@ def aggregate(
             "slot_save_error",
             "backend_retry",
             "upstream_http_error",
+            # Typed deterministic-400 errors (LP-0MW959HRZ00231FN, parent AC5):
+            # their own taxonomy categories, never folded into
+            # ``provider_exhausted`` (which is not an error event at all — it is
+            # collected separately as client-visible exhaustion).
+            "deterministic_client_error",
+            "session_wedged",
         ):
             error_events.append(ev)
             continue
