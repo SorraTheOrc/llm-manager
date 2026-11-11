@@ -893,11 +893,11 @@ python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 `DIR` (default `~/proxy-usage-reports`) holds one subdirectory per archived
 run, each with its `report.md`; every such file is parsed and the seed exits
 **without** analysing logs. Only the live state file is written — the
-committed defaults are read, never modified. Example run over the 258
+committed defaults are read, never modified. Example run over the 269
 archived windows in this deployment:
 
 ```text
-Seeded 333 measurement(s) from 258 archived report window(s); 643 measurement(s) were already present and left untouched.
+Seeded 333 measurement(s) from 269 archived report window(s); 653 measurement(s) were already present and left untouched.
 Metrics with no parseable value in the archive (history accrues from the next run):
   stream_error_rate: not rendered in the archived report
   context_pressure: not rendered in the archived report
@@ -919,17 +919,32 @@ The rules behind those numbers:
   `contention_denials_per_hour`). A metric with no rendered figure — or whose
   section did not exist in that report era — is reported as skipped and
   accrues history from the first post-ship run.
+- **`time_to_first_token` seeds the local-only p90, never the combined one.**
+  An archived report renders two first-token p90s over different populations:
+  the `## Time to first token` `| Total |` row is the **combined local +
+  remote** p90 (remote `ttft_seconds=` samples dominate its sample count and
+  drag it down to single-digit seconds), while the scorecard metric measures
+  the **local-only** p90 (`aggregation.ttft_p90_ms(...,
+  include_remote=False)`). The seed therefore derives the value from the
+  `## Prefill vs decode` `Prefill (dispatch → first byte)` `p90 (s)` column —
+  one sample per local stream, the same population as the metric — and never
+  falls back to the combined row (LP-0MWBLZ8HP005F6KO). Reports of an era that
+  renders no such section (174 of the 269 archived reports) contribute no
+  TTFT value and are reported as skipped, never seeded from the combined row.
+  Verified over the archive: the 19 windows that render it seed 21,500-55,700
+  ms (the metric's own recent actuals are 33,515-52,418 ms), where the
+  combined row's best three would have been 558-646 ms.
 - **Unknown era.** A backfilled measurement carries an empty configuration
   fingerprint, because an archived report does not record its slot geometry.
   Cross-era flags therefore ignore backfilled entries.
 - **Units are normalised to the registry.** A rendered figure whose cell
-  carries its own unit is converted to the registry's unit: the middle-era
-  `## Time to first token` table renders seconds (`43.7s`) while later tables
-  use milliseconds (`670ms`, or a bare number in the earliest reports), so the
-  seed converts a `s`/`sec` suffix to milliseconds and keeps `ms` (or an
-  unitless value) as-is. A cell with an unrecognised unit is skipped rather
-  than guessed, so a mis-scaled value never enters the best-3 history
-  (LP-0MW20RKLE006TG4M).
+  carries its own unit is converted to the registry's unit, and a bare number
+  is read in the unit its **column header** declares: the `## Prefill vs
+  decode` percentile columns are in seconds (`33.5` is 33.5 s, converted to
+  milliseconds), while the `## Time to first token` table is in milliseconds
+  (`670`, `670ms`) and the middle-era reports suffix their cells (`43.7s`). An
+  unrecognised unit is skipped rather than guessed, so a mis-scaled value
+  never enters the best-3 history (LP-0MW20RKLE006TG4M).
 - The seed writes to `--metrics-state` when given, otherwise to
   `<output-dir>/performance_metrics_state.yaml`; point `--output-dir` at the
   report directory the daily cron writes to so the next run inherits the

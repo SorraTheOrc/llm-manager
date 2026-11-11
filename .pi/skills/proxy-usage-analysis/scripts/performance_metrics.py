@@ -507,23 +507,29 @@ def _number(text: object) -> float | None:
     return float(match.group(0)) if match else None
 
 
-def _duration_ms(text: object) -> float | None:
+def _duration_ms(text: object, *, bare_unit: str = "ms") -> float | None:
     """A rendered duration cell as milliseconds, or ``None`` when not understood.
 
-    Archived reports render the time-to-first-token percentile with a per-cell
-    unit: the middle-era reports say ``43.7s`` while later ones say ``670ms``
-    (and the earliest milliseconds-era reports leave the unit off). Taking only
-    the number turned ``43.7s`` into ``43.7`` ms — a sub-second value that then
-    won the lower-is-better best-3 forever — so the suffix is converted to the
-    registry's ``ms`` unit here, and an unrecognised suffix is refused rather
-    than guessed (LP-0MW20RKLE006TG4M).
+    Archived reports render duration percentiles with a per-cell unit — the
+    middle-era ``## Time to first token`` rows say ``43.7s`` while later ones
+    say ``670ms`` — so a unit-blind read of ``43.7s`` would be ``43.7`` ms, a
+    sub-second value that then won the lower-is-better best-3 forever
+    (LP-0MW20RKLE006TG4M). The suffix is therefore converted to the registry's
+    ``ms`` unit here, and an unrecognised suffix is refused rather than guessed.
+
+    *bare_unit* is what a cell **without** a suffix means, because each table
+    declares its unit in the header: the ``## Time to first token`` table is in
+    milliseconds (the earliest reports leave the suffix off a ``670``), while
+    ``## Prefill vs decode`` declares its percentile columns in seconds (a bare
+    ``33.5`` is 33.5 s). It defaults to the milliseconds reading.
     """
     if isinstance(text, (int, float)) and not isinstance(text, bool):
         return float(text)
     match = _DURATION_RE.match(str(text).replace(",", ""))
     if not match:
         return None
-    multiplier = _DURATION_TO_MS.get((match.group(2) or "").lower())
+    suffix = (match.group(2) or "").lower()
+    multiplier = _DURATION_TO_MS.get(suffix if suffix else bare_unit)
     if multiplier is None:
         return None
     return float(match.group(1)) * multiplier
@@ -591,17 +597,42 @@ def _parse_speed(report_text: str, section_title: str) -> float | None:
 
 
 def _parse_time_to_first_token(report_text: str) -> float | None:
-    section = _section(report_text, "Time to first token")
+    """Local-only p90 time to first token (ms) from ``## Prefill vs decode``.
+
+    The archived report renders **two** first-token p90s over different
+    populations: the ``## Time to first token`` ``| Total |`` row is the
+    **combined local + remote** population (remote ``ttft_seconds=`` samples
+    dominate its sample count and drag the p90 down to single-digit seconds),
+    while the scorecard metric is the **local-only** p90
+    (``aggregation.ttft_p90_ms(..., include_remote=False)``). Only the
+    ``## Prefill vs decode`` ``Prefill (dispatch → first byte)`` ``p90 (s)``
+    column is local-only — one sample per local stream, percentile in the
+    column's declared seconds — so the seed derives the value from it and
+    **never** falls back to the combined row: a combined value must not be
+    seeded as if it were local-only, because it would install a
+    lower-is-better best-3 target an order of magnitude below every actual
+    (LP-0MWBLZ8HP005F6KO).
+
+    A report without that row (earlier eras render no such section) or whose
+    prefill row has no samples contributes nothing, so the caller reports the
+    metric as skipped instead of guessing.
+    """
+    section = _section(report_text, "Prefill vs decode")
     if section is None:
         return None
     rows = _table_rows(section)
     if not rows:
         return None
     p90_column = _column_index(rows[0], "p90")
-    row = _row_for_bucket(rows, "total")
-    if p90_column is None or row is None or p90_column >= len(row):
+    if p90_column is None:
         return None
-    return _duration_ms(row[p90_column])
+    for row in rows[1:]:
+        if not row or not row[0].strip().lower().startswith("prefill"):
+            continue
+        if p90_column >= len(row):
+            return None
+        return _duration_ms(row[p90_column], bare_unit="s")
+    return None
 
 
 def _parse_gpu_busy(report_text: str) -> float | None:

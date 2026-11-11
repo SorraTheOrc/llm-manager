@@ -74,6 +74,7 @@ sys.path.insert(0, str(SCRIPTS))
 from tests.fixtures import (  # noqa: E402
     ARCHIVED_REPORT_ERA_A,
     ARCHIVED_REPORT_ERA_B,
+    ARCHIVED_REPORT_ERA_PREFILL,
     ARCHIVED_REPORT_ERA_SECONDS,
 )
 
@@ -431,64 +432,113 @@ def test_backfill_parser_reads_the_era_b_standard_low_report():
     assert parsed["fallback_rate"] == pytest.approx(48.1)
     assert parsed["decode_speed"] == pytest.approx(37.8)
     assert parsed["prompt_eval_speed"] == pytest.approx(193.3)
-    assert parsed["time_to_first_token"] == pytest.approx(670.0)
     assert parsed["contention_denials_per_hour"] == pytest.approx(12.8)
 
 
-#: The era-B-style TTFT table with its p90 replaced, so the unit-conversion
-#: contract can be exercised cell by cell without another full report fixture.
-_TTFT_TOTAL_ROW = "| Total | 3294 | 358ms | 4.4s | 43.7s |"
+# --- Time-to-first-token population (LP-0MWBLZ8HP005F6KO) -------------------
+#
+# The archive carries two first-token p90s over different populations. The
+# ``## Time to first token`` ``| Total |`` row is the **combined local +
+# remote** p90 (remote ``ttft_seconds=`` samples dominate its sample count and
+# drag it to single-digit seconds), whereas the scorecard metric is the
+# **local-only** p90 (``aggregation.ttft_p90_ms(..., include_remote=False)``).
+# Only the ``## Prefill vs decode`` ``Prefill (dispatch → first byte)``
+# ``p90 (s)`` column is local-only, so the backfill derives the seed from it
+# and never falls back to the combined row (which seeded an unreachable
+# 558-646 ms best-3 target for a metric whose actual is 30-60 s).
 
-
-def _report_with_ttft_p90(cell: str) -> str:
-    assert _TTFT_TOTAL_ROW in ARCHIVED_REPORT_ERA_SECONDS
-    return ARCHIVED_REPORT_ERA_SECONDS.replace(
-        _TTFT_TOTAL_ROW, f"| Total | 3294 | 358ms | 4.4s | {cell} |"
-    )
-
-
-def test_backfill_parser_converts_the_seconds_era_ttft_to_milliseconds():
-    """LP-0MW20RKLE006TG4M: the 2026-09-17-era report renders the p90 as
-    ``43.7s``. Blindly taking the number seeds 43.7 ms — a sub-second value
-    that permanently wins the lower-is-better best-3 — so the cell must be
-    converted to the registry's milliseconds unit."""
-    parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_SECONDS)
-
-    assert parsed["time_to_first_token"] == pytest.approx(43700.0)
-    assert parsed["time_to_first_token"] > 1000.0, "a seconds-era value must never seed sub-second"
-
-
-@pytest.mark.parametrize(
-    ("cell", "expected_ms"),
-    [
-        ("43.7s", 43700.0),
-        ("12.5 sec", 12500.0),
-        ("670ms", 670.0),
-        ("48971.5 ms", 48971.5),
-        ("670", 670.0),
-    ],
+#: The ``## Prefill vs decode`` prefill row of the recent-era fixture.
+_PREFILL_P90_ROW = (
+    "| Prefill (dispatch → first byte) | 11h 07m | 60.4% | 0.6 | 3.9 | 33.5 | 198.0 | 3081 |"
 )
-def test_backfill_parser_converts_ttft_duration_units_to_milliseconds(cell, expected_ms):
-    parsed = pm.parse_archived_report(_report_with_ttft_p90(cell))
-
-    assert parsed["time_to_first_token"] == pytest.approx(expected_ms)
 
 
-@pytest.mark.parametrize("cell", ["43.7x", "43.7 ms/req", "~43.7", "fast"])
-def test_backfill_parser_refuses_an_unrecognised_ttft_unit(cell):
-    """An unrecognised suffix is skipped, never guessed: a wrong unit must not
-    seed history at all rather than seed a mis-scaled value."""
-    parsed = pm.parse_archived_report(_report_with_ttft_p90(cell))
+def _report_with_prefill_p90(cell: str) -> str:
+    assert _PREFILL_P90_ROW in ARCHIVED_REPORT_ERA_PREFILL
+    rows = ARCHIVED_REPORT_ERA_PREFILL.replace(
+        _PREFILL_P90_ROW, _PREFILL_P90_ROW.replace("| 33.5 |", f"| {cell} |")
+    )
+    assert cell in rows
+    return rows
+
+
+def test_backfill_parser_seeds_the_local_only_ttft_p90_not_the_combined_one():
+    """The fixture renders both figures: a combined 9.0 s p90 and a local-only
+    33.5 s p90. Only the local-only one is comparable with the metric."""
+    parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_PREFILL)
+
+    assert parsed["time_to_first_token"] == pytest.approx(33_500.0)
+    assert parsed["time_to_first_token"] != pytest.approx(9_000.0)
+
+
+def test_backfill_parser_never_seeds_the_combined_local_plus_remote_ttft():
+    """Era B renders only the combined ``## Time to first token`` p90
+    (``670ms``): seeding it as the metric's value would install a target the
+    local-only actual can never meet."""
+    parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_B)
+
+    assert "time_to_first_token" not in parsed
+    assert parsed["decode_speed"] == pytest.approx(37.8), "other metrics still parse"
+
+
+def test_backfill_parser_ignores_the_seconds_era_combined_ttft_row():
+    """The middle-era report renders its combined p90 as ``43.7s``. The unit
+    suffix no longer rescues the value: it is the wrong population."""
+    parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_SECONDS)
 
     assert "time_to_first_token" not in parsed
     assert parsed["decode_speed"] == pytest.approx(29.4), "other metrics still parse"
 
 
+@pytest.mark.parametrize(
+    ("cell", "expected_ms"),
+    [
+        ("33.5", 33_500.0),  # the column is declared in seconds
+        ("33.5s", 33_500.0),
+        ("12.5 sec", 12_500.0),
+        ("33500ms", 33_500.0),
+        ("33500 ms", 33_500.0),
+    ],
+)
+def test_backfill_parser_converts_the_prefill_p90_to_milliseconds(cell, expected_ms):
+    """The local-only column is in seconds while the registry unit is ms, so a
+    unit-blind read would seed 33.5 ms — a sub-second value that would win the
+    lower-is-better best-3 forever."""
+    parsed = pm.parse_archived_report(_report_with_prefill_p90(cell))
+
+    assert parsed["time_to_first_token"] == pytest.approx(expected_ms)
+
+
+@pytest.mark.parametrize("cell", ["33.5x", "33.5 s/req", "~33.5", "fast"])
+def test_backfill_parser_refuses_an_unrecognised_prefill_unit(cell):
+    """An unrecognised suffix is skipped, never guessed: a wrong unit must not
+    seed history at all rather than seed a mis-scaled value."""
+    parsed = pm.parse_archived_report(_report_with_prefill_p90(cell))
+
+    assert "time_to_first_token" not in parsed
+    assert parsed["decode_speed"] == pytest.approx(33.9), "other metrics still parse"
+
+
+def test_backfill_parser_omits_ttft_when_the_prefill_row_has_no_samples():
+    """A window with no local prefill samples renders ``-`` in every phase
+    cell. That is not a value, so the metric is skipped rather than seeded as
+    0 — and the combined row is still not consulted."""
+    report = ARCHIVED_REPORT_ERA_PREFILL.replace(
+        _PREFILL_P90_ROW,
+        "| Prefill (dispatch → first byte) | - | - | - | - | - | - | 0 |",
+    )
+
+    parsed = pm.parse_archived_report(report)
+
+    assert "time_to_first_token" not in parsed
+    assert parsed["decode_speed"] == pytest.approx(33.9)
+
+
 def test_backfill_parser_returns_no_measurement_for_metrics_it_cannot_parse():
     parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_A)
 
-    # Era A renders neither a time-to-first-token nor a contention section, so
-    # those metrics are skipped rather than guessed.
+    # Era A renders neither a time-to-first-token nor a local-only prefill
+    # section, so those metrics are skipped rather than guessed.
     assert "time_to_first_token" not in parsed
     assert "contention_denials_per_hour" not in parsed
     assert set(parsed) <= set(TEN_METRICS)
@@ -538,6 +588,30 @@ def test_backfill_reports_the_metrics_it_could_not_parse():
     assert "contention_denials_per_hour" in skipped
     assert _measurement_count(state, "time_to_first_token") == 0
     assert _measurement_count(state, "decode_speed") == 1
+
+
+def test_backfill_skips_ttft_when_only_the_combined_row_is_rendered():
+    """A report with no local-only figure contributes nothing for the metric,
+    so it is reported as skipped rather than seeded from the combined row."""
+    state = pm.new_state()
+
+    result = pm.seed_history(state, [("2026-10-31", ARCHIVED_REPORT_ERA_B)])
+
+    assert "time_to_first_token" in result["skipped_metrics"]
+    assert _measurement_count(state, "time_to_first_token") == 0
+
+
+def test_backfill_seeds_a_ttft_in_the_scorecard_actual_range():
+    """The seeded value is comparable with the metric's own windows (the
+    live 2026-11-08/09 actuals are 33.5 s and 34.0 s), not with the combined
+    p90 (single-digit seconds) of the same report."""
+    state = pm.new_state()
+
+    pm.seed_history(state, [("2026-11-09", ARCHIVED_REPORT_ERA_PREFILL)])
+
+    stored = state["metrics"]["time_to_first_token"]["measurements"][0]
+    assert stored["window"] == "2026-11-09"
+    assert 25_000.0 <= stored["value"] <= 60_000.0
 
 
 def test_archived_window_id_uses_the_generated_date():

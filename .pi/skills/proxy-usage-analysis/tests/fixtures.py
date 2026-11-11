@@ -1374,3 +1374,72 @@ Percentiles of time from dispatch to first token (ms), from local
 |---|---|---|---|---|
 | Total | 3294 | 358ms | 4.4s | 43.7s |
 """
+
+
+# The recent-era reports additionally render ``## Prefill vs decode``
+# (LP-0MVJNDOUU0059MMO), and that makes the archive carry **two** first-token
+# p90s over different populations:
+#
+# * ``## Time to first token`` ``| Total |`` is the **combined local + remote**
+#   p90 — remote ``ttft_seconds=`` samples dominate its sample count and drag
+#   the p90 down to sub-10 s;
+# * ``## Prefill vs decode``'s ``Prefill (dispatch → first byte)`` ``p90 (s)``
+#   column is the **local-only** p90, the same population as the scorecard
+#   metric ``aggregation.ttft_p90_ms(..., include_remote=False)``
+#   (LP-0MWBLZ8HP005F6KO).
+#
+# Seeding the combined figure would install an unreachable lower-is-better
+# best-3 target (558-646 ms) for a metric whose actual is 30-60 s. This is a
+# trimmed, format-faithful excerpt of ``~/proxy-usage-reports/2026-11-10/
+# report.md`` (window 2026-11-09): the combined p90 renders ``9.0s`` while the
+# local-only p90 renders ``33.5`` s in a column declared in seconds.
+ARCHIVED_REPORT_ERA_PREFILL = """\
+# Proxy Usage Analysis Report
+
+- Generated: 2026-11-09 05:01:22
+- Window: 2026-11-08 05:00:01 → 2026-11-09 05:00:01 (24.0h)
+- Sessions in window: **266** | Requests: **9871** (local 3086 / remote 6785)
+- Fallback events: **6700** (67.9% of requests) | dispatch denied: 59
+- Lines parsed: 76065 | lines skipped: 0
+
+## Time to first token
+
+Percentiles of time from dispatch to first token (ms), from local
+``dispatch_first_byte_ms=`` and remote ``ttft_seconds=`` log lines.
+
+| Bucket | Samples | p10 | Median | p90 |
+|---|---|---|---|---|
+| Total | 9866 | 1ms | 122ms | 9.0s |
+| Fast | 7640 | 1ms | 53ms | 6.8s |
+| Cheap | 2226 | 2ms | 729ms | 15.4s |
+
+## Decode speed
+
+| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |
+|---|---|---|---|---|---|
+| Qwen3 | Total | 3765 | 33.9 | 40.5 | 22.8 |
+| Qwen3 | Fast | 2941 | 33.6 | 40.1 | 23.6 |
+
+## Prompt eval speed
+
+| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |
+|---|---|---|---|---|---|
+| Qwen3 | Total | 3765 | 110.1 | 275.4 | 56.7 |
+| Qwen3 | Fast | 2941 | 104.7 | 246.3 | 55.1 |
+
+## Prefill vs decode
+
+Where local slot time goes, by phase. Every figure here is
+**slot-seconds** — the integral of concurrency (the sum of the
+per-stream phase durations), **not wall-clock**: two concurrent 10 s
+prefills are 20 slot-seconds but only 10 s of wall clock.
+
+| Phase | Slot-seconds | % of phase slot-time | p10 (s) | Median (s) | p90 (s) | Max (s) | Samples |
+|---|---|---|---|---|---|---|---|
+| Prefill (dispatch → first byte) | 11h 07m | 60.4% | 0.6 | 3.9 | 33.5 | 198.0 | 3081 |
+| Decode (first byte → finish) | 7h 17m | 39.6% | 1.9 | 3.3 | 17.5 | 292.0 | 3079 |
+| Total | 18h 25m | 100.0% | - | - | - | - | 6160 |
+
+Percentages are of the combined measured phase slot-time (prefill +
+decode) and always sum to 100.0%.
+"""
