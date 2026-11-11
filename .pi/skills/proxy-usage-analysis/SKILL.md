@@ -627,17 +627,29 @@ rendered from data the pipeline already collects:
   reason, context size at fallback) sorted by local turns descending — more
   local turns is the goal, so the best sessions read first.
 
-Derivation rules that matter when reading it: an unanswered local turn (error
-/ abort / log gap) is counted and flagged rather than dropped; `% local turns`
-is `local / (local + remote)` per session, so a local-only session reads
-100 %; the fallback reason is the session's **own** attribution
-(`no_remote_fallback` when it never used remote, `unattributed` when it has no
-evidence); and context size at fallback is the session's own
-`routing_skip_local estimated_tokens`, else the first remote stream's prompt
-tokens, else its session context — sessions with no token evidence render
-`n/a` with a named limitation, never a fabricated estimate. The same
-figures are in the `--json` summary under `local_turn_coverage` and in the
-per-session CSVs.
+Derivation rules that matter when reading it:
+
+- an unanswered local turn (error / abort / log gap) is counted and flagged
+  rather than dropped, never silently discarded;
+- `% local turns` is `local / (local + remote)` per session, so a local-only
+  session reads 100 %;
+- the fallback reason is the session's **own** attribution
+  (`no_remote_fallback` when it never used remote, `unattributed` when it has
+  no own evidence). `unattributed` means exactly "no own evidence" — it is
+  **not** a statement that the session's line arrived late: the own-evidence
+  join is turn-first, so an own `Fallback triggered` or routing-skip line
+  carrying the first remote stream's `turn=` is attributed however much later
+  the proxy logged it (the pre-flight-buffering order — the proxy emits the
+  fallback line after `Stream finished` on the streaming-success path), while
+  turn-less rotated lines keep the timestamp rule. A reason is never inherited
+  from a neighbouring session (LP-0MVMBMSWR0036RES);
+- context size at fallback is the session's own
+  `routing_skip_local estimated_tokens`, else the first remote stream's prompt
+  tokens, else its session context — sessions with no token evidence render
+  `n/a` with a named limitation, never a fabricated estimate.
+
+The same figures are in the `--json` summary under `local_turn_coverage` and
+in the per-session CSVs.
 
 Interpretation notes the section prints itself when the data applies:
 context-size fallbacks are `estimated_tokens` threshold decisions (they fire

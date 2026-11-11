@@ -66,6 +66,12 @@ with attribution markers — ``source=<value>``, ``actor=<value>``, and
 ``reason=<value>`` key=value pairs — that identify the origin of each
 restart/mode-switch event.
 
+These marker rules cover restart and mode-switch events only. Per-session
+**fallback attribution** — which session's `Fallback triggered` or routing-skip
+line explains a move to remote, joined turn-first by `turn=` — is documented in
+[REFERENCE.md](REFERENCE.md#limitations) under *Per-session fallback
+attribution*.
+
 ### How attribution is consumed
 
 The analysis pipeline (``analyze_proxy_usage.py``) consumes attribution data

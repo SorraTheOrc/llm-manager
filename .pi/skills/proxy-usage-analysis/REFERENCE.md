@@ -1145,12 +1145,13 @@ entry is a local runtime edit, not a committed artifact.
      depend on ordering: `pair_ttft_to_streams()` pairs a
      `dispatch_first_byte_ms=`/`ttft_seconds=` line with the `Stream started`
      line of the same turn, `pair_stream_events()` pairs `Stream started` with
-     its own `Stream finished` (busy time, decode/prefill slot-seconds), and
-     `_attribute_fallback()` prefers the fallback/skip/denial evidence carrying
-     the first remote stream's turn. Lines **without** ids (rotated logs
-     predating the field) keep the historical per-session FIFO and
-     nearest-line-within-60s heuristics, so historical windows still analyse
-     unchanged.
+     its own `Stream finished` (busy time, decode/prefill slot-seconds), and the
+     shared picker `_pick_turn_first_evidence()` lets `_attribute_fallback()`
+     take the fallback/skip evidence carrying the first remote stream's turn
+     even when that line was logged after it. Lines **without** ids (rotated
+     logs predating the field) keep the historical per-session FIFO and
+     at-or-before-the-stream / nearest-session-less-line-within-60s heuristics,
+     so historical windows still analyse unchanged.
    Local `dispatch_first_byte_ms=` lines (LP-0MTSSM5SO003PKU0) parse into
    `ttft` events carrying the prefill breakdown: `ttft_ms` (dispatch → first
    byte total), `dispatch_to_first_byte_ms` (total minus queued wait),
@@ -2053,8 +2054,12 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   logged after its first remote stream (the proxy emits `Fallback triggered`
   after the pre-flight consumed that stream, LP-0MW8U39FH005GWHY); evidence
   without a turn id keeps the historical at/before-the-stream rule. The
-  reported move time is never later than the first remote stream. The
-  provenance is exposed as the `fallback_attribution` column (`own_skip`,
+  reported move time is never later than the first remote stream. A session is
+  therefore `unattributed` only when it has **no own evidence** of any kind:
+  the state never means its own line merely arrived after the stream — a late
+  line carrying the first remote stream's `turn=` is still attributed
+  (LP-0MW8U39FH005GWHY). The provenance is exposed as the
+  `fallback_attribution` column (`own_skip`,
   `own_provider_skip`, `own_fallback`, `legacy_nearest`, `lease_denied`,
   `unattributed`) plus the `no_remote_fallback` state for sessions that never
   used a remote provider; the report's `Session fallback attribution` line and

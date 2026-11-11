@@ -14,11 +14,22 @@ work item's decisions:
   the session and the reason; the provider-context skip also names the
   provider and the ceiling that blocked that attempt), or its own
   session-bearing ``Fallback triggered`` line, falling back to the nearest
-  session-less ``Fallback triggered`` line within 60s before the first remote
-  stream (rotated logs predating the session stamp only), then to a local-lease
+  session-less ``Fallback triggered`` line within
+  ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` (60s) before the first remote stream
+  (rotated logs predating the session stamp only), then to a local-lease
   refusal, and finally to the first remote stream time itself. Another
   session's reason is never inherited — the provenance is recorded in
   ``SessionStats.fallback_attribution``;
+- every own-evidence tier above is selected **turn-first** by
+  :func:`_pick_turn_first_evidence`: an exact ``turn=`` match on the session's
+  own line wins over the timestamp, because the proxy emits
+  ``Fallback triggered`` from ``_handle_streaming_success()`` *after* the
+  pre-flight has started and finished the remote stream it describes, so a
+  timestamp-first filter would drop the session's own line. Evidence without a
+  turn id keeps the historical at-or-before-the-first-remote-stream rule, so
+  rotated logs predating ``turn=`` attribute exactly as before. The recorded
+  move time is clamped to the first remote stream, so a late matched line never
+  shifts ``context_at_fallback``;
 - fast/cheap bucket and slot count come from the slot schedule, keyed by
   session start time.
 
@@ -1576,6 +1587,16 @@ def _attribute_fallback(
     present the join is exact, so two interleaved turns of one session can no
     longer be confused (LP-0MVMBM467005BT4A AC3). Without ids the historical
     session/timestamp rules above apply unchanged.
+
+    Every own-evidence tier (1)-(3) is selected by the same picker,
+    :func:`_pick_turn_first_evidence`, so the order never depends on which tier
+    answered. Tier 4 is the **bounded legacy path**: it applies only to
+    session-less lines within ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` (60s)
+    before the first remote stream, which rotated logs predating the session
+    stamp alone can reach. The returned move time is clamped to
+    ``first_remote_ts`` on every own-evidence tier, so a late turn-matched line
+    never moves the ``context_at_fallback`` anchor past the first remote stream
+    it followed.
 
     Returns ``(None, None, attribution)`` when there is no timestamped
     evidence.
