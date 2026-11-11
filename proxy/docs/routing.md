@@ -1288,6 +1288,19 @@ concurrency remains a latency expense and not a throughput lever. Record:
 `docs/dev/prefill-concurrency-2026-11-11.md`,
 `docs/dev/prefill-concurrency-baseline-2026-11-11.json`.
 
+The four prefill-share lever families (session compaction, prefill concurrency,
+model/quantisation/slot geometry, accept-the-ceiling) are costed on one unit set
+— prefill tok/s added, per-slot resource cost, and *both* local-share
+denominators — in
+`docs/dev/local-prefill-lever-comparison-2026-11-11.md`
+(LP-0MWCEII0V003V76A). Two results matter when reading any share number below:
+no family adds aggregate prefill rate (the all-lever bound is 1.019× on the gate
+rate), and a share figure is meaningless without its denominator — offered
+**prompt tokens** (0.41–1.62 % ceiling) and offered **streams** (1.52–5.96 %
+ceiling) differ by the 3.68× prompt-size mix. The local-share target it
+recommends for the recovery criterion is **≥ 3.5 % of locally served streams**
+(= 0.951 % of offered prompt tokens), 0.587× the point ceiling.
+
 At most `server.local_max_concurrent_prefills` prefills now run at once:
 
 ```yaml
