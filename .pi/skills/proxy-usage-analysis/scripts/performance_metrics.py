@@ -483,6 +483,15 @@ def detail_copy(metric_id: str, defaults: Mapping | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_DURATION_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([A-Za-z]+)?\s*$")
+#: Duration suffix -> milliseconds multiplier. A bare number is milliseconds,
+#: matching the earliest milliseconds-era archived reports.
+_DURATION_TO_MS = {
+    "": 1.0,
+    "ms": 1.0,
+    "s": 1000.0,
+    "sec": 1000.0,
+}
 _GENERATED_DATE_RE = re.compile(r"(?m)^-\s*Generated:\s*(\d{4}-\d{2}-\d{2})")
 _FALLBACK_RATE_RE = re.compile(
     r"Fallback events:\s*\*\*[\d,]+\*\*\s*\(([\d.]+)% of requests\)"
@@ -496,6 +505,28 @@ def _number(text: object) -> float | None:
         return float(text)
     match = _NUMBER_RE.search(str(text).replace(",", ""))
     return float(match.group(0)) if match else None
+
+
+def _duration_ms(text: object) -> float | None:
+    """A rendered duration cell as milliseconds, or ``None`` when not understood.
+
+    Archived reports render the time-to-first-token percentile with a per-cell
+    unit: the middle-era reports say ``43.7s`` while later ones say ``670ms``
+    (and the earliest milliseconds-era reports leave the unit off). Taking only
+    the number turned ``43.7s`` into ``43.7`` ms — a sub-second value that then
+    won the lower-is-better best-3 forever — so the suffix is converted to the
+    registry's ``ms`` unit here, and an unrecognised suffix is refused rather
+    than guessed (LP-0MW20RKLE006TG4M).
+    """
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        return float(text)
+    match = _DURATION_RE.match(str(text).replace(",", ""))
+    if not match:
+        return None
+    multiplier = _DURATION_TO_MS.get((match.group(2) or "").lower())
+    if multiplier is None:
+        return None
+    return float(match.group(1)) * multiplier
 
 
 def _section(report_text: str, title: str) -> str | None:
@@ -570,7 +601,7 @@ def _parse_time_to_first_token(report_text: str) -> float | None:
     row = _row_for_bucket(rows, "total")
     if p90_column is None or row is None or p90_column >= len(row):
         return None
-    return _number(row[p90_column])
+    return _duration_ms(row[p90_column])
 
 
 def _parse_gpu_busy(report_text: str) -> float | None:

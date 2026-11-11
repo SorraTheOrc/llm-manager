@@ -1154,7 +1154,9 @@ LOCAL_ERROR_NO_MARKER_2026_09_25 = _stream_finish_error_line(
 #   ``## Time to first token`` nor the ``## Local contention prediction vs
 #   reality`` section (shape of ``2026-08-07/report.md``);
 # * **era B** — the same columns renamed ``Standard`` / ``Low``, with both extra
-#   sections present (shape of ``2026-10-31/report.md``).
+#   sections present (shape of ``2026-10-31/report.md``); the
+#   ``## Time to first token`` percentiles carry a per-cell unit (``358ms``,
+#   ``4.4s``, ``43.7s``) rather than one unit declared by the section.
 #
 # Each fixture below is a trimmed but format-faithful excerpt of the real file:
 # the header bullet block, then only the tables the backfill parser reads. The
@@ -1330,4 +1332,45 @@ Measures whether the payload's `lease_state` / `prefill_eta_seconds` signals pre
 | Denials per hour | 12.8 | 110.0 |
 | Local busy (dispatch → finish) | 16.8% | 29.3% |
 | Worst hour | 2026-10-30 19:00:00 (55 denials at 29.5% busy) | 2026-10-20 04:00–05:00 (187 denials at 2.5% busy) |
+"""
+
+
+# The middle-era reports render the ``## Time to first token`` percentiles in
+# mixed units — ``358ms``, ``4.4s``, ``43.7s`` — despite the section intro
+# naming milliseconds. A unit-blind extractor turns the ``43.7s`` p90 into
+# ``43.7`` ms, which then becomes an unreachable best-3 target for the
+# lower-is-better metric (LP-0MW20RKLE006TG4M). This is a trimmed,
+# format-faithful excerpt of ``~/proxy-usage-reports/2026-09-17_2/report.md``.
+ARCHIVED_REPORT_ERA_SECONDS = """\
+# Proxy Usage Analysis Report
+
+- Generated: 2026-09-17 05:00:03
+- Window: 2026-09-16 05:00:01 → 2026-09-17 05:00:01 (24.0h)
+- Sessions in window: **118** | Requests: **5552** (local 2831 / remote 2721)
+- Fallback events: **2527** (45.5% of requests) | dispatch denied: 516
+- Unattributed stream events (no session UUID): 0
+- Lines parsed: 19285 | lines skipped: 0
+
+## Decode speed
+
+| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |
+|---|---|---|---|---|---|
+| Qwen3 | Total | 2667 | 29.4 | 38.3 | 18.4 |
+| Qwen3 | Fast | 2667 | 29.4 | 38.3 | 18.4 |
+
+## Prompt eval speed
+
+| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |
+|---|---|---|---|---|---|
+| Qwen3 | Total | 2667 | 69.8 | 172.8 | 36.5 |
+| Qwen3 | Fast | 2667 | 69.8 | 172.8 | 36.5 |
+
+## Time to first token
+
+Percentiles of time from dispatch to first token (ms), from local
+``dispatch_first_byte_ms=`` and remote ``ttft_seconds=`` log lines.
+
+| Bucket | Samples | p10 | Median | p90 |
+|---|---|---|---|---|
+| Total | 3294 | 358ms | 4.4s | 43.7s |
 """

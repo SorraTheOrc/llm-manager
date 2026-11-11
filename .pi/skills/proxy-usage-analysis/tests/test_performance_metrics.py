@@ -74,6 +74,7 @@ sys.path.insert(0, str(SCRIPTS))
 from tests.fixtures import (  # noqa: E402
     ARCHIVED_REPORT_ERA_A,
     ARCHIVED_REPORT_ERA_B,
+    ARCHIVED_REPORT_ERA_SECONDS,
 )
 
 ENGINE_PATH = SCRIPTS / "performance_metrics.py"
@@ -432,6 +433,55 @@ def test_backfill_parser_reads_the_era_b_standard_low_report():
     assert parsed["prompt_eval_speed"] == pytest.approx(193.3)
     assert parsed["time_to_first_token"] == pytest.approx(670.0)
     assert parsed["contention_denials_per_hour"] == pytest.approx(12.8)
+
+
+#: The era-B-style TTFT table with its p90 replaced, so the unit-conversion
+#: contract can be exercised cell by cell without another full report fixture.
+_TTFT_TOTAL_ROW = "| Total | 3294 | 358ms | 4.4s | 43.7s |"
+
+
+def _report_with_ttft_p90(cell: str) -> str:
+    assert _TTFT_TOTAL_ROW in ARCHIVED_REPORT_ERA_SECONDS
+    return ARCHIVED_REPORT_ERA_SECONDS.replace(
+        _TTFT_TOTAL_ROW, f"| Total | 3294 | 358ms | 4.4s | {cell} |"
+    )
+
+
+def test_backfill_parser_converts_the_seconds_era_ttft_to_milliseconds():
+    """LP-0MW20RKLE006TG4M: the 2026-09-17-era report renders the p90 as
+    ``43.7s``. Blindly taking the number seeds 43.7 ms — a sub-second value
+    that permanently wins the lower-is-better best-3 — so the cell must be
+    converted to the registry's milliseconds unit."""
+    parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_SECONDS)
+
+    assert parsed["time_to_first_token"] == pytest.approx(43700.0)
+    assert parsed["time_to_first_token"] > 1000.0, "a seconds-era value must never seed sub-second"
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected_ms"),
+    [
+        ("43.7s", 43700.0),
+        ("12.5 sec", 12500.0),
+        ("670ms", 670.0),
+        ("48971.5 ms", 48971.5),
+        ("670", 670.0),
+    ],
+)
+def test_backfill_parser_converts_ttft_duration_units_to_milliseconds(cell, expected_ms):
+    parsed = pm.parse_archived_report(_report_with_ttft_p90(cell))
+
+    assert parsed["time_to_first_token"] == pytest.approx(expected_ms)
+
+
+@pytest.mark.parametrize("cell", ["43.7x", "43.7 ms/req", "~43.7", "fast"])
+def test_backfill_parser_refuses_an_unrecognised_ttft_unit(cell):
+    """An unrecognised suffix is skipped, never guessed: a wrong unit must not
+    seed history at all rather than seed a mis-scaled value."""
+    parsed = pm.parse_archived_report(_report_with_ttft_p90(cell))
+
+    assert "time_to_first_token" not in parsed
+    assert parsed["decode_speed"] == pytest.approx(29.4), "other metrics still parse"
 
 
 def test_backfill_parser_returns_no_measurement_for_metrics_it_cannot_parse():

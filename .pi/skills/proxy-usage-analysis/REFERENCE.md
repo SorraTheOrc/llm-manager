@@ -922,13 +922,14 @@ The rules behind those numbers:
 - **Unknown era.** A backfilled measurement carries an empty configuration
   fingerprint, because an archived report does not record its slot geometry.
   Cross-era flags therefore ignore backfilled entries.
-- **Units are taken as rendered.** A backfilled value keeps the scale the
-  archived report used. Where an older era rendered a figure in different
-  units from the current registry (the middle-era `## Time to first token`
-  table renders seconds, later tables milliseconds), the stored value keeps
-  the older scale; that extraction gap is tracked in LP-0MW20RKLE006TG4M, so
-  re-seed from a clean state after it lands rather than trusting a
-  seconds-era TTFT measurement.
+- **Units are normalised to the registry.** A rendered figure whose cell
+  carries its own unit is converted to the registry's unit: the middle-era
+  `## Time to first token` table renders seconds (`43.7s`) while later tables
+  use milliseconds (`670ms`, or a bare number in the earliest reports), so the
+  seed converts a `s`/`sec` suffix to milliseconds and keeps `ms` (or an
+  unitless value) as-is. A cell with an unrecognised unit is skipped rather
+  than guessed, so a mis-scaled value never enters the best-3 history
+  (LP-0MW20RKLE006TG4M).
 - The seed writes to `--metrics-state` when given, otherwise to
   `<output-dir>/performance_metrics_state.yaml`; point `--output-dir` at the
   report directory the daily cron writes to so the next run inherits the
