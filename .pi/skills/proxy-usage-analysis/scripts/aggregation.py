@@ -1486,7 +1486,13 @@ def _pick_turn_first_evidence(
     first_remote_ts: datetime,
     turn: str | None,
 ) -> LogEvent | None:
-    """Pick this session's own evidence line, turn-first (LP-0MW8U39FH005GWHY).
+    """Pick this session's own evidence line, turn-first.
+
+    Shared by **every** own-evidence tier — ``own_skip`` (``routing_skip_local``),
+    ``own_provider_skip`` (``routing_skip_provider_context``) and
+    ``own_fallback`` (``Fallback triggered``) — so no tier keeps a timestamp
+    filter ahead of an exact ``turn=`` match
+    (LP-0MW8U39FH005GWHY, LP-0MW8U39ZQ007MPQO).
 
     *events* must already be scoped to one session's own evidence (``e.session
     == session_id``), so the picker can only choose among lines that already
@@ -1534,12 +1540,15 @@ def _attribute_fallback(
     Priority — a session's own evidence always wins, and another session's
     reason is never inherited (LP-0MVMBMSWR0036RES):
 
-    1. The session's own ``routing_skip_local`` line at/before the first remote
-       stream (unchanged precedence; it names why local was skipped).
-    2. The session's own ``routing_skip_provider_context`` line at/before the
-       first remote stream (LP-0MVMBM1Y3001TPRT): also session-bearing, and it
-       names the provider + ``limit`` whose context ceiling blocked that
-       attempt, so it outranks the generic fallback line.
+    1. The session's own ``routing_skip_local`` line (it names why local was
+       skipped). Selected turn-first: an exact ``turn=`` match wins regardless
+       of its timestamp, so late-arriving evidence is attributed; turn-less
+       evidence keeps the at/before-the-stream rule (LP-0MW8U39ZQ007MPQO).
+    2. The session's own ``routing_skip_provider_context`` line
+       (LP-0MVMBM1Y3001TPRT): also session-bearing, and it names the provider +
+       ``limit`` whose context ceiling blocked that attempt, so it outranks the
+       generic fallback line. Selected turn-first by the same picker as tier 1
+       (LP-0MW8U39ZQ007MPQO).
     3. The session's own session-bearing ``Fallback triggered`` line at/before
        the first remote stream (the actual decision line). An exact ``turn=``
        match wins over the timestamp: the proxy logs that line **after** the
@@ -1572,30 +1581,28 @@ def _attribute_fallback(
     evidence.
     """
 
-    def _same_turn(events: list[LogEvent]) -> list[LogEvent]:
-        return [e for e in events if turn and e.turn == turn]
-
-    skips = [e for e in routing_skips.get(session_id, []) if e.ts <= first_remote_ts]
-    exact = _same_turn(skips)
-    if exact:
-        e = max(exact, key=lambda x: x.ts)
-        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
-    if skips:
-        e = max(skips, key=lambda x: x.ts)
-        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
+    skips = _pick_turn_first_evidence(
+        routing_skips.get(session_id, []), first_remote_ts, turn
+    )
+    if skips is not None:
+        # The move time never lands after the first remote stream, even when the
+        # matched line was logged later (same clamp as tier 3);
+        # ``context_at_fallback`` anchors on the move time.
+        return (
+            min(skips.ts, first_remote_ts),
+            skips.reason,
+            FALLBACK_ATTRIBUTION_OWN_SKIP,
+        )
     if provider_context_skips:
-        ctx_skips = [
-            e
-            for e in provider_context_skips.get(session_id, [])
-            if e.ts <= first_remote_ts
-        ]
-        exact = _same_turn(ctx_skips)
-        if exact:
-            e = max(exact, key=lambda x: x.ts)
-            return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
-        if ctx_skips:
-            e = max(ctx_skips, key=lambda x: x.ts)
-            return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
+        ctx_skip = _pick_turn_first_evidence(
+            provider_context_skips.get(session_id, []), first_remote_ts, turn
+        )
+        if ctx_skip is not None:
+            return (
+                min(ctx_skip.ts, first_remote_ts),
+                ctx_skip.reason,
+                FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP,
+            )
     own = [e for e in fallback_events if e.session == session_id]
     picked = _pick_turn_first_evidence(own, first_remote_ts, turn)
     if picked is not None:

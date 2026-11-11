@@ -2041,14 +2041,19 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
 - **Per-session fallback attribution (LP-0MVMBMSWR0036RES).** Since
   `Fallback triggered` carries `session=`, a session's fallback reason is taken
   from its **own** evidence and never inherited from a neighbouring line. The
-  precedence is (1) the session's own `routing_skip_local` line at/before its
-  first remote stream, (2) the session's own `routing_skip_provider_context`
-  line at/before its first remote stream (LP-0MVMBM1Y3001TPRT — it names the
-  provider and the `limit` that blocked that chain step, so it outranks the
-  generic fallback line), (3) the session's own `Fallback triggered` line
-  at/before its first remote stream, (4) the nearest **session-less** fallback
-  line within 60s before the first remote stream — reachable only for rotated
-  logs predating the session stamp — and (5) no own evidence at all. The
+  precedence is (1) the session's own `routing_skip_local` line, (2) the
+  session's own `routing_skip_provider_context` line (LP-0MVMBM1Y3001TPRT — it
+  names the provider and the `limit` that blocked that chain step, so it
+  outranks the generic fallback line), (3) the session's own
+  `Fallback triggered` line, (4) the nearest **session-less** fallback line
+  within 60s before the first remote stream — reachable only for rotated logs
+  predating the session stamp — and (5) no own evidence at all. Tiers (1)–(3)
+  select turn-first (LP-0MW8U39ZQ007MPQO): an exact `turn=` match wins **over**
+  the timestamp, so the session's own line is attributed even when it was
+  logged after its first remote stream (the proxy emits `Fallback triggered`
+  after the pre-flight consumed that stream, LP-0MW8U39FH005GWHY); evidence
+  without a turn id keeps the historical at/before-the-stream rule. The
+  reported move time is never later than the first remote stream. The
   provenance is exposed as the `fallback_attribution` column (`own_skip`,
   `own_provider_skip`, `own_fallback`, `legacy_nearest`, `lease_denied`,
   `unattributed`) plus the `no_remote_fallback` state for sessions that never
