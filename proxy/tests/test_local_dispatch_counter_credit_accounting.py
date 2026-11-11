@@ -43,10 +43,15 @@ Acceptance-criterion map
   disconnect, error — all share ``_cleanup_after_request``) asserts that one
   sibling's exit leaves the other's credit and record intact and that every
   counter returns to 0 once both exit, comparing the counter with the
-  outstanding-credit record set.
-- **AC2** — ``TestBurstEndsAtZeroWithoutRecovery`` runs a concentrated
-  same-session burst, running the real recovery loops between completions, and
-  asserts every counter ends at 0 with **no** ``counter recovered`` line.
+  outstanding-credit record set. ``TestPerExitPathAllCountersInvariant`` adds
+  the per-exit-path table the audit asked for: success, client disconnect,
+  **deadline cancel** and error each restore all four counters
+  (``local_active_queries``, ``active_queries``, ``local_generating_queries``,
+  ``local_generating_sessions``) to their pre-request values.
+- **AC2** — ``TestBurstEndsAtZeroWithoutRecovery`` runs concentrated bursts,
+  including a genuinely concurrent mixed-exit burst (success, disconnect and
+  deadline cancel), running the real recovery loops between exits, and asserts
+  every counter ends at 0 with **no** ``counter recovered`` line.
 - **AC3** — ``test_anonymous_overlapping_increments_append_a_credit`` names the
   missing counterpart (the anonymous increment path) deterministically.
 - **AC4** — ``TestRecoveryStillWorks`` pins that the recovery loop is retained
@@ -125,12 +130,23 @@ def _record(srv) -> dict:
     return next(iter(records.values()))
 
 
-async def _anonymous_dispatch(srv, session: str = SESSION) -> None:
-    """Take one credit through the anonymous/non-explicit increment path."""
+async def _anonymous_dispatch(srv, session: str = SESSION) -> SimpleNamespace:
+    """Take one credit through the anonymous/non-explicit increment path.
+
+    Returns the request object the production helper stamps with the credit
+    token, so a later release can be token-scoped (the cancellation path does
+    exactly that).
+    """
+    request = SimpleNamespace()
     await helpers._increment_active_queries(srv)
     await helpers._increment_local_active_queries(
-        srv, session_key=session, backend=BACKEND, model_name="qwen3"
+        srv,
+        session_key=session,
+        backend=BACKEND,
+        model_name="qwen3",
+        request=request,
     )
+    return request
 
 
 async def _explicit_dispatch(srv, session: str = SESSION) -> None:
@@ -141,17 +157,79 @@ async def _explicit_dispatch(srv, session: str = SESSION) -> None:
     assert acquired is True, f"harness must acquire a real lease (owner={owner})"
 
 
-async def _complete(srv, *, disconnected: bool = False) -> None:
+async def _complete(
+    srv,
+    *,
+    disconnected: bool = False,
+    session: str = SESSION,
+    request: SimpleNamespace | None = None,
+) -> None:
     """End one anonymous dispatch through the request's single cleanup owner."""
     await router._cleanup_after_request(
         srv,
-        SESSION,
+        session,
         disconnected=disconnected,
         decrement_local=True,
         session_explicit=False,
         model_name="qwen3",
+        request=request,
         backend=BACKEND,
     )
+
+
+async def _deadline_cancel(
+    srv, *, session: str = SESSION, request: SimpleNamespace | None = None
+) -> None:
+    """End one dispatch through the router's ``CancelledError`` exit path.
+
+    The streaming router's cancellation handler (``proxy.py`` around the
+    ``except asyncio.CancelledError`` branch) does two things, in this order:
+
+    1. ``_release_client_disconnect_dispatch`` — a synchronous, cancellation-
+       proof release of the dispatch record / prefill marker / slot;
+    2. a detached ``_cleanup_after_request(..., disconnected=True)`` that owns
+       the counter decrements.
+
+    Driving exactly that pair is what makes this a deadline-cancel row rather
+    than a second disconnect row: the request was cancelled (prefill deadline,
+    stall guard, supervisor cancel), so no client-disconnect verdict exists.
+    """
+    helpers._release_client_disconnect_dispatch(
+        srv, session, endpoint=BACKEND, request=request
+    )
+    await router._cleanup_after_request(
+        srv,
+        session,
+        disconnected=True,
+        decrement_local=True,
+        session_explicit=False,
+        model_name="qwen3",
+        request=request,
+        backend=BACKEND,
+    )
+
+
+async def _error_unwind(srv, *, session: str = SESSION) -> None:
+    """End one dispatch through the router's error path.
+
+    A raising dispatch is caught and unwinds to the same ``finally``/cleanup
+    owner. The exception is raised here so the row exercises the unwind, not
+    just a renamed success call.
+    """
+    try:
+        raise RuntimeError("dispatch failed mid-stream")
+    except RuntimeError:
+        await _complete(srv, session=session)
+
+
+async def _start_generating(srv, *, session: str = SESSION) -> None:
+    """Take the generating-only slot the streaming router takes on first byte."""
+    await helpers._increment_generating_only_slot(srv, session_key=session)
+
+
+async def _end_generating(srv, *, session: str = SESSION) -> None:
+    """Release the generating-only slot the stream's ``finally`` releases."""
+    await helpers._decrement_generating_only_slot(srv, session_key=session)
 
 
 def _assert_credit_invariant(srv) -> None:
@@ -168,6 +246,22 @@ async def _tick(srv) -> None:
     await helpers._recover_stuck_generating_queries(srv)
     await helpers._recover_stuck_local_active_queries(srv)
     await helpers._recover_stuck_global_active_queries(srv)
+
+
+async def _disconnect_exit(srv, *, session: str = SESSION) -> None:
+    """End one dispatch through the stream-end client-disconnect path."""
+    await _complete(srv, disconnected=True, session=session)
+
+
+#: Every exit path AC1 names, keyed by its user-visible name. Each callable
+#: takes ``(srv, *, session=...)`` so the per-path suite and the mixed burst
+#: drive the *same* release code the router drives.
+_EXIT_PATHS = {
+    "success": _complete,
+    "client-disconnect": _disconnect_exit,
+    "deadline-cancel": _deadline_cancel,
+    "error": _error_unwind,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +356,9 @@ class TestPerExitPathCreditInvariant:
         await _complete(srv, disconnected=True)
 
         assert srv.local_active_queries == 1
+        assert srv.active_queries == 1, (
+            "a client disconnect must decrement the global counter exactly once"
+        )
         assert len(srv.local_dispatch_records) == 1, (
             "a disconnect must not delete a record another live dispatch owns"
         )
@@ -270,6 +367,7 @@ class TestPerExitPathCreditInvariant:
 
         await _complete(srv)
         assert srv.local_active_queries == 0
+        assert srv.active_queries == 0
         assert srv.local_dispatch_records == {}
 
     @pytest.mark.asyncio
@@ -289,6 +387,101 @@ class TestPerExitPathCreditInvariant:
 
         await _complete(srv)
         assert srv.local_active_queries == 0
+
+    @pytest.mark.asyncio
+    async def test_deadline_cancel_of_one_sibling_keeps_the_other(self):
+        """Deadline-cancel path — the shared record must survive a live sibling.
+
+        The router's cancellation handler releases the dispatch synchronously
+        and then spawns the counter cleanup. Pre-fix that synchronous release
+        popped the *whole* shared record, destroying the sibling's credit as
+        well: the counter was clamped by the recovery loop (two
+        ``counter recovered`` WARNINGs) and the surviving dispatch's own
+        teardown became a no-op. Token-scoping the release keeps the sibling.
+        """
+        srv = _server()
+        request_a = await _anonymous_dispatch(srv)
+        request_b = await _anonymous_dispatch(srv)
+        assert srv.local_active_queries == 2
+        assert srv.active_queries == 2
+
+        await _deadline_cancel(srv, request=request_a)
+        await _tick(srv)
+
+        assert srv.local_active_queries == 1, (
+            "a deadline cancel must release exactly its own credit"
+        )
+        assert srv.active_queries == 1
+        assert len(srv.local_dispatch_records) == 1, (
+            "a deadline cancel must not delete a record a live sibling owns"
+        )
+        _assert_credit_invariant(srv)
+        assert _recovery_lines(srv) == [], (
+            "the cancellation release stranded live state and tripped the "
+            f"recovery loop: {_recovery_lines(srv)}"
+        )
+
+        await _complete(srv, request=request_b)
+        assert srv.local_active_queries == 0
+        assert srv.active_queries == 0
+        assert srv.local_dispatch_records == {}
+        assert _recovery_lines(srv) == []
+
+
+class TestPerExitPathAllCountersInvariant:
+    """AC1: success, disconnect, deadline cancel and error each fully settle.
+
+    The sibling rows above prove one exit does not strand *another* dispatch's
+    credit. These rows pin the complementary property the audit measured as
+    missing: for each exit path, **all four** counters
+    (``local_active_queries``, ``active_queries``,
+    ``local_generating_queries`` and ``local_generating_sessions``) return to
+    their pre-request value, and the counter equals the outstanding-credit
+    record set.
+
+    The deadline-cancel row drives the router's ``CancelledError`` release pair
+    (``_release_client_disconnect_dispatch`` + the cleanup that owns the
+    decrements), which is the path a prefill deadline, a stall guard or a
+    supervisor cancel takes. The error row raises through a ``finally`` so it
+    exercises the unwind rather than aliasing the success call.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("exit_path", sorted(_EXIT_PATHS), ids=sorted(_EXIT_PATHS))
+    async def test_exit_path_restores_all_four_counters(self, exit_path):
+        srv = _server()
+        assert srv.local_active_queries == 0
+        assert srv.active_queries == 0
+        assert srv.local_generating_queries == 0
+        assert srv.local_generating_sessions == set()
+
+        await _anonymous_dispatch(srv)
+        await _start_generating(srv)
+        assert srv.local_active_queries == 1
+        assert srv.active_queries == 1
+        assert srv.local_generating_queries == 1
+        assert srv.local_generating_sessions == {SESSION}
+
+        # The streaming generator's ``finally`` releases the generating-only
+        # slot; the request's single cleanup owner releases the dispatch.
+        await _end_generating(srv)
+        await _EXIT_PATHS[exit_path](srv)
+
+        assert srv.local_active_queries == 0, f"{exit_path} leaked a local credit"
+        assert srv.active_queries == 0, f"{exit_path} leaked a global credit"
+        assert srv.local_generating_queries == 0, (
+            f"{exit_path} leaked a generating slot"
+        )
+        assert srv.local_generating_sessions == set(), (
+            f"{exit_path} left a generating session behind"
+        )
+        assert srv.local_dispatch_records == {}, (
+            f"{exit_path} left a dispatch record behind"
+        )
+        _assert_credit_invariant(srv)
+        assert _recovery_lines(srv) == [], (
+            f"{exit_path} tripped the self-healing recovery loop"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +534,54 @@ class TestBurstEndsAtZeroWithoutRecovery:
         await _tick(srv)
         assert _recovery_lines(srv) == []
         assert srv.local_active_queries == 3
+
+    @pytest.mark.asyncio
+    async def test_concurrent_mixed_exit_burst_settles_to_zero(self):
+        """AC2: genuinely concurrent dispatches, mixed success/disconnect/cancel.
+
+        The audit's gap was that the only burst acquired credits sequentially
+        and ended every dispatch with a successful completion. This row creates
+        the dispatches as concurrent tasks, gives each a generating slot, and
+        ends them through three different exit paths, ticking the real recovery
+        loops between every exit — a healthy burst must never trip them.
+        """
+        srv = _server()
+        sessions = [f"sess-mixed-{i}" for i in range(6)]
+
+        # Concurrent acquisition: one task per dispatch, not a sequential loop.
+        await asyncio.gather(*[_anonymous_dispatch(srv, s) for s in sessions])
+        for session in sessions:
+            await _start_generating(srv, session=session)
+        assert srv.local_active_queries == len(sessions)
+        assert srv.active_queries == len(sessions)
+        assert srv.local_generating_queries == len(sessions)
+        assert srv.local_generating_sessions == set(sessions)
+        _assert_credit_invariant(srv)
+
+        exit_paths = [
+            "success",
+            "deadline-cancel",
+            "client-disconnect",
+            "error",
+            "success",
+            "deadline-cancel",
+        ]
+        for exit_path, session in zip(exit_paths, sessions):
+            await _end_generating(srv, session=session)
+            await _EXIT_PATHS[exit_path](srv, session=session)
+            await _tick(srv)
+            assert _recovery_lines(srv) == [], (
+                "the recovery loop fired during a healthy mixed burst: "
+                f"{_recovery_lines(srv)}"
+            )
+            _assert_credit_invariant(srv)
+
+        assert srv.local_active_queries == 0
+        assert srv.active_queries == 0
+        assert srv.local_generating_queries == 0
+        assert srv.local_generating_sessions == set()
+        assert srv.local_dispatch_records == {}
+        assert _recovery_lines(srv) == []
 
 
 # ---------------------------------------------------------------------------

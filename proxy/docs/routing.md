@@ -180,17 +180,27 @@ consumer must therefore use `_outstanding_dispatch_credits`, never
 `_count_active_local_dispatch_records` (they are equal only for one-credit
 records).
 
-LP-0MW0TLPOR002TAFO closed the last three record-count assumptions:
+LP-0MW0TLPOR002TAFO closed the last record-count assumptions:
 
 - `_increment_local_active_queries` (the anonymous/non-explicit increment
   path) **appends** a credit to a live record instead of overwriting it — the
   explicit path (`_try_acquire_local_dispatch`) already did. Overwriting
   dropped a sibling's credit from the record set, so `counter (2)` no longer
   matched the record's credits `(1)`.
+- `_increment_local_active_queries` also **stamps its request** with the
+  credit token (`request._local_dispatch_token`), exactly as the explicit path
+  does, so an anonymous dispatch's teardown or cancellation release is
+  token-scoped instead of consuming a sibling's credit via the untracked
+  (`dispatch_token=None`) path.
 - `_cleanup_after_request` drops a non-explicit (or disconnected) session's
   record only when it holds **no** remaining credits; a record shared with a
   still-in-flight sibling is kept, because it is the live-work evidence the
   recovery loops read.
+- `_release_client_disconnect_dispatch` (the client-cancel, prefill-deadline
+  and reaper-cancellation release) keeps a record that another in-flight
+  dispatch still holds a credit on, instead of popping the whole shared
+  record; the paired cleanup releases this request's own token-scoped credit
+  and leaves the sibling intact.
 - `_recover_stuck_local_active_queries` clamps to the outstanding-credit count,
   not the active-record count.
 
@@ -207,7 +217,11 @@ at each quiescent checkpoint under the production
 `local_active_queries_lock` → `local_dispatch_records_lock` order, then runs
 the real clamp and asserts zero `counter recovered` warnings.
 `proxy/tests/test_local_dispatch_counter_credit_accounting.py` pins the
-credit-aware behaviour per exit path and for a same-session burst.
+credit-aware behaviour for each exit path — success, client disconnect,
+**deadline cancel** and error all restore `local_active_queries`,
+`active_queries`, `local_generating_queries` and `local_generating_sessions` —
+plus a concurrently-acquired, mixed-exit burst that must settle to zero with no
+`counter recovered` line.
 
 #### The recovery WARNING names the request it could not account for
 

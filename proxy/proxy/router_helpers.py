@@ -3547,6 +3547,7 @@ async def _increment_local_active_queries(
     body_json: dict | None = None,
     model_name: str | None = None,
     admission_evidence: dict | None = None,
+    request: Request | None = None,
 ) -> None:
     """Safely increment the local-only active queries counter.
 
@@ -3660,6 +3661,18 @@ async def _increment_local_active_queries(
                     _pin_dispatch_slot(
                         srv, record_key, session_key, backend
                     )
+                    # LP-0MW0TLPOR002TAFO: stamp the owning request with this
+                    # dispatch's credit token on the anonymous path too. The
+                    # explicit path already did, so a teardown/cancellation
+                    # release was token-scoped only for explicit sessions; an
+                    # anonymous request released with ``dispatch_token=None``
+                    # could consume a *sibling's* credit and make the recovery
+                    # loop fire. Stamping makes the credit model complete.
+                    if request is not None:
+                        try:
+                            request._local_dispatch_token = dispatch_token
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -6278,6 +6291,17 @@ def _release_client_disconnect_dispatch(
     True)``, which is the single owner of those decrements. Decrementing in
     both places would release another session's capacity
     (``local_active_queries`` is a pool-wide counter).
+
+    LP-0MW0TLPOR002TAFO: a dispatch record is keyed ``(endpoint, session)`` and
+    is **shared** by overlapping dispatches of one session — one credit per
+    in-flight dispatch. When another dispatch still holds a credit, this
+    release must not pop the shared record: doing so destroyed the sibling's
+    credit/lease/attribution and left ``local_active_queries`` above the record
+    set, which the self-healing clamp then "repaired" with a WARNING. In that
+    case the paired ``_cleanup_after_request`` releases this request's
+    token-scoped credit and leaves the sibling intact; the synchronous pop is
+    correct only when this request's credit is the last one (or the caller
+    cannot name it).
     """
     if not session_key:
         return False
@@ -6293,13 +6317,33 @@ def _release_client_disconnect_dispatch(
                 # Belt-and-braces tuple-key form (mirrors
                 # ``_release_prefill_deadline_dispatch``).
                 keys.append((endpoint, session_key))
+            dispatch_token = (
+                getattr(request, "_local_dispatch_token", None)
+                if request is not None
+                else None
+            )
+            shared_with_sibling = False
             for key in keys:
-                record = records.pop(key, None)
-                if isinstance(record, dict):
-                    released_record = record
-                    stream_cm = record.get("stream_cm")
-                    removed = True
+                record = records.get(key)
+                if not isinstance(record, dict):
+                    continue
+                credits = _dispatch_credit_tokens(record)
+                if (
+                    credits
+                    and dispatch_token is not None
+                    and dispatch_token in credits
+                    and len(credits) > 1
+                ):
+                    shared_with_sibling = True
                     break
+            if not shared_with_sibling:
+                for key in keys:
+                    record = records.pop(key, None)
+                    if isinstance(record, dict):
+                        released_record = record
+                        stream_cm = record.get("stream_cm")
+                        removed = True
+                        break
         except Exception:
             removed = False
 

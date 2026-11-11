@@ -1812,6 +1812,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             # LP-0MVODJ3P6000AIUM AC1: same admission-time snapshot for the
             # anonymous-session path (verbatim; never a recompute).
             admission_evidence=getattr(request, "_local_admission_evidence", None),
+            # LP-0MW0TLPOR002TAFO: stamp this request with its credit token so
+            # its cancellation/teardown release is scoped to its own credit.
+            request=request,
         )
 
     # Token accounting
