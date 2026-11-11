@@ -31,9 +31,11 @@ Retention, target and verdict rules
   ``None`` below three. With less evidence there is no target, and the report
   says ``Insufficient history`` rather than inventing one.
 - **Verdict** — :func:`derive_verdict` compares this window's actual against
-  that target (equality counts as met) and returns ``Met``/``Unmet``; fewer
-  than three measurements always returns ``Insufficient history``, and an
-  unmeasurable actual (``None``) returns ``n/a`` and is never recorded as
+  that target inside the metric's tolerance band
+  (:func:`tolerance_for`, default :data:`DEFAULT_TOLERANCE_PCT` = 10 % of the
+  target, direction-aware, both edges met) and returns ``Met``/``Unmet``;
+  fewer than three measurements always returns ``Insufficient history``, and
+  an unmeasurable actual (``None``) returns ``n/a`` and is never recorded as
   ``0``.
 
 State schema
@@ -100,6 +102,10 @@ NOT_AVAILABLE = "n/a"
 #: Measurements retained behind a target (best 3, direction-aware).
 RETENTION_LIMIT = 3
 
+#: Default relative tolerance band around a target, as a percentage. A metric
+#: may override it with ``tolerance_pct`` in the committed defaults file.
+DEFAULT_TOLERANCE_PCT = 10.0
+
 #: Fingerprint recorded when the configuration era is unknown (backfill).
 UNKNOWN_FINGERPRINT = ""
 
@@ -117,6 +123,9 @@ DETAIL_FIELDS = (
     "trade_offs",
     "data_section_anchor",
 )
+
+#: Per-metric tolerance override key in the committed defaults file.
+TOLERANCE_FIELD = "tolerance_pct"
 
 
 @dataclass(frozen=True)
@@ -285,14 +294,32 @@ def baseline_from(measurements: Iterable[Mapping], direction: str) -> dict | Non
 
 
 def derive_verdict(
-    actual: float | None, measurements: Iterable[Mapping], direction: str
+    actual: float | None,
+    measurements: Iterable[Mapping],
+    direction: str,
+    tolerance_pct: float = DEFAULT_TOLERANCE_PCT,
 ) -> str:
     """Direction-aware verdict of *actual* against the best-3 target.
 
+    The target is met when the actual lies **inside the tolerance band**
+    around it, not only when it beats the target exactly, so run-to-run
+    measurement noise is not reported as a regression:
+
+    - higher-is-better: ``actual >= target * (1 - tolerance)``
+    - lower-is-better:  ``actual <= target * (1 + tolerance)``
+
+    Both band edges count as met, and any actual better than the target is
+    met. A zero target therefore has a zero-width band (10 % of zero is
+    zero): only an actual of zero qualifies, which the documentation states
+    rather than substituting an invented absolute epsilon.
+
     Returns ``"n/a"`` when the window has no actual value, ``"Insufficient
     history"`` when fewer than three measurements are recorded (never a
-    misleading Met/Unmet), and otherwise ``"Met"``/``"Unmet"``. Equality with
-    the target counts as met.
+    misleading Met/Unmet), and otherwise ``"Met"``/``"Unmet"``.
+
+    *tolerance_pct* is the metric's relative band width (see
+    :func:`tolerance_for`); an absent, non-numeric or negative value falls
+    back to :data:`DEFAULT_TOLERANCE_PCT` and never raises.
     """
     if actual is None:
         return NOT_AVAILABLE
@@ -300,8 +327,12 @@ def derive_verdict(
     target = target_from(measurements, direction)
     if target is None:
         return INSUFFICIENT
+    shift = _normalise_tolerance(tolerance_pct) / 100.0
     actual_value = float(actual)
-    met = actual_value >= target if direction == HIGHER else actual_value <= target
+    if direction == HIGHER:
+        met = actual_value >= target * (1.0 - shift)
+    else:
+        met = actual_value <= target * (1.0 + shift)
     return MET if met else UNMET
 
 
@@ -476,6 +507,41 @@ def detail_copy(metric_id: str, defaults: Mapping | None = None) -> dict:
         for field in DETAIL_FIELDS
         if entry.get(field) is not None
     }
+
+
+def _normalise_tolerance(value: object) -> float:
+    """A usable tolerance percentage, falling back to the default.
+
+    ``10 %`` is the default band, so a missing, non-numeric, boolean, NaN or
+    negative value is the default rather than a failure: the scorecard must
+    never stop a reporting run because one hand-edited number is wrong.
+    """
+    if isinstance(value, bool):
+        return DEFAULT_TOLERANCE_PCT
+    try:
+        tolerance = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_TOLERANCE_PCT
+    if tolerance != tolerance or tolerance < 0:  # NaN or negative
+        return DEFAULT_TOLERANCE_PCT
+    return tolerance
+
+
+def tolerance_for(metric_id: str, defaults: Mapping | None = None) -> float:
+    """The relative tolerance band (percentage) for *metric_id*.
+
+    Read from the committed defaults file's ``metrics.<id>.tolerance_pct`` when
+    present and valid, otherwise :data:`DEFAULT_TOLERANCE_PCT`. The file is
+    read-only at runtime, so this never writes. An unregistered metric id
+    raises, matching :func:`record_measurement` and :func:`detail_copy`.
+    """
+    if metric_id not in _METRICS_BY_ID:
+        raise ValueError(f"unknown metric id {metric_id!r}")
+    data = load_defaults() if defaults is None else defaults
+    metrics = data.get("metrics") if isinstance(data, Mapping) else None
+    entry = metrics.get(metric_id) if isinstance(metrics, Mapping) else None
+    raw = entry.get(TOLERANCE_FIELD) if isinstance(entry, Mapping) else None
+    return _normalise_tolerance(raw)
 
 
 # ---------------------------------------------------------------------------

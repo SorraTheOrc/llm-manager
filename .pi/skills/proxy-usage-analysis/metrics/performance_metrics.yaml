@@ -15,9 +15,20 @@
 #   value:       the measured value in the metric's unit
 #   date:        the measurement date
 #   fingerprint: configuration era, "slots=<n>,ctx=<per-slot context>"
+#
+# Verdict band (LP-0MWADHS83006QFQS):
+#   tolerance_pct:  optional per-metric relative band around the target,
+#                   default 10 (percent). A metric is `Met` when its actual is
+#                   inside the band — higher-is-better: actual >= target x
+#                   (1 - tolerance_pct/100); lower-is-better: actual <= target x
+#                   (1 + tolerance_pct/100) — so run-to-run noise is not read as
+#                   a regression. An absent, non-numeric or negative value falls
+#                   back to the 10 % default. Any value other than 10 needs a
+#                   one-line rationale comment beside it.
 
 metrics:
   gpu_busy:
+    tolerance_pct: 10
     measurements: []
     why: "GPU activity shows whether the hardware is actually computing, so a quiet GPU is the first sign that local capacity is going unused — but the figure counts any GPU consumer, not only the local model, so it is read as hardware activity rather than local utilisation."
     calculation: "Coverage-honest power-based computing share from GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer): every 15-second instant across the window is classified computing / idle / unknown, with the unobserved share reported as unknown instead of being renormalised away; corroborated by log-derived local busy time for the same window."
@@ -26,6 +37,7 @@ metrics:
     data_section_anchor: "## Local model utilization"
 
   fallback_rate:
+    tolerance_pct: 10
     measurements: []
     why: "The fallback rate states how often a request that could have run locally was sent to a remote provider, so it is the direct cost signal of local capacity shortfalls."
     calculation: "Share of window requests that produced Fallback triggered log events, as a percentage of all requests; the dominant reason is reported alongside it."
@@ -34,6 +46,7 @@ metrics:
     data_section_anchor: "## Fallback reasons"
 
   decode_speed:
+    tolerance_pct: 10
     measurements: []
     why: "Decode speed is the throughput a caller actually feels for long answers, so a falling median is the earliest sign of GPU throttling, contention or an oversized model."
     calculation: "Median decode throughput in tokens per second from Stream finished token counts for local streams in the window."
@@ -42,6 +55,7 @@ metrics:
     data_section_anchor: "## Decode speed"
 
   prompt_eval_speed:
+    tolerance_pct: 10
     measurements: []
     why: "Prompt-evaluation speed sets how quickly a local request starts answering, and prefill dominates first-byte latency for large prompts."
     calculation: "Median prompt-evaluation throughput in tokens per second from llama-server prompt eval timing for local requests in the window."
@@ -50,6 +64,7 @@ metrics:
     data_section_anchor: "## Prompt eval speed"
 
   time_to_first_token:
+    tolerance_pct: 10
     measurements: []
     why: "Time to first token is the first thing a caller experiences; a long local first byte reads as a hang even when total response time is acceptable."
     calculation: "Local p90 of dispatch to first byte for the window, from dispatch_first_byte_ms and ttft_seconds log lines."
@@ -58,6 +73,7 @@ metrics:
     data_section_anchor: "## Time to first token"
 
   stream_error_rate:
+    tolerance_pct: 10
     measurements: []
     why: "Stream errors are failed user requests; the rate separates genuine reliability problems from ordinary slow responses."
     calculation: "Share of streams ending in error for the window, from Stream error and Stream finished reason=error lines divided by all streams."
@@ -66,6 +82,7 @@ metrics:
     data_section_anchor: "## Error analysis"
 
   context_pressure:
+    tolerance_pct: 10
     measurements: []
     why: "Context pressure shows how much local demand is pushed away by prompt size. The per-slot context is fixed by the model and the hardware available, so this metric measures pressure against a ceiling no setting can raise."
     calculation: "Share of local requests whose estimated prompt size is at or above the per-slot context threshold, from routing_skip_local estimated_tokens lines against the configured slot geometry."
@@ -74,6 +91,7 @@ metrics:
     data_section_anchor: "## Context sizes approaching per-slot limits"
 
   prompt_cache_hit_ratio:
+    tolerance_pct: 10
     measurements: []
     why: "Prompt-cache reuse is what makes long, repeated conversations cheap locally; a falling hit ratio turns the same prompts into full prefill work."
     calculation: "Median cached_ratio across local dispatches plus the warm share, from the cached_ratio and cache_state log fields on dispatch lines."
@@ -82,6 +100,7 @@ metrics:
     data_section_anchor: "## Time to first token"
 
   contention_denials_per_hour:
+    tolerance_pct: 10
     measurements: []
     why: "Contention denials count requests refused local service because the pool was busy, so the hourly rate is the direct measure of unmet local capacity."
     calculation: "Dispatch denials per hour for the window, counted from local_dispatch_denied log events and divided by the window length."
@@ -90,6 +109,7 @@ metrics:
     data_section_anchor: "## Local contention prediction vs reality"
 
   prefill_eta_accuracy:
+    tolerance_pct: 10
     measurements: []
     why: "The prefill ETA drives admission refusals, so its accuracy decides whether servable work is rejected or overload is admitted silently."
     calculation: "Median absolute relative error between the priced ETA and the observed first byte, from local_admission_guard prefill ETA and dispatch first-byte pairs, reported as an accuracy percentage."

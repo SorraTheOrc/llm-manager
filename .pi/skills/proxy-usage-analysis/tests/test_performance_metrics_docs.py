@@ -94,7 +94,7 @@ def test_skill_documents_the_scorecard_surfaces_and_four_flags():
 
     assert "## Performance metrics summary" in skill
     assert "## Performance metric details" in skill
-    for column in ("Metric", "Baseline", "Target", "Actual", "Result"):
+    for column in ("Metric", "Baseline", "Target", "Tolerance", "Actual", "Result"):
         assert column in skill, f"scorecard column {column} is undocumented"
     for flag in (
         "--metrics-config",
@@ -103,6 +103,27 @@ def test_skill_documents_the_scorecard_surfaces_and_four_flags():
         "--seed-metrics-history",
     ):
         assert flag in skill, f"{flag} is undocumented in SKILL.md"
+
+
+def test_skill_documents_the_tolerance_column_and_its_default():
+    """LP-0MWADHS83006QFQS AC3/AC7: the scorecard documents the visible band,
+    the 10 % default and the per-metric override."""
+    skill = _read(SKILL_DOC)
+
+    assert "| Tolerance |" in skill
+    assert "±10 %" in skill
+    assert "within the tolerance band of the target" in skill
+    assert "tolerance_pct" in skill
+
+
+def test_reference_documents_the_tolerance_rule_and_override_field():
+    """AC2/AC5/AC7: the verdict rule, the defaults-file field and the
+    zero-width band that follows from a zero target."""
+    reference = _read(REFERENCE_DOC)
+
+    assert "tolerance_pct" in reference
+    assert "±10 %" in reference
+    assert "zero-width band" in reference.lower()
 
 
 def test_skill_states_the_0500_cron_invocation_is_unchanged():

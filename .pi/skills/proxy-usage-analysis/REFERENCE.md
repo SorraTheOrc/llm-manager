@@ -702,11 +702,11 @@ the renderer.
 ```text
 ## Performance metrics summary
 
-| Metric | Baseline | Target | Actual | Result |
-|---|---|---|---|---|
-| GPU activity — power-based, any consumer | 18.4 % (2026-11-03) | n/a | 18.4 % | Insufficient history |
-| Fallback rate | 87.9 % of requests (2026-11-03) | n/a | 87.9 % of requests | Insufficient history |
-| Decode speed | 32.1 tok/s (2026-11-03) | n/a | 32.1 tok/s | Insufficient history |
+| Metric | Baseline | Target | Tolerance | Actual | Result |
+|---|---|---|---|---|---|
+| GPU activity — power-based, any consumer | 18.4 % (2026-11-03) | n/a | ±10 % | 18.4 % | Insufficient history |
+| Fallback rate | 87.9 % of requests (2026-11-03) | n/a | ±10 % | 87.9 % of requests | Insufficient history |
+| Decode speed | 32.1 tok/s (2026-11-03) | n/a | ±10 % | 32.1 tok/s | Insufficient history |
 …one row per registered metric, in registry order…
 ```
 
@@ -721,14 +721,23 @@ exists.)
   (best per the metric's direction). `n/a` when nothing is recorded yet.
 - **Target** — the mean of the **three best** recorded measurements. `n/a`
   below three, because there is no evidence base to average.
+- **Tolerance** — the relative band around the target the verdict was judged
+  against, rendered as `±10 %` for the default. It is a *relative* band
+  (`tolerance × target`) because the ten metrics carry different units, and a
+  relative band is the only unit-free reading of "within 10 % of the target".
+  A metric may override it with `tolerance_pct` in the committed defaults
+  file; an absent, non-numeric or negative value falls back to the 10 %
+  default (see [Verdict rule](#verdict-rule-tolerance-band)).
 - **Actual** — this window's measurement. `n/a` (never `0`) when the window
   cannot be measured: no GPU sample, no llama-server eval lines, no matched
   ETA pairs, and so on. A genuine measured zero renders as `0.0 <unit>`.
 - **Result** — `Met` / `Unmet` / `Insufficient history`. The comparison is
-  direction-aware and *equality with the target counts as met*. Fewer than
-  three recorded measurements always reports `Insufficient history`, never a
-  false Met/Unmet; a metric with no measurable actual also reports
-  `Insufficient history` (its actual is `n/a`).
+  direction-aware and **inside the tolerance band**: `Met` means the actual is
+  within the tolerance band of the target (any actual better than the target
+  is also `Met`), not that the target was beaten exactly. Fewer than three
+  recorded measurements always reports `Insufficient history`, never a false
+  Met/Unmet; a metric with no measurable actual also reports `Insufficient
+  history` (its actual is `n/a`).
 - **Retention rules.** All measurements are stored (they are the evidence
   behind the target); the best three are *derived* per direction, at most one
   per window, so a re-run of the same window replaces that window's value
@@ -748,6 +757,33 @@ exists.)
   and the detail block exactly one subsection per metric, both in registry
   order — the integration tests assert both, so a metric cannot be added to
   one surface and forgotten in the other.
+
+### Verdict rule (tolerance band)
+
+`Met` means the actual is **within the tolerance band of the target**, not
+that it beat the target exactly, so a normal run-to-run wobble (a decode
+median 0.3 tok/s under target, a p90 first token a few milliseconds over) is
+not reported as a regression. The band is relative and direction-aware
+(`target × tolerance_pct / 100`):
+
+| Direction | `Met` when |
+|---|---|
+| Higher is better | `actual >= target × (1 − tolerance_pct / 100)` |
+| Lower is better | `actual <= target × (1 + tolerance_pct / 100)` |
+
+- **Both band edges count as met**, and any actual better than the target is
+  met.
+- **Default ±10 %** for every metric. The committed defaults file sets
+  `tolerance_pct` per metric; an absent, non-numeric or negative value falls
+  back to 10 and never fails the run. A value other than 10 carries a one-line
+  rationale comment beside it, because widening or tightening a metric's band
+  weakens or strengthens its verdict.
+- **A zero target has a zero-width band.** 10 % of zero is zero, so a
+  lower-is-better metric whose target is 0 is `Met` only at an actual of 0.
+  This is stated rather than replaced by an invented absolute epsilon.
+- **No other rule changes.** Retention (best three, one per window), the target
+  maths (mean of the retained three) and history recording are unchanged —
+  only the comparison band moved.
 
 ### Metric definitions
 
@@ -830,6 +866,7 @@ future default history could seed:
 metrics:
   decode_speed:
     measurements: []          # optional seeded history, one entry per window
+    tolerance_pct: 10         # optional relative verdict band (default 10)
     why: "…why the metric matters…"
     calculation: "…how it is calculated and from which data…"
     levers: "…what an operator can change…"
@@ -839,7 +876,9 @@ metrics:
 
 Every field except `measurements` is optional: a field a custom defaults file
 omits is reported as `not documented in the committed metrics defaults.`
-rather than invented. `data_section_anchor` is the `##` heading of the data
+rather than invented. `tolerance_pct` is the metric's verdict band (default
+10, see [Verdict rule](#verdict-rule-tolerance-band)); it is a number, not
+prose. `data_section_anchor` is the `##` heading of the data
 section reporting the metric's figures; the renderer links to it instead of
 restating its tables. Loading either file never writes it, and
 `config_loader`'s guarded-import YAML pattern keeps PyYAML optional — no new
@@ -961,6 +1000,7 @@ parses Markdown:
     "actual": 33.1,
     "baseline": {"date": "2026-11-03", "value": 32.1},
     "target": null,
+    "tolerance_pct": 10.0,
     "verdict": "Insufficient history"
   }
 },
@@ -969,10 +1009,11 @@ parses Markdown:
 
 The block is keyed by metric id (all ten, in registry order) and each entry
 carries `baseline` (`value` + `date`, `null` when nothing is recorded),
-`target` (`null` below three measurements), `actual` (`null`, never `0`, when
-unmeasurable) and `verdict`. It is produced by the same derivation as the
-rendered table, so the two views can never disagree, and it is **read-only**:
-the single state write happens while the report is built.
+`target` (`null` below three measurements), `tolerance_pct` (the additive
+relative band the verdict was judged against, `10.0` by default), `actual`
+(`null`, never `0`, when unmeasurable) and `verdict`. It is produced by the same
+derivation as the rendered table, so the two views can never disagree, and it
+is **read-only**: the single state write happens while the report is built.
 
 ## Wasted GPU compute (LP-0MW2SQNHJ0044PV6)
 

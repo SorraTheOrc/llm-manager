@@ -34,7 +34,10 @@ Functions::
     retained(measurements, direction, limit=3) -> list[dict]  # best first
     target_from(measurements, direction) -> float | None      # None below 3
     baseline_from(measurements, direction) -> dict | None     # best value+date
-    derive_verdict(actual, measurements, direction) -> str
+    derive_verdict(actual, measurements, direction,
+                   tolerance_pct=DEFAULT_TOLERANCE_PCT) -> str
+    tolerance_for(metric_id, defaults=None) -> float          # band, 10 % default
+    DEFAULT_TOLERANCE_PCT -> float                            # 10.0
     configuration_fingerprint(slot_count, per_slot_context) -> str
     is_cross_era(measurements) -> bool
     parse_archived_report(report_text) -> dict[str, float]    # omit unparseable
@@ -47,7 +50,8 @@ Functions::
 ``target_from`` returns ``None`` below three measurements; the summary renderer
 prints that as ``n/a`` (pinned by the report integration item
 LP-0MW1BU93N0022IYJ). ``derive_verdict`` returns the literals ``"Met"``,
-``"Unmet"``, ``"Insufficient history"`` and ``n/a``.
+``"Unmet"``, ``"Insufficient history"`` and ``n/a``, and judges the actual
+against the target inside the metric's tolerance band (LP-0MWADHS83006QFQS).
 
 Fail-first window
 -----------------
@@ -273,7 +277,7 @@ def test_baseline_is_the_single_best_value_with_its_date(measurements, direction
         (30.0, "Unmet"),
     ],
 )
-def test_higher_is_better_is_met_when_actual_reaches_the_target(actual, expected):
+def test_higher_is_better_is_met_within_the_tolerance_band(actual, expected):
     assert pm.derive_verdict(actual, HIGHER_MEASUREMENTS, HIGHER) == expected
 
 
@@ -281,10 +285,10 @@ def test_higher_is_better_is_met_when_actual_reaches_the_target(actual, expected
     ("actual", "expected"),
     [
         (400.0, "Met"),
-        (480.0, "Unmet"),
+        (600.0, "Unmet"),
     ],
 )
-def test_lower_is_better_is_met_when_actual_stays_under_the_target(actual, expected):
+def test_lower_is_better_is_met_within_the_tolerance_band(actual, expected):
     assert pm.derive_verdict(actual, LOWER_MEASUREMENTS, LOWER) == expected
 
 
@@ -297,12 +301,147 @@ def test_equality_with_the_target_counts_as_met(measurements, direction):
     # three in a test constant would make the verdict a float-associativity
     # problem rather than an equality-semantics one.
     target = pm.target_from(measurements, direction)
-    worse = target - 0.1 if direction == HIGHER else target + 0.1
     better = target + 0.1 if direction == HIGHER else target - 0.1
 
     assert pm.derive_verdict(target, measurements, direction) == "Met"
     assert pm.derive_verdict(better, measurements, direction) == "Met"
-    assert pm.derive_verdict(worse, measurements, direction) == "Unmet"
+
+
+# --- Tolerance band (LP-0MWADHS83006QFQS) -----------------------------------
+#
+# A target is met when the actual is inside a relative band of it (default
+# ±10 %), not only when it beats it exactly. The band is direction-aware and
+# both edges count as met, so run-to-run measurement noise is not reported as a
+# regression.
+
+
+def test_the_default_tolerance_is_ten_percent():
+    assert pm.DEFAULT_TOLERANCE_PCT == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    ("measurements", "direction"),
+    [(HIGHER_MEASUREMENTS, HIGHER), (LOWER_MEASUREMENTS, LOWER)],
+)
+def test_an_actual_just_inside_the_band_is_met(measurements, direction):
+    target = pm.target_from(measurements, direction)
+    band = pm.DEFAULT_TOLERANCE_PCT / 100.0
+    inside = target * (1 - band) if direction == HIGHER else target * (1 + band)
+
+    assert pm.derive_verdict(inside, measurements, direction) == "Met"
+
+
+@pytest.mark.parametrize(
+    ("measurements", "direction"),
+    [(HIGHER_MEASUREMENTS, HIGHER), (LOWER_MEASUREMENTS, LOWER)],
+)
+def test_the_band_edge_counts_as_met(measurements, direction):
+    target = pm.target_from(measurements, direction)
+    band = pm.DEFAULT_TOLERANCE_PCT / 100.0
+    # Derived from the engine's own target so the assertion is about band
+    # semantics, not float associativity.
+    edge = target * (1 - band) if direction == HIGHER else target * (1 + band)
+
+    assert pm.derive_verdict(edge, measurements, direction) == "Met"
+
+
+@pytest.mark.parametrize(
+    ("measurements", "direction"),
+    [(HIGHER_MEASUREMENTS, HIGHER), (LOWER_MEASUREMENTS, LOWER)],
+)
+def test_an_actual_just_outside_the_band_is_unmet(measurements, direction):
+    target = pm.target_from(measurements, direction)
+    band = pm.DEFAULT_TOLERANCE_PCT / 100.0
+    outside = (
+        target * (1 - band) - 1e-6
+        if direction == HIGHER
+        else target * (1 + band) + 1e-6
+    )
+
+    assert pm.derive_verdict(outside, measurements, direction) == "Unmet"
+
+
+@pytest.mark.parametrize(
+    ("measurements", "direction"),
+    [(HIGHER_MEASUREMENTS, HIGHER), (LOWER_MEASUREMENTS, LOWER)],
+)
+def test_an_actual_better_than_the_target_is_met(measurements, direction):
+    target = pm.target_from(measurements, direction)
+    better = target * 2 if direction == HIGHER else target / 2
+
+    assert pm.derive_verdict(better, measurements, direction) == "Met"
+
+
+def test_a_zero_target_has_a_zero_width_band():
+    # A lower-is-better metric whose target is 0: 10 % of 0 is 0, so only an
+    # actual of 0 is inside the band. Documented, never replaced by an invented
+    # absolute epsilon.
+    measurements = [
+        measurement(0.0, "2026-07-01"),
+        measurement(0.0, "2026-07-02"),
+        measurement(0.0, "2026-07-03"),
+    ]
+
+    assert pm.target_from(measurements, LOWER) == pytest.approx(0.0)
+    assert pm.derive_verdict(0.0, measurements, LOWER) == "Met"
+    assert pm.derive_verdict(0.1, measurements, LOWER) == "Unmet"
+
+
+# --- Per-metric tolerance override -----------------------------------------
+
+
+def test_tolerance_defaults_to_ten_percent_when_the_key_is_absent():
+    defaults = {"metrics": {"decode_speed": {"measurements": []}}}
+
+    assert pm.tolerance_for("decode_speed", defaults) == pytest.approx(
+        pm.DEFAULT_TOLERANCE_PCT
+    )
+
+
+def test_tolerance_reads_the_per_metric_override():
+    defaults = {"metrics": {"decode_speed": {"tolerance_pct": 25}}}
+
+    assert pm.tolerance_for("decode_speed", defaults) == pytest.approx(25.0)
+
+
+@pytest.mark.parametrize("value", ["wide", None, -5, -0.1, True, float("nan")])
+def test_an_invalid_tolerance_falls_back_to_the_default(value):
+    defaults = {"metrics": {"decode_speed": {"tolerance_pct": value}}}
+
+    assert pm.tolerance_for("decode_speed", defaults) == pytest.approx(
+        pm.DEFAULT_TOLERANCE_PCT
+    )
+
+
+def test_the_committed_defaults_carry_a_ten_percent_tolerance_per_metric():
+    defaults = pm.load_defaults()
+
+    for metric in pm.METRIC_REGISTRY:
+        assert pm.tolerance_for(metric.id, defaults) == pytest.approx(10.0), metric.id
+
+
+def test_an_explicit_tolerance_widens_the_band_the_verdict_uses():
+    target = pm.target_from(LOWER_MEASUREMENTS, LOWER)
+    actual = target * 1.15
+
+    assert pm.derive_verdict(actual, LOWER_MEASUREMENTS, LOWER) == "Unmet"
+    assert (
+        pm.derive_verdict(actual, LOWER_MEASUREMENTS, LOWER, tolerance_pct=20) == "Met"
+    )
+    # A metric that demands exactness can override to a zero band, in which
+    # case only a value at least as good as the target qualifies.
+    assert (
+        pm.derive_verdict(
+            target, LOWER_MEASUREMENTS, LOWER, tolerance_pct=0
+        )
+        == "Met"
+    )
+    assert (
+        pm.derive_verdict(
+            target * 1.01, LOWER_MEASUREMENTS, LOWER, tolerance_pct=0
+        )
+        == "Unmet"
+    )
 
 
 @pytest.mark.parametrize("direction", [HIGHER, LOWER])
@@ -317,6 +456,8 @@ def test_fewer_than_three_measurements_never_yields_a_verdict(direction, count):
 
 def test_a_missing_actual_renders_not_available():
     assert pm.derive_verdict(None, HIGHER_MEASUREMENTS, HIGHER) == "n/a"
+    # A missing actual stays n/a whatever tolerance is applied.
+    assert pm.derive_verdict(None, HIGHER_MEASUREMENTS, HIGHER, tolerance_pct=25) == "n/a"
 
 
 # --- State ------------------------------------------------------------------

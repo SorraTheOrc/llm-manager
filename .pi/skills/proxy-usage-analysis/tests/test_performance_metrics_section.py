@@ -76,11 +76,17 @@ def _summary() -> aggregation.AnalysisResult:
     return aggregation.aggregate(events, WINDOW_START, WINDOW_END, schedule)
 
 
-def _report(*, metrics_state: Path | None = None, update: bool = False) -> str:
+def _report(
+    *,
+    metrics_state: Path | None = None,
+    metrics_config: Path | None = None,
+    update: bool = False,
+) -> str:
     return reporting.build_report(
         _summary(),
         CONFIG,
         metrics_state=metrics_state,
+        metrics_config=metrics_config,
         update_metrics=update,
     )
 
@@ -90,7 +96,7 @@ def _measurements(state: dict, metric_id: str) -> list[dict]:
 
 
 def _cells(report: str, label: str) -> list[str]:
-    """The summary table row for *label*, as its five cells."""
+    """The summary table row for *label*, as its six cells."""
     section = report.split(SUMMARY_HEADING, 1)[1].split("\n## ", 1)[0]
     rows = [
         line.strip().strip("|").split("|")
@@ -101,6 +107,10 @@ def _cells(report: str, label: str) -> list[str]:
         if row[0].strip() == label:
             return [cell.strip() for cell in row]
     raise AssertionError(f"no summary row for {label!r}")
+
+
+#: Cell indices once the Tolerance column sits between Target and Actual.
+BASELINE, TARGET, TOLERANCE, ACTUAL, RESULT = 1, 2, 3, 4, 5
 
 
 def _seed(state_path: Path, metric_id: str, entries: list[tuple[str, float, str]]) -> None:
@@ -247,10 +257,10 @@ class TestRenderedHistory:
             _measurements(state, "fallback_rate")[index]["value"] for index in (0, 1)
         ]
 
-        assert cells[1] == "20.0 % of requests (2026-07-01)"
-        assert cells[2] == f"{(20.0 + 22.0 + 33.3) / 3:.1f} % of requests"
-        assert cells[3] == "33.3 % of requests"
-        assert cells[4] == "Unmet", "33.3 % is above the best-3 target"
+        assert cells[BASELINE] == "20.0 % of requests (2026-07-01)"
+        assert cells[TARGET] == f"{(20.0 + 22.0 + 33.3) / 3:.1f} % of requests"
+        assert cells[ACTUAL] == "33.3 % of requests"
+        assert cells[RESULT] == "Unmet", "33.3 % is above the best-3 target and its band"
         assert leading == [20.0, 22.0], "prior windows are retained"
 
     def test_a_three_measurement_history_met_verdict_matches_the_engine(
@@ -272,8 +282,8 @@ class TestRenderedHistory:
             pm.LOWER,
         )
 
-        assert cells[4] == expected == "Met"
-        assert cells[2] != "n/a", "a three-measurement target must render"
+        assert cells[RESULT] == expected == "Met"
+        assert cells[TARGET] != "n/a", "a three-measurement target must render"
 
     def test_an_unknown_configuration_fingerprint_is_recorded_as_unknown(
         self, tmp_path
@@ -376,6 +386,87 @@ class TestPrefillEtaAccuracyDirection:
             measurement["value"]
             for measurement in _measurements(state, "prefill_eta_accuracy")
         ] == [expected]
-        assert _cells(report, "Prefill ETA accuracy")[3] == (
+        assert _cells(report, "Prefill ETA accuracy")[ACTUAL] == (
             f"{expected:.1f} %"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tolerance column (LP-0MWADHS83006QFQS)
+# ---------------------------------------------------------------------------
+
+
+class TestToleranceColumn:
+    def test_every_row_renders_the_default_ten_percent_band(self):
+        report = _report()
+
+        for metric in pm.METRIC_REGISTRY:
+            assert _cells(report, metric.label)[TOLERANCE] == "±10 %", metric.id
+
+    def test_the_header_names_target_tolerance_actual_and_result(self):
+        section = _report().split(SUMMARY_HEADING, 1)[1].split("\n## ", 1)[0]
+        header = next(line for line in section.splitlines() if line.startswith("|"))
+
+        assert [cell.strip() for cell in header.strip("|").split("|")] == [
+            "Metric",
+            "Baseline",
+            "Target",
+            "Tolerance",
+            "Actual",
+            "Result",
+        ]
+
+    def test_the_paragraph_explains_the_tolerance_band(self):
+        section = _report().split(SUMMARY_HEADING, 1)[1].split("\n## ", 1)[0]
+
+        assert "within the tolerance band of the target" in section
+        assert "±10 %" in section
+
+    def test_a_per_metric_override_changes_the_rendered_band(self, tmp_path):
+        config = tmp_path / "custom_metrics.yaml"
+        config.write_text(
+            "metrics:\n  fallback_rate:\n    tolerance_pct: 25\n", encoding="utf-8"
+        )
+
+        report = _report(metrics_config=config)
+
+        assert _cells(report, "Fallback rate")[TOLERANCE] == "±25 %"
+        # Every other metric keeps the default band.
+        assert _cells(report, "Decode speed")[TOLERANCE] == "±10 %"
+
+    def test_the_verdict_uses_the_band_not_an_exact_comparison(self, tmp_path):
+        # fallback_rate is lower-is-better: three seeded 30.5 % windows give a
+        # 30.5 % target whose band edge is 33.55 %. This window's 33.3 % is
+        # worse than the target yet inside the band, so it must read Met. A
+        # 30.0 % seed makes the edge 33.0 %, which the same actual misses.
+        inside = tmp_path / "inside.yaml"
+        _seed(
+            inside,
+            "fallback_rate",
+            [
+                ("2026-07-01", 30.5, FINGERPRINT),
+                ("2026-07-02", 30.5, FINGERPRINT),
+                ("2026-07-03", 30.5, FINGERPRINT),
+            ],
+        )
+        outside = tmp_path / "outside.yaml"
+        _seed(
+            outside,
+            "fallback_rate",
+            [
+                ("2026-07-01", 30.0, FINGERPRINT),
+                ("2026-07-02", 30.0, FINGERPRINT),
+                ("2026-07-03", 30.0, FINGERPRINT),
+            ],
+        )
+
+        inside_cells = _cells(_report(metrics_state=inside), "Fallback rate")
+        outside_cells = _cells(_report(metrics_state=outside), "Fallback rate")
+
+        assert inside_cells[ACTUAL] == "33.3 % of requests"
+        assert inside_cells[RESULT] == "Met", (
+            "33.3 % is worse than the 30.5 % target but inside its ±10 % band"
+        )
+        assert outside_cells[RESULT] == "Unmet", (
+            "33.3 % is outside the 30.0 % target's ±10 % band"
         )

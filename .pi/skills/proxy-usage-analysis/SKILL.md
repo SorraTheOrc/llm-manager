@@ -151,18 +151,19 @@ artifact and the archival behaviour.
 
 The report opens with `## Performance metrics summary`: the ten metrics the
 proxy is held to, one row each, with the columns **Metric | Baseline |
-Target | Actual | Result**. It is the report's first section after the header
-bullets — before `## Performance metric details`, `## Summary by hour` and
-every data section — so a stakeholder who reads only this table still learns
-whether the proxy improved in this window.
+Target | Tolerance | Actual | Result**. It is the report's first section after
+the header bullets — before `## Performance metric details`, `## Summary by
+hour` and every data section — so a stakeholder who reads only this table
+still learns whether the proxy improved in this window.
 
 | Column | Meaning |
 |---|---|
 | Metric | The registry label; row order is the registry order, which never changes between runs |
 | Baseline | The single best recorded value and the date it was measured |
 | Target | The mean of the three best recorded measurements (direction-aware) |
+| Tolerance | The relative band around the target the verdict was judged against — `±10 %` by default, overridable per metric |
 | Actual | This window's measurement, `n/a` when it cannot be measured |
-| Result | `Met` / `Unmet` against the target, or `Insufficient history` below three measurements |
+| Result | `Met` (within the tolerance band of the target), `Unmet`, or `Insufficient history` below three measurements |
 
 The rules behind those numbers:
 
@@ -175,10 +176,26 @@ The rules behind those numbers:
   value instead of appending a duplicate.
 - **Target.** The mean of those three retained measurements; below three the
   target is `n/a`.
-- **Verdict.** The actual is compared with the target (equality counts as
-  met). Fewer than three measurements reports **Insufficient history** —
-  never a false Met/Unmet — and a window with no measurable actual reports
-  `n/a` with `Insufficient history`, never `0`.
+- **Verdict.** The actual is compared with the target inside the metric's
+  **tolerance band**: a metric is `Met` when the actual is within the
+  tolerance band of the target, and any actual better than the target is also
+  `Met`. The band is direction-aware and relative to the target —
+  higher-is-better needs `actual >= target × (1 − tolerance)`,
+  lower-is-better needs `actual <= target × (1 + tolerance)` — and both edges
+  count as met, so ordinary run-to-run noise (a decode median 0.3 tok/s under
+  target) is not reported as a regression. Fewer than three measurements
+  reports **Insufficient history** — never a false Met/Unmet — and a window
+  with no measurable actual reports `n/a` with `Insufficient history`, never
+  `0`.
+- **Tolerance.** The band defaults to **±10 %** of the target for every
+  metric and is rendered in the `Tolerance` column, so a reader can see what
+  produced each verdict. A metric whose own noise needs a wider or tighter
+  band sets `tolerance_pct` in the committed defaults file (beside a one-line
+  rationale for any value other than 10); an absent, non-numeric or negative
+  value falls back to the 10 % default and never fails the run. A **zero
+  target** has a zero-width band — 10 % of zero is zero — so only an actual of
+  zero is `Met` there; this is stated rather than replaced by an invented
+  absolute epsilon.
 - **Configuration era.** Every measurement records the slot geometry it was
   taken under (`slots=<n>,ctx=<per-slot context>`). When a metric's retained
   best three span more than one era the section prints a **cross-era note**
@@ -197,8 +214,9 @@ instead of repeating those tables.
 Where the numbers live:
 
 - `.pi/skills/proxy-usage-analysis/metrics/performance_metrics.yaml` — the
-  **committed defaults**: empty history plus each metric's detail copy.
-  **Read-only at runtime**; no run ever writes it.
+  **committed defaults**: empty history plus each metric's detail copy and
+  optional `tolerance_pct` band. **Read-only at runtime**; no run ever writes
+  it.
 - `<output-dir>/performance_metrics_state.yaml` — the **live state**: every
   recorded measurement, written once per run while the report is built.
 
@@ -218,7 +236,8 @@ needed: a default run reads the committed defaults, writes
 the cron line under [Daily cadence](#daily-cadence-0500-cron) stays exactly
 as it is. `--json` carries the same figures as a `performance_metrics` block
 keyed by metric id (plus `performance_metrics_counts`), so an audit reads
-`baseline` / `target` / `actual` / `verdict` without parsing Markdown.
+`baseline` / `target` / `tolerance_pct` / `actual` / `verdict` without parsing
+Markdown.
 
 Metric definitions, the two file schemas and a worked backfill run:
 [REFERENCE.md § Performance metrics scorecard](REFERENCE.md#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3).

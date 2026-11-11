@@ -18,6 +18,7 @@ import csv
 import json
 import math
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -1270,18 +1271,24 @@ def _load_metrics_state(
 
 
 def _scorecard_rows(
-    state: dict, actuals: dict[str, float | None]
+    state: dict,
+    actuals: dict[str, float | None],
+    defaults: Mapping | None = None,
 ) -> list[dict]:
-    """Per-metric baseline/target/actual/verdict, in registry order.
+    """Per-metric baseline/target/tolerance/actual/verdict, in registry order.
 
     The **single** derivation behind both scorecard surfaces — the rendered
     summary table and the ``--json`` ``performance_metrics`` block — so the two
-    views can never disagree (LP-0MW1BUAQD001WL8X, parent AC7).
+    views can never disagree (LP-0MW1BUAQD001WL8X, parent AC7). *defaults* is
+    the committed defaults mapping the per-metric ``tolerance_pct`` band is
+    read from; ``None`` loads it, and an absent/invalid value falls back to the
+    10 % default (LP-0MWADHS83006QFQS).
     """
     rows: list[dict] = []
     for metric in performance_metrics.METRIC_REGISTRY:
         measurements = state["metrics"][metric.id]["measurements"]
         actual = actuals.get(metric.id)
+        tolerance_pct = performance_metrics.tolerance_for(metric.id, defaults)
         # The verdict only ever reads Met / Unmet / Insufficient history: a
         # window with no measurable actual has no verdict to give, and the
         # engine's ``n/a`` (its "no actual" answer) would be a fourth label the
@@ -1290,7 +1297,9 @@ def _scorecard_rows(
         verdict = (
             performance_metrics.INSUFFICIENT
             if actual is None
-            else performance_metrics.derive_verdict(actual, measurements, metric.direction)
+            else performance_metrics.derive_verdict(
+                actual, measurements, metric.direction, tolerance_pct=tolerance_pct
+            )
         )
         rows.append(
             {
@@ -1301,11 +1310,22 @@ def _scorecard_rows(
                 "target": performance_metrics.target_from(
                     measurements, metric.direction
                 ),
+                "tolerance_pct": tolerance_pct,
                 "actual": actual,
                 "verdict": verdict,
             }
         )
     return rows
+
+
+def _fmt_metric_tolerance(tolerance_pct: float) -> str:
+    """The tolerance cell: the relative band that decided the verdict.
+
+    ``±10 %`` for the default; a per-metric override renders with its own
+    precision (``±12.5 %``), and ``±0 %`` is rendered rather than hidden
+    because a zero band is a deliberate choice for that metric.
+    """
+    return f"±{float(tolerance_pct):g} %"
 
 
 def _append_performance_metrics_section(
@@ -1333,6 +1353,9 @@ def _append_performance_metrics_section(
     reflects what was just recorded.
     """
     state = _load_metrics_state(metrics_config, metrics_state)
+    defaults = performance_metrics.load_defaults(
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
     actuals = _performance_metric_actuals(summary, config, mode_map)
 
     if update_metrics and metrics_state is not None:
@@ -1358,17 +1381,22 @@ def _append_performance_metrics_section(
     ap(
         "**Baseline** is the best recorded value and the date it was measured; "
         "**Target** is the mean of the three best measurements (direction-aware); "
+        "**Tolerance** is the relative band around the target that the verdict "
+        "was judged against (default ±10 %, overridable per metric); "
         "**Actual** is this window; **Result** compares the actual against the "
-        "target and reads `Met`, `Unmet` or `Insufficient history`."
+        "target and reads `Met` when the actual is within the tolerance band of "
+        "the target (any actual better than the target is also `Met`), `Unmet` "
+        "when it is outside the band, or `Insufficient history`."
     )
     ap("")
-    ap("| Metric | Baseline | Target | Actual | Result |")
-    ap("|---|---|---|---|---|")
-    for row in _scorecard_rows(state, actuals):
+    ap("| Metric | Baseline | Target | Tolerance | Actual | Result |")
+    ap("|---|---|---|---|---|---|")
+    for row in _scorecard_rows(state, actuals, defaults):
         metric = row["metric"]
         ap(
             f"| {metric.label} | {_fmt_metric_baseline(row['baseline'], metric.unit)} | "
             f"{_fmt_metric_value(row['target'], metric.unit)} | "
+            f"{_fmt_metric_tolerance(row['tolerance_pct'])} | "
             f"{_fmt_metric_value(row['actual'], metric.unit)} | {row['verdict']} |"
         )
 
@@ -1506,22 +1534,27 @@ def performance_metrics_json(
 
     Read-only: the single state write happens while the report is built, so a
     ``--json`` consumer can never mutate history. Each entry carries
-    ``baseline`` (``value`` + ``date``), ``target``, ``actual`` and ``verdict``,
-    produced by :func:`_scorecard_rows` — the same derivation the rendered
-    table uses — so the machine-readable block always agrees with the report
-    (parent AC7). A metric without a measurable actual reports ``actual`` as
-    ``null``, never a misleading ``0``.
+    ``baseline`` (``value`` + ``date``), ``target``, ``tolerance_pct`` (the
+    additive relative band the verdict was judged against), ``actual`` and
+    ``verdict``, produced by :func:`_scorecard_rows` — the same derivation the
+    rendered table uses — so the machine-readable block always agrees with the
+    report (parent AC7). A metric without a measurable actual reports ``actual``
+    as ``null``, never a misleading ``0``.
     """
     state = _load_metrics_state(metrics_config, metrics_state)
+    defaults = performance_metrics.load_defaults(
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
     actuals = _performance_metric_actuals(summary, config, mode_map)
     return {
         row["metric"].id: {
             "baseline": row["baseline"],
             "target": row["target"],
+            "tolerance_pct": row["tolerance_pct"],
             "actual": row["actual"],
             "verdict": row["verdict"],
         }
-        for row in _scorecard_rows(state, actuals)
+        for row in _scorecard_rows(state, actuals, defaults)
     }
 
 
