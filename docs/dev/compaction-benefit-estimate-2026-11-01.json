@@ -1,0 +1,609 @@
+{
+  "schema_version": 1,
+  "work_item": "LP-0MWCEGXEK000U6G6",
+  "parent_item": "LP-0MVXY8ZBZ0003042",
+  "purpose": "Cost the proxy-side session-compaction lever against the 2026-11-01 measured basis, for the spike's AC1a option table.",
+  "read_only": true,
+  "window": {
+    "start": "2026-11-01 13:12:48",
+    "end": "2026-11-01 14:00:03",
+    "seconds": 2835.0,
+    "source_report": "/home/rgardler/proxy-usage-reports/postfix-thrash-gate/report.md"
+  },
+  "basis": {
+    "window_seconds": 2835.0,
+    "offered_prompt_tokens": 125577780,
+    "offered_requests": 1788,
+    "local_prompt_tokens": 877908,
+    "local_streams": 46,
+    "local_busy_seconds": 1223.0,
+    "capacity_tokens": 2035052.4775143089
+  },
+  "inputs": {
+    "size_distribution": {
+      "source": "standard_sessions.csv (messages x avg_context_size)",
+      "sessions_with_size_evidence": 52,
+      "requests_with_size_evidence": 1649,
+      "total_tokens": 127020154.5,
+      "mean_tokens": 77028.6,
+      "percentiles": {
+        "p10": 33488.1,
+        "p25": 43965.6,
+        "p50": 60714.6,
+        "p75": 106375.7,
+        "p90": 121788.5,
+        "p95": 158274.1,
+        "p99": 219387.8
+      },
+      "offered_prompt_tokens": 125577780,
+      "reconstruction_vs_offered_pct": 1.15
+    },
+    "cache_density": {
+      "measured_window": "2026-11-10 20:00:00 -> 2026-11-11 20:00:00 (UTC)",
+      "provenance": "retained /var/log/llama-proxy segments; routing_skip_local lines carry estimated_tokens + cached_ratio + reason",
+      "skip_decisions": 47722,
+      "cold_share": 0.8591425338418339,
+      "cache_state_counts": {
+        "cold": 41000,
+        "warm": 5938,
+        "restored": 784
+      },
+      "reuse_percentiles_all_skips": {
+        "p10": 0.17,
+        "p25": 1.0,
+        "p50": 1.0,
+        "p75": 1.0,
+        "p90": 1.0
+      },
+      "window_residency_denials_without_slot": 413,
+      "window_residency_denials": 417,
+      "notes": "The refused population is essentially cache-cold by construction: a session with no resident slot is denied before any residency measurement, and context_too_large is decided before the ladder."
+    },
+    "gate_mix": {
+      "free": 0.716,
+      "busy": 0.28400000000000003,
+      "provenance": "retained 2026-11-10/11 local_admission_guard lines, gate_occupancy=0 share of 31,958 decisions"
+    },
+    "guard": {
+      "flat_cap_tokens": 25000,
+      "deadline_seconds": 180.0,
+      "safety_budget_seconds": 171.0,
+      "queue_budget_seconds": 30.0,
+      "free_gate_rung": true,
+      "ms_per_new_token": 3.9,
+      "ms_per_coded_token": 0.5
+    },
+    "routing": {
+      "always_local_tokens": 38000,
+      "warm_cap_tokens": 120000,
+      "warm_cap_ratio": 0.4578,
+      "local_model_ctx_size": 262144,
+      "per_slot_ctx_tokens": 131072
+    },
+    "compaction": {
+      "trigger_ratio": 0.0,
+      "dry_run": false,
+      "resolved_trigger_tokens": 91750,
+      "fast_target_tokens": 38000,
+      "cheap_target_tokens": 30000,
+      "remote_boundary_compaction": false,
+      "remote_boundary_min_tokens": 20000,
+      "summarizer_model": "Qwen2.5-7B",
+      "summarizer_quant": "Q4_K_M",
+      "summarizer_parallel": 1,
+      "summarizer_ctx_size": 32768,
+      "summarizer_prompt_tokens": 8192,
+      "summarizer_max_tokens": 512,
+      "summarizer_weights_gb": 4.5,
+      "summarizer_kv_bytes_per_token": 57344,
+      "gpu_vram_gb": 120.0
+    },
+    "engine": {
+      "w3_solo_tok_s": 253.8,
+      "bucket_20k_40k_aggregate_tok_s": 242.3,
+      "bucket_40k_80k_tok_s": 156.2,
+      "aggregate_all_sizes_tok_s": 160.0,
+      "small_regime_max_tokens": 40000,
+      "large_regime_max_tokens": 80000,
+      "small_regime_tok_s": 253.8,
+      "large_regime_tok_s": 156.2,
+      "huge_regime_tok_s": 160.0
+    }
+  },
+  "classes": [
+    {
+      "reason": "context_too_large",
+      "sessions": 6,
+      "requests": 161,
+      "requests_with_size_evidence": 161,
+      "mean_tokens": 181827.7,
+      "size_grid": [
+        157965.2,
+        157965.2,
+        157965.2,
+        158274.1,
+        158274.1,
+        158274.1,
+        197698.1,
+        219387.8,
+        219387.8,
+        219387.8
+      ]
+    },
+    {
+      "reason": "large_context_bypass",
+      "sessions": 4,
+      "requests": 99,
+      "requests_with_size_evidence": 80,
+      "mean_tokens": 104184.4,
+      "size_grid": [
+        99614.4,
+        99614.4,
+        99614.4,
+        99614.4,
+        99614.4,
+        99614.4,
+        111801.1,
+        111801.1,
+        111801.1,
+        111801.1
+      ]
+    },
+    {
+      "reason": "resident_prefix_insufficient",
+      "sessions": 8,
+      "requests": 217,
+      "requests_with_size_evidence": 158,
+      "mean_tokens": 86022.9,
+      "size_grid": [
+        61430.3,
+        61430.3,
+        61430.3,
+        61430.3,
+        73413.2,
+        101571.7,
+        101571.7,
+        101571.7,
+        114466.0,
+        114466.0
+      ]
+    }
+  ],
+  "prefill_curve": [
+    {
+      "point": "median",
+      "tokens": 60714.6,
+      "cold_guard_default": 236.8,
+      "cold_engine_253_8_tok_s": 239.2,
+      "cold_engine_156_2_tok_s": 388.7,
+      "warm_reuse_0p10_guard_default": 51.0,
+      "capped_25000_cold": 97.5,
+      "capped_38000_cold": 148.2,
+      "capped_57000_cold": 222.3
+    },
+    {
+      "point": "top decile (p90)",
+      "tokens": 121788.5,
+      "cold_guard_default": 475.0,
+      "cold_engine_253_8_tok_s": 479.9,
+      "cold_engine_156_2_tok_s": 779.7,
+      "warm_reuse_0p10_guard_default": 102.3,
+      "capped_25000_cold": 97.5,
+      "capped_38000_cold": 148.2,
+      "capped_57000_cold": 222.3
+    }
+  ],
+  "thresholds_cold": [
+    {
+      "tokens": null,
+      "label": "uncapped (shipped)",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 0.0,
+      "already_admissible_streams": 0.0,
+      "newly_admitted_streams": 0.0,
+      "mean_compacted_tokens": 0.0,
+      "demand_tokens": 0.0,
+      "demand_gate_seconds": 0.0,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 0.0,
+      "added_tokens": 0.0,
+      "local_prompt_tokens": 877908.0,
+      "local_token_share_pct": 0.699,
+      "local_streams": 46.0,
+      "local_stream_share_pct": 2.573,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "demand",
+      "token_share_delta_pp": 0.0,
+      "stream_share_delta_pp": 0.0
+    },
+    {
+      "tokens": 57000,
+      "label": "intake median cap (~57k)",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 0.0,
+      "already_admissible_streams": 0.0,
+      "newly_admitted_streams": 0.0,
+      "mean_compacted_tokens": 0.0,
+      "demand_tokens": 0.0,
+      "demand_gate_seconds": 0.0,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 0.0,
+      "added_tokens": 0.0,
+      "local_prompt_tokens": 877908.0,
+      "local_token_share_pct": 0.699,
+      "local_streams": 46.0,
+      "local_stream_share_pct": 2.573,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "demand",
+      "token_share_delta_pp": 0.0,
+      "stream_share_delta_pp": 0.0
+    },
+    {
+      "tokens": 38000,
+      "label": "shipped fast compaction target / always-local threshold",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 0.0,
+      "already_admissible_streams": 0.0,
+      "newly_admitted_streams": 0.0,
+      "mean_compacted_tokens": 0.0,
+      "demand_tokens": 0.0,
+      "demand_gate_seconds": 0.0,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 0.0,
+      "added_tokens": 0.0,
+      "local_prompt_tokens": 877908.0,
+      "local_token_share_pct": 0.699,
+      "local_streams": 46.0,
+      "local_stream_share_pct": 2.573,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "demand",
+      "token_share_delta_pp": 0.0,
+      "stream_share_delta_pp": 0.0
+    },
+    {
+      "tokens": 30000,
+      "label": "shipped cheap compaction target",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 0.0,
+      "already_admissible_streams": 0.0,
+      "newly_admitted_streams": 0.0,
+      "mean_compacted_tokens": 0.0,
+      "demand_tokens": 0.0,
+      "demand_gate_seconds": 0.0,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 0.0,
+      "added_tokens": 0.0,
+      "local_prompt_tokens": 877908.0,
+      "local_token_share_pct": 0.699,
+      "local_streams": 46.0,
+      "local_stream_share_pct": 2.573,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "demand",
+      "token_share_delta_pp": 0.0,
+      "stream_share_delta_pp": 0.0
+    },
+    {
+      "tokens": 25000,
+      "label": "cold-prefill budget (local_cold_prefill_budget_tokens)",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 71.6,
+      "already_admissible_streams": 0.0,
+      "newly_admitted_streams": 285.7,
+      "mean_compacted_tokens": 25000.0,
+      "demand_tokens": 7142100.0,
+      "demand_gate_seconds": 28140.7,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 16.4,
+      "added_tokens": 409125.6,
+      "local_prompt_tokens": 1287033.6,
+      "local_token_share_pct": 1.025,
+      "local_streams": 62.4,
+      "local_stream_share_pct": 3.488,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "gate idle seconds (demand clipped)",
+      "token_share_delta_pp": 0.326,
+      "stream_share_delta_pp": 0.915
+    }
+  ],
+  "thresholds_warm_sensitivity": [
+    {
+      "tokens": null,
+      "label": "uncapped (shipped)",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 0.0,
+      "already_admissible_streams": 170.4,
+      "newly_admitted_streams": 0.0,
+      "mean_compacted_tokens": 0.0,
+      "demand_tokens": 0.0,
+      "demand_gate_seconds": 0.0,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 0.0,
+      "added_tokens": 0.0,
+      "local_prompt_tokens": 877908.0,
+      "local_token_share_pct": 0.699,
+      "local_streams": 46.0,
+      "local_stream_share_pct": 2.573,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "demand",
+      "token_share_delta_pp": 0.0,
+      "stream_share_delta_pp": 0.0
+    },
+    {
+      "tokens": 57000,
+      "label": "intake median cap (~57k)",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 28.89,
+      "already_admissible_streams": 170.4,
+      "newly_admitted_streams": 115.3,
+      "mean_compacted_tokens": 57000.0,
+      "demand_tokens": 6570732.0,
+      "demand_gate_seconds": 42066.1,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 156.2,
+      "served_streams": 4.4,
+      "added_tokens": 251794.4,
+      "local_prompt_tokens": 1129702.4,
+      "local_token_share_pct": 0.9,
+      "local_streams": 50.4,
+      "local_stream_share_pct": 2.82,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "gate idle seconds (demand clipped)",
+      "token_share_delta_pp": 0.201,
+      "stream_share_delta_pp": 0.247
+    },
+    {
+      "tokens": 38000,
+      "label": "shipped fast compaction target / always-local threshold",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 28.89,
+      "already_admissible_streams": 170.4,
+      "newly_admitted_streams": 115.3,
+      "mean_compacted_tokens": 38000.0,
+      "demand_tokens": 4380488.0,
+      "demand_gate_seconds": 17259.6,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 10.8,
+      "added_tokens": 409125.6,
+      "local_prompt_tokens": 1287033.6,
+      "local_token_share_pct": 1.025,
+      "local_streams": 56.8,
+      "local_stream_share_pct": 3.175,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "gate idle seconds (demand clipped)",
+      "token_share_delta_pp": 0.326,
+      "stream_share_delta_pp": 0.602
+    },
+    {
+      "tokens": 30000,
+      "label": "shipped cheap compaction target",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 28.89,
+      "already_admissible_streams": 170.4,
+      "newly_admitted_streams": 115.3,
+      "mean_compacted_tokens": 30000.0,
+      "demand_tokens": 3458280.0,
+      "demand_gate_seconds": 13626.0,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 13.6,
+      "added_tokens": 409125.6,
+      "local_prompt_tokens": 1287033.6,
+      "local_token_share_pct": 1.025,
+      "local_streams": 59.6,
+      "local_stream_share_pct": 3.335,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "gate idle seconds (demand clipped)",
+      "token_share_delta_pp": 0.326,
+      "stream_share_delta_pp": 0.762
+    },
+    {
+      "tokens": 25000,
+      "label": "cold-prefill budget (local_cold_prefill_budget_tokens)",
+      "size_refused_population_requests": 399.0,
+      "newly_admissible_share_pct": 28.89,
+      "already_admissible_streams": 170.4,
+      "newly_admitted_streams": 115.3,
+      "mean_compacted_tokens": 25000.0,
+      "demand_tokens": 2881900.0,
+      "demand_gate_seconds": 11355.0,
+      "idle_gate_seconds": 1612.0,
+      "engine_rate_tok_s": 253.8,
+      "served_streams": 16.4,
+      "added_tokens": 409125.6,
+      "local_prompt_tokens": 1287033.6,
+      "local_token_share_pct": 1.025,
+      "local_streams": 62.4,
+      "local_stream_share_pct": 3.488,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "gate idle seconds (demand clipped)",
+      "token_share_delta_pp": 0.326,
+      "stream_share_delta_pp": 0.915
+    }
+  ],
+  "throughput": {
+    "shipped_gate_rate_tok_s": 253.8,
+    "blended_delivered_tok_s": 717.8,
+    "cold_prefill_rate_ratio": 2.83,
+    "rate_added_by_lever_tok_s": 0.0,
+    "idle_gate_seconds": 1612.0,
+    "idle_gate_share_pct": 56.9,
+    "attributable_delivered_tok_s_cold_25k": 144.3,
+    "notes": "The lever adds no prefill rate: it converts idle gate-seconds into served tokens by making large cold prompts admissible. Delivered-rate attribution is the converted volume divided by the window. Displacement caveat: a cold token costs ~2.83x the gate time of a blended delivered token, so the gain is real only while gate time is idle; in a saturated window the same substitution would lower the delivered token share."
+  },
+  "per_slot_cost": {
+    "summarizer_model": "Qwen2.5-7B",
+    "quantisation": "Q4_K_M",
+    "parallel": 1,
+    "ctx_size": 32768,
+    "max_output_tokens": 512,
+    "weights_gb": 4.5,
+    "kv_cache_bytes_per_token": 57344,
+    "kv_cache_gib": 1.75,
+    "total_vram_gb_estimate": 6.25,
+    "vram_share_pct": 5.2,
+    "prompt_prefill_seconds_estimate": [
+      16.4,
+      32.8
+    ],
+    "generation_seconds_estimate": [
+      8.5,
+      12.8
+    ],
+    "gpu_seconds_per_compaction_estimate": [
+      24.9,
+      45.6
+    ],
+    "documented_typical_latency": "typically < 2 s (models.ini [Qwen2.5-7B])",
+    "notes": "The summariser runs on the same GPU as the main model, so its GPU-seconds compete with the serialised prefill gate; VRAM is held for the lifetime of the server (parallel=1, ctx 32768)."
+  },
+  "compaction_state": {
+    "assembly_time_trigger_ratio": 0.0,
+    "assembly_time_enabled": false,
+    "dry_run": false,
+    "resolved_trigger_tokens_if_enabled": 91750,
+    "targets_tokens": {
+      "fast": 38000,
+      "cheap": 30000
+    },
+    "remote_boundary_compaction": false,
+    "remote_boundary_min_tokens": 20000,
+    "summarizer_model": "Qwen2.5-7B",
+    "summarizer_parallel": 1,
+    "notes": "Two independent triggers. Assembly-time compaction (compaction_trigger_ratio) is the one that shrinks a LOCAL prompt and is therefore the lever costed here; it ships disabled (0). Boundary compaction only shrinks the history sent to a REMOTE provider and ships false, so it does not change local prefill."
+  },
+  "verdicts": {
+    "flat_cap_is_the_binding_size_test": "The cold refused population is cache-cold, so new_tokens equals the prompt size. A cap therefore clears the flat local_cold_prefill_budget_tokens=25000 test only when the cap itself is <= 25000: caps at 30k/38k/57k change prefill cost but admit no cold prompt.",
+    "large_prompt_refusal_is_size_bound": "The three size-caused classes (context_too_large, large_context_bypass, resident_prefix_insufficient) are 477 of 1788 requests in the window (sessions: context_too_large 6, large_context_bypass 4, resident_prefix_insufficient 8); capacity/lease classes are not convertible by a size cap.",
+    "token_share_upside": {
+      "uncapped_pct": 0.699,
+      "cap_25000_pct": 1.025,
+      "cap_25000_delta_pp": 0.326,
+      "cap_57000_pct": 0.699,
+      "capacity_ceiling_pct": 1.621,
+      "binding_constraint": "gate idle seconds (demand clipped)",
+      "added_tokens": 409125.6,
+      "demand_gate_seconds": 28140.7,
+      "idle_gate_seconds": 1612.0
+    },
+    "shipped_targets_do_not_convert": {
+      "cap_57000_newly_admitted": 0.0,
+      "cap_38000_newly_admitted": 0.0,
+      "cap_30000_newly_admitted": 0.0,
+      "cap_25000_newly_admitted": 285.7,
+      "cap_25000_served_streams_gate_bound": 16.4,
+      "note": "The shipped fast/cheap targets (38k/30k) sit above the flat cold-prefill budget, so enabling assembly-time compaction without lowering the target would pay the summariser cost without admitting a cold prompt. Even at 25k the gain is gate-bound: the demand exceeds the window's idle gate seconds, so only a fraction of the newly admissible requests can be served."
+    },
+    "busy_gate_ceiling_tokens": 3846.0,
+    "warm_population_gain": {
+      "cap_25000_pct": 1.025,
+      "cap_57000_pct": 0.9,
+      "note": "Sensitivity only: the admitted (dispatched) population is 90 % cache-warm, and warm prompts are already admissible at sizes far above any candidate cap, so a cap adds little there."
+    },
+    "size_distribution": {
+      "median_tokens": 60714.6,
+      "top_decile_tokens": 121788.5,
+      "mean_tokens": 77028.6,
+      "intake_figures": "median ~57k, top decile >100k"
+    }
+  },
+  "checks": [
+    {
+      "claim": "reconstructed size total within 3 % of offered prompt tokens",
+      "recorded": 1.15,
+      "recomputed": 1.15,
+      "tolerance": "+/-3 % relative",
+      "ok": true
+    },
+    {
+      "claim": "baseline local token share reproduces 0.699 %",
+      "recorded": 0.699,
+      "recomputed": 0.699,
+      "tolerance": "+/-0.002 pp",
+      "ok": true
+    },
+    {
+      "claim": "baseline local stream share reproduces 2.573 %",
+      "recorded": 2.573,
+      "recomputed": 2.573,
+      "tolerance": "+/-0.002 pp",
+      "ok": true
+    },
+    {
+      "claim": "token share at cap None never exceeds the capacity ceiling",
+      "recorded": 0.699,
+      "recomputed": 1.621,
+      "tolerance": "clamped at basis.ceiling_tokens",
+      "ok": true
+    },
+    {
+      "claim": "token share at cap 57000 never exceeds the capacity ceiling",
+      "recorded": 0.699,
+      "recomputed": 1.621,
+      "tolerance": "clamped at basis.ceiling_tokens",
+      "ok": true
+    },
+    {
+      "claim": "token share at cap 38000 never exceeds the capacity ceiling",
+      "recorded": 0.699,
+      "recomputed": 1.621,
+      "tolerance": "clamped at basis.ceiling_tokens",
+      "ok": true
+    },
+    {
+      "claim": "token share at cap 30000 never exceeds the capacity ceiling",
+      "recorded": 0.699,
+      "recomputed": 1.621,
+      "tolerance": "clamped at basis.ceiling_tokens",
+      "ok": true
+    },
+    {
+      "claim": "token share at cap 25000 never exceeds the capacity ceiling",
+      "recorded": 1.025,
+      "recomputed": 1.621,
+      "tolerance": "clamped at basis.ceiling_tokens",
+      "ok": true
+    },
+    {
+      "claim": "flat cap admits exactly 25 000 cold new tokens",
+      "recorded": "within_budget",
+      "recomputed": "within_budget",
+      "tolerance": "guard refuses on >, not >=",
+      "ok": true
+    },
+    {
+      "claim": "flat cap refuses 25 001 cold new tokens",
+      "recorded": "prefill_budget_exceeded",
+      "recomputed": "prefill_budget_exceeded",
+      "tolerance": "guard refuses on >, not >=",
+      "ok": true
+    },
+    {
+      "claim": "busy-gate ceiling = queue budget / 2 at the measured coefficients",
+      "recorded": 3846.0,
+      "recomputed": 3846.0,
+      "tolerance": "exact",
+      "ok": true
+    },
+    {
+      "claim": "cold prefill seconds scale linearly with prompt size",
+      "recorded": 0.0039,
+      "recomputed": 0.0039,
+      "tolerance": "exact",
+      "ok": true
+    },
+    {
+      "claim": "capping never reduces served local prompt tokens",
+      "recorded": 877908.0,
+      "recomputed": 877908.0,
+      "tolerance": "monotone",
+      "ok": true
+    }
+  ]
+}
