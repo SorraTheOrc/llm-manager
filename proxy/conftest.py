@@ -21,6 +21,16 @@ if proxy_dir not in sys.path:
 _proxy_tests_dir = str(Path(proxy_dir) / "tests")
 if _proxy_tests_dir not in sys.path:
     sys.path.insert(0, _proxy_tests_dir)
+# ``proxy/tests/fixtures`` — shared fixture modules importable by test files.
+# Import them here so pytest discovers the @pytest.fixture objects.
+_proxy_fixtures_dir = str(Path(proxy_dir) / "tests" / "fixtures")
+if _proxy_fixtures_dir not in sys.path:
+    sys.path.insert(0, _proxy_fixtures_dir)
+# Import fixture module so its @pytest.fixture objects are registered.
+try:
+    import test_prefill_scenarios  # noqa: F401
+except ImportError:
+    pass
 
 
 @pytest.fixture(autouse=True)
