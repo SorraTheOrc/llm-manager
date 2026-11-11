@@ -1205,6 +1205,28 @@ def _get_max_prefill_seconds(srv) -> float:
         return 900.0
 
 
+def _get_prefill_eta_factor(srv) -> float:
+    """Return the runaway-prefill ETA factor (default 2.0).
+
+    A prefill whose elapsed time exceeds ``eta_prefill_s * factor`` is a
+    runaway: the prompt is taking more than the priced prefill duration by a
+    wide margin. Such a record is released early with the distinct reason
+    ``prefill_eta_exceeded`` instead of waiting out the full hard deadline
+    (LP-0MW8VOKB9002W2C1 AC4, parent AC14).
+
+    ``eta_prefill_s`` is the contended prefill estimate captured at admission
+    by ``_dispatch_evidence``. A value <= 0 or a missing estimate disables the
+    ETA bound for that record — the ceiling and no-progress watchdog still
+    bound it. Returns 0 to disable the ETA bound entirely.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_prefill_eta_factor", 2.0)
+        return float(raw) if raw is not None else 2.0
+    except Exception:
+        return 2.0
+
+
 def _get_first_byte_timeout_seconds(srv, request=None) -> float:
     """Return the initial first-byte wait ceiling in seconds (default 840).
 
@@ -3053,16 +3075,35 @@ async def _extend_lease_during_prefill(
                     if advancing or alive:
                         record["last_progress_ts"] = time.monotonic()
                     extended = True
+                    # LP-0MW8VOKB9002W2C1 AC1: distinguish a measured-
+                    # progress extension from a liveness-only or in-flight-only
+                    # one so the window can be analysed by reason.
+                    _extend_reason = (
+                        "measured_progress" if advancing
+                        else ("liveness" if alive else "in_flight")
+                    )
                     try:
                         srv.logger.info(
                             "lease_extended_during_prefill session=%s progress=%s "
-                            "alive=%s in_flight=%s buffer=%.0fs",
+                            "alive=%s in_flight=%s reason=%s buffer=%.0fs",
                             session_key if session_key else "unknown",
                             progress,
                             alive,
                             in_flight_own,
+                            _extend_reason,
                             buffer_seconds,
                         )
+                        if advancing:
+                            # Parent AC2: a bounded extension based on measured
+                            # tokens, logged under its own name so the rate is
+                            # directly countable.
+                            srv.logger.info(
+                                "lease_extended_on_measured_progress session=%s "
+                                "progress=%s buffer=%.0fs",
+                                session_key if session_key else "unknown",
+                                progress,
+                                buffer_seconds,
+                            )
                     except Exception:
                         pass
     except Exception:
@@ -6540,6 +6581,62 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
         return False
 
 
+def _watchdog_release_reason(srv, record: dict) -> str | None:
+    """Return the distinct reason a watchdog release applies, or ``None``.
+
+    This is the single source of truth for *why* the watchdog would release a
+    record; :func:`_watchdog_no_progress` is a thin boolean wrapper so the
+    decision and the recorded reason can never drift (LP-0MW8VOKB9002W2C1
+    AC2/AC3). Reasons, in earliest-abort priority order:
+
+    - ``prefill_eta_exceeded`` — elapsed since ``started_at`` exceeds the
+      admission ``eta_prefill_s`` bound by ``local_prefill_eta_factor``. A
+      runaway prefill (progressing but far over its priced duration) is cut
+      early rather than at the full wait (parent AC14).
+    - ``prefill_stalled`` — no observed progress for
+      ``local_dispatch_no_progress_timeout_seconds`` (measured progress now
+      refreshes ``last_progress_ts``, so a genuinely progressing prefill never
+      trips this).
+    - ``prefill_max_exceeded`` — total active time exceeds
+      ``local_dispatch_max_prefill_seconds`` (the hard backstop).
+
+    Returns ``None`` for a record without a ``last_progress_ts`` baseline
+    (legacy records) — the pre-existing expiry/orphan path owns those.
+    """
+    no_progress_timeout = _get_no_progress_timeout_seconds(srv)
+    max_prefill = _get_max_prefill_seconds(srv)
+    eta_factor = _get_prefill_eta_factor(srv)
+    now = time.monotonic()
+
+    last_progress_ts = record.get("last_progress_ts")
+    if last_progress_ts is None:
+        return None
+
+    started_at = record.get("started_at")
+
+    # Runaway ETA bound: the earliest evidence of failure when progress is
+    # measured but far slower than priced. Only applies when an ETA exists.
+    if eta_factor > 0:
+        try:
+            eta = float(record.get("eta_prefill_s"))
+        except (TypeError, ValueError):
+            eta = 0.0
+        if math.isfinite(eta) and eta > 0 and started_at is not None:
+            if now - float(started_at) > eta * eta_factor:
+                return "prefill_eta_exceeded"
+
+    # No-progress timeout: no observed progress for longer than the timeout.
+    if no_progress_timeout > 0 and now - last_progress_ts > no_progress_timeout:
+        return "prefill_stalled"
+
+    # Max-prefill ceiling: total active time exceeds the ceiling.
+    if max_prefill > 0:
+        if started_at is not None and now - float(started_at) > max_prefill:
+            return "prefill_max_exceeded"
+
+    return None
+
+
 def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
     """Check whether a dispatch record has exceeded the no-progress timeout.
 
@@ -6553,6 +6650,8 @@ def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
       progress has been observed for that long.
     - Or the record's ``started_at`` exceeds ``local_dispatch_max_prefill_seconds``
       (hard ceiling on any single request's lifetime, even with progress).
+    - Or the record's elapsed time exceeds its admission ``eta_prefill_s``
+      bound by ``local_prefill_eta_factor`` (runaway prefill, parent AC14).
 
     Records without a ``last_progress_ts`` baseline (legacy records created
     before this feature) return ``False`` — they fall through to the
@@ -6560,36 +6659,14 @@ def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
     watchdog. This keeps the change surgical and avoids misclassifying
     records whose age was never tracked on a progress clock.
 
+    The reason is available from :func:`_watchdog_release_reason` for the
+    caller's release log; this wrapper exists so existing boolean call sites
+    and tests are unchanged.
+
     When ``True``, the caller should release the lease so the session can
     fall through to the next backend (LP-0MUCEFB8E003YVFF).
     """
-    no_progress_timeout = _get_no_progress_timeout_seconds(srv)
-    max_prefill = _get_max_prefill_seconds(srv)
-    now = time.monotonic()
-
-    # The watchdog only has an opinion about records whose progress clock it
-    # owns (``last_progress_ts``). This is set at creation and refreshed on
-    # every observed progress advance, every observed prefill liveness signal
-    # (LP-0MUXQ5QL40027VZ4), every in-flight prefill refresh
-    # (LP-0MUXTW4MD003TVIC), and every data chunk. A record that is being
-    # liveness- or in-flight-extended therefore falls through to the
-    # ``max_prefill`` ceiling below, which bounds a wedged slot that keeps
-    # reporting ``is_processing`` or never answers.
-    last_progress_ts = record.get("last_progress_ts")
-    if last_progress_ts is None:
-        return False
-
-    # No-progress timeout: no observed progress for longer than the timeout.
-    if no_progress_timeout > 0 and now - last_progress_ts > no_progress_timeout:
-        return True
-
-    # Max-prefill ceiling: total active time exceeds the ceiling.
-    if max_prefill > 0:
-        started_at = record.get("started_at")
-        if started_at is not None and now - started_at > max_prefill:
-            return True  # exceeded max prefill ceiling
-
-    return False
+    return _watchdog_release_reason(srv, record) is not None
 
 
 async def _cleanup_stale_local_dispatch(srv) -> int:
@@ -6718,6 +6795,28 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 ):
                     session_key = _dispatch_key_session_id(sid)
                     endpoint_from_record = _endpoint_from_record(record)
+                    # LP-0MW8VOKB9002W2C1 AC2/AC3: record the distinct reason
+                    # and elapsed seconds so a pre-deadline abort is
+                    # diagnosable and is never a "blind kill". Computed from
+                    # the still-live ``record`` dict before it is mutated.
+                    _watchdog_reason = (
+                        _watchdog_release_reason(srv, record)
+                        or "no_progress_watchdog"
+                    )
+                    _now_wd = time.monotonic()
+                    try:
+                        _elapsed_s = max(
+                            0.0, _now_wd - float(record.get("started_at") or _now_wd)
+                        )
+                    except (TypeError, ValueError):
+                        _elapsed_s = 0.0
+                    try:
+                        _stalled_s = max(
+                            0.0,
+                            _now_wd - float(record.get("last_progress_ts") or _now_wd),
+                        )
+                    except (TypeError, ValueError):
+                        _stalled_s = 0.0
                     # LP-0MUGQHPJ50046LV8: capture the upstream stream context
                     # manager before deleting the record so we can cancel the
                     # in-flight request after releasing the lock.
@@ -6737,10 +6836,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         pass
                     try:
                         srv.logger.warning(
-                            "lease_released session=%s reason=no_progress_watchdog "
-                            "endpoint=%s",
+                            "lease_released session=%s reason=%s "
+                            "endpoint=%s elapsed_s=%.1f stalled_for_s=%.1f",
                             session_key if session_key else "unknown",
+                            _watchdog_reason,
                             endpoint_from_record or "default",
+                            _elapsed_s,
+                            _stalled_s,
                         )
                     except Exception:
                         pass
@@ -6748,7 +6850,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     _note_local_dispatch_release(
                         srv,
                         session_key,
-                        reason="no_progress_watchdog",
+                        reason=_watchdog_reason,
                         record=released_record,
                         record_key=sid,
                         endpoint=endpoint_from_record,

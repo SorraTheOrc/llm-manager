@@ -1816,6 +1816,16 @@ server:
   #   value and ``local_prefill_deadline_seconds`` below, so by default the
   #   deadline (90 s) is the bound that fires; setting the deadline to 0
   #   restores this ceiling unchanged.
+  # local_prefill_eta_factor: Runaway-prefill ETA factor (default 2.0; 0
+  #   disables; LP-0MW8VOKB9002W2C1 AC4, parent AC14). A dispatch whose elapsed
+  #   time exceeds its admission prefill estimate (``eta_prefill_s``) multiplied
+  #   by this factor is released EARLY with the distinct reason
+  #   ``prefill_eta_exceeded`` (recorded with ``elapsed_s`` and ``stalled_for_s``
+  #   on the ``lease_released`` line) instead of waiting out the full hard
+  #   deadline. The ETA bound is the earliest evidence of a runaway; the
+  #   no-progress watchdog (``prefill_stalled``) and the max-prefill ceiling
+  #   (``prefill_max_exceeded``) remain the fallback backstops. A record without
+  #   a positive ``eta_prefill_s`` is unaffected.
   # local_prefill_deadline_seconds: Prefill deadline — a hard backstop
   #   INDEPENDENT of ETA-estimator quality (default 90 s; 0 disables;
   #   LP-0MVIQ0G2M0006QF6 AC3). If a local dispatch has produced no first byte
