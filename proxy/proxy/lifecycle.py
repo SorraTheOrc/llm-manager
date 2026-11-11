@@ -949,6 +949,7 @@ async def _probe_backend_reachable(llama_port: int) -> bool:
     else:
        probe_paths.append("/health")
     client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+    reachable = False
     try:
        for probe_path in probe_paths:
            try:
@@ -956,11 +957,24 @@ async def _probe_backend_reachable(llama_port: int) -> bool:
                response = await client.get(url, timeout=timeout_seconds)
                status_code = int(getattr(response, "status_code", 0) or 0)
                if 200 <= status_code < 500:
-                   return True
+                   reachable = True
+                   break
            except Exception:
                continue
-       return False
+       return reachable
     finally:
+       # LP-0MWCOMI160011F6C AC1/AC2: publish the probe result as reachability
+       # evidence for the pre-dispatch routing gate. The gate no longer treats
+       # a stale slots snapshot alone as unreachability, so it needs a recent
+       # measured verdict — the ``/health`` poll (the only frequent probe) is
+       # exactly that evidence source. Best-effort: a recorder fault must
+       # never break the probe.
+       try:
+           from proxy.observability import record_local_backend_reachability
+
+           record_local_backend_reachability(reachable)
+       except Exception:
+           pass
        if not srv._http_client:
            try:
                await client.aclose()

@@ -146,6 +146,18 @@ def _classify_backend_exception(exc: Exception) -> str:
 #   - :func:`_local_backend_unreachable_remaining_seconds` — the pre-dispatch
 #     routing gate combining the armed deadline with the slots-snapshot
 #     staleness signal (AC2).
+#
+# LP-0MWCOMI160011F6C (2026-11-11 starvation): the staleness signal above is
+# an observation about *the poll*, not proof the backend is down. After a
+# llama-server respawn the ``/slots`` probe failed for 93 minutes while
+# ``/health`` reported ``backend_reachable=true`` the whole time, so the
+# staleness branch skipped local forever (60 s per call, never probing) and
+# starved a healthy idle backend. The gate now refuses to treat a stale
+# snapshot alone as unreachability: it requires *corroborating reachability
+# evidence* — a probe result (``/health``/``/models`` probe, or a refused
+# connect) recorded within ``local_reachability_probe_max_age_seconds``.
+# Failing open is the designed outcome: a real attempt re-establishes the
+# evidence, and a refused connect fail-fasts and arms the skip as before.
 # ===================================================================
 
 
@@ -171,13 +183,21 @@ def _local_backend_skip_seconds(config: dict | None = None) -> float:
 
 def _arm_local_backend_unreachable(config: dict | None = None) -> None:
     """Arm the routing skip: local is not to be dispatched for
-    ``local_backend_skip_seconds``."""
+    ``local_backend_skip_seconds``.
+
+    Every caller arms the skip on *measured* unreachability — a failed
+    reachability probe or a deterministic connection-refused dispatch — so the
+    arm also records unreachable evidence for the staleness corroboration of
+    :func:`_local_backend_unreachable_remaining_seconds`
+    (LP-0MWCOMI160011F6C AC1/AC2).
+    """
     try:
         _srv().local_backend_unreachable_until = (
             time.monotonic() + _local_backend_skip_seconds(config)
         )
     except Exception:
         pass
+    record_local_backend_reachability(False)
 
 
 def _clear_local_backend_unreachable() -> None:
@@ -251,6 +271,94 @@ def _record_connection_refused_fail_fast(
     raise exc
 
 
+# ===================================================================
+# Reachability evidence (LP-0MWCOMI160011F6C)
+#
+# The staleness branch below used to treat an over-age slots snapshot as
+# proof of unreachability. Observed 2026-11-11: from 20:55 the ``/slots``
+# probe failed on every call (``reason="unknown"``) after a llama-server
+# respawn moved the child port, so the counts cache froze; at 300 s of age
+# the gate started skipping local and never probed again, starving a healthy
+# idle backend for 93 minutes while ``/health`` reported
+# ``backend_reachable=true``. A stale *observation* is therefore never used
+# alone: the gate needs a reachability probe result recorded inside the probe
+# window, which is what makes the skip both evidence-based and self-healing.
+# ===================================================================
+
+_local_reachability_probe: tuple[bool, float] | None = None
+"""Last measured ``(reachable, monotonic_ts)`` from a reachability probe.
+
+Written by :func:`record_local_backend_reachability` from the ``/health`` /
+``/models`` probe (:func:`proxy.lifecycle._probe_backend_reachable`) and from
+the fail-fast arm path. Consumed only by the staleness corroboration in
+:func:`_local_backend_unreachable_remaining_seconds` (LP-0MWCOMI160011F6C).
+"""
+
+_REACHABILITY_LOCK = threading.Lock()
+
+
+def record_local_backend_reachability(reachable: bool) -> None:
+    """Record the outcome of a reachability probe (best-effort).
+
+    A recorder fault must never break a dispatch or a probe, so any exception
+    is swallowed.
+    """
+    global _local_reachability_probe
+    try:
+        with _REACHABILITY_LOCK:
+            _local_reachability_probe = (bool(reachable), time.monotonic())
+    except Exception:
+        pass
+
+
+def local_reachability_probe_max_age_seconds(config: dict | None = None) -> float:
+    """Freshness window (seconds) for a reachability probe result.
+
+    Reads ``server.local_reachability_probe_max_age_seconds`` (default 60 s —
+    the same order as ``local_backend_skip_seconds``, so a skip decided from
+    probe evidence is re-decided on the next probe cycle instead of being
+    permanent). A non-positive/non-numeric value falls back to the default.
+    """
+    server_cfg = config.get("server") if isinstance(config, dict) else None
+    if not isinstance(server_cfg, dict):
+        server_cfg = {}
+    try:
+        val = float(
+            server_cfg.get("local_reachability_probe_max_age_seconds") or 60
+        )
+    except (TypeError, ValueError):
+        val = 60.0
+    return val if val > 0 else 60.0
+
+
+def last_local_backend_reachability(config: dict | None = None) -> bool | None:
+    """Recent reachability verdict: ``True``/``False``, or ``None``.
+
+    ``None`` means "not measured recently" — either no probe has run or the
+    last result is older than
+    :func:`local_reachability_probe_max_age_seconds`. Callers must treat
+    ``None`` as *no evidence*, never as unreachable (LP-0MWCOMI160011F6C AC1:
+    a missing observation is not a negative one).
+    """
+    entry = _local_reachability_probe
+    if entry is None:
+        return None
+    reachable, ts = entry
+    try:
+        if (time.monotonic() - ts) > local_reachability_probe_max_age_seconds(config):
+            return None
+    except Exception:
+        return None
+    return reachable
+
+
+def reset_local_backend_reachability() -> None:
+    """Clear the recorded reachability evidence (test isolation)."""
+    global _local_reachability_probe
+    with _REACHABILITY_LOCK:
+        _local_reachability_probe = None
+
+
 def _local_backend_unreachable_remaining_seconds(config: dict | None = None) -> float:
     """Seconds local routing should keep skipping the backend (0 = usable).
 
@@ -260,10 +368,13 @@ def _local_backend_unreachable_remaining_seconds(config: dict | None = None) -> 
        (``srv.local_backend_unreachable_until``, set by a refused local
        dispatch or a failed reachability probe);
     2. a slots snapshot older than the configured staleness bound
-       (``local_slots_max_snapshot_age_seconds``) — a dead backend leaves
-       the counts cache stale (6.5 h in the incident), and a missing
-       snapshot (``None``) is *not* evidence of staleness, mirroring
-       :func:`slots_snapshot_too_old`.
+       (``local_slots_max_snapshot_age_seconds``) **corroborated by negative
+       reachability evidence** — a missing snapshot (``None``) is *not*
+       evidence of staleness, mirroring :func:`slots_snapshot_too_old`, and a
+       stale snapshot alone is no longer treated as unreachability
+       (LP-0MWCOMI160011F6C AC1). The corroborating evidence must be recent
+       (``local_reachability_probe_max_age_seconds``), which bounds the skip
+       by the probe interval (AC2) instead of by a lucky ``/slots`` success.
 
     Returns 0.0 when neither signal says unreachable, so a healthy backend is
     always dispatched (fail-open).
@@ -282,7 +393,13 @@ def _local_backend_unreachable_remaining_seconds(config: dict | None = None) -> 
         if stamp is not None:
             ceiling = local_slots_max_snapshot_age_seconds(config)
             if slots_snapshot_too_old(max(0.0, time.monotonic() - stamp), ceiling):
-                return _local_backend_skip_seconds(config)
+                # LP-0MWCOMI160011F6C AC1/AC2: staleness is an observation
+                # about the poll, not proof of unreachability. Skip only when
+                # a *recent* probe also measured unreachable; otherwise fail
+                # open and let the attempt (or the next /health probe)
+                # produce fresh evidence.
+                if last_local_backend_reachability(config) is False:
+                    return _local_backend_skip_seconds(config)
     except Exception:
         pass
     return 0.0
@@ -1237,13 +1354,37 @@ async def _query_slots(
         _record_slots_query_failure("timeout")
         _set_slots_status_out(status_out, reason="timeout")
     except Exception as exc:
-        if isinstance(exc, (ConnectionError, OSError)):
-            _record_slots_query_failure("connection_error")
-            _set_slots_status_out(status_out, reason="connection_error")
-        else:
-            _record_slots_query_failure("unknown")
-            _set_slots_status_out(status_out, reason="unknown")
+        reason = classify_slots_transport_failure(exc)
+        _record_slots_query_failure(reason)
+        _set_slots_status_out(status_out, reason=reason)
     return 0, 0
+
+
+def classify_slots_transport_failure(exc: BaseException) -> str:
+    """Map a ``/slots`` transport exception onto the failure-label vocabulary.
+
+    The ``llama_slots_query_failures_total`` labels are shared by every
+    ``/slots`` caller (``monitoring/slots_query_alerts.yaml`` matches them), so
+    the mapping lives once here instead of being re-spelled per call site
+    (LP-0MWCOMI160011F6C AC3):
+
+    * ``httpx.TimeoutException`` — ``ConnectTimeout``, ``ReadTimeout``,
+      ``WriteTimeout``, ``PoolTimeout`` — becomes ``timeout``.
+    * ``httpx.NetworkError`` (``ConnectError``, ``ReadError``, ``WriteError``,
+      ``CloseError``) and the builtin ``ConnectionError``/``OSError`` family
+      become ``connection_error``.
+    * Anything else stays ``unknown``.
+
+    Before this mapping every httpx transport error fell into the generic
+    branch and was recorded as ``unknown``, so the 2026-11-11 starvation (a
+    permanently failing ``/slots`` probe after a child-port change) could not
+    be diagnosed from the metric.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, (httpx.NetworkError, ConnectionError, OSError)):
+        return "connection_error"
+    return "unknown"
 
 
 def _set_slots_status_out(
@@ -1439,10 +1580,10 @@ async def _query_slots_detail(
         _set_slots_status_out(status_out, reason="timeout")
         _srv().logger.debug("Slot detail query timed out for %s", url)
     except Exception as exc:
-        if isinstance(exc, (ConnectionError, OSError)):
-            _set_slots_status_out(status_out, reason="connection_error")
-        else:
-            _set_slots_status_out(status_out, reason="unknown")
+        # LP-0MWCOMI160011F6C AC3: httpx transport errors are classified, not
+        # collapsed into ``unknown`` (the shared mapping keeps the label
+        # vocabulary identical to ``_query_slots``).
+        _set_slots_status_out(status_out, reason=classify_slots_transport_failure(exc))
         _srv().logger.debug(
             "Slot detail query failed [%s] for %s: %s",
             type(exc).__name__, url, exc,
@@ -1535,9 +1676,7 @@ async def _fetch_slots_payload_for_sampler(
     except TimeoutError:
         return None, "timeout"
     except Exception as exc:
-        if isinstance(exc, (ConnectionError, OSError)):
-            return None, "connection_error"
-        return None, "unknown"
+        return None, classify_slots_transport_failure(exc)
     if status != 200:
         return None, f"http_{status}"
     if not isinstance(data, list):

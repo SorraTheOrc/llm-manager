@@ -42,12 +42,18 @@ def _reset_slot_counts_cache():
     Without a reset, an earlier test that populated the cache would make a
     later test observing a stubbed (0,0) /slots failure see degraded counts
     instead of 0/0.
+
+    The same fixture clears the reachability-probe evidence recorded for the
+    pre-dispatch routing gate (LP-0MWCOMI160011F6C): an earlier test's passing
+    probe must not make a later test's stale-snapshot case look corroborated.
     """
     import proxy.observability as obs
 
     obs._last_slot_counts_cache = None
+    obs.reset_local_backend_reachability()
     yield
     obs._last_slot_counts_cache = None
+    obs.reset_local_backend_reachability()
 
 
 @pytest.fixture(autouse=True)
