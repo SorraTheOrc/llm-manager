@@ -702,6 +702,90 @@ models:
 - `{"model": "claude-3-opus"}` → matches `anthropic` config via exact alias → routes to Anthropic API
 - No model specified + `current_model` is set → uses the currently loaded local model
 
+## Prefill progress signal provenance (LP-0MW7V2DK400365ER)
+
+During a large local prefill no stream chunk is emitted, so the dispatch lease
+and the occupancy surface need a *measured* prefill progress signal to tell
+"still working" apart from "stalled". This section records where that signal
+comes from, in the order the proxy consults it.
+
+### Sources, in preference order
+
+The probe is `proxy.router_helpers._query_prefill_progress`, polled every
+`local_dispatch_lease_prefill_poll_seconds` while the dispatch awaits its first
+byte. Each source is bounded by `STATUS_QUERY_TIMEOUT` (default 1 s) and never
+blocks the stream loop.
+
+1. **Per-slot `/slots`** (`proxy.observability._query_slots_progress`), on the
+discovered model-child port (never the router). A slot's progress is the
+maximum of `n_past` and `n_prompt_tokens_processed`; liveness is
+`is_processing`. Older llama.cpp builds publish these per-slot fields firmly.
+2. **Per-slot log tail** (`proxy.observability.get_slot_prefill_progress`).
+   llama-server writes, for every prompt-processing batch:
+
+   ```
+   slot update_slots: id  0 | task 2833255 | prompt processing progress, n_tokens = 17690, batch.n_tokens = 1024, progress = 0.999774
+   ```
+
+   stderr, which the proxy redirects into `llama-server.log` and parses into
+   `_slot_progress_cache` (see `_update_slot_progress_from_log`). The measured
+   token count is `n_tokens`; an entry is trusted while the log's mtime is
+   within `SLOT_PROGRESS_MAX_AGE_SECONDS` (60 s). This source is what makes
+   progress observable on builds that dropped the `/slots` fields (below).
+3. **Aggregate `/status`** (`proxy.observability.query_llama_status`), reading
+   `kv_cache_tokens` (or `n_past` when present) from `/model`, `/status`,
+   `/models`, `/v1/models`. It is a whole-server aggregate, not per-slot, so it
+   is the last resort.
+
+### Build-specific caveats
+
+- The deployed llama.cpp **b8782** build removed `n_past` /
+  `n_prompt_tokens_processed` / `context_tokens` from the `/slots` response.
+  Observed 2026-11-08 on the live child: `/slots` returns `id`, `n_ctx`,
+  `is_processing`, `id_task`, `params` and `next_token.{n_decoded,n_remain}` —
+  **no per-slot prompt-progress field**.
+- That build still emits the `slot update_slots … n_tokens = N` stderr line,
+  so source 2 is the supported measured signal there. Nothing in the proxy
+  fabricates `n_past` when a build omits it (a fabricated context size would
+  mis-price the ETA).
+- `query_llama_status`'s `kv_cache_tokens` is build-dependent; `/status`
+  itself is *not* a llama.cpp endpoint (it 404s), so the aggregate reads the
+  model-list endpoints and returns `null` when the field is absent.
+
+### Unobservable case (fail-safe)
+
+When all three sources yield nothing **and** the slot is not observed
+processing, progress is *unobservable*. The proxy then:
+
+- leaves the lease at its adaptive acquisition estimate (no unbounded
+  extension — a genuinely progress-less dispatch is still released by
+  `local_dispatch_no_progress_timeout_seconds` and the
+  `local_dispatch_max_prefill_seconds` ceiling);
+- keeps the liveness-only extension path (`is_processing`) as the fail-safe;
+- emits a throttled `prefill_progress_unobservable` WARNING (at most once per
+  `_PREFILL_WARN_INTERVAL`, 60 s); and
+- increments the `proxy_prefill_progress_unobservable_total{reason="no_source"}`
+  counter on **every** blind poll, so a persistent rate is visible in
+  `/metrics` and not only in the log
+  (LP-0MW8VPH2Q007XPHQ, parent AC6/AC11).
+
+### How the signal is consumed
+
+- **Lease extension** (`_extend_lease_during_prefill`): a numeric advance
+  refreshes `last_progress_ts` and logs
+  `lease_extended_on_measured_progress` / `reason=measured_progress`; liveness
+  or an in-flight own-session request extends without refreshing the clock.
+- **Early abort** (`_watchdog_release_reason`): `prefill_eta_exceeded` when
+  elapsed > `eta_prefill_s * local_prefill_eta_factor` (default 2×),
+  `prefill_stalled` when no progress for
+  `local_dispatch_no_progress_timeout_seconds`, and `prefill_max_exceeded` at
+  the hard ceiling. The `lease_released` WARNING records the reason plus
+  `elapsed_s` / `stalled_for_s` (parent AC4/AC14).
+- **Occupancy** (`measured_occupied_slot_ids`): the union of `/slots`
+  `is_processing` and fresh log-derived progress; published additively as
+  `measured_in_flight_requests` so the residual analyser no longer under-counts
+  a busy second slot (LP-0MW8VP0XR007UGQF).
+
 ## Large-Context Routing: Mode-Dependent Economic Bypass (LP-0MU5A4QBR003YJM0)
 
 When a request's estimated token count exceeds the cold-cache threshold
