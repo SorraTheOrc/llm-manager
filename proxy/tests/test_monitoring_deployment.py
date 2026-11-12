@@ -1271,7 +1271,14 @@ class TestPrometheusSystemdUnit:
 
 
 class TestGrafanaSystemdUnit:
-    """Validation of docs/systemd/grafana-server.service."""
+    """Validation of docs/systemd/grafana-server.service.
+
+    The unit is the fenced ``ini`` block of the document, extracted with the
+    same ``unit_from_doc`` helper every other unit in ``docs/systemd/`` is
+    installed with (monitoring/README.md) — the document must keep exactly one
+    ``ini`` block and the extracted unit must be safe: loopback-only bind, the
+    admin password from the ``%h`` file, no credential anywhere in the prose.
+    """
 
     def test_unit_file_exists(self):
         """Grafana systemd unit file exists."""
@@ -1294,6 +1301,78 @@ class TestGrafanaSystemdUnit:
         content = (DOCS_SYSTEMD_DIR / "grafana-server.service").read_text()
         assert "[Service]" in content
         assert "ExecStart=" in content
+
+    def test_extracted_unit_has_required_sections(self):
+        """The extracted ini block is a complete unit (unit_from_doc contract)."""
+        unit = _unit_text("grafana-server")
+        for section in ("[Unit]", "[Service]", "[Install]"):
+            assert section in unit, f"grafana-server.service is missing {section}"
+
+    def test_binds_loopback_only(self):
+        """AC 1: the unit pins 127.0.0.1:3000 — the process never binds a wildcard."""
+        unit = _unit_text("grafana-server")
+        assert "Environment=GF_SERVER_HTTP_PORT=3000" in unit, (
+            "the unit must set GF_SERVER_HTTP_PORT=3000"
+        )
+        # Grafana's http_addr default is empty (all interfaces). The unit must
+        # pin an explicit loopback address; any other GF_SERVER_HTTP_ADDR value
+        # (empty, 0.0.0.0, a bare :port) keeps the wildcard exposure.
+        addr_lines = [
+            line for line in unit.splitlines() if "GF_SERVER_HTTP_ADDR=" in line
+        ]
+        assert addr_lines == ["Environment=GF_SERVER_HTTP_ADDR=127.0.0.1"], (
+            f"the only GF_SERVER_HTTP_ADDR line must pin 127.0.0.1, got {addr_lines}"
+        )
+
+    def test_admin_password_from_file_not_inline(self):
+        """AC 2: the admin password comes from the %h file, never an inline value."""
+        unit = _unit_text("grafana-server")
+        assert (
+            "Environment=GF_SECURITY_ADMIN_PASSWORD__FILE=%h/.config/grafana/admin.pass"
+            in unit
+        ), (
+            "the unit must point at the per-user secret file via %h "
+            "(systemd user-unit expansion)"
+        )
+        for line in unit.splitlines():
+            if "GF_SECURITY_ADMIN_PASSWORD=" in line:
+                assert "GF_SECURITY_ADMIN_PASSWORD__FILE=" in line, (
+                    f"inline admin password in the unit: {line!r} — "
+                    f"use the __FILE variant"
+                )
+
+    def test_no_admin_credentials_in_document(self):
+        """AC 3: no admin:admin and no GF_SECURITY_ADMIN_PASSWORD=admin anywhere."""
+        content = _norm((DOCS_SYSTEMD_DIR / "grafana-server.service").read_text())
+        assert "admin:admin" not in content
+        assert "gf_security_admin_password=admin" not in content
+
+    def test_setup_verification_points_to_deploy_script(self):
+        """AC 4: setup/verification delegate to scripts/deploy_grafana.sh."""
+        content = _norm((DOCS_SYSTEMD_DIR / "grafana-server.service").read_text())
+        assert "scripts/deploy_grafana.sh" in content
+        assert "scripts/deploy_grafana.sh --check" in content
+        assert "cp monitoring/grafana" not in content, (
+            "the cp-based provisioning block must be gone — the deploy script "
+            "renders provisioning from monitoring/"
+        )
+        assert "curl -u admin:admin" not in content
+
+    def test_execstart_keeps_documented_binary_path(self):
+        """AC 5: ExecStart keeps the documented binary path and home/config flags."""
+        unit = _unit_text("grafana-server")
+        args = _exec_start_args(unit)
+        assert args[0] == "/home/rgardler/bin/grafana/bin/grafana-server", (
+            f"ExecStart must keep the documented binary path, got argv[0]={args[0]!r}"
+        )
+        assert _flag_values(unit, "--homepath") == ["/home/rgardler/bin/grafana"], (
+            "ExecStart must keep --homepath=/home/rgardler/bin/grafana"
+        )
+        configs = _flag_values(unit, "--config")
+        assert len(configs) == 1, f"expected one --config flag, got {configs}"
+        assert configs[0].endswith("conf/defaults.ini"), (
+            f"ExecStart must point at Grafana's own defaults.ini, got {configs}"
+        )
 
 
 # ---------------------------------------------------------------------------

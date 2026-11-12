@@ -6,6 +6,24 @@ This systemd unit file runs Grafana for the LLM proxy stack monitoring
 infrastructure. It uses the host-first model (binary installation, no
 containers) and is designed to be deployed as a **user service**.
 
+Three properties of the unit below are deliberate and guarded by
+`TestGrafanaSystemdUnit` (`proxy/tests/test_monitoring_deployment.py`):
+
+1. **Loopback-only bind.** `Environment=GF_SERVER_HTTP_ADDR=127.0.0.1` pins
+   Grafana's listener to loopback — the process never binds a wildcard
+   address. Tailnet access is provided by `tailscale serve --tcp=3000` (from
+   `scripts/deploy_grafana.sh`), never by widening Grafana's own bind.
+2. **No inline credential.** The admin password comes from
+   `Environment=GF_SECURITY_ADMIN_PASSWORD__FILE=%h/.config/grafana/admin.pass`
+   (`%h` expands to the user's home in a systemd **user** unit). The file is
+   generated once by `scripts/deploy_grafana.sh` with `0600` permissions and
+   is never printed, logged or committed.
+3. **Installed from this document, not copied.** Like every other unit in
+   `docs/systemd/`, the running unit is the single `ini` block below,
+   extracted with the `unit_from_doc` helper documented in
+   `monitoring/README.md` (`cp` would install markdown that systemd cannot
+   parse).
+
 ## User Service (Recommended)
 
 **File location**: `~/.config/systemd/user/grafana-server.service`
@@ -18,6 +36,17 @@ Wants=network.target
 
 [Service]
 Type=simple
+
+# Loopback-only bind — the process never listens on a wildcard address.
+# Tailnet exposure is provided by `tailscale serve --tcp=3000` from
+# scripts/deploy_grafana.sh, not by widening this bind.
+Environment=GF_SERVER_HTTP_ADDR=127.0.0.1
+Environment=GF_SERVER_HTTP_PORT=3000
+
+# Admin password from a 0600 file, never inline. %h expands to the user's
+# home in a systemd user unit; scripts/deploy_grafana.sh creates the file.
+Environment=GF_SECURITY_ADMIN_PASSWORD__FILE=%h/.config/grafana/admin.pass
+
 ExecStart=/home/rgardler/bin/grafana/bin/grafana-server \
   --homepath=/home/rgardler/bin/grafana \
   --config=/home/rgardler/bin/grafana/conf/defaults.ini \
@@ -38,49 +67,49 @@ MemoryMax=1G
 WantedBy=default.target
 ```
 
-### Setup commands (user service)
+## Setup (user service)
+
+Deploy with the repository's one-command script. It installs the Grafana
+binary, renders the datasource and dashboard provisioning, installs this unit
+by extracting the `ini` block above (`unit_from_doc`), generates
+`~/.config/grafana/admin.pass` once (strong password, `0600`), starts the
+service and verifies the result:
 
 ```bash
-# Create directories
-mkdir -p ~/.local/share/grafana/data
-mkdir -p ~/.local/state/grafana/logs
+cd /path/to/llm          # repository root, so docs/systemd/ resolves
+scripts/deploy_grafana.sh
+```
 
-# Copy provisioning files
-cp monitoring/grafana/datasources/datasources.yaml ~/bin/grafana/conf/provisioning/datasources/
-cp monitoring/grafana/dashboards/dashboards.yaml ~/bin/grafana/conf/provisioning/dashboards/
-cp monitoring/grafana_llama_memory_dashboard.json ~/bin/grafana/conf/provisioning/dashboards/
+Manual diagnostics after deployment:
 
-# Enable and start the service
-systemctl --user daemon-reload
-systemctl --user enable grafana-server.service
-systemctl --user start grafana-server.service
-
-# Check status
+```bash
 systemctl --user status grafana-server.service
-
-# View logs
 journalctl --user -u grafana-server.service -f
 ```
 
+The unit is installed from the documented `ini` block — do not hand-edit
+`~/.config/systemd/user/grafana-server.service`, or the repository and the
+running state drift. Re-install with the script instead.
+
 ## Verification
 
+Verify the deployed stack with the script's read-only check (never changes
+anything):
+
 ```bash
-# Check Grafana health
-curl http://localhost:3000/api/health
-
-# Open Grafana in browser
-# http://localhost:3000
-# Default credentials: admin / admin
-
-# Verify Prometheus datasource is configured
-curl -u admin:admin http://localhost:3000/api/datasources
-
-# Verify dashboards are loaded
-curl -u admin:admin http://localhost:3000/api/search?type=dash-db
+cd /path/to/llm          # repository root, so docs/systemd/ resolves
+scripts/deploy_grafana.sh --check
 ```
+
+The check confirms Grafana is healthy on `127.0.0.1:3000`, the Prometheus
+datasource and the `LLama Server Memory` dashboard are loaded, the listener is
+loopback-only (the LAN address is refused) and authentication with the stored
+credential succeeds — reporting the credential **path** only, never the value.
+Open the dashboard at `http://localhost:3000`.
 
 ## Cross-references
 
 - See also: `docs/systemd/prometheus.service` for the Prometheus systemd unit.
+- See also: `scripts/deploy_grafana.sh` for the deploy / verify script.
 - See also: `monitoring/README.md` for full monitoring deployment documentation.
 - See also: `monitoring/grafana/datasources/datasources.yaml` and `monitoring/grafana/dashboards/dashboards.yaml` for provisioning configuration.
