@@ -467,6 +467,7 @@ wrong on both counts and is superseded by this section.
 | 12 | `LP-0MVV29WR0009DY1A` | Own-request queue-wait banding (this re-banding) + enqueue-line pricing fields |
 | 13 | `LP-0MVT110PJ003XYLP` | Standalone contention-queue residual report (consumer of the harness join and log fields) |
 | 14 | `LP-0MVV29XDW006VTWK` | Diurnally matched pre-change baseline — **52.6 %** working baseline ([`prefill-admission-conversion-diurnal-baseline.md`](prefill-admission-conversion-diurnal-baseline.md)) |
+| 15 | `LP-0MVV29YP6006PLNP` | Post-fix 24 h re-measurement of this window's question — share **82.1 %** (23/28), still met the 85 % bar but not the working baseline ([`prefill-admission-conversion-postfix.md`](prefill-admission-conversion-postfix.md)) |
 
 Related: [`docs/dev/contended-prefill-pricing.md`](contended-prefill-pricing.md)
 (the contended pricing and rollback page),
