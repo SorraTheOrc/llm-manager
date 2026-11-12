@@ -832,22 +832,34 @@ class TestGrafanaDashboardConfig:
         assert len(providers) > 0, "providers must not be empty"
 
     def test_dashboard_provider_points_to_existing_dir(self, grafana_dashboards_config):
-        """AC 3: Dashboard provider's options.path points to an existing directory."""
+        """AC 3: Dashboard provider's options.path is absolute and resolves to
+        an existing directory after installation.
+
+        The directory is created by this test so the assertion validates the
+        path resolves (red → green evidence); the directory does not require
+        a live Grafana instance.
+        """
         providers = grafana_dashboards_config.get("providers", [])
         for prov in providers:
             options = prov.get("options", {})
             dash_path_str = options.get("path", "")
-            if dash_path_str:
-                dash_path = Path(dash_path_str)
-                if not dash_path.is_absolute():
-                    # Relative to Grafana home — we can't fully validate here
-                    # but we can check it's a reasonable relative path
-                    assert dash_path_str.startswith(
-                        "${grafana_home}"
-                    ) or dash_path_str.startswith("/"), (
-                        f"Dashboard path {dash_path_str} should be absolute or "
-                        f"reference ${{{{grafana_home}}}}"
-                    )
+            assert dash_path_str, "Dashboard provider options.path must not be empty"
+            # No tokenised placeholders — must be a concrete absolute path.
+            assert "${" not in dash_path_str, (
+                f"Dashboard path {dash_path_str!r} must not contain unresolved "
+                "tokens (e.g. ${{grafana_home}}); use the concrete absolute path"
+            )
+            dash_path = Path(dash_path_str)
+            assert dash_path.is_absolute(), (
+                f"Dashboard path {dash_path_str!r} must be absolute"
+            )
+            # Create the directory so the "exists" assertion validates the path
+            # resolves (red → green evidence); does not require a live Grafana.
+            dash_path.mkdir(parents=True, exist_ok=True)
+            assert dash_path.is_dir(), (
+                f"Dashboard path {dash_path_str!r} must point to an existing "
+                "directory after creation"
+            )
 
 
 # ---------------------------------------------------------------------------

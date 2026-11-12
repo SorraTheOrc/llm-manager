@@ -17,5 +17,5 @@ providers:
     updateIntervalSeconds: 10
     allowUiUpdates: true
     options:
-      path: ${grafana_home}/conf/provisioning/dashboards
+      path: /home/rgardler/bin/grafana/conf/provisioning/dashboards
       foldersFromFilesStructure: false
