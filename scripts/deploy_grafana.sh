@@ -141,6 +141,11 @@ preflight() {
     die "Prometheus ($PROM_URL) is not answering /-/healthy — refusing to deploy a dashboard with a dead datasource. Start it with: systemctl --user start prometheus.service"
   fi
   mkdir -p "$HOME/bin"
+  # The unit's StandardOutput/StandardError are append targets under
+  # ~/.local/state/grafana/logs — systemd cannot open an append: path whose
+  # parent dir does not exist, so the state dirs must exist before the unit
+  # starts (observed as status=209/STDOUT on a fresh host).
+  mkdir -p "$HOME/.local/share/grafana/data" "$HOME/.local/state/grafana/logs"
   if ! command -v systemctl >/dev/null 2>&1; then
     die "systemctl not found — a systemd user session is required to install the grafana-server unit."
   fi

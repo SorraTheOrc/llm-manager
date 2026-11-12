@@ -1537,6 +1537,53 @@ class TestGrafanaDeployScript:
             + "\n".join(offenders)
         )
 
+    def test_script_creates_unit_log_state_dirs(self):
+        """Guard (blocker LP-0MWDPB4NK005BXY3): the script creates the dirs
+        the unit appends its logs to.
+
+        The unit's ``StandardOutput``/``StandardError`` are ``append:``
+        targets under ``~/.local/state/grafana/logs``. systemd cannot open an
+        ``append:`` path whose parent directory does not exist, so on a fresh
+        host the unit fails at start with ``status=209/STDOUT`` before
+        Grafana ever runs; the script must mkdir the state data/log dirs
+        before installing the unit.
+        """
+        unit = self._extract_unit()
+        append_targets: list[str] = []
+        for line in unit.splitlines():
+            if (
+                line.startswith(("StandardOutput=", "StandardError="))
+                and "append:" in line
+            ):
+                append_targets.append(line.split("append:", 1)[1].strip())
+        assert append_targets, (
+            "the unit must append its logs to a file under the user state "
+            "dir (StandardOutput/StandardError=append:...)"
+        )
+        script = DEPLOY_SCRIPT.read_text()
+        mkdir_marker = (
+            'mkdir -p "$HOME/.local/share/grafana/data" '
+            '"$HOME/.local/state/grafana/logs"'
+        )
+        assert mkdir_marker in script, (
+            "the deploy script must create the Grafana state dirs "
+            "(~/.local/share/grafana/data, ~/.local/state/grafana/logs) "
+            "before the unit starts; without them systemd fails the append "
+            "log target with status=209/STDOUT"
+        )
+        for target in append_targets:
+            parent = str(Path(target).parent)
+            idx = parent.find("/.local/")
+            assert idx > 0, (
+                f"append target {target!r} must live under ~/.local/ so the "
+                "script can pre-create it with $HOME"
+            )
+            rel = parent[idx + 1:]  # e.g. .local/state/grafana/logs
+            assert f'"$HOME/{rel}"' in mkdir_marker, (
+                f"the script must mkdir the append target's parent dir "
+                f"('$HOME/{rel}') so systemd can open {target!r}"
+            )
+
     def test_undeployed_host_check(self, tmp_path):
         """AC 7: --check --allow-absent exits 0 on an undeployed host; plain
         --check exits 1. HOME is isolated so the assertions hold on a deployed
