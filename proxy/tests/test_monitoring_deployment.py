@@ -3140,6 +3140,69 @@ class TestMonitoringReadmeInstallSteps:
             assert unit in content, f"monitoring/README.md does not mention {unit}"
 
 
+class TestGrafanaDeploymentDocs:
+    """The README documents the scripted Grafana deploy (LP-0MWBQL7IV00783FB).
+
+    Guards the implemented-state claims a reader depends on: one command to
+    deploy/verify (`scripts/deploy_grafana.sh`, `--check`, `--allow-absent`),
+    the loopback + tailnet exposure decision, the password-file path (never the
+    value), and start/stop/check via `systemctl --user`. Reintroducing the
+    `cp`-based sketch, the "not running on this host" claim or a default
+    credential must fail a test.
+    """
+
+    def test_section4_names_the_deploy_script_and_its_flags(self):
+        """AC 1: § 4 points at the script and its install/verify commands."""
+        lowered = _norm(_readme())
+        assert "scripts/deploy_grafana.sh" in lowered
+        assert "scripts/deploy_grafana.sh --check" in lowered
+        assert "--allow-absent" in lowered
+
+    def test_section4_documents_the_exposure_decision(self):
+        """AC 1: loopback bind plus the tailnet serve decision, not a wildcard."""
+        lowered = _norm(_readme())
+        assert "127.0.0.1:3000" in lowered
+        assert "tailscale serve --tcp=3000" in lowered
+
+    def test_section4_documents_the_password_file_path_only(self):
+        """AC 1: the password-file path is named; no default credential."""
+        lowered = _norm(_readme())
+        assert "~/.config/grafana/admin.pass" in lowered
+        assert "admin:admin" not in lowered
+
+    def test_what_runs_here_row_states_the_real_bind(self):
+        """AC 2: the table row names the actual bind and drops the stale claim."""
+        content = _readme()
+        row = next(
+            line
+            for line in content.splitlines()
+            if line.strip().startswith("| `grafana-server.service`")
+        )
+        assert "not running on this host" not in row
+        assert "if deployed" not in row
+        assert "127.0.0.1:3000" in row
+        assert "tailscale serve" in row
+
+    def test_no_cp_sketch_block_remains(self):
+        """AC 4: the hand-run cp install block is replaced by the script."""
+        content = _readme()
+        assert "cp monitoring/grafana" not in content
+        assert "Sketch only" not in content
+
+    def test_security_notes_describe_loopback_and_generated_password(self):
+        """AC 3: the security bullet matches the implemented state."""
+        lowered = _norm(_readme())
+        assert "admin:admin" not in lowered
+        assert "default credentials" not in lowered
+        assert "on all interfaces" not in lowered
+
+    def test_proxy_readme_mentions_the_deploy_script(self):
+        """AC 5: the host-script list in proxy/README.md names the script."""
+        path = PROJECT_ROOT / "proxy" / "README.md"
+        assert path.exists(), "Missing proxy/README.md"
+        assert "scripts/deploy_grafana.sh" in path.read_text()
+
+
 # ---------------------------------------------------------------------------
 # Tests: monitoring/README.md query cookbook
 # (LP-0MVO8DORX004P05G AC 4)

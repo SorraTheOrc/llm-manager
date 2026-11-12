@@ -21,13 +21,13 @@ alive across reboots with `loginctl enable-linger`.
 | `llama-proxy.service` | n/a (Python/uvicorn) | `:8000` | scraped by Prometheus: proxy counters **and** the 10 s slot-occupancy sample (`llama_slots_*`, `llama_slot_busy`) | [docs/systemd/llama-proxy.service](../docs/systemd/llama-proxy.service) |
 | `gpu-metrics.service` | n/a (bash sampler) | — (writes `gpu.prom`) | 10 s sysfs sampler for node_exporter's textfile collector | [docs/systemd/gpu-metrics.service](../docs/systemd/gpu-metrics.service) |
 | `rocm-exporter.service` | — | — | **not installable**: no published release artefacts | [docs/systemd/rocm-exporter.service](../docs/systemd/rocm-exporter.service) |
-| `grafana-server.service` | 11.6.0 (documented) | `:3000` if deployed | optional dashboards; **not running on this host** | [docs/systemd/grafana-server.service](../docs/systemd/grafana-server.service) |
+| `grafana-server.service` | 11.6.0 | `127.0.0.1:3000` (tailnet via `tailscale serve --tcp=3000`) | optional dashboards; deploy & verify with `scripts/deploy_grafana.sh`; start/stop/check via `systemctl --user` | [docs/systemd/grafana-server.service](../docs/systemd/grafana-server.service) |
 
 Scrape pipeline:
 
 ```
 llama-proxy :8000/metrics ─┐
-node_exporter :9100/metrics ┤─► prometheus :9090 (90 d) ─► (optional) grafana :3000
+node_exporter :9100/metrics ┤─► prometheus :9090 (90 d) ─► (optional) grafana 127.0.0.1:3000 ─► tailscale serve :3000
   ├ hwmon collector  ◄── /sys/class/hwmon  (GPU power)
   └ textfile collector ◄── gpu.prom ◄── gpu-metrics.service (10 s sysfs sampler)
 ```
@@ -62,7 +62,7 @@ the only working `/slots` path.
   ```
 
 - Ports 9090 (Prometheus), 9100 (node_exporter) and, if Grafana is deployed,
-  3000, are free.
+  3000 (loopback only), are free.
 
 ## Exposure boundary
 
@@ -344,25 +344,49 @@ already in the store are **historical only** — still queryable inside the 90 d
 retention window and no longer maintained; see
 [Retired series: `gpu_busy_percent` (historical only)](#retired-series-gpu_busy_percent-historical-only).
 
-## 4. Grafana (optional, not deployed here)
+## 4. Grafana (deploy with `scripts/deploy_grafana.sh`)
 
-Grafana is **not running on this host** and is not part of the verified stack.
-The dashboard and provisioning files are in the repository
-(`monitoring/grafana/`, `monitoring/grafana_llama_memory_dashboard.json`) and
-the unit is documented in
+Grafana is optional, but deploying it is one command
+([`scripts/deploy_grafana.sh`](../scripts/deploy_grafana.sh)) rather than the
+hand-run `cp` runbook this guide used to sketch. The script installs Grafana
+11.6.0 into `~/bin/grafana` (verifying the published SHA-256 before
+extraction), provisions the Prometheus datasource and the `LLama Server
+Memory` dashboard from the repo copies, installs the systemd user unit
+extracted from
 [docs/systemd/grafana-server.service](../docs/systemd/grafana-server.service),
-but treat deploying it as a separate change with its own review: Grafana binds
-`:3000` (wildcard, i.e. LAN-reachable) by default and ships `admin`/`admin`
-credentials, which is a wider exposure than the tailnet-only boundary Prometheus
-uses. If you deploy it, bind it to loopback and the tailnet addresses the same
-way as Prometheus and change the admin password first.
+generates the admin password file once, starts the service and verifies the
+result from Grafana's own APIs:
 
 ```bash
-# Sketch only — see docs/systemd/grafana-server.service for the full steps
-cp monitoring/grafana/datasources/datasources.yaml ~/bin/grafana/conf/provisioning/datasources/
-cp monitoring/grafana/dashboards/dashboards.yaml   ~/bin/grafana/conf/provisioning/dashboards/
-cp monitoring/grafana_llama_memory_dashboard.json  ~/bin/grafana/conf/provisioning/dashboards/
+scripts/deploy_grafana.sh                          # install + provision + enable + start + verify
+scripts/deploy_grafana.sh --check                  # verify only; never changes anything
+scripts/deploy_grafana.sh --check --allow-absent   # exit 0 when Grafana is not deployed
 ```
+
+**Exposure.** Grafana listens on `127.0.0.1:3000` only. The installed unit
+pins `GF_SERVER_HTTP_ADDR=127.0.0.1`, so the process never binds a wildcard
+address; tailnet access is provided separately by
+`tailscale serve --tcp=3000` (run by the script), never by widening the bind.
+The verify step asserts the LAN address is refused.
+
+**Admin password.** On first run the script generates a strong password into
+`~/.config/grafana/admin.pass` (`0600`, directory `0700`) and Grafana reads it
+via `GF_SECURITY_ADMIN_PASSWORD__FILE`. The value is never printed, logged,
+embedded in the unit or passed on a command line; only the **path** is
+reported.
+
+**Start / stop / check.** The service is a systemd user unit:
+
+```bash
+systemctl --user start grafana-server.service      # start
+systemctl --user stop grafana-server.service       # stop
+systemctl --user status grafana-server.service     # status/check
+systemctl --user restart grafana-server.service    # restart
+```
+
+`scripts/deploy_grafana.sh --check` is the full health probe: installed and
+enabled, service active, `/api/health` ok, datasource and dashboard present,
+loopback-only listener, LAN refused, credential file safe.
 
 The dashboard's GPU memory panel — "GPU memory: GTT (models) and VRAM
 carve-out (bytes)" — charts three of the series § 3 lists as published:
@@ -1259,15 +1283,17 @@ LP-0MW5K7WKZ005VJXA).
 
 ## Security notes
 
-- **No authentication anywhere in this stack.** The exposure boundary is the
-  tailnet — see [Exposure boundary](#exposure-boundary).
+- **Prometheus and the exporters have no authentication.** The exposure boundary
+  is the tailnet — see [Exposure boundary](#exposure-boundary). (Grafana, when
+  deployed, does authenticate — see the note below.)
 - **Prometheus can be stopped by any tailnet peer** (`POST /-/quit`). Lifecycle
   (`/-/reload`) and admin (delete-series) APIs are disabled; keep them disabled.
 - **Exporters are loopback-only** (`127.0.0.1:9100`) and are scraped locally;
   publishing them adds no value and removes the network boundary.
-- **Grafana, if deployed, needs attention**: it binds `:3000` on all interfaces
-  by default and ships default credentials — bind it like Prometheus and change
-  the password.
+- **Grafana is loopback-bound with a generated credential**: the deploy script
+  pins `127.0.0.1:3000` and exposes the tailnet via `tailscale serve --tcp=3000`
+  (never a wildcard or LAN bind); the admin password is generated once into
+  `~/.config/grafana/admin.pass` (`0600`) and is never committed or printed.
 - **Never commit secrets** (Alertmanager webhook URLs, tokens) to
   `monitoring/`; alerting delivery is not implemented yet.
 

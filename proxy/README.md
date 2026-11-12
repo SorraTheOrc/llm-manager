@@ -3318,6 +3318,15 @@ instructions covering Prometheus and Grafana binary installation, systemd user
 service setup, Grafana datasource and dashboard provisioning, and
 verification steps.
 
+Grafana is deployed with one host script,
+[`scripts/deploy_grafana.sh`](../scripts/deploy_grafana.sh): it installs the
+pinned Grafana release, provisions the Prometheus datasource and the
+`LLama Server Memory` dashboard, installs the systemd user unit, binds it to
+`127.0.0.1:3000` (tailnet via `tailscale serve --tcp=3000`), generates the
+admin password file at `~/.config/grafana/admin.pass`, and verifies the
+result. Run `scripts/deploy_grafana.sh --check` to verify without changing
+anything (`--check --allow-absent` reports an undeployed host as exit 0).
+
 ### Runbook
 
 See [5xx Error Runbook](docs/runbook-5xx.md) for on-call investigation, remediation, and escalation steps when the `ProxyHttpErrorsHigh` alert fires.
