@@ -819,6 +819,17 @@ def _startup_config_logging():
     _startup_validate_compaction_config(config)
     _startup_validate_prefill_timeout_config(config)
 
+    # Audit budget migration warning (LP-0MW95FYMH006XYNK AC5): the per-host
+    # ContextHub budget.json is no longer authoritative for audit admission;
+    # warn when it conflicts with the proxy cap. Best-effort — never blocks
+    # startup (a missing/unreadable file logs nothing).
+    try:
+        from proxy.audit_budget import warn_on_conflicting_client_cap
+
+        warn_on_conflicting_client_cap(config)
+    except Exception:  # pragma: no cover - defensive, never block startup
+        pass
+
     # Log resolved hard-routing caps (LP-0MTBOX45O005LD1S). With the mode
     # axis removed (LP-0MVDT94F0003VHUA AC4) there is a single unified cap
     # derived from the base profile's ratio against the active per-slot

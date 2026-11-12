@@ -3153,6 +3153,78 @@ choice — a client that wants the proxy to wait opts in with `local-preferred`.
 `reserved_cancelled`, `reserved_expired`) — `issued − used − cancelled −
 expired` is the reserved-but-unused signal for ticket hoarding.
 
+## Cross-host audit admission budget (LP-0MW95FYMH006XYNK)
+
+Audits run against the **one local `llama-server` GPU that every host and
+project shares**, and per-host guards cannot serialise them: with two agent
+hosts and four projects, the per-host one-audit-per-host guards permitted
+five audits plus a plan run to overlap on the single GPU (2026-11-03
+08:30–09:10: 592,452 prompt tokens / 4,345 decoded tokens across 30 streams
+in 40 minutes). The proxy is the one component every host talks to, so it
+owns the audit cap and the live lease registry (`proxy/proxy/audit_budget.py`):
+the ContextHub per-host `budget.json` (`maxAudit`) is **no longer
+authoritative** for audit admission.
+
+### The gate: a long-TTL audit-tier lease
+
+The proxy issues **audit-tier leases** — long-TTL (default 1 h), renewable,
+releasable — keyed by audit session (`X-Session-Id` prefix `audit-`). At most
+`audit_admission.max_audits` (default 1) leases are live at once, so a second
+**different** audit session is refused with a stable token and waits instead
+of competing:
+
+```
+GET /llama/local/audit/availability
+  -> {cap: 1, live: 0, available: 1, leases: []}
+  -> {cap: 1, live: 1, available: 0,
+     leases: [{session_id, client_ip, acquired_at, expires_at, expires_in_s}]}
+
+POST /llama/local/audit/lease  {"session_id": "audit-...", "cap": 1}
+  -> 200 {admit: true, lease_id, cap, live, available, ttl_s, expires_at, ...}
+  -> 429 {admit: false, reason: "audit-budget-saturated", cap, live,
+         available: 0, retry_after_s: <bounded>}
+
+POST   /llama/local/audit/lease/renew   {"session_id": "audit-..."}
+  -> 200 {renewed: true, lease_id, live, cap, expires_at, ...}
+       # no live lease -> 200 {renewed: false} (next acquire starts fresh)
+
+DELETE /llama/local/audit/lease/<session_id>
+  -> 200 {released: true, live}   |   200 {released: false} (no-op)
+```
+
+- **Single mutation path.** Acquire/renew/release are the only ways to change
+the live lease set; a refused acquire performs no partial state change.
+- **Idempotent re-acquire.** The same session re-acquiring (or renewing) its
+own lease is a renew — never a self-refusal. A lease older than its TTL is
+reclaimed (`audit_lease_reclaimed reason=expired`), so a crashed holder can
+never wedge the budget.
+- **Proxy clock only.** Expiry comparisons use the proxy's monotonic clock, so
+a skewed client host cannot hold a stale lease.
+- **Client cap clamped.** A client may send a requested `cap`; it is clamped
+to the proxy's configured `audit_admission.max_audits` (never honoured above
+it, never a capacity grant the proxy does not own).
+- **Fail-safe.** An internal registry failure returns the stable token
+`audit-budget-unavailable` with a bounded `retry_after_s`; the availability
+read reports `error: registry_unavailable` instead of asserting capacity. The
+audit skill's documented fallback is a bounded wait then legacy per-host
+behaviour — a proxy error never blocks every audit indefinitely.
+- **Kill switch.** `audit_admission.max_audits: 0` disables audit admission
+entirely (mirrors the ContextHub `maxAudit: 0` kill switch).
+
+### Dispatcher integration (parent AC3)
+
+The herdr dispatcher's capacity decision consumes this **lease-derived
+availability signal** (`GET /llama/local/audit/availability`) instead of raw
+version counts or a per-host `budget.json` assertion, so dispatcher admission
+and proxy refusal can never disagree — even when ContextHub runs on several
+servers. `budget.json` is read for a startup migration warning only
+(`conflicting client-side cap`), never for admission.
+
+`/llama/local/status` publishes the audit-budget counters
+(`audit_leases_live`, `audit_leases_issued`, `audit_leases_reclaimed`,
+`audit_leases_released`, `audit_refused_saturated`,
+`audit_refused_unavailable`).
+
 ## Stream Error Handling (recovery-first + informative-error fallback)
 
 ### Prefill deadline (LP-0MVIQ0G2M0006QF6)

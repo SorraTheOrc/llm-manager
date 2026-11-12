@@ -1641,6 +1641,11 @@ async def get_llama_local_status(request: Request):
         # reserved_used - reserved_cancelled - reserved_expired`` is the
         # reserved-but-unused signal the work item asks to monitor.
         **(admission_reserve_stats()),
+        # Cross-host audit admission budget (LP-0MW95FYMH006XYNK): live /
+        # issued / reclaimed / released audit leases + saturated/unavailable
+        # refusal counters — the observable shadow of the lease-based gate
+        # that serialises audits across hosts at the shared local GPU.
+        **(audit_budget_stats()),
     }
 
 
@@ -1742,6 +1747,117 @@ async def cancel_reservation(reservation_id: str):
     from proxy import admission_reserve
 
     status, payload = admission_reserve.cancel(reservation_id)
+    return JSONResponse(status_code=status, content=payload)
+
+
+# ---------------------------------------------------------------------------
+# /llama/local/audit — cross-host audit admission budget
+# (LP-0MW95FYMH006XYNK, parent LP-0MW0KZUJP0019SLS AC1)
+#
+# A long-TTL audit-tier lease serialises audits ACROSS client hosts at the
+# shared local GPU: at most ``audit_admission.max_audits`` (default 1) live
+# leases exist at once, and a second different audit session is refused with
+# the stable token ``audit-budget-saturated`` plus a bounded retry hint. The
+# availability read is the lease-derived signal the herdr dispatcher consumes
+# (parent AC3) so dispatcher admission and proxy refusal can never disagree.
+# ---------------------------------------------------------------------------
+
+def audit_budget_stats() -> dict:
+    """Audit-budget counters for the status payload (fail-open)."""
+    try:
+        from proxy.audit_budget import stats
+
+        return stats()
+    except Exception:
+        return {}
+
+
+@router.get("/llama/local/audit/availability")
+async def get_audit_budget_availability():
+    """Publish the audit budget: ``{cap, live, available, leases}``.
+
+    The read is the dispatcher's lease-derived availability signal: it never
+    asserts capacity on an internal error (reports ``error:
+    registry_unavailable`` instead) and compares on the proxy's clock only.
+    """
+    from proxy import audit_budget
+
+    srv = _srv()
+    config = getattr(srv, "config", {})
+    if not isinstance(config, dict):
+        config = {}
+    return JSONResponse(audit_budget.availability(config))
+
+
+@router.post("/llama/local/audit/lease")
+async def acquire_audit_lease(request: Request):
+    """Acquire (or idempotently renew) an audit-tier lease for a session.
+
+    Body: ``{"session_id": "audit-...", "cap": <optional requested cap>}``.
+
+    - ``200`` — lease acquired (or the session's existing lease renewed).
+    - ``429`` — the budget is saturated by a different session
+      (``reason: audit-budget-saturated`` + bounded ``retry_after_s``); the
+      audit waits and retries instead of competing.
+    - ``503`` — internal registry failure (fail-safe token
+      ``audit-budget-unavailable``; the client falls back after a bounded
+      wait, per the documented fallback).
+    """
+    from proxy import audit_budget
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    session_id = body.get("session_id")
+    client_ip, _source = _resolve_client_ip(request)
+    requested_cap = body.get("cap")
+    srv = _srv()
+    config = getattr(srv, "config", {})
+    if not isinstance(config, dict):
+        config = {}
+    status, payload = audit_budget.acquire(
+        config, session_id, client_ip, requested_cap=requested_cap
+    )
+    headers: dict[str, str] = {"Cache-Control": "no-store"}
+    if status == 429:
+        headers["Retry-After"] = str(payload.get("retry_after_s", 1))
+        headers["X-Audit-Admission"] = "reject"
+        headers["X-Audit-Admission-Reason"] = str(payload.get("reason", ""))
+    elif status == 200:
+        headers["X-Audit-Admission"] = "admit"
+    return JSONResponse(status_code=status, content=payload, headers=headers)
+
+
+@router.post("/llama/local/audit/lease/renew")
+async def renew_audit_lease(request: Request):
+    """Extend the audit lease of *session_id* (body ``{"session_id": ...}``)."""
+    from proxy import audit_budget
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    session_id = body.get("session_id")
+    client_ip, _source = _resolve_client_ip(request)
+    srv = _srv()
+    config = getattr(srv, "config", {})
+    if not isinstance(config, dict):
+        config = {}
+    status, payload = audit_budget.renew(config, session_id, client_ip=client_ip)
+    return JSONResponse(status_code=status, content=payload)
+
+
+@router.delete("/llama/local/audit/lease/{session_id}")
+async def release_audit_lease(session_id: str):
+    """Release the audit lease of *session_id* (clean run exit)."""
+    from proxy import audit_budget
+
+    status, payload = audit_budget.release(session_id)
     return JSONResponse(status_code=status, content=payload)
 
 

@@ -2259,6 +2259,37 @@ still refusing the re-dispatch it was armed for
 (LP-0MVRMI5HK00558TB; details in
 [docs/routing.md](docs/routing.md#post-deadline-prefill-thrash-cooldown-lp-0mvkukfhh005udwl-rescoped-by-lp-0mvt2ksxy002o75c)).
 
+#### Cross-host Audit Admission Budget
+
+(LP-0MW95FYMH006XYNK, parent epic LP-0MW0KZUJP0019SLS.) Audit sessions run
+against the one local `llama-server` GPU that **every host and project
+shares**, so the proxy owns the audit cap and the live lease registry (at most
+`audit_admission.max_audits` — default 1 — live leases across all client
+hosts). The herdr dispatcher consumes this lease-derived availability signal
+instead of a per-host `budget.json` assertion:
+
+```bash
+# Availability read (the dispatcher's capacity signal)
+curl http://localhost:8000/llama/local/audit/availability
+# -> {"cap": 1, "live": 0, "available": 1, "leases": []}
+
+# Acquire / renew / release an audit-tier lease
+curl -X POST http://localhost:8000/llama/local/audit/lease \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id": "audit-LP-0MW0KZUJP0019SLS-ctx-deadbeef"}'
+curl -X POST http://localhost:8000/llama/local/audit/lease/renew \
+  -d '{"session_id": "audit-LP-0MW0KZUJP0019SLS-ctx-deadbeef"}'
+curl -X DELETE http://localhost:8000/llama/local/audit/lease/audit-LP-0MW0KZUJP0019SLS-ctx-deadbeef
+```
+
+A second **different** audit session is refused (`reason:
+audit-budget-saturated` + bounded `retry_after_s`) and waits; the same
+holder's re-acquire/renew is idempotent. Expired leases are reclaimed
+(`audit_lease_reclaimed reason=expired`) and expiry compares on the proxy's
+clock only. The per-host ContextHub `~/.herdr/downtime/budget.json`
+(`maxAudit`) is no longer authoritative — a conflicting value logs a startup
+WARNING. Full contract: [docs/routing.md](docs/routing.md#cross-host-audit-admission-budget-lp-0mw95fymh006xynk).
+
 This endpoint requires no authentication (internal) and is rate-unlimited.
 
 **Per-dispatch live-work attribution (LP-0MVYZEYZY003IQAH).** `local_in_flight_requests`,

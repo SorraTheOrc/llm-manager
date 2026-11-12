@@ -2449,6 +2449,46 @@ server:
   # local_prefill_deadline_seconds, so a band-slow prompt cannot slip past the
   # flat token cap.
   local_cold_prefill_budget_tokens: 25000
+
+  # ---------------------------------------------------------------------
+  # Cross-host audit admission budget (LP-0MW95FYMH006XYNK)
+  # ---------------------------------------------------------------------
+  # At most ``max_audits`` audit-tier sessions may hold a live audit lease
+  # ACROSS ALL client hosts at once — the single shared resource audits
+  # actually contend for is the one local llama-server GPU, and per-host
+  # guards (the ContextHub ``~/.herdr/downtime/budget.json`` ``maxAudit``
+  # ledger) cannot serialise two servers that each believe they are under
+  # cap. The proxy owns this cap and the live lease registry; every
+  # dispatcher queries ``GET /llama/local/audit/availability`` for the
+  # lease-derived signal instead of asserting its own cap (parent AC3).
+  #
+  # The gate is a long-TTL audit-tier lease (the audit skill's
+  # acquire/renew/release loop): a second DIFFERENT audit session is refused
+  # with ``reason: audit-budget-saturated`` + ``retry_after_s`` and waits,
+  # while the same holder's re-acquire/renew is idempotent. A lease older
+  # than its TTL is reclaimed (``audit_lease_reclaimed reason=expired``), so
+  # a crashed holder cannot wedge the budget; clock comparisons use the
+  # proxy's clock only. Fail-safe: an internal registry error returns the
+  # stable token ``audit-budget-unavailable`` with a bounded retry hint and
+  # the availability read reports ``error: registry_unavailable`` — never a
+  # fabricated capacity.
+  #
+  # Endpoints:
+  #   GET    /llama/local/audit/availability  -> {cap, live, available, leases}
+  #   POST   /llama/local/audit/lease         -> acquire {"session_id", "cap"?}
+  #   POST   /llama/local/audit/lease/renew   -> renew   {"session_id"}
+  #   DELETE /llama/local/audit/lease/<sid>   -> release
+  #
+  # ROLLBACK / kill switch: ``max_audits: 0`` disables audit admission
+  # entirely (mirrors the ContextHub ``maxAudit: 0`` kill switch). Default 1
+  # preserves today's single-flight audit behaviour at the cap.
+  audit_admission:
+    max_audits: 1
+    # Long lease TTL (seconds): a whole audit (multi-phase, dozens of Pi
+    # calls) can last tens of minutes, so a per-request TTL would reclaim a
+    # live holder mid-run. The holder renews periodically; a crashed holder
+    # is reclaimed this long after its last renew.
+    lease_ttl_seconds: 3600
   # Fraction of local_prefill_deadline_seconds a budgeted prompt's conservative
   # p75 ETA must fit inside before it is admitted (default 0.0 = DISABLED =
   # documented rollback). CANONICAL DERIVATION for the "safety budget" — the
