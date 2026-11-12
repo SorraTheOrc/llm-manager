@@ -1376,6 +1376,218 @@ class TestGrafanaSystemdUnit:
 
 
 # ---------------------------------------------------------------------------
+# Tests: scripts/deploy_grafana.sh and its defect guards
+# (LP-0MWBQKQJ7005M4GC)
+#
+# The deploy script is the single entry point that installs Grafana and
+# provisions the dashboard. Three latent defects were locked out of its path:
+# a wildcard bind, a default `admin`/`admin` credential and a provider path
+# that cannot resolve. Every test below must fail when its guarded defect is
+# reintroduced (AC 12); the reintroduction evidence is recorded as a comment
+# on the work item.
+# ---------------------------------------------------------------------------
+
+DEPLOY_SCRIPT = PROJECT_ROOT / "scripts" / "deploy_grafana.sh"
+
+
+def _run_deploy_script(*args: str) -> subprocess.CompletedProcess:
+    """Run scripts/deploy_grafana.sh in a pure/read-only mode via ``bash``."""
+    return subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT), *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestGrafanaDeployScript:
+    """Behavioural guards for scripts/deploy_grafana.sh.
+
+    Uses only the script's pure helper modes (--extract-unit,
+    --render-provider-config, --check) so the guards run on any host without
+    installing Grafana; --check additionally isolates ``HOME`` so the
+    undeployed-host assertions stay true even on a host where Grafana is
+    deployed.
+    """
+
+    def test_deploy_script_syntax(self):
+        """AC 1: bash -n accepts the script on every host."""
+        result = subprocess.run(
+            ["bash", "-n", str(DEPLOY_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"bash -n rejected {DEPLOY_SCRIPT.name}:\n{result.stderr}"
+        )
+
+    def test_deploy_script_shellcheck(self):
+        """AC 2: shellcheck passes; when absent, skip with a named reason."""
+        shellcheck = shutil.which("shellcheck")
+        if shellcheck is None:
+            pytest.skip(
+                "shellcheck is not installed on this host — the binary "
+                "'shellcheck' was not found; install it to lint "
+                "scripts/deploy_grafana.sh"
+            )
+        result = subprocess.run(
+            [shellcheck, str(DEPLOY_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"shellcheck reported issues in {DEPLOY_SCRIPT.name}:\n"
+            f"{result.stdout}{result.stderr}"
+        )
+
+    def _extract_unit(self) -> str:
+        """Run the script's --extract-unit helper and return its output."""
+        result = _run_deploy_script("--extract-unit")
+        assert result.returncode == 0, (
+            f"--extract-unit failed: {result.stderr}"
+        )
+        return result.stdout
+
+    def test_unit_extract_no_wildcard_bind(self):
+        """AC 3: the extracted unit pins 127.0.0.1:3000, never a wildcard."""
+        unit = self._extract_unit()
+        # The script extraction must agree with the documented `unit_from_doc`
+        # extraction (monitoring/README.md), or the running unit would not be
+        # the one the docs review.
+        assert unit == _unit_text("grafana-server"), (
+            "--extract-unit output must equal the documented fenced `ini` "
+            "unit of docs/systemd/grafana-server.service"
+        )
+        assert "Environment=GF_SERVER_HTTP_ADDR=127.0.0.1" in unit, (
+            "the extracted unit must set GF_SERVER_HTTP_ADDR=127.0.0.1"
+        )
+        assert "Environment=GF_SERVER_HTTP_PORT=3000" in unit, (
+            "the extracted unit must set GF_SERVER_HTTP_PORT=3000"
+        )
+        addr_lines = [
+            line for line in unit.splitlines() if "GF_SERVER_HTTP_ADDR=" in line
+        ]
+        assert addr_lines == ["Environment=GF_SERVER_HTTP_ADDR=127.0.0.1"], (
+            f"the only GF_SERVER_HTTP_ADDR line must pin 127.0.0.1 so the "
+            f"process never binds a wildcard; found {addr_lines}"
+        )
+
+    def test_unit_extract_no_inline_credential(self):
+        """AC 4: the extracted unit never carries an inline admin password."""
+        unit = self._extract_unit()
+        assert (
+            "Environment=GF_SECURITY_ADMIN_PASSWORD__FILE="
+            "%h/.config/grafana/admin.pass" in unit
+        ), (
+            "the extracted unit must read the admin password from the %h file "
+            "via GF_SECURITY_ADMIN_PASSWORD__FILE"
+        )
+        for line in unit.splitlines():
+            if "GF_SECURITY_ADMIN_PASSWORD=" in line:
+                assert "GF_SECURITY_ADMIN_PASSWORD__FILE=" in line, (
+                    f"inline admin password in extracted unit: {line!r} — use "
+                    f"the __FILE variant"
+                )
+        assert "admin:admin" not in unit
+
+    def test_provider_path_is_absolute(self, tmp_path):
+        """AC 5: rendered provider options.path is absolute, existing, no tokens."""
+        result = _run_deploy_script("--render-provider-config", str(tmp_path))
+        assert result.returncode == 0, (
+            f"--render-provider-config failed: {result.stderr}"
+        )
+        rendered = yaml.safe_load(result.stdout)
+        providers = rendered.get("providers", [])
+        assert providers, "rendered provider config must define a provider"
+        dash_path_str = providers[0].get("options", {}).get("path", "")
+        assert dash_path_str, "rendered options.path must be set"
+        assert "${" not in dash_path_str, (
+            f"rendered options.path must not carry unresolved tokens like "
+            f"${{grafana_home}}; got {dash_path_str!r}"
+        )
+        dash_path = Path(dash_path_str)
+        assert dash_path.is_absolute(), (
+            f"rendered options.path must be absolute, got {dash_path_str!r}"
+        )
+        assert dash_path.exists(), (
+            f"rendered options.path {dash_path_str!r} must exist"
+        )
+        assert (tmp_path / "dashboards.yaml").is_file(), (
+            "--render-provider-config must write the rendered config to "
+            f"{tmp_path}/dashboards.yaml"
+        )
+
+    def test_no_admin_admin_credentials(self):
+        """AC 6: no admin:admin or GF_SECURITY_ADMIN_PASSWORD=admin anywhere."""
+        targets = [
+            DEPLOY_SCRIPT,
+            DOCS_SYSTEMD_DIR / "grafana-server.service",
+            MONITORING_DIR / "README.md",
+        ]
+        offenders: list[str] = []
+        for path in targets:
+            content = path.read_text()
+            if "admin:admin" in content:
+                offenders.append(f"{path.name}: contains 'admin:admin'")
+            if "GF_SECURITY_ADMIN_PASSWORD=admin" in content:
+                offenders.append(
+                    f"{path.name}: contains GF_SECURITY_ADMIN_PASSWORD=admin"
+                )
+        assert not offenders, (
+            "default admin credentials leaked into the deploy path:\n"
+            + "\n".join(offenders)
+        )
+
+    def test_undeployed_host_check(self, tmp_path):
+        """AC 7: --check --allow-absent exits 0 on an undeployed host; plain
+        --check exits 1. HOME is isolated so the assertions hold on a deployed
+        host too."""
+        empty_home = tmp_path / "home"
+        empty_home.mkdir()
+        env = {**os.environ, "HOME": str(empty_home)}
+
+        allow_absent = subprocess.run(
+            ["bash", str(DEPLOY_SCRIPT), "--check", "--allow-absent"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert allow_absent.returncode == 0, (
+            f"--check --allow-absent must exit 0 when Grafana is absent; "
+            f"stderr: {allow_absent.stderr}"
+        )
+        assert "not deployed" in allow_absent.stdout, (
+            "--check must report 'not deployed' when Grafana is absent, got: "
+            f"{allow_absent.stdout!r}"
+        )
+
+        strict = subprocess.run(
+            ["bash", str(DEPLOY_SCRIPT), "--check"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert strict.returncode == 1, (
+            "--check without --allow-absent must exit 1 when Grafana is "
+            "absent"
+        )
+
+    def test_dashboard_json_byte_identical(self):
+        """AC 8: the two dashboard JSON copies stay byte-identical."""
+        assert (
+            MONITORING_DIR / "grafana_llama_memory_dashboard.json"
+        ).read_bytes() == (
+            MONITORING_DIR
+            / "grafana"
+            / "dashboards"
+            / "grafana_llama_memory_dashboard.json"
+        ).read_bytes(), (
+            "monitoring/grafana_llama_memory_dashboard.json and "
+            "monitoring/grafana/dashboards/grafana_llama_memory_dashboard.json "
+            "must stay byte-identical (edit both together)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests: Monitoring documentation
 # ---------------------------------------------------------------------------
 
