@@ -823,6 +823,46 @@ processing, progress is *unobservable*. The proxy then:
   `measured_in_flight_requests` so the residual analyser no longer under-counts
   a busy second slot (LP-0MW8VP0XR007UGQF).
 
+## Cold (measured) prefill calibration (LP-0MW957Q41002EXE2)
+
+Q410 makes the large-prompt rate honest: the mixed calibration window is
+polluted by instant cache hits (measured: 85 751 tokens in 2.6 s), which puts
+the fitted rate 1.4–1.7× above the genuinely-cold regime (measured
+3.81–4.26 ms/token ≈ 235–295 tok/s). The fix is a third per-`(model, bucket)`
+window that only ever holds **measured** cold prefill samples.
+
+### Sample predicate
+
+A sample enters the cold window only when `measured_cached_ratio < 0.10`
+**and** `processed_tokens >= 32 000` (first byte `>= 1 s`), so instant
+cache-hit completions can never price the cold rate. The samples come from
+the measured-prefill capture (`MeasuredPrefill.measured_cached_ratio` /
+`processed`, the same `prefill_progress_measured` flow documented above) at
+the point the measurement is finalised — the existing priced window
+(`record_dispatch_sample`, `dispatch_first_byte_ms`) is untouched.
+
+### Selection
+
+- Prompts **below** `local_admission_guard_eta_percentile_min_tokens` keep the
+existing mixed/contended calibration byte-for-byte (no small-prompt
+regression).
+- Prompts **at or above** the percentile floor are priced from the cold window
+only. When the cold window is not yet calibrated (`cold_samples`
+`< local_admission_guard_min_samples`), large-prompt pricing is **inert** —
+the guard admits exactly like an uncalibrated bucket, it never falls back to
+the mixed window's optimistic rate. The conservative percentile path
+(`local_admission_guard_eta_percentile`, default p75, never below the cold
+window's p50) still applies, now to the cold distribution; a percentile of
+`0` restores the point estimate byte-for-byte.
+
+### Observability
+
+`rate_bucket=cold cold_samples=<n>` on the admission decision/log line and
+`prefill_eta_cold_samples` on `/llama/local/status` make the honest split
+legible: a `cold_samples` count below the minimum explains an inert
+large-prompt admission, and a calibrated `rate_bucket=cold` decision states
+exactly which window priced it.
+
 ## Large-Context Routing: Mode-Dependent Economic Bypass (LP-0MU5A4QBR003YJM0)
 
 When a request's estimated token count exceeds the cold-cache threshold

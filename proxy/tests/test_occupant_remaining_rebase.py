@@ -72,10 +72,19 @@ def _seed_contended(
     ms_per_token: float = _CONTENDED_MS_PER_TOKEN,
     count: int = 6,
 ) -> None:
-    """Seed a calibrated contended window for *tokens*' context bucket."""
+    """Seed a calibrated contended window for *tokens*' context bucket.
+
+    Q410 AC2 re-basis: the occupants are COLD large prompts (60k new tokens,
+    >= the 32 768 floor), so their re-priced service is read from the cold
+    window — the genuinely-cold samples are seeded here too (processed =
+    tokens), alongside the contended window for the mixed-path fallback.
+    """
     for _ in range(count):
         prefill_eta.record_dispatch_sample(
             _MODEL, tokens, 0.0, tokens * ms_per_token, contended=True
+        )
+        prefill_eta.record_cold_measured_sample(
+            _MODEL, tokens, 0.0, tokens, tokens * ms_per_token
         )
 
 

@@ -124,9 +124,21 @@ def _guard_config(**overrides) -> dict:
 
 
 def _calibrate(tokens: int, service_ms: float, count: int = 6) -> None:
-    """Seed an identical-sample bucket so the ``(model, bucket)`` is calibrated."""
+    """Seed an identical-sample bucket so the ``(model, bucket)`` is calibrated.
+
+    Q410 AC2 re-basis: the calibrated profile is genuinely-cold, so the cold
+    window is seeded with a genuinely-cold LARGE sample of the same per-token
+    rate (40 000 tokens, same ms/token as *tokens*) — the cold predicate
+    requires >= 32 000 processed, and bucket 1 spans 16k-64k, so a 40k sample
+    calibrates the same bucket a 20k prompt prices from.
+    """
+    ms_per_token = service_ms / tokens
+    cold_tokens = 40_000
     for _ in range(count):
         prefill_eta.record_dispatch_sample(MODEL, tokens, 0.0, service_ms)
+        prefill_eta.record_cold_measured_sample(
+            MODEL, cold_tokens, 0.0, cold_tokens, cold_tokens * ms_per_token
+        )
 
 
 def _body(tokens: int = 120_000) -> dict:

@@ -860,6 +860,10 @@ def _eta_calibration():
     prefill_eta.reset()
     for _ in range(6):
         prefill_eta.record_dispatch_sample("test-model", 100_000, 0.0, 390_000.0)
+        # Q410 AC2 re-basis: the cold bound is priced from the cold window.
+        prefill_eta.record_cold_measured_sample(
+            "test-model", 100_000, 0.0, 100_000, 390_000.0
+        )
     yield
     prefill_eta.reset()
 

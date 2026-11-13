@@ -57,9 +57,27 @@ def _seed_varied(
 ) -> None:
     """Record one synthetic cold dispatch per *service_ms* value (spread
     window — unlike the identical-sample fixtures used elsewhere, so the
-    conservative percentile actually has something to be conservative about)."""
+    conservative percentile actually has something to be conservative about).
+
+    Q410 AC2 re-basis: a large prompt (>= the percentile floor) is priced
+    from the genuinely-cold window only, so the large-prompt conservative
+    rows seed the cold window (see :func:`_seed_cold_varied`); this mixed
+    seeder remains for the small-prompt no-regression row.
+    """
     for ms in service_ms:
         prefill_eta.record_dispatch_sample(model, tokens, ratio, float(ms))
+
+
+def _seed_cold_varied(
+    model: str = "Qwen3",
+    tokens: int = 100_000,
+    ratio: float = 0.0,
+    service_ms: tuple[float, ...] = (),
+) -> None:
+    """Record one synthetic genuinely-cold MEASURED sample per *service_ms*
+    value (Q410 AC2 re-basis: large prompts price from the cold window)."""
+    for ms in service_ms:
+        prefill_eta.record_cold_measured_sample(model, tokens, ratio, tokens, float(ms))
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +136,7 @@ def test_large_prompt_estimate_is_at_least_the_configured_percentile():
     150k + 0.75 × (600k − 150k) = 487.5k ms ⇒ the conservative estimate is
     exactly 487.5 s (≥ p75, never the optimistic 420 s).
     """
-    _seed_varied(service_ms=(150_000, 150_000, 150_000, 150_000, 600_000, 900_000))
+    _seed_cold_varied(service_ms=(150_000, 150_000, 150_000, 150_000, 600_000, 900_000))
     eta, coeffs = prefill_eta.estimate_prefill_seconds("Qwen3", 100_000, 0.0, _cfg())
 
     assert eta * 1000.0 == pytest.approx(487_500.0, rel=1e-6)
@@ -132,7 +150,16 @@ def test_large_prompt_estimate_is_at_least_the_configured_percentile():
 
 def test_percentile_pricing_starts_exactly_at_32k_tokens():
     """The conservative pricing (and the p50 floor) applies to large prompts
-    >= 32k tokens and not one token below (AC2 boundary)."""
+    >= 32k tokens and not one token below (AC2 boundary).
+
+    Q410 AC2 re-basis: an at/above-floor prompt prices from the genuinely-cold
+    window (seeded below), a below-floor prompt from the mixed window
+    (seeded too, so the point estimate is defined on this bucket).
+    """
+    _seed_cold_varied(
+        tokens=40_000,
+        service_ms=(80_000, 80_000, 80_000, 80_000, 240_000, 320_000),
+    )
     _seed_varied(
         tokens=40_000,
         service_ms=(80_000, 80_000, 80_000, 80_000, 240_000, 320_000),
@@ -144,8 +171,12 @@ def test_percentile_pricing_starts_exactly_at_32k_tokens():
         "Qwen3", prefill_eta.CONSERVATIVE_MIN_TOKENS - 1, 0.0, _cfg()
     )
 
-    # Same (model, bucket) window, so the only difference is the threshold.
+    # Same (model, bucket) window, so the only difference is the threshold:
+    # at/above the floor the COLD window prices (conservative); below it the
+    # mixed window prices (point estimate).
     assert coeffs_above.samples == coeffs_below.samples == 6
+    assert coeffs_above.rate_bucket == "cold"
+    assert coeffs_below.rate_bucket == "solitary"
     assert coeffs_above.uplift > 1.0
     assert coeffs_below.uplift == pytest.approx(1.0)
     assert coeffs_above.percentile_ms is not None
@@ -173,7 +204,7 @@ def test_large_bucket_never_prices_below_the_measured_p50():
     and the 1.2 × mean point estimate (902k) is itself below p50 — so only the
     floor keeps the price at the measured median.
     """
-    _seed_varied(
+    _seed_cold_varied(
         service_ms=(10_000, 500_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000)
     )
     eta, coeffs = prefill_eta.estimate_prefill_seconds(
@@ -195,7 +226,7 @@ def test_conservative_large_prompt_is_refused_under_the_deadline():
     estimate = 1.2 × 48k ms = 57.6 s (within the 60 s budget); p75 =
     4k + 0.75 × 132k = 103k ms = 103 s >= the 90 s deadline ⇒ refused.
     """
-    _seed_varied(
+    _seed_cold_varied(
         tokens=50_000,
         service_ms=(4_000, 4_000, 4_000, 4_000, 136_000, 136_000),
     )
@@ -227,7 +258,7 @@ def test_conservative_large_prompt_is_refused_under_the_deadline():
 def test_zero_percentile_is_the_rollback_to_the_point_estimate():
     """AC4 rollback: ``local_admission_guard_eta_percentile: 0`` restores the
     exact point-estimate behaviour (1.2 × the fitted mean) for every prompt."""
-    _seed_varied(service_ms=(150_000, 150_000, 150_000, 150_000, 600_000, 900_000))
+    _seed_cold_varied(service_ms=(150_000, 150_000, 150_000, 150_000, 600_000, 900_000))
     eta, coeffs = prefill_eta.estimate_prefill_seconds(
         "Qwen3", 100_000, 0.0, _cfg(local_admission_guard_eta_percentile=0)
     )

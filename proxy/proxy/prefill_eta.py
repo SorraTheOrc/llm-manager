@@ -188,6 +188,15 @@ MIN_CALIBRATION_SAMPLES = 5
 #: parent scope guardrail (``cached_ratio`` / coded-token path untouched).
 WARM_CACHE_RATIO = 0.9
 
+#: Cold-sample predicate (Q410 AC1): a sample enters the COLD window only
+#: when the MEASURED cache reuse is below 10 % AND at least 32 000 tokens
+#: were actually processed — i.e. a genuinely-cold large prefill. Cache-hit
+#: samples (``processed`` near 0, first byte < 1 s) are excluded by the same
+#: predicate.
+COLD_MAX_CACHED_RATIO = 0.10
+COLD_MIN_PROCESSED_TOKENS = 32_000
+COLD_MIN_FIRST_BYTE_MS = 1_000.0
+
 #: Rolling-window size per ``(model, bucket)``.
 WINDOW_SAMPLES = 200
 
@@ -293,6 +302,15 @@ _samples: dict[tuple[str, int], deque] = {}
 #: slower distribution (measured 2-4x lower t/s). Pricing a contended
 #: admission from the mixed solitary-dominated window is therefore optimistic.
 _contended_samples: dict[tuple[str, int], deque] = {}
+#: ``(model, bucket) -> deque[(coded, new, ms)]`` — the genuinely-cold
+#: calibration window (Q410 AC1). Fed ONLY from MEASURED cold prefill records
+#: (``MeasuredPrefill.measured_cached_ratio < 0.10`` and ``processed``
+#: ``>= 32 000`` via :func:`record_cold_measured_sample`), so a
+#: cache-hit-polluted mixed window can never price a large cold prompt
+#: optimistically. When the window is uncalibrated, large-prompt pricing is
+#: inert (AC2): it admits exactly like an uncalibrated bucket, never a
+#: fallback to the mixed window's optimistic rate.
+_cold_samples: dict[tuple[str, int], deque] = {}
 #: ``model -> prompt_tokens`` of the most recent observed dispatch.
 _last_prompt_tokens: dict[str, int] = {}
 #: ``model -> deque[prompt_tokens]`` of recent dispatch prompt sizes, the
@@ -304,6 +322,7 @@ def reset() -> None:
     """Clear all calibration state (test helper / config reload)."""
     _samples.clear()
     _contended_samples.clear()
+    _cold_samples.clear()
     _last_prompt_tokens.clear()
     _recent_prompt_tokens.clear()
 
@@ -669,6 +688,77 @@ def record_dispatch_sample(
         logger.debug("record_dispatch_sample failed", exc_info=True)
 
 
+def record_cold_measured_sample(
+    model: str | None,
+    prompt_tokens: int,
+    measured_cached_ratio: float | None,
+    processed_tokens: int | None,
+    service_ms: float,
+) -> None:
+    """Record one genuinely-cold MEASURED prefill into the cold window.
+
+    Q410 AC1/Q2(option a): the sample is fed from the measured-prefill
+    capture (``measured_prefill.MeasuredPrefill.measured_cached_ratio`` /
+    ``processed``) at the point the measurement is finalised, keeping the
+    existing priced window (:func:`record_dispatch_sample`) untouched.
+
+    Cold predicate (AC1): ``measured_cached_ratio < COLD_MAX_CACHED_RATIO``
+    AND ``processed_tokens >= COLD_MIN_PROCESSED_TOKENS``, excluding
+    cache-hit samples (``processed`` near 0, first byte < 1 s). Samples that
+    do not satisfy the predicate are silently dropped — the cold window only
+    ever contains genuinely-cold large prefill observations, so a fit from it
+    cannot be polluted by cache-hit optimism.
+
+    Identical fail-open contract to :func:`record_dispatch_sample`: never
+    raises, invalid inputs are ignored, and the priced window is not
+    touched.
+    """
+    try:
+        model_key = str(model or "").strip()
+        if not model_key:
+            return
+        tokens = int(prompt_tokens or 0)
+        if tokens <= 0:
+            return
+        ms = float(service_ms)
+        if not math.isfinite(ms) or ms <= 0:
+            return
+        try:
+            ratio = float(measured_cached_ratio)
+        except (TypeError, ValueError):
+            ratio = 1.0
+        if not math.isfinite(ratio):
+            ratio = 1.0
+        processed = int(processed_tokens or 0)
+        # Cold predicate (AC1): measured-cold AND genuinely large. A cache
+        # hit (``measured_cached_ratio`` >= 0.10, or ``processed`` ~ 0 / a
+        # sub-second first byte) must never price the cold rate.
+        if ratio >= COLD_MAX_CACHED_RATIO or processed < COLD_MIN_PROCESSED_TOKENS:
+            return
+        if ms < COLD_MIN_FIRST_BYTE_MS:
+            return
+        coded = int(tokens * ratio)
+        new = processed
+        bucket = bucket_for(tokens)
+        window = _cold_samples.get((model_key, bucket))
+        if window is None:
+            window = deque(maxlen=WINDOW_SAMPLES)
+            _cold_samples[(model_key, bucket)] = window
+        window.append((coded, new, ms))
+        # The sample is an observed dispatch: keep the published reference
+        # statistic (``reference_tokens``) fed from genuinely-cold samples
+        # too, mirroring the priced path so a cold-heavy window still
+        # publishes a truthful reference prompt size.
+        _last_prompt_tokens[model_key] = tokens
+        history = _recent_prompt_tokens.get(model_key)
+        if history is None:
+            history = deque(maxlen=REFERENCE_HISTORY_SAMPLES)
+            _recent_prompt_tokens[model_key] = history
+        history.append(tokens)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("record_cold_measured_sample failed", exc_info=True)
+
+
 @dataclass(frozen=True)
 class Coefficients:
     """Fitted (or default) per-token prefill coefficients, in milliseconds.
@@ -699,6 +789,10 @@ class Coefficients:
     #: Number of samples in the contended window for this ``(model, bucket)``
     #: — always reported for diagnosis, independent of ``rate_bucket``.
     contended_samples: int = 0
+    #: Number of samples in the genuinely-cold (MEASURED) window for this
+    #: ``(model, bucket)`` (Q410 AC1) — always reported for diagnosis,
+    #: independent of ``rate_bucket``.
+    cold_samples: int = 0
 
 
 def _solve(
@@ -770,12 +864,15 @@ def _fit_coefficients_from_samples(
     prompt_tokens: int,
     rate_bucket: str,
     contended_samples: int,
+    cold_samples: int = 0,
 ) -> Coefficients:
     """Fit coefficients from a given sample list and compute diagnostics.
 
-    Shared by :func:`coefficients` for both the solitary and contended windows
-    (LP-0MVS9Y76R004B5M8), so the conservative-uplift and clamp logic is
-    applied identically regardless of which window priced the estimate.
+    Shared by :func:`coefficients` for the solitary, contended and genuinely-
+    cold windows (LP-0MVS9Y76R004B5M8, Q410 AC1), so the conservative-uplift
+    and clamp logic is applied identically regardless of which window priced
+    the estimate. ``cold_samples`` reports the genuinely-cold window's sample
+    count for diagnosis (Q410), independent of ``rate_bucket``.
     """
     if len(samples) < guard_cfg.min_samples:
         return Coefficients(
@@ -786,6 +883,7 @@ def _fit_coefficients_from_samples(
             eta_percentile=guard_cfg.eta_percentile,
             rate_bucket=rate_bucket,
             contended_samples=contended_samples,
+            cold_samples=cold_samples,
         )
     fitted = _fit(samples)
     if fitted is None:
@@ -797,6 +895,7 @@ def _fit_coefficients_from_samples(
             eta_percentile=guard_cfg.eta_percentile,
             rate_bucket=rate_bucket,
             contended_samples=contended_samples,
+            cold_samples=cold_samples,
         )
     fitted_coded, fitted_prefill = fitted
     coded_ms = (
@@ -866,6 +965,7 @@ def _fit_coefficients_from_samples(
         uplift=uplift,
         rate_bucket=rate_bucket,
         contended_samples=contended_samples,
+        cold_samples=cold_samples,
     )
 
 
@@ -874,6 +974,7 @@ def coefficients(
     prompt_tokens: int,
     config: dict | None = None,
     contended: bool = False,
+    cached_ratio: float = 0.0,
 ) -> Coefficients:
     """Return the coefficients to use for *model* at *prompt_tokens*.
 
@@ -888,6 +989,12 @@ def coefficients(
     change (LP-0MVKUKF65008D5UN). Smaller prompts and ``eta_percentile: 0``
     (rollback) return the un-uplifted point estimate byte-for-byte.
 
+    *cached_ratio* (Q410 AC2) distinguishes a genuinely-cold large prompt
+    (priced from the cold window) from a WARM large prompt (``ratio``
+    ``>= WARM_CACHE_RATIO``), which keeps the pre-change mixed/contended
+    selection byte-for-byte so a calibrated warm admit can never turn inert
+    (parent warm-prompt guardrail).
+
     *contended* (LP-0MVS9Y76R004B5M8) selects the co-residency window: when
     True the estimate is priced from the contended window if it holds
     ``min_samples`` observations, else it falls back to the solitary window
@@ -899,6 +1006,38 @@ def coefficients(
     guard_cfg = resolve_config(config)
     model_key = str(model or "").strip()
     bucket = bucket_for(prompt_tokens)
+    try:
+        ratio = min(1.0, max(0.0, float(cached_ratio)))
+    except (TypeError, ValueError):
+        ratio = 0.0
+    # Q410 AC2: for COLD prompts at/above the conservative percentile floor
+    # (the large-prompt regime this feature corrects) the estimate is priced
+    # from the genuinely-COLD window ONLY, never the mixed window's
+    # optimistic rate. When the cold window is uncalibrated, large-prompt
+    # pricing is INERT (admit, exactly today's uncalibrated behaviour) and
+    # reports ``rate_bucket=cold`` with the observed ``cold_samples`` so the
+    # reason is legible. WARM prompts (``cached_ratio >= WARM_CACHE_RATIO``)
+    # keep the pre-change mixed/contended selection byte-for-byte: their
+    # expensive ``new_tokens`` term is already small, so cold-window routing
+    # could only ever turn a calibrated warm admit into an inert one (parent
+    # warm-prompt guardrail). Small prompts (below the floor) likewise keep
+    # the existing selection (parent AC1 "small-prompt calibration must not be
+    # degraded").
+    cold_window = _cold_samples.get((model_key, bucket))
+    cold = list(cold_window) if cold_window else []
+    cold_count = len(cold)
+    if (
+        prompt_tokens >= guard_cfg.eta_percentile_min_tokens
+        and ratio < WARM_CACHE_RATIO
+    ):
+        return _fit_coefficients_from_samples(
+            cold,
+            guard_cfg,
+            prompt_tokens,
+            "cold",
+            _contended_count(guard_cfg, model_key, bucket),
+            cold_samples=cold_count,
+        )
     solitary_window = _samples.get((model_key, bucket))
     solitary = list(solitary_window) if solitary_window else []
     contended_window = _contended_samples.get((model_key, bucket))
@@ -923,6 +1062,14 @@ def coefficients(
     return _fit_coefficients_from_samples(
         solitary, guard_cfg, prompt_tokens, "solitary", contended_count,
     )
+
+
+def _contended_count(
+    guard_cfg: GuardConfig, model_key: str, bucket: int
+) -> int:
+    """Sample count of the contended window (diagnostic, never a decision)."""
+    contended_window = _contended_samples.get((model_key, bucket))
+    return len(contended_window) if contended_window else 0
 
 
 def estimate_prefill_seconds(
@@ -954,7 +1101,7 @@ def estimate_prefill_seconds(
         ratio = min(1.0, max(0.0, float(cached_ratio)))
     except (TypeError, ValueError):
         ratio = 0.0
-    coeffs = coefficients(model, tokens, config, contended=contended)
+    coeffs = coefficients(model, tokens, config, contended=contended, cached_ratio=ratio)
     coded = tokens * ratio
     new = tokens - coded
     seconds = (
@@ -1117,6 +1264,12 @@ class AdmissionDecision:
     #: Samples in the contended window for the priced ``(model, bucket)`` at
     #: decision time (always reported; 0 when none observed).
     contended_samples: int = 0
+    #: Samples in the genuinely-cold (MEASURED) window for the priced
+    #: ``(model, bucket)`` at decision time (Q410 AC1; always reported, 0 when
+    #: none observed) — the count that justifies a ``rate_bucket=cold``
+    #: decision, or the reason a large prompt went inert (fewer than
+    #: ``min_samples``).
+    cold_samples: int = 0
     #: The **measured** occupant hold this decision priced into its occupancy
     #: term (LP-0MVV29YDQ00437N6): the live prefilling occupants' remaining
     #: prefill service or dispatch-lease hold, whichever is larger, read from
@@ -1310,6 +1463,7 @@ def evaluate_admission(
             contended_samples=(
                 adjudicated.contended_samples if adjudicated else 0
             ),
+            cold_samples=adjudicated.cold_samples if adjudicated else 0,
             occupant_hold_seconds=(
                 projected.measured_occupancy_seconds if projected else None
             ),
@@ -1457,6 +1611,7 @@ def evaluate_admission(
         deadline_budget_seconds=deadline_budget,
         rate_bucket=coeffs.rate_bucket,
         contended_samples=coeffs.contended_samples,
+        cold_samples=coeffs.cold_samples,
         occupant_hold_seconds=projected.measured_occupancy_seconds,
     )
 
@@ -1671,6 +1826,7 @@ def status_estimate(
             "prefill_eta_calibrated": coeffs.calibrated,
             "prefill_eta_rate_bucket": coeffs.rate_bucket,
             "prefill_eta_contended_samples": coeffs.contended_samples,
+            "prefill_eta_cold_samples": coeffs.cold_samples,
             "prefill_budget_seconds": budget_published,
         }
     except Exception:  # pragma: no cover - defensive
@@ -1687,6 +1843,7 @@ def status_estimate(
             "prefill_eta_calibrated": False,
             "prefill_eta_rate_bucket": "solitary",
             "prefill_eta_contended_samples": 0,
+            "prefill_eta_cold_samples": 0,
             "prefill_budget_seconds": None,
         }
 
@@ -1792,7 +1949,7 @@ def record_guard_decision(
         "projected_wait_s=%.1f "
         "budget_s=%.1f bound_s=%.1f deadline_s=%.1f deadline_budget_s=%.1f "
         "new_tokens=%d budget_tokens=%d "
-        "rate_bucket=%s contended_samples=%d "
+        "rate_bucket=%s contended_samples=%d cold_samples=%d "
         "busy_slots=%d in_flight_prefills=%d gate_occupancy=%d "
         "free_slot=%s priority=%s policy=%s model=%s samples=%d provider=%s "
         "session=%s",
@@ -1817,6 +1974,7 @@ def record_guard_decision(
         int(decision.budget_tokens or 0),
         decision.rate_bucket or "solitary",
         int(decision.contended_samples or 0),
+        int(decision.cold_samples or 0),
         int(decision.busy_slots or 0),
         int(decision.in_flight_prefills or 0),
         int(decision.gate_occupancy or 0),

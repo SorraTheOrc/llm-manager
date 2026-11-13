@@ -150,6 +150,12 @@ def _seed_calibration(tokens: int = 100_000, ms_per_token: float = 3.9) -> None:
         prefill_eta.record_dispatch_sample(
             "Qwen3", tokens, 0.0, tokens * ms_per_token
         )
+        # Q410 AC2 re-basis: the seeded profile is a genuinely-cold dispatch,
+        # so it also feeds the cold window (processed = tokens) — a cold large
+        # prompt is priced from the cold window only.
+        prefill_eta.record_cold_measured_sample(
+            "Qwen3", tokens, 0.0, tokens, tokens * ms_per_token
+        )
 
 
 @contextmanager

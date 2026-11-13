@@ -59,6 +59,25 @@ def _seed_samples(
         )
 
 
+def _seed_cold(
+    model: str = "Qwen3",
+    tokens: int = 100_000,
+    ratio: float = 0.0,
+    ms_per_token: float = 3.9,
+    count: int = 6,
+) -> None:
+    """Record *count* synthetic genuinely-cold MEASURED samples (Q410).
+
+    Q410 AC2 re-basis: a large prompt (>= the percentile floor) is priced
+    from the genuinely-cold window only, so the deadline rows seed the cold
+    window the way the measured-prefill capture feeds it.
+    """
+    for _ in range(count):
+        prefill_eta.record_cold_measured_sample(
+            model, tokens, ratio, tokens, tokens * ms_per_token
+        )
+
+
 # ---------------------------------------------------------------------------
 # AC3: configuration resolution
 # ---------------------------------------------------------------------------
@@ -103,7 +122,7 @@ def test_none_deadline_uses_default():
 
 def test_deadline_refuses_when_eta_exceeds_deadline():
     """AC1: projected ETA >= deadline ⇒ refused with reason=prefill_eta_exceeds_deadline."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     decision = prefill_eta.evaluate_admission(_cfg(), "Qwen3", 100_000, 0.0, "low")
 
     assert decision.admit is False
@@ -120,7 +139,7 @@ def test_deadline_refuses_when_eta_exceeds_deadline():
 
 def test_deadline_refusal_has_active_true():
     """The deadline refusal is an active decision (logged by usage analysis)."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     decision = prefill_eta.evaluate_admission(_cfg(), "Qwen3", 100_000, 0.0, "low")
 
     assert decision.active is True
@@ -130,7 +149,7 @@ def test_deadline_refusal_has_active_true():
 def test_deadline_dominates_when_both_bounds_fire():
     """When both bounds fire the deadline is the reason: it is the binding
     constraint (that prefill will be cancelled at the deadline regardless)."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     # Tight budget (30 s) + default deadline: both fire for a 390 s ETA.
     cfg = _cfg(contention_queue_max_wait_seconds=30, local_prefill_deadline_seconds=90)
     decision = prefill_eta.evaluate_admission(cfg, "Qwen3", 100_000, 0.0, "low")
@@ -146,7 +165,11 @@ def test_deadline_dominates_when_both_bounds_fire():
 def test_eta_within_deadline_is_admitted():
     """AC2: projected ETA < deadline keeps today's admission (no new refusals)."""
     # Calibrate a 60k bucket cache-cold at 3.9 ms/token (same bucket as the
-    # request below) — prefill_ms becomes 3.9 * 1.2 = 4.68 ms/token.
+    # request below) — prefill_ms becomes 3.9 * 1.2 = 4.68 ms/token. The
+    # request is 95 %-cached (warm), so it keeps the pre-change mixed path
+    # (Q410 AC2 warm-prompt guardrail): the mixed window must be calibrated
+    # too.
+    _seed_cold(tokens=60_000, ratio=0.0, ms_per_token=3.9, count=6)
     _seed_samples(tokens=60_000, ratio=0.0, ms_per_token=3.9, count=6)
     # A 95 %-cached 60k prompt: 57k coded at 0.5 ms + 3k new at 4.68 ms
     # ≈ 42.5 s < 60 s budget and < 90 s deadline ⇒ admitted exactly as today.
@@ -180,7 +203,7 @@ def test_boundary_eta_equals_deadline_refuses():
     exactly 75_000 * 1.2 / 1000 = 90 s — the default deadline, the boundary.
     """
     for _ in range(6):
-        prefill_eta.record_dispatch_sample("Qwen3", 75_000, 0.0, 75_000 * 1.0)
+        prefill_eta.record_cold_measured_sample("Qwen3", 75_000, 0.0, 75_000, 75_000 * 1.0)
 
     cfg = _cfg(local_prefill_deadline_seconds=90)
     decision = prefill_eta.evaluate_admission(cfg, "Qwen3", 75_000, 0.0, "low")
@@ -195,7 +218,7 @@ def test_disabled_deadline_does_not_refuse():
     """AC3: 0 disables the deadline bound — the deadline adds nothing on top of
     the budget bound.  A prompt within budget but far beyond the deadline is
     admitted exactly as today when the deadline is 0."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     # Effective ETA = 468 s (100k × 4.68 ms).  Budget 600 s > ETA: only the
     # deadline could refuse this.
     cfg = _cfg(
@@ -216,7 +239,7 @@ def test_disabled_deadline_does_not_refuse():
 
 def test_observe_mode_logs_deadline_refusal():
     """In observe mode the deadline refusal is logged but not enforced."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     cfg = _cfg(
         local_admission_guard_policy="observe",
         local_prefill_deadline_seconds=90,
@@ -230,7 +253,7 @@ def test_observe_mode_logs_deadline_refusal():
 
 def test_off_mode_skips_all_guards():
     """Policy off: guard is inert regardless of deadline."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     cfg = _cfg(
         local_admission_guard_policy="off",
         local_prefill_deadline_seconds=90,
@@ -249,7 +272,7 @@ def test_off_mode_skips_all_guards():
 def test_record_guard_decision_logs_deadline_refusal(caplog):
     """The log line carries the deadline reason and the deadline value."""
     caplog.set_level(logging.INFO, logger="llama-proxy")
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     cfg = _cfg()
     decision = prefill_eta.evaluate_admission(cfg, "Qwen3", 100_000, 0.0, "low")
 
@@ -329,7 +352,7 @@ async def test_direct_path_uses_deadline_reason_in_log(caplog):
     """AC1: the direct guard logs ``prefill_eta_exceeds_deadline`` — never
     the generic ``eta_exceeds_budget_direct`` label — when the deadline is the
     cause."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
 
     line = await _drive_direct_guard(_cfg(), 100_000, caplog)
 
@@ -369,7 +392,7 @@ async def test_direct_path_safety_budget_keeps_own_reason(caplog):
     the 85.5 s safety budget (0.95 × 90 s) but below the 90 s deadline, so the
     safety bound is the reason that fires.
     """
-    _seed_samples(tokens=72_500, ratio=0.0, ms_per_token=1.0, count=6)
+    _seed_cold(tokens=72_500, ratio=0.0, ms_per_token=1.0, count=6)
     cfg = _cfg(
         local_prefill_deadline_seconds=90,
         local_admission_guard_budget_safety_fraction=0.95,
@@ -504,7 +527,7 @@ async def test_queue_path_refuses_on_deadline_before_the_queue(
     import proxy.provider as provider
 
     caplog.set_level(logging.INFO, logger="llama-proxy")
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     calls: list[str] = []
 
     async def _local(_req, _path):
@@ -547,7 +570,7 @@ async def test_direct_path_refuses_on_deadline_and_reaches_next_provider(
     import proxy.provider as provider
 
     caplog.set_level(logging.INFO, logger="llama-proxy")
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     calls: list[str] = []
 
     async def _local(_req, _path):
@@ -592,7 +615,7 @@ async def test_direct_path_refuses_on_deadline_and_reaches_next_provider(
 # ---------------------------------------------------------------------------
 
 def test_high_priority_is_refused_when_the_prefill_exceeds_the_deadline():
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
 
     decision = prefill_eta.evaluate_admission(
         _cfg(local_prefill_deadline_seconds=120), "Qwen3", 100_000, 0.0, "high"
@@ -642,7 +665,7 @@ def test_high_priority_still_admits_when_both_bounds_fit():
 
 
 def test_high_priority_observe_policy_records_without_refusing():
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
 
     decision = prefill_eta.evaluate_admission(
         _cfg(
@@ -660,7 +683,7 @@ def test_high_priority_observe_policy_records_without_refusing():
 
 def test_high_priority_stays_inert_when_every_bound_is_disabled():
     """The documented rollback: no queue budget AND no time bound => inert."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
 
     decision = prefill_eta.evaluate_admission(
         _cfg(
@@ -676,7 +699,7 @@ def test_high_priority_stays_inert_when_every_bound_is_disabled():
 
 
 def test_high_priority_refusal_emits_the_guard_log_line(caplog):
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     decision = prefill_eta.evaluate_admission(
         _cfg(local_prefill_deadline_seconds=120), "Qwen3", 100_000, 0.0, "high"
     )

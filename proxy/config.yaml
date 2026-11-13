@@ -2330,6 +2330,24 @@ server:
   # ``budget_s``, ``busy_slots``, ``in_flight_prefills`` and (since
   # LP-0MVS9Y76R004B5M8) ``rate_bucket`` / ``contended_samples``.
   #
+  # COLD (MEASURED) RATE BUCKET (Q410 / LP-0MW957Q41002EXE2). The mixed
+  # calibration window is dominated by instant cache hits (measured: 85 751
+  # tokens in 2.6 s), which makes the coefficient fit 1.4-1.7x optimistic for
+  # the cold large-prompt regime (measured 3.81-4.26 ms/token vs the ETA's
+  # 342-424 tok/s). A separate window therefore holds ONLY genuinely-cold
+  # MEASURED samples (``measured_cached_ratio < 0.10`` AND ``processed``
+  # ``>= 32 000``, first byte >= 1 s), fed from the measured-prefill capture
+  # (``prefill_progress_measured`` / MeasuredPrefill) when the measurement is
+  # finalised; the existing priced window is untouched. Large prompts
+  # (>= ``local_admission_guard_eta_percentile_min_tokens``) are priced from
+  # the cold window when calibrated; when it is NOT yet calibrated,
+  # large-prompt pricing is INERT (guard admits — today's uncalibrated
+  # behaviour) rather than falling back to the mixed window's optimistic
+  # rate. Decisions/log lines carry ``rate_bucket=cold`` and
+  # ``cold_samples=<n>`` so the honest split is legible. Small prompts below
+  # the percentile floor keep the existing mixed/contended calibration
+  # byte-for-byte.
+  #
   # Local admission reservations + fallback intent
   # ----------------------------------------------
   # (LP-0MVIKPCSG002B0NL) A dispatcher can claim local capacity ATOMICALLY

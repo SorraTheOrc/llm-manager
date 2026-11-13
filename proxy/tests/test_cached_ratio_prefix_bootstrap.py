@@ -178,8 +178,15 @@ class TestPrefillEtaGuard:
     @staticmethod
     def _calibrate():
         # A handful of cold dispatches identify the prefill coefficient.
+        # Q410 AC2 re-basis: the evaluated prompt (45 028 >= the 32 768 floor)
+        # prices from the cold window, so a genuinely-cold 40k sample (same
+        # rate, bucket 1) calibrates it; the 20k mixed seed keeps the ratio
+        # baseline path.
         for _ in range(6):
             prefill_eta.record_dispatch_sample(MODEL, 20000, 0.0, 78000.0)
+            prefill_eta.record_cold_measured_sample(
+                MODEL, 40_000, 0.0, 40_000, 40_000 * (78000.0 / 20000.0)
+            )
 
     @staticmethod
     def _guard_config():

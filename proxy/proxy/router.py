@@ -3253,6 +3253,43 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                         _first_byte_service_ms,
                                                         contended=_is_contended,
                                                     )
+                                                    # Q410 AC1 / Q2(option a):
+                                                    # feed the genuinely-cold
+                                                    # MEASURED window from the
+                                                    # measured-prefill record
+                                                    # at the point the
+                                                    # measurement is finalised
+                                                    # (first-byte time, where
+                                                    # both the measured record
+                                                    # and the service time
+                                                    # exist). The existing
+                                                    # priced window above stays
+                                                    # untouched. Fail-open: no
+                                                    # measurement (feature
+                                                    # disabled / no progress
+                                                    # observed) simply records
+                                                    # nothing.
+                                                    try:
+                                                        from proxy.measured_prefill import (
+                                                            get_measured_prefill,
+                                                        )
+                                                        from proxy.prefill_eta import (
+                                                            record_cold_measured_sample,
+                                                        )
+
+                                                        _cold_measured = get_measured_prefill(
+                                                            model_name, session_id
+                                                        )
+                                                        if _cold_measured is not None:
+                                                            record_cold_measured_sample(
+                                                                model_name,
+                                                                _estimated_tokens,
+                                                                _cold_measured.measured_cached_ratio,
+                                                                _cold_measured.processed,
+                                                                _first_byte_service_ms,
+                                                            )
+                                                    except Exception:
+                                                        pass
                                                 except Exception:
                                                     pass
                                             _first_byte_emitted = True
