@@ -1,0 +1,34 @@
+# Two-server llama-server.log slice for the Qwen3-only seconds basis
+# (LP-0MW957SKX0079QKC).
+#
+# In router mode the parent announces each child:
+#
+#   srv load: spawning server instance with name=Qwen3 on port <n>
+#   srv load: spawning server instance with name=mxbai-embed on port <m>
+#
+# Child lines carry a ``[<port>]`` prefix; eval-timing lines carry no
+# timestamp. Both children emit ``prompt eval time`` lines, and the embeddings
+# child runs at roughly half Qwen3's rate. A naive median over every line is
+# therefore polluted (LP-0MW7V2D13004ZO65: ``seconds_basis_tok_s = 128.4``
+# mixed ~102 tok/s embeddings lines with ~250 tok/s Qwen3 lines).
+#
+# Ground truth for the assertions:
+#   Qwen3 (port 32999) prompt-eval rates: 240, 246, 250, 254, 260 tok/s
+#       -> median 250.0 tok/s  (the honest basis)
+#   Embeddings (port 51973) prompt-eval rates: 100, 101, 102, 103, 104 tok/s
+#       -> must be excluded
+#   Naive all-lines median (10 samples):
+#       sorted 100, 101, 102, 103, 104, 240, 246, 250, 254, 260
+#       -> (104 + 240) / 2 = 172.0 tok/s  (the polluted figure this fixes)
+srv          load: spawning server instance with name=Qwen3 on port 32999
+srv          load: spawning server instance with name=mxbai-embed on port 51973
+[32999] prompt eval time =   50000.00 ms / 12000 tokens (    4.17 ms per token,   240.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10000 tokens (   10.00 ms per token,   100.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12300 tokens (    4.07 ms per token,   246.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10100 tokens (    9.90 ms per token,   101.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12500 tokens (    4.00 ms per token,   250.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10200 tokens (    9.80 ms per token,   102.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12700 tokens (    3.94 ms per token,   254.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10300 tokens (    9.71 ms per token,   103.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 13000 tokens (    3.85 ms per token,   260.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10400 tokens (    9.62 ms per token,   104.00 tokens per second)

@@ -3838,6 +3838,21 @@ the paths that actually produce the releases, not on the deadline path alone:
   one `--ubatch-size 1024` at the window's measured **155.51 tok/s**. The
   recorded bound is **6.6 s**.
 
+The measured rate (`seconds_basis_tok_s`) is **Qwen3-only**. The analyser
+attributes every `prompt eval time = … tokens per second` line to a model port
+from the router spawn line (`name=Qwen3 on port <n>` /
+`name=mxbai-embed on port <m>`), falling back to a single otherwise-unannounced
+port when the spawn line was rotated away; if the port cannot be resolved the
+basis is `null` with a reason, never a median over mixed models. The rule
+mirrors `.pi/skills/proxy-usage-analysis/scripts/llama_log_parser.py`. It
+exists because a glob that carries both servers mixes the embeddings child's
+~100 tok/s lines with Qwen3's ~250 tok/s — a polluted `128.4 tok/s` was
+recorded (`LP-0MW7V2D13004ZO65`) and mis-prices the cancel bound
+(`LP-0MW957SKX0079QKC`). The report's `seconds_basis` block publishes the rate,
+the Qwen3 and excluded ports, the contributing/excluded line counts and, when
+the rate is `null`, the reason; single-server (Qwen3-only) windows keep the
+previously published value.
+
 The 2026-10-28 sampler (**42 of 82** `Connection handling canceled` events,
 never reaching `prompt processing done`) is retained here as history: it was
 taken on the **deadline** path and must not be quoted as a generic

@@ -200,6 +200,53 @@ prompt for hundreds of seconds, which the
 (p90 cancel→stop 6.6 s; re-measured in this window as p90 ≈ 9.9 s, mean 4.2 s,
 n = 19 joined releases in the 24 h window).
 
+### 4.1 Seconds basis: Qwen3-only prompt-eval lines (LP-0MW957SKX0079QKC)
+
+The measured basis divides post-cancel tokens by the backend's observed
+prompt-eval rate, published as `seconds_basis_tok_s`. That rate is the median
+of the `prompt eval time = … tokens per second` lines in the supplied
+llama-server log(s).
+
+**The rule.** Each eval line is attributed to a model port, and only lines
+attributed to the local **Qwen3** child contribute:
+
+1. the router's spawn line binds a port to a model —
+   `name=Qwen3 on port <n>` / `name=mxbai-embed on port <m>`;
+2. when the spawn line was rotated away, a single otherwise-unannounced
+eval-line port is inferred as Qwen3;
+3. anything else (multiple unannounced ports, only non-Qwen3 ports, portless
+   lines) is **unusable**: `seconds_basis_tok_s` is `None` with a reason,
+   never a median over mixed models.
+
+The contract mirrors `.pi/skills/proxy-usage-analysis/scripts/llama_log_parser.py`,
+which already attributes eval lines per model port; this document's tool now
+reuses the same rule instead of forking it.
+
+**Why it exists.** On a two-server host the `llama-server*.log` glob can carry
+the embeddings child's `prompt eval` lines (~100 tok/s) alongside Qwen3's
+(~250 tok/s). A median over all lines is then **polluted** — measured as
+`seconds_basis_tok_s = 128.4` on the certified window — and the polluted rate
+is used to price cancel→stop latency, so it describes a model that is not the
+one under test. The payload now reports the basis provenance so an operator can
+see why it moved:
+
+| `seconds_basis` field | Meaning |
+|---|---|
+| `tok_s` | the Qwen3-only median rate (`null` when unattributable) |
+| `qwen3_ports`, `port_source` | the port(s) used and how they were found (`spawn_line` / `inferred` / `none`) |
+| `excluded_ports` | ports excluded as another model's (e.g. the embeddings child) |
+| `contributing_eval_lines`, `excluded_eval_lines`, `eval_lines_total` | the line accounting behind the median |
+| `reason` | why `tok_s` is `null` (missing log, ambiguity, non-Qwen3 ports) |
+
+**Effect on the figures in this document.** Every window above is served by a
+single-server (Qwen3-only) log, so the attributed set equals the previous
+all-lines set and the published `seconds_basis_tok_s` values are unchanged. The
+regression is pinned by a committed two-server fixture
+(`proxy/tests/fixtures/two_server_llama.log`): Qwen3 lines at 240–260 tok/s
+(median 250) are mixed with embeddings lines at 100–104 tok/s, and the test
+asserts the basis is 250 tok/s rather than the naive all-lines median of
+172 tok/s.
+
 ## 5. Accepted dispatches that expired with no measured progress (AC3, second half)
 
 Target: **zero** such dispatches. Occurrences are listed individually so they

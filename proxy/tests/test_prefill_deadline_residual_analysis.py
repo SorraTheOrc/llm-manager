@@ -32,8 +32,16 @@ from pathlib import Path
 import pytest
 
 FIXTURE = Path(__file__).parent / "fixtures" / "prefill_deadline_residual_synthetic.log"
+TWO_SERVER_LLAMA = Path(__file__).parent / "fixtures" / "two_server_llama.log"
+SINGLE_SERVER_LLAMA = (
+    Path(__file__).parent / "fixtures" / "abandoned_prefill_release_cancel_llama.log"
+)
 WINDOW_START = datetime(2026, 1, 1, 0, 0, 0)
 WINDOW_END = datetime(2026, 1, 1, 1, 0, 0)
+
+#: The two-server fixture's Qwen3-only median and the naive all-lines median.
+TWO_SERVER_QWEN3_TOK_S = 250.0
+TWO_SERVER_NAIVE_TOK_S = 172.0
 
 
 @pytest.fixture(name="script")
@@ -258,3 +266,107 @@ def test_backend_accounting_flags_abandoned_prefills(script, tmp_path):
     assert accounting["backend_completed_prefills"] == 1
     assert accounting["proxy_consumed_local_streams"] == 1
     assert accounting["abandoned_prefills"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Honest seconds basis: Qwen3-only prompt-eval lines (LP-0MW957SKX0079QKC)
+# ---------------------------------------------------------------------------
+
+
+def _basis_for(script, llama_log):
+    """The ``seconds_basis`` payload for an empty window over *llama_log*."""
+    log = script.WindowLog()
+    report = script.build_report(log, WINDOW_START, WINDOW_END, llama_log=str(llama_log))
+    return report["seconds_basis"]
+
+
+def test_seconds_basis_uses_only_qwen3_prompt_eval_lines(script):
+    """AC2: the embeddings child's ~100 tok/s lines must not enter the median."""
+    basis = _basis_for(script, TWO_SERVER_LLAMA)
+    assert basis["model"] == "Qwen3"
+    assert basis["tok_s"] == pytest.approx(TWO_SERVER_QWEN3_TOK_S, abs=0.5)
+    assert basis["qwen3_ports"] == [32999]
+    assert basis["port_source"] == "spawn_line"
+    # A regression to the all-lines median fails loudly, not by a few tok/s.
+    assert abs(basis["tok_s"] - TWO_SERVER_NAIVE_TOK_S) > 50.0
+
+
+def test_seconds_basis_is_mirrored_on_the_release_cancel_accounting(script):
+    """AC2: the payload surface that published the basis keeps the same value."""
+    log = script.WindowLog()
+    report = script.build_report(
+        log, WINDOW_START, WINDOW_END, llama_log=str(TWO_SERVER_LLAMA)
+    )
+    accounting = report["release_cancel_accounting"]
+    assert accounting["seconds_basis_tok_s"] == pytest.approx(
+        TWO_SERVER_QWEN3_TOK_S, abs=0.5
+    )
+    assert accounting["seconds_basis"] == report["seconds_basis"]
+    assert report["abandoned_prefill_windows"]["seconds_basis_tok_s"] == pytest.approx(
+        TWO_SERVER_QWEN3_TOK_S, abs=0.5
+    )
+
+
+def test_seconds_basis_reports_excluded_ports_and_line_counts(script):
+    """AC2: an operator can see why the basis moved from the payload alone."""
+    basis = _basis_for(script, TWO_SERVER_LLAMA)
+    assert basis["excluded_ports"] == [51973]
+    assert basis["contributing_eval_lines"] == 5
+    assert basis["excluded_eval_lines"] == 5
+    assert basis["eval_lines_total"] == 10
+    assert basis["reason"] is None
+
+
+def test_seconds_basis_infers_the_port_when_the_spawn_line_was_rotated_away(
+    script, tmp_path
+):
+    """AC1/AC3: a rotation-split file with one unannounced port is inferred."""
+    rotated = tmp_path / "llama-server.log"
+    lines = [
+        line
+        for line in TWO_SERVER_LLAMA.read_text().splitlines()
+        if "spawning server instance" not in line and "[51973]" not in line
+    ]
+    rotated.write_text("\n".join(lines) + "\n")
+
+    basis = _basis_for(script, rotated)
+    assert basis["port_source"] == "inferred"
+    assert basis["qwen3_ports"] == [32999]
+    assert basis["tok_s"] == pytest.approx(TWO_SERVER_QWEN3_TOK_S, abs=0.5)
+
+
+def test_seconds_basis_is_none_when_the_qwen3_port_is_ambiguous(script, tmp_path):
+    """AC3: never a polluted median — the basis is None and says why."""
+    ambiguous = tmp_path / "llama-server.log"
+    lines = [
+        line
+        for line in TWO_SERVER_LLAMA.read_text().splitlines()
+        if "spawning server instance" not in line
+    ]
+    ambiguous.write_text("\n".join(lines) + "\n")
+
+    basis = _basis_for(script, ambiguous)
+    assert basis["tok_s"] is None
+    assert basis["contributing_eval_lines"] == 0
+    assert "ambiguous" in basis["reason"]
+    assert "32999, 51973" in basis["reason"]
+
+
+def test_single_server_windows_keep_the_previously_published_basis(script):
+    """AC4: the already-published basis for single-server windows is unchanged."""
+    lifecycle = script.parse_llama_lifecycle(
+        SINGLE_SERVER_LLAMA.read_text().splitlines()
+    )
+    assert lifecycle.observed_rate_tok_s == pytest.approx(625.0)
+    assert lifecycle.qwen3_ports == [54819]
+    assert lifecycle.port_source == "inferred"
+    assert lifecycle.contributing_eval_lines == 1
+    assert lifecycle.excluded_ports == []
+    assert lifecycle.rate_unavailable_reason is None
+
+
+def test_seconds_basis_without_a_llama_log_explains_itself(script, report):
+    """No backend log supplied: the payload says so instead of looking absent."""
+    basis = report["seconds_basis"]
+    assert basis["tok_s"] is None
+    assert "--llama-log" in basis["reason"]

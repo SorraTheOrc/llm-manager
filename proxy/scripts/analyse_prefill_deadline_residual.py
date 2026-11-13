@@ -39,8 +39,13 @@ timestamp): the release→backend-cancel joiner
 accepted local dispatch to a backend task lifecycle segment, and the window
 accounting cross-check in :func:`backend_prefill_accounting`, which compares the
 number of completed prefills in ``llama-server`` with the number of local
-streams the proxy actually consumed. When a llama-server log is supplied the
-abandoned-prefill windows are bounded by the **observed** backend stop
+streams the proxy actually consumed. The joiner's seconds basis
+(``seconds_basis_tok_s``) is derived **only from Qwen3-attributed prompt-eval
+lines**: a two-server glob that also carries the embeddings child's ~100 tok/s
+lines would otherwise pollute the median that prices cancel→stop latency
+(LP-0MW957SKX0079QKC; see :func:`_attribute_prompt_eval_rates`). When a
+llama-server log is supplied the abandoned-prefill windows are bounded by the
+**observed** backend stop
 (:func:`abandoned_prefill_windows`); without one they degrade to the legacy
 token/rate estimate, and the report says so (`measured_available=False`).
 
@@ -162,7 +167,32 @@ LLAMA_STOP = re.compile(
 LLAMA_OPERATOR_CANCEL = re.compile(
     r"operator\(\): http client error: Connection handling canceled"
 )
-LLAMA_EVAL_TIME = re.compile(r"prompt eval time =.*?([\d.]+)\s*tokens per second")
+#: A ``prompt eval time`` line's rate in tokens/s. Kept unanchored so the
+#: previous matching breadth (including a ``slot print_timing:`` prefix) is
+#: preserved — the attribution below only changes *which* lines contribute.
+LLAMA_EVAL_TIME = re.compile(
+    r"prompt eval time\s*=.*?([\d.]+)\s*tokens per second"
+)
+#: The ``[<port>]`` child prefix a router-mode line starts with. The prefix is
+#: the backend instance's listening port (see ``llama_log_parser.py``); a bare
+#: ``slot print_timing:`` line has no port.
+LLAMA_EVAL_PORT = re.compile(r"^\s*\[(\d+)\]\s*")
+#: Router parent line announcing a child instance and its port:
+#: ``spawning server instance with name=Qwen3 on port 32999``. Mirrors
+#: ``llama_log_parser.SPAWN_MODEL_PORT_RE`` so the two tools agree on how a
+#: model is bound to a port.
+LLAMA_SPAWN_MODEL_PORT = re.compile(r"name=([A-Za-z0-9._-]+) on port (\d+)")
+
+#: The local model the seconds basis must be derived from. The embeddings child
+#: (``name=mxbai-embed …``) also emits ``prompt eval time`` lines at roughly half
+#: Qwen3's rate; mixing them pollutes the median (LP-0MW957SKX0079QKC).
+LLAMA_QWEN3_MODEL = "Qwen3"
+
+#: How a file's Qwen3 port was discovered (matches
+#: ``llama_log_parser._resolve_port``).
+LLAMA_PORT_SOURCE_SPAWN = "spawn_line"
+LLAMA_PORT_SOURCE_INFERRED = "inferred"
+LLAMA_PORT_SOURCE_NONE = "none"
 
 #: Machine-readable ``unjoined_reason`` vocabulary for the release→cancel joiner.
 UNJOINED_NO_LLAMA_LOG = "no_llama_log"
@@ -322,12 +352,23 @@ class LlamaLifecycle:
     """Parsed ``llama-server.log``: ordered task segments and the observed rate.
 
     ``observed_rate_tok_s`` is the median ``… tokens per second`` value from the
-    file's ``prompt eval time`` lines — the only seconds basis the joiner and
-    the measured window model may use (never :data:`ABANDONED_PREFILL_RATE_TOK_S`).
+    file's **Qwen3-attributed** ``prompt eval time`` lines — the only seconds
+    basis the joiner and the measured window model may use (never
+    :data:`ABANDONED_PREFILL_RATE_TOK_S`). The Qwen3 port comes from the router's
+    ``name=Qwen3 on port <n>`` spawn line, falling back to the single
+    otherwise-unannounced eval-line port; the embeddings child's lines are
+    excluded (LP-0MW957SKX0079QKC). When no port can be resolved the basis is
+    ``None`` rather than a median over mixed models, and
+    :attr:`rate_unavailable_reason` says why.
+
     ``operator_cancels`` holds the line indices of bare ``operator(): …
     Connection handling canceled`` lines — today's cancel shape, which carries no
     task id — so they can be paired (as unjoined-with-cancel) with the releases
     that triggered them.
+
+    The attribution fields are the diagnostic surface AC2/AC3 require: which
+    ports were used, which were excluded, how many eval lines contributed, and
+    (when the basis is ``None``) the reason.
     """
 
     segments: list[LlamaTaskLifecycle] = field(default_factory=list)
@@ -335,6 +376,13 @@ class LlamaLifecycle:
     observed_rate_tok_s: float | None = None
     source: str | None = None
     lines: int = 0
+    qwen3_ports: list[int] = field(default_factory=list)
+    port_source: str = LLAMA_PORT_SOURCE_NONE
+    excluded_ports: list[int] = field(default_factory=list)
+    contributing_eval_lines: int = 0
+    excluded_eval_lines: int = 0
+    eval_lines_total: int = 0
+    rate_unavailable_reason: str | None = None
 
 
 @dataclass
@@ -634,6 +682,130 @@ def _group_by(items, key) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _ports_text(ports) -> str:
+    """Render a port list for a diagnostic reason (never an empty string)."""
+    listed = ", ".join(str(port) for port in ports)
+    return listed or "none"
+
+
+def _attribute_prompt_eval_rates(lines: list[str]) -> dict:
+    """Attribute every ``prompt eval time`` line to a model port (AC1–AC3).
+
+    Rules mirror ``.pi/skills/proxy-usage-analysis/scripts/llama_log_parser.py``:
+
+    1. **Spawn line.** Every ``name=<model> on port <n>`` line binds a port to a
+       model. Eval lines whose port was announced for Qwen3 contribute; ports
+       announced for another model (the embeddings child) are excluded. A
+       restart may announce a new Qwen3 port, so *all* Qwen3-announced ports
+       contribute (the reference parser resolves one port per file; the merged
+       log is resolved across files here).
+    2. **Single unannounced port.** With no Qwen3 spawn line — the rotation split
+       case — a single eval-line port not announced for another model is
+       inferred as Qwen3.
+    3. **Unusable.** Anything else (multiple unannounced ports, only non-Qwen3
+       ports, portless lines) yields an empty rate list and a reason: the basis
+       is ``None`` rather than a median polluted by another model.
+
+    Returns the attributed ``rates`` plus the diagnostic counts AC2/AC3 require
+    (contributing/excluded eval lines, Qwen3 and excluded ports, the reason the
+    basis is unavailable).
+    """
+    announced: dict[int, str] = {}
+    eval_port_counts: Counter[int | None] = Counter()
+    samples: list[tuple[int | None, float]] = []
+    for line in lines:
+        if line.lstrip().startswith("#"):
+            continue
+        spawn = LLAMA_SPAWN_MODEL_PORT.search(line)
+        if spawn is not None:
+            announced.setdefault(int(spawn.group(2)), spawn.group(1))
+        match = LLAMA_EVAL_TIME.search(line)
+        if match is None:
+            continue
+        prefix = LLAMA_EVAL_PORT.match(line)
+        port = int(prefix.group(1)) if prefix is not None else None
+        rate = float(match.group(1))
+        if not _lazy_is_finite(rate):
+            continue
+        eval_port_counts[port] += 1
+        samples.append((port, rate))
+
+    total = len(samples)
+    qwen3_announced = sorted(
+        port for port, model in announced.items() if model == LLAMA_QWEN3_MODEL
+    )
+    other_announced = sorted(
+        port for port, model in announced.items() if model != LLAMA_QWEN3_MODEL
+    )
+
+    attributed_ports: list[int] = []
+    port_source = LLAMA_PORT_SOURCE_NONE
+    reason: str | None = None
+    if qwen3_announced:
+        port_source = LLAMA_PORT_SOURCE_SPAWN
+        attributed_ports = [port for port in qwen3_announced if eval_port_counts.get(port)]
+    else:
+        unannounced = sorted(
+            port
+            for port in eval_port_counts
+            if port is not None and port not in other_announced
+        )
+        if len(unannounced) == 1:
+            port_source = LLAMA_PORT_SOURCE_INFERRED
+            attributed_ports = unannounced
+        elif total == 0:
+            reason = "no 'prompt eval time' lines in the llama-server log"
+        elif len(unannounced) > 1:
+            reason = (
+                "no Qwen3 spawn line and eval-timing lines carry multiple "
+                f"unannounced ports ({_ports_text(unannounced)}); the Qwen3 "
+                "port is ambiguous"
+            )
+        elif eval_port_counts.get(None):
+            reason = (
+                "no Qwen3 spawn line and the eval-timing lines carry no "
+                "[port] prefix, so the model cannot be attributed"
+            )
+        else:
+            reason = (
+                "no Qwen3 spawn line and every eval-timing line belongs to a "
+                f"non-Qwen3 child port ({_ports_text(other_announced)})"
+            )
+
+    attributed = [rate for port, rate in samples if port in set(attributed_ports)]
+    if attributed:
+        reason = None
+    elif reason is None:
+        seen = sorted(port for port in eval_port_counts if port is not None)
+        if not total:
+            reason = "no 'prompt eval time' lines in the llama-server log"
+        else:
+            reason = (
+                "no 'prompt eval time' line on the announced Qwen3 port(s) "
+                f"({_ports_text(qwen3_announced)}); eval ports seen: "
+                f"{_ports_text(seen)}"
+            )
+
+    excluded_ports = sorted(
+        set(other_announced)
+        | {
+            port
+            for port in eval_port_counts
+            if port is not None and port not in set(attributed_ports)
+        }
+    )
+    return {
+        "rates": attributed,
+        "qwen3_ports": attributed_ports or qwen3_announced,
+        "port_source": port_source,
+        "excluded_ports": excluded_ports,
+        "contributing_eval_lines": len(attributed),
+        "excluded_eval_lines": total - len(attributed),
+        "eval_lines_total": total,
+        "reason": reason,
+    }
+
+
 def parse_llama_lifecycle(lines: list[str], source: str | None = None) -> LlamaLifecycle:
     """Parse ``llama-server.log`` *lines* into ordered task segments.
 
@@ -643,7 +815,8 @@ def parse_llama_lifecycle(lines: list[str], source: str | None = None) -> LlamaL
     operator-cancel event; ``prompt processing progress`` / ``stop: cancel
     task`` / ``release: … stop processing`` / ``prompt eval time`` lines attach
     to the current segment. ``observed_rate_tok_s`` is the median ``… tokens
-    per second`` value of the eval lines — the only seconds basis the joiner
+    per second`` value of the **Qwen3-attributed** eval lines (see
+    :func:`_attribute_prompt_eval_rates`) — the only seconds basis the joiner
     and the measured window model may use.
     """
     lifecycle = LlamaLifecycle(source=source, lines=len(lines))
@@ -689,14 +862,16 @@ def parse_llama_lifecycle(lines: list[str], source: str | None = None) -> LlamaL
             if current.cancel_seen:
                 current.eval_time_after_cancel = True
             continue
-    data_lines = [line for line in lines if not line.lstrip().startswith("#")]
-    rates = [
-        float(value)
-        for value in LLAMA_EVAL_TIME.findall("\n".join(data_lines))
-        if _lazy_is_finite(float(value))
-    ]
+    attribution = _attribute_prompt_eval_rates(lines)
+    lifecycle.qwen3_ports = attribution["qwen3_ports"]
+    lifecycle.port_source = attribution["port_source"]
+    lifecycle.excluded_ports = attribution["excluded_ports"]
+    lifecycle.contributing_eval_lines = attribution["contributing_eval_lines"]
+    lifecycle.excluded_eval_lines = attribution["excluded_eval_lines"]
+    lifecycle.eval_lines_total = attribution["eval_lines_total"]
+    lifecycle.rate_unavailable_reason = attribution["reason"]
+    rates = sorted(attribution["rates"])
     if rates:
-        rates.sort()
         lifecycle.observed_rate_tok_s = _percentile(rates, 50.0)
     return lifecycle
 
@@ -790,6 +965,40 @@ def _pair_releases(
                 join_basis="slot_id" if event.slot_id is not None else "log_order",
             )
     return joins
+
+
+def seconds_basis_payload(llama: LlamaLifecycle | None) -> dict:
+    """The seconds-basis provenance block (AC2/AC3).
+
+    Reports the Qwen3-only median rate, the ports it came from, the excluded
+    (embeddings) ports, the contributing/excluded eval-line counts and — when
+    the rate is ``None`` — the reason it could not be attributed. This is the
+    diagnostic surface that shows an operator *why* the basis moved instead of
+    silently publishing a median over mixed models.
+    """
+    if llama is None:
+        return {
+            "tok_s": None,
+            "model": LLAMA_QWEN3_MODEL,
+            "qwen3_ports": [],
+            "port_source": LLAMA_PORT_SOURCE_NONE,
+            "excluded_ports": [],
+            "contributing_eval_lines": 0,
+            "excluded_eval_lines": 0,
+            "eval_lines_total": 0,
+            "reason": "no llama-server log supplied (--llama-log)",
+        }
+    return {
+        "tok_s": llama.observed_rate_tok_s,
+        "model": LLAMA_QWEN3_MODEL,
+        "qwen3_ports": list(llama.qwen3_ports),
+        "port_source": llama.port_source,
+        "excluded_ports": list(llama.excluded_ports),
+        "contributing_eval_lines": llama.contributing_eval_lines,
+        "excluded_eval_lines": llama.excluded_eval_lines,
+        "eval_lines_total": llama.eval_lines_total,
+        "reason": llama.rate_unavailable_reason,
+    }
 
 
 def release_cancel_accounting(
@@ -891,6 +1100,7 @@ def release_cancel_accounting(
         "seconds_basis_tok_s": (
             llama.observed_rate_tok_s if llama is not None else None
         ),
+        "seconds_basis": seconds_basis_payload(llama),
         "note": LLAMA_COVERAGE_NOTE,
         "releases": rows,
     }
@@ -1491,9 +1701,13 @@ def build_report(
     joins = _pair_releases(order, llama)
     paired = [join.segment for join in joins]
     window_rows = abandoned_prefill_windows(log, paired=paired, llama=llama)
-    measured_available = any(
-        join.segment is not None and join.segment.stop_seen
-        for join in joins
+    # A measured-stop window needs the observed rate to convert post-cancel
+    # tokens to seconds; without an attributable Qwen3 basis the window model
+    # honestly degrades to the legacy basis (LP-0MW957SKX0079QKC AC3).
+    measured_available = (
+        any(join.segment is not None and join.segment.stop_seen for join in joins)
+        and llama is not None
+        and llama.observed_rate_tok_s is not None
     )
     verdict_basis = (
         "measured_stop" if measured_available else "legacy_rate_estimate"
@@ -1527,12 +1741,19 @@ def build_report(
         },
         "abandoned_prefill_windows": {
             "legacy_rate_tok_s": ABANDONED_PREFILL_RATE_TOK_S,
+            "seconds_basis_tok_s": (
+                llama.observed_rate_tok_s if llama is not None else None
+            ),
             "basis": verdict_basis,
             "measured_available": measured_available,
             "coverage": _llama_coverage(llama_spec, llama, log),
             "note": LLAMA_COVERAGE_NOTE,
             "rows": window_rows,
         },
+        # AC2/AC3: the Qwen3-only basis, with the excluded ports and
+        # contributing line counts, so an operator can see why it moved (or
+        # why it is None). Always present; ``reason`` names a missing log.
+        "seconds_basis": seconds_basis_payload(llama),
         "attribution": attribution_summary(
             rows,
             capture_available=bool(log.measurements),
@@ -1650,6 +1871,17 @@ def _text_summary(report: dict) -> str:
             f"(user {split['user']} / audit {split['audit']}) — "
             f"user {split['user_per_hour']}/h, audit {split['audit_per_hour']}/h"
         )
+    basis = report.get("seconds_basis")
+    if basis is not None:
+        if basis["tok_s"] is None:
+            lines.append(f"Seconds basis: unavailable — {basis['reason']}")
+        else:
+            lines.append(
+                f"Seconds basis: {basis['tok_s']} tok/s from {basis['model']} "
+                f"({basis['contributing_eval_lines']} prompt-eval line(s), "
+                f"port_source={basis['port_source']}); excluded ports: "
+                f"{basis['excluded_ports'] or 'none'}"
+            )
     windows = report.get("abandoned_prefill_windows")
     if windows:
         bounded = sum(1 for row in windows["rows"] if row["bounded"])
