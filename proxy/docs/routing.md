@@ -2760,7 +2760,8 @@ Each row's **Outcome** column says what a pinned `local-preferred` request does
 with that exit: `refusing` rows end in the retryable `429` deferral, while
 `promoting` rows leave the local chain and are served remotely. The promoting
 set is exactly `admission_reserve.CAPACITY_TOO_LARGE_REASONS` —
-`prefill_budget_exceeded` and `context_too_large` (the latter also carrying the
+`prefill_budget_exceeded`, `prefill_eta_exceeds_capacity` and
+`context_too_large` (the latter also carrying the
 per-entry `max_context_tokens` ceiling, which composes into the same skip);
 every other row is a temporal (deferrable) exit and therefore refuses.
 
@@ -2770,7 +2771,8 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
 | Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
 | Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`): the prompt outgrows the local serving envelope | `prefill_budget_exceeded` | promoting | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
-| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` — **only** when the free-slot ETA/budget bound is itself the cause; a deadline, deadline-relative safety-budget or flat cold-prefill refusal keeps its own governing token (`prefill_eta_exceeds_deadline` / `prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded`), so the direct path never relabels a non-ETA bound (`prefill_budget_exceeded` is a `too_large` verdict there: the pin declines and a remote tier serves the request — see [Promoted](#promoted-a-too-large-request-leaves-the-local-chain)) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`remote-ok` / absent header — the immediate-step default) |
+| Admission guard, queue path — deadline token capacity (`local_prefill_deadline_seconds * 1000 / cold_ms_per_token`): the request's cold whole-prompt projection (residency unmeasured) or measured new tokens (measured residency) cannot finish inside the deadline, so waiting cannot help | `prefill_eta_exceeds_capacity` | promoting | `local_admission_guard ... reason=prefill_eta_exceeds_capacity ... deadline_capacity_tokens=<n> capacity_basis=cold\|measured capacity_priced_tokens=<n> ...` |
+| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` — **only** when the free-slot ETA/budget bound is itself the cause; a deadline, deadline-relative safety-budget, flat cold-prefill or deadline-capacity refusal keeps its own governing token (`prefill_eta_exceeds_deadline` / `prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded` / `prefill_eta_exceeds_capacity`), so the direct path never relabels a non-ETA bound (`prefill_budget_exceeded` and `prefill_eta_exceeds_capacity` are `too_large` verdicts there: the pin declines and a remote tier serves the request — see [Promoted](#promoted-a-too-large-request-leaves-the-local-chain)) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`remote-ok` / absent header — the immediate-step default) |
 | Local entry in cooldown (chain resolution) | `local_provider_cooldown` | refusing | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
 | Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap — the prompt can never fit local, however long it waits | `context_too_large` | promoting | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
@@ -3040,7 +3042,8 @@ and header a client must honour:
   compaction half (resend at `budget_tokens` or less) as the actionable remedy.
 - `verdict` — `deferrable` when the block is temporal (waiting can help) or
   `too_large` when the request itself exceeds the local serving envelope
-  (`prefill_budget_exceeded` / `context_too_large`). Additive: every other
+  (`prefill_budget_exceeded` / `prefill_eta_exceeds_capacity` /
+  `context_too_large`). Additive: every other
   field/header keeps its value. It is computed exactly once by
   `admission_reserve.local_capacity_verdict` in the pin-local refusal builder,
   which is the only verdict computation in `provider.py`
@@ -3094,6 +3097,7 @@ and header a client must honour:
 | Reason | `Retry-After` | `retryable` | `retry_at` | Client action |
 |---|---|---|---|---|
 | `prefill_budget_exceeded` | absent | `false` | absent | compact the prompt |
+| `prefill_eta_exceeds_capacity` | absent | `false` | absent | compact the prompt |
 | `context_too_large` | absent | `false` | absent | compact the prompt |
 | `eta_exceeds_budget` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
 | `eta_exceeds_budget_direct` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
@@ -3104,9 +3108,10 @@ and header a client must honour:
 
 **The dispatch path never changes the reason.** `eta_exceeds_budget_direct` is
 the free-slot *label* of the ETA/budget bound **only**: a deadline,
-deadline-relative safety-budget or flat cold-prefill refusal keeps its
-governing reason (`prefill_eta_exceeds_deadline` /
-`prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded`) on **both**
+deadline-relative safety-budget, flat cold-prefill or deadline-capacity refusal
+keeps its governing reason (`prefill_eta_exceeds_deadline` /
+`prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded` /
+`prefill_eta_exceeds_capacity`) on **both**
 the queue and the free-slot path, so the row above applies to it unchanged
 wherever it fires. Relabelling a non-ETA bound as the ETA/budget reason would
 advertise a timer for a prompt that waiting cannot heal — the 2026-10-25
@@ -3501,6 +3506,64 @@ no code change): `local_prefill_deadline_seconds: 90`,
 `local_admission_guard_eta_percentile_min_tokens: 32768` (the old floor),
 `local_admission_guard_budget_safety_fraction: 0.0` (bound disabled) and
 `local_admission_guard_reference_tokens: 32000`.
+
+#### Deadline token capacity (LP-0MW957RB3000ER79)
+
+The prefill deadline is also expressed as an explicit number of **cold
+tokens**, derived from the same cold calibration the admission guard prices
+cold large prompts with:
+
+    deadline_capacity_tokens =
+        local_prefill_deadline_seconds * 1000 / cold_ms_per_token
+
+`cold_ms_per_token` is the cold MEASURED window's fitted rate after the
+conservatism factor (and the p75 uplift, when engaged), so the capacity is the
+token form of the same price the guard enforces — the published number and the
+priced ETA cannot drift. It is published on `/llama/local/status`
+(`deadline_capacity_tokens`, `deadline_capacity_calibrated`,
+`deadline_capacity_cold_ms_per_token`) and on every `local_admission_guard`
+decision line (`deadline_capacity_tokens=`, `capacity_basis=`,
+`cold_ms_per_token=`, `capacity_priced_tokens=`).
+
+**Cold basis, measured residency honoured.** The capacity is compared against
+the **whole prompt priced cold** when residency is unmeasured (a
+predicted/credited warm ratio is not evidence) and against the **measured new
+tokens** when a measured prefill record exists (`prompt_progress` capture or a
+cached ratio recorded from a previous local response's usage data). A
+measured-warm large prompt is therefore *not* refused for its prompt size — the
+warm-prompt guardrail. The bound is a **request-property** refusal: the request
+itself is too large to finish inside the deadline, so it is classified
+`too_large`, detours to the next provider, and is never advertised with a
+`Retry-After`.
+
+**Enforcement.** It lives in the shared `prefill_eta.evaluate_admission`, so it
+applies on every admission path the flat cold-prefill cap guards — queue entry,
+direct/free-slot dispatch, idle/economic bypass — and on the capacity-gate path
+(the capacity gate's admitted request still reaches the dispatch guard). When
+the capacity is exceeded the refusal reason is `prefill_eta_exceeds_capacity`.
+
+**Interaction with the flat cap (AC5).** `local_cold_prefill_budget_tokens`
+(shipped **25 000**) is the *tighter* bound for an ordinary cold prompt: a
+request over 25 000 **new** tokens is refused as `prefill_budget_exceeded`
+first. The capacity governs (a) whole-prompt cold pricing when residency is
+unmeasured — where the flat cap sees only the predicted new tokens — and (b)
+any deployment that raises or disables the flat cap (`0`). Both derive from the
+same deadline and both detour to remote, so they never contradict each other.
+
+**Rollback** (values only, no code change): the guard policy is the single
+switch —
+
+- `local_admission_guard_policy: observe` — log the would-be capacity refusal
+  (`enforced=false`) but never refuse;
+- `local_admission_guard_policy: off` — do not evaluate the guard at all (the
+  capacity is inert; tested);
+- `local_admission_guard_eta_percentile: 0` — derive the capacity from the cold
+  point estimate instead of the p75 uplift (tested);
+- `local_prefill_deadline_seconds: 0` — no deadline, therefore no capacity.
+
+An uncalibrated cold window never manufactures a refusal either: the published
+number is informational (`deadline_capacity_calibrated=false`) and the bound is
+not enforced.
 
 Note: the existing `stream_heartbeat_interval_seconds` (default 10 s) emits
 `data: {"type":"heartbeat",…}` frames during prefill **after** the upstream

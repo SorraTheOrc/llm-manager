@@ -455,6 +455,8 @@ async def get_llama_local_status(request: Request):
          "prefill_eta_reference_tokens": int | None,
          "queue_eta_seconds": float | None,
          "prefill_budget_seconds": float | None,
+         "deadline_capacity_tokens": int | None,
+         "deadline_capacity_calibrated": bool,
          "capacity_hint": str,
          "local_route_available": bool,
          "local_route_reason": str | None,
@@ -1464,6 +1466,13 @@ async def get_llama_local_status(request: Request):
         "prefill_eta_rate_bucket": prefill_eta.get(
             "prefill_eta_rate_bucket", "solitary"
         ),
+        # Deadline token capacity (LP-0MW957RB3000ER79 AC1): the published
+        # capacity is part of the poll line too, from the same derivation as
+        # the payload so the two can never drift.
+        "deadline_capacity_tokens": prefill_eta.get("deadline_capacity_tokens"),
+        "deadline_capacity_calibrated": bool(
+            prefill_eta.get("deadline_capacity_calibrated", False)
+        ),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         "local_idle_seconds": published_idle_seconds,
@@ -1574,6 +1583,20 @@ async def get_llama_local_status(request: Request):
         # shared prefill_eta calibration: the wait a prefill must fit inside
         # (``None`` when unresolvable — never a fabricated 0).
         "prefill_budget_seconds": prefill_eta.get("prefill_budget_seconds"),
+        # Deadline token capacity (LP-0MW957RB3000ER79 AC1): the prefill
+        # deadline expressed as an explicit number of cold tokens, derived
+        # from the same cold calibration the admission guard prices with, so
+        # a dispatcher can compare a prompt's size against it before
+        # launching. ``deadline_capacity_calibrated`` says whether the cold
+        # window has enough MEASURED samples; an uncalibrated number is
+        # informational and the bound is not enforced.
+        "deadline_capacity_tokens": prefill_eta.get("deadline_capacity_tokens"),
+        "deadline_capacity_calibrated": bool(
+            prefill_eta.get("deadline_capacity_calibrated", False)
+        ),
+        "deadline_capacity_cold_ms_per_token": prefill_eta.get(
+            "deadline_capacity_cold_ms_per_token"
+        ),
         # Whether the local pool is genuinely working (LP-0MVGDUVGE0024YAI
         # AC4): ``idle`` | ``prefill_bound`` | ``saturated`` | ``abandoned_busy``
         # (LP-0MVRMI5HK00558TB AC1 — occupied only by work the proxy abandoned).

@@ -58,6 +58,11 @@ DOCUMENTED_EXIT_TOKENS = {
     "prefill_eta_exceeds_deadline",
     "prefill_eta_exceeds_safety_budget",
     "prefill_budget_exceeded",
+    # Admission guard, deadline token capacity (LP-0MW957RB3000ER79): the
+    # request's cold whole-prompt projection / measured new tokens cannot fit
+    # inside the deadline, so it is promoted (``too_large``) rather than
+    # deferred.
+    "prefill_eta_exceeds_capacity",
     # Admission guard, direct free-slot path.
     "eta_exceeds_budget_direct",
     # Chain resolution.

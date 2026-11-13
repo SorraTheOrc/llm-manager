@@ -906,6 +906,36 @@ def _get_cached_ratio_source(model_name: str, session_id: str | None) -> str | N
     return _cached_ratio_source.get((model_name, session_id))
 
 
+def _residency_is_measured(model_name: str | None, session_id: str | None) -> bool:
+    """Whether a MEASURED residency record exists for this session.
+
+    The deadline token capacity (LP-0MW957RB3000ER79 AC3) prices the whole
+    prompt cold when residency is *unmeasured* (a predicted/credited ratio is
+    not evidence) and the measured new tokens when a measured record exists.
+    A measurement is either the ``prompt_progress`` capture
+    (:mod:`proxy.measured_prefill`) or a cached ratio recorded from a previous
+    local response's usage data (``_CACHED_RATIO_SOURCE_USAGE``). A
+    slot-snapshot restore (``"restored"``/``"save"``) is a prediction, not a
+    measurement, so it does not count. Fail-open: any error reads as
+    unmeasured.
+    """
+    try:
+        from proxy.measured_prefill import get_measured_prefill
+
+        measured = get_measured_prefill(model_name, session_id)
+        if measured is not None and measured.measured_new_tokens is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        return (
+            _get_cached_ratio_source(model_name, session_id)
+            == _CACHED_RATIO_SOURCE_USAGE
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Expected-reuse credit from the previous prompt (LP-0MVI2XOTY008Q4UV)
 # ---------------------------------------------------------------------------
@@ -4615,6 +4645,7 @@ def _evaluate_idle_admission_override(
     provider_cfg: dict,
     estimated_tokens: int,
     cached_ratio: float = 0.0,
+    session_id: str | None = None,
 ) -> dict | None:
     """Decide whether idle local capacity should serve a bypassed request.
 
@@ -4666,7 +4697,7 @@ def _evaluate_idle_admission_override(
         if idle_seconds < threshold:
             return None
         admission = _idle_admission_budget_verdict(
-            config, provider_cfg, estimated_tokens, cached_ratio
+            config, provider_cfg, estimated_tokens, cached_ratio, session_id
         )
         return {
             "admitted": admission is None or bool(admission.admit),
@@ -4686,6 +4717,7 @@ def _idle_admission_budget_verdict(
     provider_cfg: dict,
     estimated_tokens: int,
     cached_ratio: float,
+    session_id: str | None = None,
 ):
     """Run the shared cold-prefill admission guard for the idle bypass path.
 
@@ -4706,9 +4738,13 @@ def _idle_admission_budget_verdict(
         guard_cfg = prefill_eta.resolve_config(server_cfg)
         if guard_cfg.policy == prefill_eta.POLICY_OFF:
             return None
-        # Only the cold-prefill budget and its deadline-relative sibling are
-        # consulted here: the idle bypass exists precisely because the
-        # occupancy/queue bounds do not apply to an idle GPU.
+        # Only the cold-prefill budget and its deadline-relative sibling gate
+        # whether the idle bypass consults the guard at all: the idle bypass
+        # exists precisely because the occupancy/queue bounds do not apply to
+        # an idle GPU, and the documented "every knob disabled" rollback keeps
+        # it inert. When the guard IS consulted (the shipped flat cap is
+        # 25 000 > 0) the deadline token capacity applies here too
+        # (LP-0MW957RB3000ER79).
         if (
             guard_cfg.cold_prefill_budget_tokens <= 0
             and guard_cfg.budget_safety_fraction <= 0.0
@@ -4718,7 +4754,12 @@ def _idle_admission_budget_verdict(
             provider_cfg, dict
         ) else ""
         decision = prefill_eta.evaluate_admission(
-            config, model_name, estimated_tokens, cached_ratio, "medium"
+            config,
+            model_name,
+            estimated_tokens,
+            cached_ratio,
+            "medium",
+            residency_measured=_residency_is_measured(model_name, session_id),
         )
         # LP-0MVODJ3P6000AIUM AC1: return the decision for BOTH verdicts so
         # the idle-admit accept path can thread the ETA the guard actually
@@ -6306,12 +6347,13 @@ def _max_retry_after_seconds(config: dict | None) -> int:
 
 #: Reasons for which no amount of waiting can restore local service: the
 #: cause is a property of the *request* (a prompt permanently over the flat
-#: cold-prefill token cap, or one that cannot fit a KV slot), so a timer would
-#: only invite futile retries — the 2026-10-25 incident answered such a request
-#: with ``Retry-After: 1`` and the client backed off seven times before
-#: reporting the 429 as terminal (LP-0MVNTT4X8009IO2X AC1).
+#: cold-prefill token cap, over the deadline token capacity, or one that cannot
+#: fit a KV slot), so a timer would only invite futile retries — the
+#: 2026-10-25 incident answered such a request with ``Retry-After: 1`` and the
+#: client backed off seven times before reporting the 429 as terminal
+#: (LP-0MVNTT4X8009IO2X AC1).
 NOT_TIME_RETRYABLE_REFUSAL_REASONS = frozenset(
-    {"prefill_budget_exceeded", "context_too_large"}
+    {"prefill_budget_exceeded", "context_too_large", "prefill_eta_exceeds_capacity"}
 )
 
 #: Remedy advertised for a refusal waiting cannot fix.
@@ -10358,6 +10400,12 @@ async def _prefill_admission_guard(
             in_flight_prefills=in_flight_prefills,
             occupant_prefill_seconds=occupant_prefill_seconds,
             capacity_admitted=capacity_admitted,
+            # Deadline token capacity (LP-0MW957RB3000ER79 AC3): a measured
+            # residency record prices the measured new tokens; anything else
+            # (no measurement, a predicted/credited ratio) is priced as a cold
+            # whole prompt, so a predicted-warm prompt can never slip past the
+            # capacity on optimism.
+            residency_measured=_residency_is_measured(model_name, session_id),
         )
         if not decision.active:
             return None
@@ -10373,6 +10421,7 @@ async def _prefill_admission_guard(
                 "prefill_eta_exceeds_deadline",
                 "prefill_eta_exceeds_safety_budget",
                 "prefill_budget_exceeded",
+                "prefill_eta_exceeds_capacity",
             )
         ):
             log_label = decision.reason
@@ -10421,6 +10470,15 @@ def _local_admission_evidence(decision: Any) -> dict[str, Any]:
     budget_tokens = getattr(decision, "budget_tokens", None)
     if budget_tokens is not None:
         evidence["budget_tokens"] = int(budget_tokens)
+    # Deadline token capacity evidence (LP-0MW957RB3000ER79): a capacity
+    # refusal carries the token counts the guard actually compared, so the
+    # 429 body states the target size explicitly (like the flat cap does).
+    capacity_tokens = getattr(decision, "deadline_capacity_tokens", None)
+    if capacity_tokens is not None:
+        evidence["deadline_capacity_tokens"] = int(capacity_tokens)
+    capacity_priced = getattr(decision, "capacity_priced_tokens", None)
+    if capacity_priced:
+        evidence["capacity_priced_tokens"] = int(capacity_priced)
     return evidence
 
 
@@ -17098,6 +17156,7 @@ async def _proxy_with_fallback_cycle(
                         provider_cfg,
                         _estimated_tokens,
                         _routing_cached_ratio,
+                        _session_id,
                     )
                     if _idle_admit is not None and not _idle_admit.get(
                         "admitted", True
@@ -17578,6 +17637,7 @@ async def _proxy_with_fallback_cycle(
                             "prefill_eta_exceeds_deadline",
                             "prefill_eta_exceeds_safety_budget",
                             "prefill_budget_exceeded",
+                            "prefill_eta_exceeds_capacity",
                         )
                     ):
                         _direct_reason = str(_direct_admission.reason)

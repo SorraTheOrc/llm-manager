@@ -2467,6 +2467,14 @@ server:
   # local_prefill_deadline_seconds, so a band-slow prompt cannot slip past the
   # flat token cap.
   local_cold_prefill_budget_tokens: 25000
+  # DEADLINE TOKEN CAPACITY (LP-0MW957RB3000ER79, AC5): the flat cap above is
+  # the tighter bound for an ordinary cold prompt (a request over 25000 NEW
+  # tokens is refused as ``prefill_budget_exceeded`` first). The capacity
+  # (``local_prefill_deadline_seconds * 1000 / cold_ms_per_token``, derived
+  # below at ``local_prefill_deadline_seconds``) governs the WHOLE-PROMPT cold
+  # price when residency is unmeasured and any deployment that raises or
+  # disables this flat cap (``0``). Both refuse at admission with their own
+  # reason and detour to remote, so they can never contradict each other.
 
   # ---------------------------------------------------------------------
   # Cross-host audit admission budget (LP-0MW95FYMH006XYNK)
@@ -2555,6 +2563,58 @@ server:
   # admission behaviour (the comparator derived from that deadline); no code
   # change is needed.
   local_prefill_deadline_seconds: 180
+  # DEADLINE TOKEN CAPACITY (LP-0MW957RB3000ER79). The deadline above is also
+  # expressed as an explicit number of COLD tokens, derived from the same cold
+  # calibration the admission guard prices cold large prompts with (the cold
+  # MEASURED window, the conservatism factor and any p75 uplift):
+  #
+  #     deadline_capacity_tokens =
+  #         local_prefill_deadline_seconds * 1000 / cold_ms_per_token
+  #
+  # It is published on ``/llama/local/status`` (``deadline_capacity_tokens``,
+  # ``deadline_capacity_calibrated``, ``deadline_capacity_cold_ms_per_token``)
+  # and on EVERY ``local_admission_guard`` decision line, so the number an
+  # operator reads and the number the guard enforces are derived from one
+  # place. A request whose cold basis exceeds the capacity is refused at
+  # admission with its own reason ``prefill_eta_exceeds_capacity`` and detours
+  # to the next provider; it is never dispatched and then cancelled at the
+  # deadline.
+  #
+  # COLD BASIS / MEASURED RESIDENCY (LP-0MW957RB3000ER79 AC3). When a MEASURED
+  # residency record exists for the session (a captured ``prompt_progress``
+  # measurement or a cached ratio recorded from a previous local response's
+  # usage data) the capacity is compared against the MEASURED NEW tokens, so a
+  # measured-warm large prompt is not refused for its prompt size (the
+  # warm-prompt guardrail). When residency is UNMEASURED the WHOLE PROMPT is
+  # priced cold — a predicted/credited warm ratio is not evidence — so the
+  # predicted-warm cold prompts that slip past the ordinary ETA bound are
+  # refused here. The bound is enforced on every admission path the flat
+  # cold-prefill cap guards (queue entry, direct/free-slot dispatch, idle /
+  # economic bypass) and on the capacity-gate path, because it lives in the
+  # shared ``evaluate_admission`` decision.
+  #
+  # INTERACTION WITH local_cold_prefill_budget_tokens (AC5). The flat cap
+  # (25000 new tokens) stays the TIGHTER bound for an ordinary cold prompt: a
+  # prompt with more than 25000 NEW tokens is refused by
+  # ``prefill_budget_exceeded`` before the capacity is reached. The capacity
+  # governs (a) whole-prompt cold pricing when residency is unmeasured — where
+  # the flat cap sees only the predicted new tokens — and (b) any deployment
+  # that RAISES or DISABLES the flat cap (``0``), where the capacity is the
+  # only token-shaped deadline bound left. The two never contradict each
+  # other: both derive from the same deadline and both detour to remote.
+  #
+  # ROLLBACK (AC4). The guard policy is the single switch:
+  #   local_admission_guard_policy: observe  — log the would-be capacity
+  #       refusal (``enforced=false``) but never refuse;
+  #   local_admission_guard_policy: off      — do not evaluate the guard at
+  #       all (the capacity is inert);
+  #   local_admission_guard_eta_percentile: 0 — derive the capacity from the
+  #       cold point estimate instead of the p75 uplift;
+  #   local_prefill_deadline_seconds: 0      — no deadline, therefore no
+  #       capacity.
+  # Each is a pure value change; no code change and no restart-ordering
+  # constraint beyond the usual process restart.
+  #
   # Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL): when a
   # local dispatch is cancelled by the prefill deadline
   # (``prefill_deadline_exceeded``) or by the measured-cache early abort
