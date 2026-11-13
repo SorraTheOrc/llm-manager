@@ -125,6 +125,36 @@ def test_capacity_is_published_on_the_status_estimate():
     )
 
 
+def test_shipped_config_capacity_is_derived_from_the_shipped_deadline():
+    """The shipped ``proxy/config.yaml`` deadline (180 s) is pinned to its
+    *derivation* — the cold rate the guard prices with — not to a
+    hard-coded capacity number, so the published figure follows the config
+    and the calibration rather than drifting with either."""
+    from config_test_utils import get_merged_config
+
+    _seed_cold()
+    server = dict(get_merged_config("fast")["server"])
+    config = {"server": server}
+    shipped_deadline = server["local_prefill_deadline_seconds"]
+    assert shipped_deadline == 180, (
+        "the shipped deadline is the pinned input; if it changes deliberately, "
+        "update this pin with the config change"
+    )
+
+    capacity = prefill_eta.deadline_capacity(_MODEL, _TOKENS, config)
+
+    assert capacity.calibrated is True
+    assert capacity.cold_ms_per_token is not None
+    assert capacity.tokens == int(
+        float(shipped_deadline) * 1000.0 / capacity.cold_ms_per_token
+    )
+    status = prefill_eta.status_estimate(config, _MODEL)
+    assert status["deadline_capacity_tokens"] == capacity.tokens
+    assert status["deadline_capacity_cold_ms_per_token"] == pytest.approx(
+        capacity.cold_ms_per_token, rel=1e-6
+    )
+
+
 def test_capacity_appears_on_the_guard_log_line(caplog):
     """The decision log line carries the capacity, the basis and the cold
     rate, so the published payload and the enforced decision cannot drift."""
@@ -347,8 +377,10 @@ def test_uncalibrated_cold_window_never_refuses():
 
 
 def test_disabled_deadline_yields_no_capacity():
-    """``local_prefill_deadline_seconds: 0`` disables the deadline, so there is
-    no capacity to enforce or publish."""
+    """An unreadable capacity (``local_prefill_deadline_seconds: 0`` disables
+    the deadline, so there is no number to enforce) never manufactures a
+    refusal, and the status payload publishes ``None`` rather than a stale
+    figure."""
     _seed_cold()
     cfg = _cfg(local_prefill_deadline_seconds=0)
     capacity = _capacity(cfg)

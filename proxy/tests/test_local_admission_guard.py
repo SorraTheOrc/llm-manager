@@ -3489,3 +3489,205 @@ async def test_dead_remote_chain_makes_the_eta_verdict_irrelevant(caplog):
     assert calls == ["local", "local"], (
         f"the same prompt must get a single routing decision, got {calls}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Deadline token capacity at admission (LP-0MW957QPH004644X AC2/AC4/AC5)
+#
+# The unit rows in ``test_deadline_token_capacity.py`` pin the decision, the
+# published payload and the log line. These rows drive the same bound through
+# the provider helpers on the direct/free-slot admission path so the shipped
+# routing outcome is pinned too: a cold-basis prompt above the capacity is
+# refused with its own reason, falls through to the remote tier and never
+# queues, while the boundary and the rollbacks keep the old routing.
+#
+# The queue-entry guard is not exercised here: it is reachable only for a
+# pin-local request (a ``remote-ok`` request falls back as soon as the slots
+# are busy), and a pin-local capacity refusal currently keeps the pin and
+# returns a retryable 429 — filed as a discovered work item rather than pinned
+# as expected behaviour.
+# ---------------------------------------------------------------------------
+
+def _capacity_cfg(**server_overrides) -> dict:
+    """A queue config with the deadline ENABLED, so the capacity bound exists.
+
+    The seeded cold window prices a 40k-token prompt at 3.9 * 1.2 = 4.68
+    ms/token, so the capacity for the 90 s deadline is ~19 230 tokens —
+    derived in each row, never hard-coded.
+    """
+    return _queue_cfg(local_prefill_deadline_seconds=90, **server_overrides)
+
+
+def _capacity_tokens(config: dict, tokens: int = 40_000) -> int:
+    capacity = prefill_eta.deadline_capacity("Qwen3", tokens, config)
+    assert capacity.calibrated is True
+    assert capacity.tokens is not None
+    return capacity.tokens
+
+
+@pytest.mark.asyncio
+async def test_direct_dispatch_capacity_refusal_falls_through_to_remote(
+    mixed_model_config, caplog
+):
+    """AC2: on the DIRECT (free-slot) path a prompt whose cold basis exceeds
+    the capacity is refused with its own reason, never dispatched locally and
+    never queued; the remote tier serves it. The reason is the capacity one,
+    not ``prefill_eta_exceeds_deadline``, because the predicted-warm ETA alone
+    would have admitted it."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_calibration(tokens=40_000, ms_per_token=3.9)
+    config = _capacity_cfg()
+    capacity = _capacity_tokens(config)
+    prompt = capacity * 2  # still inside the same (16 384–65 536) bucket
+    assert prompt < 65_536
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        # The predicted-warm ETA is well inside every time bound; only the
+        # cold-basis capacity refuses this prompt.
+        _guard_patches(tokens=prompt, cached_ratio=0.95),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config, config,
+        )
+
+    assert result.status_code == 200
+    assert calls == ["remote"], (
+        "a capacity refusal must fall through to the remote tier, not "
+        "dispatch or wait locally"
+    )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "local_admission_guard decision=reject" in messages
+    assert "reason=prefill_eta_exceeds_capacity" in messages
+    assert "reason=prefill_eta_exceeds_deadline" not in messages
+    assert f"deadline_capacity_tokens={capacity}" in messages
+    assert "capacity_basis=cold" in messages
+    assert "contention_queue_wait" not in messages, "must not enter the queue"
+
+
+@pytest.mark.asyncio
+async def test_direct_dispatch_admits_exactly_the_capacity(
+    mixed_model_config, caplog
+):
+    """AC2 boundary at admission: exactly ``deadline_capacity_tokens`` on the
+    cold basis is admitted and dispatched locally (the comparison is ``>``),
+    so an off-by-one cannot start refusing feasible prompts."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_calibration(tokens=40_000, ms_per_token=3.9)
+    config = _capacity_cfg()
+    capacity = _capacity_tokens(config)
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=capacity, cached_ratio=0.95),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config, config,
+        )
+
+    assert result.status_code == 200
+    assert calls == ["local"]
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "local_admission_guard decision=admit" in messages
+    assert "reason=prefill_eta_exceeds_capacity" not in messages
+
+
+@pytest.mark.asyncio
+async def test_observe_policy_admits_the_capacity_refusal(
+    mixed_model_config, caplog
+):
+    """AC4 rollback (admission path): ``local_admission_guard_policy:
+    observe`` logs the would-be capacity refusal (``decision=reject``,
+    ``enforced=false``) and still dispatches locally — restoring today's
+    routing while the number is validated in the log."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_calibration(tokens=40_000, ms_per_token=3.9)
+    config = _capacity_cfg(local_admission_guard_policy="observe")
+    capacity = _capacity_tokens(config)
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=capacity * 2, cached_ratio=0.95),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config, config,
+        )
+
+    assert result.status_code == 200
+    assert calls == ["local"], "observe must never change the routing outcome"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "reason=prefill_eta_exceeds_capacity" in messages
+    assert "decision=reject" in messages
+    assert "enforced=false" in messages
+
+
+@pytest.mark.asyncio
+async def test_uncalibrated_cold_window_never_refuses_at_admission(
+    mixed_model_config, caplog
+):
+    """AC5 fail-open (admission path): with no cold calibration the capacity
+    is not enforceable, so a large prompt is dispatched locally exactly as an
+    uncalibrated guard does today."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    config = _capacity_cfg()
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=40_000, cached_ratio=0.95),  # no calibration
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config, config,
+        )
+
+    assert result.status_code == 200
+    assert calls == ["local"], "an uncalibrated capacity must not refuse local work"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "reason=prefill_eta_exceeds_capacity" not in messages
