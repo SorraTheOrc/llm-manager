@@ -5981,6 +5981,77 @@ async def _release_measured_cache_abort_dispatch(
     return removed
 
 
+def _record_abandoned_prefill_cold_sample(
+    srv,
+    model_name: str | None,
+    latest: list[Any] | None,
+    config: Any | None,
+    *,
+    session_id: str | None = None,
+) -> bool:
+    """Record one cold sample from a prefill abandoned at the deadline/ceiling.
+
+    LP-0MWGAEBWJ00334W2 (option 1 of the work item). A dispatch the prefill
+    deadline (or the max-prefill ceiling) cancels never emits a first byte, so
+    the first-byte cold-sample call site in ``router.proxy_to_local`` can never
+    see it — which is why the cold window never calibrates for the buckets that
+    carry large cold prompts. *latest* is the :func:`_prefetch_measured_cache_abort`
+    ``latest_sink``: the last ``prompt_progress`` observation of this dispatch,
+    filled on every event so a peek cancelled at the deadline still carries it.
+
+    The sample is priced by :func:`proxy.prefill_eta.record_abandoned_prefill_sample`
+    (prompt bucket from ``total``, positions actually prefilled, the dispatch's
+    own measured elapsed) and nothing else changes: no admission decision, no
+    release ordering, no client-visible behaviour.
+
+    Fail-open by contract: any problem (no observation, rollback key off,
+    unusable fields, an internal error) simply records nothing and returns
+    ``False``. Returns ``True`` when the sample entered the cold window, and
+    logs one ``cold_sample_abandoned`` line so an operator can watch the new
+    source fill (the evidence AC1 asks for is that count reaching
+    ``local_admission_guard_min_samples``).
+    """
+    try:
+        from proxy.prefill_eta import (
+            eviction_cold_sample_enabled,
+            record_abandoned_prefill_sample,
+        )
+
+        if not latest:
+            return False
+        measured = latest[-1]
+        if measured is None:
+            return False
+        if not eviction_cold_sample_enabled(config):
+            return False
+        recorded = record_abandoned_prefill_sample(
+            model_name,
+            getattr(measured, "total", None),
+            getattr(measured, "cache", None),
+            getattr(measured, "processed", None),
+            getattr(measured, "time_ms", None),
+        )
+        if not recorded:
+            return False
+        try:
+            srv.logger.info(
+                "cold_sample_abandoned session=%s model=%s total=%s cache=%s "
+                "processed=%s time_ms=%s → recorded into the cold calibration "
+                "window from the abandoned prefill",
+                session_id or "unknown",
+                model_name or "unknown",
+                getattr(measured, "total", None),
+                getattr(measured, "cache", None),
+                getattr(measured, "processed", None),
+                getattr(measured, "time_ms", None),
+            )
+        except Exception:
+            pass
+        return True
+    except Exception:  # fail-open: a metric path must not break a dispatch
+        return False
+
+
 @dataclass
 class MeasuredAbortPrefetch:
     """Outcome of :func:`_prefetch_measured_cache_abort` (LP-0MVR7IN0O000DPXN).
@@ -5994,12 +6065,21 @@ class MeasuredAbortPrefetch:
     ``measured_cache_abort`` line (``detail``/``measured_eta_s``/``budget_s``)
     so a tolerated deficit is explainable. ``None`` when no decision was taken
     (no measurement, or the peek ended before one).
+
+    ``latest_measured`` is the **last** ``prompt_progress`` observation the peek
+    saw, which is what the abandonment cold sample prices
+    (LP-0MWGAEBWJ00334W2): ``measured`` stays the *deciding* (first) event
+    because its ``cache`` is the final reused prefix, while ``latest_measured``
+    carries the progress reached at abandonment. It is also delivered through
+    the caller's ``latest_sink`` so a peek cancelled at the deadline — the case
+    this exists for — still leaves the latest observation with the caller.
     """
 
     chunks: list[bytes]
     abort: bool = False
     decision: Any | None = None
     measured: Any | None = None
+    latest_measured: Any | None = None
     complete: bool = False
     error: BaseException | None = None
 
@@ -6013,6 +6093,7 @@ async def _prefetch_measured_cache_abort(
     timeout: float = 5.0,
     max_chunks: int = 1024,
     chunks_sink: list[bytes] | None = None,
+    latest_sink: list[Any] | None = None,
 ) -> MeasuredAbortPrefetch:
     """Peek the local SSE stream for the first ``prompt_progress`` measurement.
 
@@ -6049,6 +6130,14 @@ async def _prefetch_measured_cache_abort(
     replays those bytes through a fresh ``SSEEventReframer``, so a cancelled
     peek never loses or re-orders a byte.
 
+    *latest_sink* (LP-0MWGAEBWJ00334W2) is the same cancellation-safe channel
+    for the **latest** measurement: it is refreshed on every ``prompt_progress``
+    event (single element, so a caller never has to reason about growth), which
+    is what the abandonment cold sample prices when the prefill deadline
+    cancels the peek. A peek that is cancelled therefore still leaves the
+    progress reached at abandonment with the caller; nothing else about the
+    decision changes (only the FIRST event decides).
+
     *aiter* is the dispatch's ``aiter_bytes()`` iterator and *reframer* its
     :class:`proxy.utils.SSEEventReframer`, both owned by the caller: the peek
     must consume the SAME cursor and event buffer the normal stream loop
@@ -6070,6 +6159,20 @@ async def _prefetch_measured_cache_abort(
     capture = PromptProgressCapture()
     decided_measured = None
     decided_decision = None
+    latest_measured = None
+
+    def _observe_latest(measured) -> None:
+        """Refresh the latest-measurement channel (cancellation-safe)."""
+        nonlocal latest_measured
+        latest_measured = measured
+        if latest_sink is None:
+            return
+        try:
+            latest_sink.clear()
+            latest_sink.append(measured)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     deadline_at = time.monotonic() + timeout if timeout > 0 else None
 
     while len(chunks) < max_chunks:
@@ -6099,13 +6202,19 @@ async def _prefetch_measured_cache_abort(
             chunk = read_task.result()
         except StopAsyncIteration:
             return MeasuredAbortPrefetch(
-                chunks=chunks, complete=True, decision=decided_decision
+                chunks=chunks,
+                complete=True,
+                decision=decided_decision,
+                latest_measured=latest_measured,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # read error — fail open, replay + raise later
             return MeasuredAbortPrefetch(
-                chunks=chunks, error=exc, decision=decided_decision
+                chunks=chunks,
+                error=exc,
+                decision=decided_decision,
+                latest_measured=latest_measured,
             )
         chunks.append(chunk)
 
@@ -6119,15 +6228,21 @@ async def _prefetch_measured_cache_abort(
                         chunks=chunks,
                         measured=decided_measured,
                         decision=decided_decision,
+                        latest_measured=latest_measured,
                     )
+                # Every progress event refreshes the latest measurement: what
+                # the prefill reached is the abandonment cold sample's evidence
+                # (LP-0MWGAEBWJ00334W2), and only this peek ever observes it
+                # before the deadline cancels the dispatch.
+                measured = MeasuredPrefill.from_progress(
+                    progress, priced_new_tokens=priced_new_tokens
+                )
+                _observe_latest(measured)
                 if decided_measured is not None:
                     # Only the FIRST progress event decides (its ``cache`` is
                     # the final reused prefix); later ones add no decision
                     # information, so keep peeking for the deadline bound.
                     continue
-                measured = MeasuredPrefill.from_progress(
-                    progress, priced_new_tokens=priced_new_tokens
-                )
                 decided_measured = measured
                 decision = decide_measured_cache_abort(
                     progress, priced_new_tokens, effective
@@ -6135,7 +6250,11 @@ async def _prefetch_measured_cache_abort(
                 decided_decision = decision
                 if decision.abort:
                     return MeasuredAbortPrefetch(
-                        chunks=chunks, abort=True, decision=decision, measured=measured
+                        chunks=chunks,
+                        abort=True,
+                        decision=decision,
+                        measured=measured,
+                        latest_measured=latest_measured,
                     )
                 # No abort: keep peeking so ``local_prefill_deadline_seconds``
                 # keeps bounding the whole pre-first-byte wait. The declined
@@ -6150,10 +6269,14 @@ async def _prefetch_measured_cache_abort(
                 chunks=chunks,
                 measured=decided_measured,
                 decision=decided_decision,
+                latest_measured=latest_measured,
             )
         # No complete event yet (partial/empty read): keep reading.
     return MeasuredAbortPrefetch(
-        chunks=chunks, measured=decided_measured, decision=decided_decision
+        chunks=chunks,
+        measured=decided_measured,
+        decision=decided_decision,
+        latest_measured=latest_measured,
     )
 
 

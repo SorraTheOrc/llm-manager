@@ -214,6 +214,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _occupancy_divergence_reason,
     _prefetch_measured_cache_abort,
     _prefill_thrash_fingerprint,
+    _record_abandoned_prefill_cold_sample,
     _record_prefill_thrash_cooldown,
     _release_client_disconnect_dispatch,
     _release_completed_dispatch,
@@ -2045,6 +2046,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         _prefetched_chunks: list[bytes] = []
                         _prefetched_aiter = None
                         _prefetch_error = None
+                        # Latest ``prompt_progress`` observation of this dispatch
+                        # (LP-0MWGAEBWJ00334W2): refreshed on every progress
+                        # event so the abandonment cold sample still has it when
+                        # the prefill deadline cancels the peek.
+                        _prefetched_latest: list = []
                         if (
                             _prompt_progress_capture_enabled
                             and _measured_abort_settings is not None
@@ -2111,6 +2117,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                         # Keep every raw read even if the
                                         # monitor cancels the peek.
                                         chunks_sink=_prefetched_chunks,
+                                        # ...and the latest progress observation,
+                                        # for the abandonment cold sample.
+                                        latest_sink=_prefetched_latest,
                                     ),
                                     timeout=_prefetch_timeout,
                                     poll_seconds=_first_byte_poll_seconds,
@@ -2530,6 +2539,29 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # slot to the release so the real task is cancelled and
                         # the slot is recorded as abandoned for the status
                         # annotation.
+                        # LP-0MWGAEBWJ00334W2: a prefill the deadline (or the
+                        # max-prefill ceiling) abandons is the ONLY evidence the
+                        # cold calibration window can get for the buckets that
+                        # carry large cold prompts — it never emits a first byte,
+                        # so the first-byte sample site below can never see it.
+                        # Record one cold sample from the latest progress the
+                        # peek observed (tokens actually prefilled against the
+                        # dispatch's own measured elapsed). Fail-open: no
+                        # observation, the rollback key off, or any problem
+                        # simply records nothing.
+                        if isinstance(_exc, asyncio.TimeoutError):
+                            try:
+                                _record_abandoned_prefill_cold_sample(
+                                    srv,
+                                    model_name,
+                                    _prefetched_latest
+                                    if "_prefetched_latest" in locals()
+                                    else None,
+                                    server_config,
+                                    session_id=session_id,
+                                )
+                            except Exception:
+                                pass
                         if _prefill_deadline_fired:
                             # LP-0MVSAMN14001DMTY AC2: the deadline detour is
                             # TERMINAL for local inside this request. Marking

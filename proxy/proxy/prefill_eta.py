@@ -134,6 +134,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 logger = logging.getLogger("llama-proxy")
@@ -196,6 +197,18 @@ WARM_CACHE_RATIO = 0.9
 COLD_MAX_CACHED_RATIO = 0.10
 COLD_MIN_PROCESSED_TOKENS = 32_000
 COLD_MIN_FIRST_BYTE_MS = 1_000.0
+
+#: Rollback key for the ABANDONED-prefill sample source
+#: (LP-0MWGAEBWJ00334W2, option 1). An abandoned prefill (a dispatch the
+#: prefill deadline or the max-prefill ceiling cancels) never emits a first
+#: byte, so it can never feed the cold window from the first-byte path. The
+#: eviction path therefore records one sample from the LATEST ``prompt_progress``
+#: observation (``total``/``cache``/``processed``/``time_ms``) instead. Setting
+#: this key to ``0``/``false``/``off`` restores the pre-change sample source
+#: exactly (completed prefills only). Absent keeps the target behaviour enabled;
+#: a present-but-unreadable value fails open to the pre-change behaviour,
+#: mirroring ``measured_cache_abort.AbortSettings.from_config``.
+EVICTION_COLD_SAMPLE_KEY = "local_deadline_cold_sample_enabled"
 
 #: Rolling-window size per ``(model, bucket)``.
 WINDOW_SAMPLES = 200
@@ -796,6 +809,139 @@ def record_cold_measured_sample(
         history.append(tokens)
     except Exception:  # pragma: no cover - defensive
         logger.debug("record_cold_measured_sample failed", exc_info=True)
+
+
+def record_abandoned_prefill_sample(
+    model: str | None,
+    prompt_tokens: int | None,
+    cache_tokens: int | None,
+    processed_tokens: int | None,
+    service_ms: float | None,
+) -> bool:
+    """Record one cold sample from a prefill abandoned at the deadline/ceiling.
+
+    LP-0MWGAEBWJ00334W2 (option 1, producer-confirmed). The certified window
+    proves the shipped source can never calibrate the large-prompt buckets: a
+    dispatch the prefill deadline cancels never emits a first byte, so
+    :func:`record_cold_measured_sample`'s first-byte call site can never see it,
+    and bucket 2 (65k+) can never supply the sample that would let the capacity
+    bound refuse its own prompts. This entry point is the missing source: it is
+    called on the abandonment path with the **latest** ``prompt_progress``
+    observation of that dispatch.
+
+    The four arguments are exactly the fields a ``prompt_progress`` event
+    carries (``total``, ``cache``, ``processed``, ``time_ms``), so the sample is
+    built only from evidence the proxy observes in production:
+
+    ``prompt_tokens``
+        The prompt's whole size (``total``). It selects the context bucket, so
+        a 90k dispatch feeds bucket 2 even when it only prefilled part of it.
+    ``cache_tokens``
+        The reused prefix (``cache``). A dispatch measured at/above
+        :data:`WARM_CACHE_RATIO` reuse is warm *by the codebase's own
+        definition* (it is priced on the warm path), so its abandonment is not
+        cold evidence and the sample is dropped.
+    ``processed_tokens``
+        The position the prefill reached (``processed``, which includes the
+        reused prefix — llama-server reports ``n_prompt_tokens_processed``).
+        This is the "tokens actually prefilled" the work item cites (the
+        certified window's 180 s eviction reached 43 414); it must clear
+        :data:`COLD_MIN_PROCESSED_TOKENS`.
+    ``service_ms``
+        The dispatch's own measured elapsed (``time_ms``). It must clear
+        :data:`COLD_MIN_FIRST_BYTE_MS`, and the progress must exceed the reused
+        prefix — a run that only replayed its cached prefix measured nothing
+        about the cold rate.
+
+    The sample is recorded as ``(cached=0, new=processed, ms=time_ms)``: no
+    cache credit is claimed, because ``time_ms`` already covers every position
+    traversed and every position is charged the one fitted rate. Claiming a
+    separate cached term for the same tokens would double-count them and make
+    the cold window *more optimistic* than the prior it exists to correct
+    (the shipped first-byte path has that shape only because its ``processed``
+    is the completed total and its cache share is below
+    :data:`COLD_MAX_CACHED_RATIO`).
+
+    Fail-open contract identical to :func:`record_cold_measured_sample`: never
+    raises, invalid/inconsistent inputs are ignored, the priced window
+    (:func:`record_dispatch_sample`) is untouched. Returns ``True`` when the
+    sample entered the cold window (tests and the log line use it).
+    """
+    try:
+        model_key = str(model or "").strip()
+        if not model_key:
+            return False
+        total = int(prompt_tokens or 0)
+        if total <= 0:
+            return False
+        try:
+            ms = float(service_ms)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(ms) or ms < COLD_MIN_FIRST_BYTE_MS:
+            return False
+        positions = int(processed_tokens or 0)
+        if positions < COLD_MIN_PROCESSED_TOKENS:
+            return False
+        cache = int(cache_tokens or 0)
+        # Inconsistent observations are ignored, never guessed at.
+        if cache < 0 or cache > total or positions > total or positions <= cache:
+            return False
+        if cache / total >= WARM_CACHE_RATIO:
+            return False
+        bucket = bucket_for(total)
+        window = _cold_samples.get((model_key, bucket))
+        if window is None:
+            window = deque(maxlen=WINDOW_SAMPLES)
+            _cold_samples[(model_key, bucket)] = window
+        window.append((0, positions, ms))
+        # Mirror the other recorders: an abandoned dispatch is still an
+        # observed dispatch, so it keeps the published reference statistic fed.
+        _last_prompt_tokens[model_key] = total
+        history = _recent_prompt_tokens.get(model_key)
+        if history is None:
+            history = deque(maxlen=REFERENCE_HISTORY_SAMPLES)
+            _recent_prompt_tokens[model_key] = history
+        history.append(total)
+        return True
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("record_abandoned_prefill_sample failed", exc_info=True)
+        return False
+
+
+def eviction_cold_sample_enabled(config: dict | None) -> bool:
+    """Whether an abandoned prefill may feed the cold window (rollback key).
+
+    Reads :data:`EVICTION_COLD_SAMPLE_KEY` from the ``server`` section
+    (tolerating a flat dict and ``None``). Absent keeps the target behaviour
+    enabled so a partially configured deploy does not silently leave the
+    defect in place; a present-but-unreadable or explicitly false value
+    restores the pre-change sample source (completed prefills only).
+    """
+    try:
+        if config is None:
+            return True
+        if not isinstance(config, Mapping):
+            return False
+        server_cfg = config.get("server", config)
+        if not isinstance(server_cfg, Mapping):
+            return False
+        if EVICTION_COLD_SAMPLE_KEY not in server_cfg:
+            return True
+        value = server_cfg.get(EVICTION_COLD_SAMPLE_KEY)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalised = value.strip().lower()
+            if normalised in {"1", "true", "yes", "on", "enabled"}:
+                return True
+            if normalised in {"0", "false", "no", "off", "disabled", ""}:
+                return False
+        return False
+    except Exception:  # pragma: no cover - defensive
+        return False
 
 
 @dataclass(frozen=True)

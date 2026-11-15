@@ -2348,6 +2348,32 @@ server:
   # the percentile floor keep the existing mixed/contended calibration
   # byte-for-byte.
   #
+  # HOW THE COLD WINDOW FILLS (LP-0MWGAEBWJ00334W2). Two sources, both built
+  # only from evidence the proxy observes in production:
+  #   1. COMPLETED genuinely-cold prefills — the first-byte branch of
+  #      ``router.proxy_to_local`` records the measured-prefill record
+  #      (measured reuse < 0.10, >= 32 000 positions prefilled).
+  #   2. ABANDONED prefills — a dispatch the prefill deadline (or the
+  #      max-prefill ceiling) cancels never emits a first byte, so source 1 can
+  #      never see it. The eviction path records one sample from the LATEST
+  #      ``prompt_progress`` observation of that dispatch (tokens actually
+  #      prefilled against the dispatch's own measured elapsed), bucketed by the
+  #      PROMPT size — that is the only way bucket 2 (65k+) can ever calibrate,
+  #      because a 65k+ cold prefill cannot complete inside the deadline and so
+  #      can never supply a completed sample. Such a dispatch is admitted on the
+  #      abandonment evidence (it demonstrably was not cache-served); a dispatch
+  #      measured at/above ``WARM_CACHE_RATIO`` (0.90) reuse is warm by
+  #      definition and is not cold evidence. Each recorded sample logs one
+  #      ``cold_sample_abandoned total=… cache=… processed=… time_ms=…`` line.
+  # ROLLBACK for source 2 — set this key to 0/false/off to restore the
+  # pre-change sample source exactly (completed prefills only; the cold window
+  # then returns to its uncalibrated, inert behaviour for the large buckets).
+  # Absent keeps the target behaviour enabled; an unreadable value fails open to
+  # the pre-change behaviour. Turning the whole capture off
+  # (``local_measured_cache_abort_enabled: 0``) also disables source 2, because
+  # no ``prompt_progress`` observation is captured at all.
+  local_deadline_cold_sample_enabled: 1
+  #
   # Local admission reservations + fallback intent
   # ----------------------------------------------
   # (LP-0MVIKPCSG002B0NL) A dispatcher can claim local capacity ATOMICALLY

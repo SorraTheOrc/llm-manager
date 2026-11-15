@@ -839,7 +839,59 @@ cache-hit completions can never price the cold rate. The samples come from
 the measured-prefill capture (`MeasuredPrefill.measured_cached_ratio` /
 `processed`, the same `prefill_progress_measured` flow documented above) at
 the point the measurement is finalised — the existing priced window
-(`record_dispatch_sample`, `dispatch_first_byte_ms`) is untouched.
+(`record_dispatch_sample`, `dispatch_first_byte_ms`) is untouched. (That
+predicate governs the *completed*-prefill source; the abandoned-prefill source
+below replaces the reuse-ratio test with the warm boundary and keeps both
+floors — see “How the window actually fills”.)
+
+### How the window actually fills (LP-0MWGAEBWJ00334W2)
+
+The completed-prefill source above can never calibrate the large buckets: a
+dispatch the prefill deadline cancels never emits a first byte, and a 65k+
+cold prompt cannot finish inside the deadline at all. In the certified window
+(2026-11-06 14:15:50 → 2026-11-08 00:00) that left bucket 1 with one
+qualifying sample and bucket 2 with **zero**, so `DeadlineCapacity.calibrated`
+was permanently `False` and the capacity bound never refused anything.
+
+The cold window therefore has **two** sources, both built only from evidence
+the proxy observes in production:
+
+| Source | Where | Evidence |
+|---|---|---|
+| completed cold prefill | first-byte branch of `router.proxy_to_local` | `prompt_progress_measured` at first byte (measured reuse < 0.10, ≥ 32 000 positions) |
+| **abandoned** prefill | the deadline / max-prefill-ceiling eviction path | the LATEST `prompt_progress` observation the peek saw: tokens actually prefilled (`processed`) against the dispatch's own measured elapsed (`time_ms`) |
+
+The peek (`_prefetch_measured_cache_abort`) refreshes that latest observation
+on **every** progress event into a cancellation-safe sink, so the observation
+survives the deadline cancelling the peek. The eviction path then calls
+`prefill_eta.record_abandoned_prefill_sample`, which:
+
+- buckets the sample by the **prompt** size (`total`) — bucketing by the
+  progress reached would put every abandoned large prefill in bucket 1 and
+  leave bucket 2 empty again;
+- requires `processed >= 32 000` positions and a measured elapsed
+  `>= 1 s`, exactly the floors the completed source uses;
+- drops a dispatch whose measured reuse is at/above `WARM_CACHE_RATIO`
+  (0.90) — it is warm by the codebase's own definition, so its abandonment is
+  not cold evidence;
+- records the sample as `(cached=0, new=processed, ms=time_ms)`: the elapsed
+  already covers every position traversed, so claiming a cache credit for the
+  same tokens would double-count them and make the cold window *more
+  optimistic* than the prior it exists to correct.
+
+A dispatch abandoned mid-prefill is admitted as cold evidence because it
+demonstrably was **not** cache-served (a cache-served dispatch returns in
+milliseconds). Each recorded sample emits one
+`cold_sample_abandoned session=… model=… total=… cache=… processed=… time_ms=…`
+line, so the new source is watchable in production.
+
+**Rollback:** `server.local_deadline_cold_sample_enabled: 0` restores the
+completed-only source exactly (the cold window then returns to its
+uncalibrated, inert behaviour for the large buckets). Absent keeps the target
+behaviour; an unreadable value fails open to the pre-change behaviour.
+Disabling the whole measured-prefill capture
+(`local_measured_cache_abort_enabled: 0`) disables it too, because no
+`prompt_progress` observation is captured at all.
 
 ### Selection
 
