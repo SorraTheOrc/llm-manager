@@ -937,16 +937,25 @@ measure, and none replaces another:
 | `llama_slots_busy` (the rule's input) | slot occupancy published by the proxy | "how many of our slots are processing right now?" — a count, not a % | anything about power draw |
 | `local_busy.busy_pct` (local capacity/contention) | proxy log, `dispatch → finish` slot union — **proxy-inferred**, no hardware | "how contended was local capacity?" — the `> 60 %` local-busy capacity gate quotes **this** figure | how much GPU power that work drew, or any GPU work outside the proxy |
 
+**The nightly usage report reports this measure on every GPU surface.** The
+scorecard's GPU row and the **Summary by hour**
+`GPU computing (attributable)` column are both the attributable share (the
+latter bucketed per hour), so the two tables can no longer show two different
+"GPU usage" numbers; an hour with no observed instants reads `unknown`, never
+a fabricated `0 %`. The retired power-only `gpu:computing:bool` share is not
+reported as a GPU-usage figure anywhere on the report.
+
 **A figure's name must state its scope.** No number may be quoted as a bare
 "GPU busy %", and the derivations are **never interchangeable** with the
 measure or with each other. The `> 60 %` local-busy capacity gate quotes the
 log-derived `local_busy` — never a power-derived GPU figure — and the
 attributable share is produced only by `scripts/gpu_utilisation.py`.
 
-The log-derived and power-based figures end up on different scales and
+The log-derived and attributable figures end up on different scales and
 legitimately diverge. Measured
 2026-10-27 22:10 → 2026-10-28 22:10 the log-derived figure was **12.6 %**
-against a power-based **39.3 %** — a ~27-point gap (LP-0MVSPWLLP008AQXZ). The
+against a power-based (power-only) **39.3 %** — a ~27-point gap
+(LP-0MVSPWLLP008AQXZ). The
 causes are structural: the log union counts queued slot time and misses work it
 never logged, while the power figure counts *any* GPU draw at compute power,
 including work the proxy never served, and (because a 15 s scrape is binarised
@@ -955,11 +964,13 @@ at 90 W) rounds a 2 s burst up to a whole sample.
 Read them as answers to different questions:
 
 - **Is local capacity contended?** → `local_busy.busy_pct`. This is the
-  decision figure; see
+  decision figure gates and alerts quote; see
   [which busy figure is authoritative](../.pi/skills/proxy-usage-analysis/REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
 - **Did our slots actually keep the GPU computing?** → the attributable share
-  (`gpu:computing_workload:bool`), via `scripts/gpu_utilisation.py`.
-- **Is the GPU busy at all, whoever asked?** → `gpu:computing:bool`.
+  (`gpu:computing_workload:bool`), via `scripts/gpu_utilisation.py` — the
+  scorecard's GPU row and the hourly column.
+- **Is the GPU busy at all, whoever asked?** → the power-only
+  `gpu:computing:bool` derivation, which is never local model utilisation.
 
 ## GPU utilisation CLI (`scripts/gpu_utilisation.py`)
 

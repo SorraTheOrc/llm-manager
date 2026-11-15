@@ -147,10 +147,10 @@ class Metric:
 METRIC_REGISTRY: tuple[Metric, ...] = (
     Metric(
         id="gpu_busy",
-        label="GPU activity — power-based, any consumer",
+        label="GPU computing — attributable (power ≥ 90 W and a busy local slot)",
         unit="%",
         direction=HIGHER,
-        source="GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer)",
+        source="GPU telemetry power and busy-slot samples (gpu:computing_workload:bool, via scripts/gpu_utilisation.py)",
     ),
     Metric(
         id="fallback_rate",
@@ -364,8 +364,16 @@ def is_cross_era(measurements: Iterable[Mapping]) -> bool:
 
 
 def new_state() -> dict:
-    """An empty state covering every registered metric."""
-    return {"metrics": {metric.id: {"measurements": []} for metric in METRIC_REGISTRY}}
+    """An empty state covering every registered metric.
+
+    ``notes`` records deliberate discontinuity events (a metric's definition
+    changed and its history was reset), so a future reader can tell a reset
+    from a data loss.
+    """
+    return {
+        "metrics": {metric.id: {"measurements": []} for metric in METRIC_REGISTRY},
+        "notes": {},
+    }
 
 
 def _normalise_measurement(raw: Mapping) -> dict:
@@ -415,16 +423,22 @@ def load_state(path: str | Path | None, *, defaults_path: str | Path | None = No
     """
     state = new_state()
     if defaults_path is not None:
-        for metric_id, measurements in _history_entries(
-            config_loader.load_yaml_mapping(defaults_path)
-        ).items():
-            state["metrics"][metric_id]["measurements"] = measurements
+        defaults = config_loader.load_yaml_mapping(defaults_path)
+        _merge_history(state, defaults)
     if path is not None and Path(path).is_file():
-        for metric_id, measurements in _history_entries(
-            config_loader.load_yaml_mapping(path)
-        ).items():
-            state["metrics"][metric_id]["measurements"] = measurements
+        _merge_history(state, config_loader.load_yaml_mapping(path))
     return state
+
+
+def _merge_history(state: dict, data: Mapping) -> None:
+    """Merge one loaded mapping's measurements and definition-change notes."""
+    for metric_id, measurements in _history_entries(data).items():
+        state["metrics"][metric_id]["measurements"] = measurements
+    notes = data.get("notes") if isinstance(data, Mapping) else None
+    if isinstance(notes, Mapping):
+        for metric_id, events in notes.items():
+            if metric_id in _METRICS_BY_ID and isinstance(events, list):
+                state["notes"][metric_id] = [dict(event) for event in events]
 
 
 def save_state(state: Mapping, path: str | Path) -> None:
@@ -440,7 +454,52 @@ def save_state(state: Mapping, path: str | Path) -> None:
             if isinstance(measurement, Mapping)
         ]
         payload["metrics"][registered.id] = {"measurements": measurements}
+    notes = state.get("notes") if isinstance(state, Mapping) else None
+    if isinstance(notes, Mapping) and notes:
+        payload["notes"] = {
+            metric_id: [dict(event) for event in events]
+            for metric_id, events in notes.items()
+            if metric_id in _METRICS_BY_ID and events
+        }
     config_loader.dump_yaml_mapping(payload, path)
+
+
+def reset_metric_history(
+    state: dict,
+    metric_id: str,
+    *,
+    note: str,
+    reset_at: str | None = None,
+) -> int:
+    """Clear a metric's recorded measurements, documenting *why*.
+
+    A metric whose definition changed must not be compared across the two
+    definitions, so its history is reset rather than silently continued; the
+    ``note`` (a definition-change note) is stored alongside the empty history so
+    the reset is a recorded discontinuity, not an apparent data loss. Returns
+    the number of measurements removed.
+    """
+    if metric_id not in _METRICS_BY_ID:
+        raise ValueError(f"unknown metric id {metric_id!r}")
+    previous = state["metrics"][metric_id]["measurements"]
+    removed = len(previous)
+    state["metrics"][metric_id]["measurements"] = []
+    events = state.setdefault("notes", {}).setdefault(metric_id, [])
+    events.append(
+        {
+            "event": "definition_change",
+            "note": str(note),
+            "at": str(reset_at or ""),
+        }
+    )
+    return removed
+
+
+def metric_notes(state: Mapping, metric_id: str) -> list[dict]:
+    """Definition-change notes recorded for *metric_id* (empty when none)."""
+    notes = state.get("notes") if isinstance(state, Mapping) else None
+    events = notes.get(metric_id) if isinstance(notes, Mapping) else None
+    return [dict(event) for event in events] if isinstance(events, list) else []
 
 
 def record_measurement(
@@ -702,11 +761,21 @@ def _parse_time_to_first_token(report_text: str) -> float | None:
 
 
 def _parse_gpu_busy(report_text: str) -> float | None:
+    """Read the attributable GPU row of ``## Local model utilization``.
+
+    Only the row whose label names the **attributable** scope is read, so an
+    archived report rendering the retired power-only figure seeds **nothing**:
+    the two definitions are never compared across the reset
+    (LP-0MWG7KQVZ008DBZM Q4).
+    """
     section = _section(report_text, "Local model utilization")
     if section is None:
         return None
     for row in _table_rows(section):
-        if not row or not row[0].strip().lower().startswith("gpu busy"):
+        if not row:
+            continue
+        label = row[0].strip().lower()
+        if not label.startswith("gpu") or "attributable" not in label:
             continue
         for cell in row[1:]:
             percent = _PERCENT_IN_TEXT_RE.search(cell)

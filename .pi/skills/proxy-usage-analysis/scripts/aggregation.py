@@ -2949,13 +2949,14 @@ def local_busy_pct(busy: BusyStats | None) -> float | None:
 
 
 def gpu_busy_pct(gpu: object | None) -> float | None:
-    """Coverage-honest power-based GPU computing percentage (any GPU consumer).
+    """Attributable GPU-computing percentage (power ≥ 90 W and a busy local slot).
 
-    Supplementary hardware telemetry (see :mod:`gpu_busy`), **not** a
-    local-utilisation signal. The value divides computing instants by the
-    window's *expected* grid instants, so unobserved time is neither idle nor
-    busy and cannot inflate the figure. ``None`` when the Prometheus query
-    failed or no GPU result was collected.
+    The one reported GPU-activity figure, produced only by
+    ``scripts/gpu_utilisation.py`` (via :mod:`gpu_busy`): the share of the
+    window's expected 15 s instants on which our local model kept the GPU
+    computing. Unobserved time is neither idle nor busy and cannot inflate the
+    figure. ``None`` when the Prometheus query failed or no GPU result was
+    collected.
     """
     value = _float_or_none(getattr(gpu, "busy_pct", None))
     return round(value, 1) if value is not None else None

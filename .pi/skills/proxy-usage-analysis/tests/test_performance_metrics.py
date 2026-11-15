@@ -198,16 +198,19 @@ def test_registry_direction_matches_the_parent_definition(metric_id, direction):
     assert registry_entry(metric_id).direction == direction
 
 
-def test_gpu_busy_names_its_hardware_scope_and_keeps_a_comparable_history():
-    """AC4 (LP-0MW5K8YE9001QO39): the scorecard label names the hardware
-    scope (power-based, any GPU consumer) rather than reading as local model
-    utilisation, while the unit and direction stay unchanged so the recorded
-    history remains comparable."""
+def test_gpu_busy_names_its_attributable_scope():
+    """LP-0MWG7KQVZ008DBZM: the scorecard label names the attributable scope
+    (power ≥ 90 W **and** a busy local slot, our local model's work) rather
+    than the retired power-only ``gpu:computing:bool`` figure. Unit and
+    direction are unchanged so the reset history stays comparable within one
+    definition."""
     metric = registry_entry("gpu_busy")
 
-    assert "power-based" in metric.label
-    assert "any consumer" in metric.label
-    assert "any GPU consumer" in metric.source
+    assert "attributable" in metric.label
+    assert "power" in metric.label and "busy local slot" in metric.label
+    assert "gpu:computing_workload:bool" in metric.source
+    assert "scripts/gpu_utilisation.py" in metric.source
+    assert "any consumer" not in metric.label
     assert metric.unit == "%"
     assert metric.direction == HIGHER
 
@@ -574,6 +577,89 @@ def test_backfill_parser_reads_the_era_b_standard_low_report():
     assert parsed["decode_speed"] == pytest.approx(37.8)
     assert parsed["prompt_eval_speed"] == pytest.approx(193.3)
     assert parsed["contention_denials_per_hour"] == pytest.approx(12.8)
+
+
+# --- Scorecard parser: the attributable GPU row (LP-0MWG7KQVZ008DBZM) -------
+
+_ATTRIBUTABLE_REPORT = """
+## Local model utilization
+
+| Metric | Total | Standard | Low |
+|---|---|---|---|
+| GPU computing — attributable (power ≥ 90 W and a busy local slot) | 6h 45m (28.1%) | - | - |
+"""
+
+_POWER_ONLY_REPORT = """
+## Local model utilization
+
+| Metric | Total | Standard | Low |
+|---|---|---|---|
+| GPU busy — power-based (hardware) | 6h 45m (28.1%) | - | - |
+"""
+
+
+def test_scorecard_parser_reads_the_attributable_row():
+    """The scorer parses the attributable figure the report now renders."""
+    assert pm._parse_gpu_busy(_ATTRIBUTABLE_REPORT) == pytest.approx(28.1)
+
+
+def test_scorecard_parser_ignores_the_retired_power_only_row():
+    """A pre-reset archived report carries the power-only figure; it must seed
+    **nothing**, so history is never compared across two definitions."""
+    assert pm._parse_gpu_busy(_POWER_ONLY_REPORT) is None
+    assert "gpu_busy" not in pm.parse_archived_report(_POWER_ONLY_REPORT)
+
+
+# --- History reset (definition change) --------------------------------------
+
+
+def test_reset_metric_history_clears_measurements_and_records_the_reason():
+    """A definition change resets the metric's history, documenting the reset."""
+    state = pm.new_state()
+    pm.record_measurement(state, "gpu_busy", window="2026-11-03", value=23.1)
+    pm.record_measurement(state, "gpu_busy", window="2026-11-04", value=52.3)
+
+    removed = pm.reset_metric_history(
+        state,
+        "gpu_busy",
+        note="definition changed to the attributable gpu:computing_workload:bool share",
+        reset_at="2026-11-15",
+    )
+
+    assert removed == 2
+    assert state["metrics"]["gpu_busy"]["measurements"] == []
+    assert pm.metric_notes(state, "gpu_busy") == [
+        {
+            "event": "definition_change",
+            "note": "definition changed to the attributable gpu:computing_workload:bool share",
+            "at": "2026-11-15",
+        }
+    ]
+    # Baseline/target are derived only from the post-reset history.
+    assert pm.baseline_from(state["metrics"]["gpu_busy"]["measurements"], HIGHER) is None
+
+
+def test_reset_metric_history_round_trips_through_the_state_file(tmp_path):
+    """The reset note survives save/load, so it is not a silent discontinuity."""
+    path = tmp_path / "state.yaml"
+    state = pm.new_state()
+    pm.record_measurement(state, "gpu_busy", window="2026-11-03", value=23.1)
+    pm.reset_metric_history(
+        state,
+        "gpu_busy",
+        note="definition changed to the attributable share",
+        reset_at="2026-11-15",
+    )
+    pm.save_state(state, path)
+
+    loaded = pm.load_state(path)
+    assert loaded["metrics"]["gpu_busy"]["measurements"] == []
+    assert pm.metric_notes(loaded, "gpu_busy")[0]["event"] == "definition_change"
+
+
+def test_reset_metric_history_rejects_an_unknown_metric():
+    with pytest.raises(ValueError):
+        pm.reset_metric_history(pm.new_state(), "nope", note="x")
 
 
 # --- Time-to-first-token population (LP-0MWBLZ8HP005F6KO) -------------------

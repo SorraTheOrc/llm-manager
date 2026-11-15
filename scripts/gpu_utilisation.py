@@ -581,6 +581,45 @@ def cross_check_warning(
     )
 
 
+#: Instant classifications the attributable share is built from.
+STATE_COMPUTING = "computing"
+STATE_IDLE = "idle"
+STATE_UNKNOWN = "unknown"
+
+
+def pipeline_alive(
+    series: dict[str, dict[int, float]],
+    timestamp: int,
+    scrape_interval_seconds: int,
+) -> bool:
+    """True when a sentinel proves the sampling pipeline was reporting then.
+
+    ``up{job="llama-proxy"} == 1``, ``up{job="node-exporter"} == 1``, or a
+    ``llama_slots_sample_timestamp_seconds`` heartbeat no older than one scrape
+    interval. A *stale* heartbeat proves the sampler stopped reporting, so it
+    does not count.
+    """
+    if series.get("up_llama_proxy", {}).get(timestamp) == 1:
+        return True
+    if series.get("up_node_exporter", {}).get(timestamp) == 1:
+        return True
+    beat = series.get("slot_heartbeat", {}).get(timestamp)
+    return beat is not None and abs(timestamp - beat) <= scrape_interval_seconds
+
+
+def workload_state(workload: float | None, *, alive: bool) -> str:
+    """Classify one grid instant for the attributable share.
+
+    ``computing`` when the pipeline was alive and ``gpu:computing_workload:bool``
+    is ``>= 0.5`` (power ≥ 90 W **and** a busy local slot), ``idle`` when alive
+    and the rule is ``0``, ``unknown`` otherwise. Absence is never ``idle`` and
+    never folded into the numerator.
+    """
+    if not alive or workload is None:
+        return STATE_UNKNOWN
+    return STATE_COMPUTING if workload >= 0.5 else STATE_IDLE
+
+
 @dataclass(frozen=True)
 class GpuUtilisation:
     """Measured GPU utilisation for one window, with explicit coverage."""
@@ -718,14 +757,6 @@ def compute_utilisation(
     workload_bool = series.get("computing_workload_bool", {})
     slots_busy = series.get("slots_busy", {})
     heartbeat = series.get("slot_heartbeat", {})
-    up_llama_proxy = series.get("up_llama_proxy", {})
-    up_node_exporter = series.get("up_node_exporter", {})
-
-    def pipeline_alive(timestamp: int) -> bool:
-        if up_llama_proxy.get(timestamp) == 1 or up_node_exporter.get(timestamp) == 1:
-            return True
-        beat = heartbeat.get(timestamp)
-        return beat is not None and abs(timestamp - beat) <= scrape_interval_seconds
 
     computing = idle = power_only = 0
     cross_checked = mismatches = 0
@@ -734,13 +765,13 @@ def compute_utilisation(
         timestamp = window.start + index * step_seconds
         workload = workload_bool.get(timestamp)
         computing_flag = computing_bool.get(timestamp)
-        alive = pipeline_alive(timestamp)
+        alive = pipeline_alive(series, timestamp, scrape_interval_seconds)
 
-        if alive and workload is not None:
-            if workload >= 0.5:
-                computing += 1
-            else:
-                idle += 1
+        state = workload_state(workload, alive=alive)
+        if state == STATE_COMPUTING:
+            computing += 1
+        elif state == STATE_IDLE:
+            idle += 1
         if alive and computing_flag is not None and computing_flag >= 0.5:
             power_only += 1
 
@@ -813,6 +844,129 @@ def compute_utilisation(
         cross_check_mismatches=mismatches,
         warnings=tuple(warnings),
     )
+
+
+@dataclass(frozen=True)
+class HourlyAttributable:
+    """One absolute hour's attributable share, with explicit coverage.
+
+    ``attributable_pct`` is the ``computing`` share of that hour's **expected**
+    grid instants — the window-level definition applied to one hour, so the
+    per-hour figures and the window figure can never disagree about what
+    "attributable" means. It is ``None`` when the hour has **no observed
+    instants at all**: an unobserved hour is never a fabricated ``0 %``.
+
+    ``computing_samples + idle_samples + unknown_samples == expected_samples``
+    by construction.
+    """
+
+    hour_start: int
+    duration_seconds: int
+    expected_samples: int
+    observed_samples: int
+    computing_samples: int
+    idle_samples: int
+    unknown_samples: int
+
+    def __post_init__(self) -> None:
+        total = self.computing_samples + self.idle_samples + self.unknown_samples
+        if total != self.expected_samples:
+            raise ValueError(
+                "coverage must account for every expected sample: "
+                f"{total} != {self.expected_samples}"
+            )
+        if self.observed_samples != self.computing_samples + self.idle_samples:
+            raise ValueError("observed samples must be exactly computing + idle")
+
+    @property
+    def attributable_pct(self) -> float | None:
+        """Computing share of the hour's expected instants; ``None`` if unobserved."""
+        if self.observed_samples == 0 or self.expected_samples <= 0:
+            return None
+        return 100.0 * self.computing_samples / self.expected_samples
+
+    @property
+    def unknown_pct(self) -> float:
+        if self.expected_samples <= 0:
+            return 0.0
+        return 100.0 * self.unknown_samples / self.expected_samples
+
+    def to_dict(self) -> dict:
+        """The machine-readable shape the report's ``--json`` block carries."""
+        pct = self.attributable_pct
+        return {
+            "hour": _iso(self.hour_start),
+            "hour_start": self.hour_start,
+            "duration_seconds": self.duration_seconds,
+            "attributable_pct": None if pct is None else round(pct, 4),
+            "unknown_pct": round(self.unknown_pct, 4),
+            "coverage": {
+                "expected_samples": self.expected_samples,
+                "observed_samples": self.observed_samples,
+                "computing_samples": self.computing_samples,
+                "idle_samples": self.idle_samples,
+                "unknown_samples": self.unknown_samples,
+            },
+        }
+
+
+def hourly_attributable_shares(
+    series: dict[str, dict[int, float]],
+    *,
+    window: Window,
+    step_seconds: int,
+    scrape_interval_seconds: int,
+) -> list[HourlyAttributable]:
+    """Per-absolute-hour attributable shares, bucketed in Python.
+
+    Reuses the same grid and instant classification as
+    :func:`compute_utilisation`, and issues **no** new PromQL aggregation: the
+    per-hour bucketing is arithmetic over the series the producer already
+    queried, which keeps ``scripts/gpu_utilisation.py`` the single producer of
+    the attributable share (LP-0MWG7KQVZ008DBZM).
+
+    Buckets are absolute wall-clock hours (``timestamp - timestamp % 3600``) so
+    a rolling window's two edge partials stay distinct; the first/last hour's
+    duration is bounded by the window. Every expected instant is classified
+    ``computing`` / ``idle`` / ``unknown`` exactly once.
+    """
+    expected = expected_sample_count(window.start, window.end, step_seconds)
+    workload_bool = series.get("computing_workload_bool", {})
+    buckets: dict[int, dict[str, int]] = {}
+    for index in range(expected):
+        timestamp = window.start + index * step_seconds
+        hour_start = timestamp - timestamp % 3600
+        bucket = buckets.setdefault(
+            hour_start,
+            {"expected": 0, STATE_COMPUTING: 0, STATE_IDLE: 0, STATE_UNKNOWN: 0},
+        )
+        bucket["expected"] += 1
+        state = workload_state(
+            workload_bool.get(timestamp),
+            alive=pipeline_alive(series, timestamp, scrape_interval_seconds),
+        )
+        bucket[state] += 1
+
+    shares: list[HourlyAttributable] = []
+    for hour_start in sorted(buckets):
+        bucket = buckets[hour_start]
+        computing = bucket[STATE_COMPUTING]
+        idle = bucket[STATE_IDLE]
+        shares.append(
+            HourlyAttributable(
+                hour_start=hour_start,
+                duration_seconds=int(
+                    min(hour_start + 3600, window.end)
+                    - max(hour_start, window.start)
+                ),
+                expected_samples=bucket["expected"],
+                observed_samples=computing + idle,
+                computing_samples=computing,
+                idle_samples=idle,
+                unknown_samples=bucket[STATE_UNKNOWN],
+            )
+        )
+    return shares
 
 
 # ---------------------------------------------------------------------------

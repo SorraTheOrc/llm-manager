@@ -3405,7 +3405,7 @@ DECISION_ANCHOR = "#which-busy-figure-is-authoritative-for-decisions"
 DIVERGENCE_ANCHOR = "#why-the-two-figures-diverge"
 
 #: Labels the shipped report renders; the docs must quote these, not invent any.
-GPU_BUSY_ROW_LABEL = "GPU busy — power-based (hardware)"
+GPU_BUSY_ROW_LABEL = "GPU computing — attributable (power ≥ 90 W and a busy local slot)"
 BUSY_UPPER_ROW_LABEL = "Busy time — upper bound (dispatch → finish)"
 
 #: Docs carrying a busy-figure claim; every anchor link in them must resolve.
@@ -3468,18 +3468,19 @@ class TestAuthoritativeBusyFigureIsDocumented:
             "the guidance must tie the decision figure to its definition"
         )
 
-    def test_reference_limits_the_power_figure_to_hardware_questions(self):
-        """AC2: prefer ``gpu_busy`` only for hardware questions."""
+    def test_reference_scopes_the_attributable_measure(self):
+        """AC2 (LP-0MWG7KQVZ008DBZM): the report's GPU figure is the
+        attributable share — our local model's GPU work — not slot occupancy,
+        and it is not the retired power-only figure."""
         section = _reference_section(
             start=AUTHORITATIVE_BUSY_HEADING, end=DIVERGENCE_HEADING
         )
-        assert "prefer `gpu_busy` for hardware questions only" in section
-        assert "hardware activity, not local model utilisation" in section, (
-            "the power figure must be explicitly labelled non-local"
+        assert "the attributable `gpu:computing_workload:bool` share" in section
+        assert "not slot occupancy" in section, (
+            "the attributable figure must be distinguished from slot occupancy"
         )
-        assert "was the gpu computing at all" in section, (
-            "the hardware questions the power figure does answer must be named"
-        )
+        assert "answers the gpu question" in section
+        assert "capacity question" in section
 
     def test_reference_keeps_one_divergence_explanation_and_links_it(self):
         """AC3: the causes live once, in the explanation the rule links to."""
@@ -3506,7 +3507,7 @@ class TestAuthoritativeBusyFigureIsDocumented:
     def test_skill_states_the_matching_rule_and_cross_links(self):
         """AC4: SKILL.md carries the same rule and links the reference."""
         skill = _norm(SKILL_DOC.read_text())
-        assert "hardware activity, not local model utilisation" in skill
+        assert "not slot occupancy" in skill
         assert "decisions use the log-derived `local_busy`" in skill, (
             "SKILL.md must say decisions use the log-derived figure"
         )
@@ -3521,8 +3522,9 @@ class TestAuthoritativeBusyFigureIsDocumented:
         assert "decision figure" in json_row, (
             "the --json key table must mark local_busy as the decision figure"
         )
-        assert "**not** local model utilisation" in json_row, (
-            "the --json key table must flag gpu_busy as hardware-only"
+        assert "**not** slot occupancy" in json_row, (
+            "the --json key table must flag gpu_busy as the attributable measure, "
+            "not slot occupancy"
         )
 
     def test_monitoring_readme_does_not_leave_power_as_local_utilisation(self):
@@ -3583,7 +3585,8 @@ class TestAuthoritativeBusyFigureIsDocumented:
 
         assert GPU_BUSY_ROW_LABEL in rendered
         assert BUSY_UPPER_ROW_LABEL in rendered
-        assert "local_busy" in rendered and "not local model utilisation" in rendered
+        assert "local_busy" in rendered and "capacity/contention" in rendered
+        assert "not any GPU consumer" in rendered
 
         for doc in (REFERENCE_DOC, SKILL_DOC):
             content = doc.read_text()
@@ -3638,8 +3641,9 @@ JSON_SCOPE_STATEMENTS = (
         "quote), not a GPU measurement."
     ),
     (
-        "`gpu_busy` — the power-derived `gpu:computing:bool` share measuring "
-        "hardware activity for any GPU consumer, not local model utilisation."
+        "`gpu_busy` — the attributable `gpu:computing_workload:bool` share "
+        "(power ≥ 90 W and a busy local slot) measuring our local model's GPU "
+        "work, not slot occupancy."
     ),
 )
 
@@ -3808,7 +3812,8 @@ class TestJsonBusyKeyScopeDescriptions:
                 "share like the README does"
             )
             assert "attributable" in content
-            assert "scoped derivation" in content
+            assert "busy local slot" in content
+            assert "not slot occupancy" in content
 
 
 # ---------------------------------------------------------------------------

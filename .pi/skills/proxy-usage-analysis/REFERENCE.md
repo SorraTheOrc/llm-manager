@@ -371,15 +371,20 @@ Outputs written to:
   before the Session summary and always — regardless of local traffic): one
   row per
   **absolute wall-clock hour** of the report window (partial first/last hours
-  truncated to the window edges, idle hours included as `0s`) with busy time
-  / busy-% columns — busy seconds ÷ window-bounded bucket duration,
-  defensively clamped to 100% — plus five per-hour **activity** columns
+  truncated to the window edges, idle hours included) with a **GPU computing
+  (attributable)** column — the per-hour `gpu:computing_workload:bool` share
+  (power ≥ 90 W **and** ≥ 1 busy local slot), produced only by
+  `scripts/gpu_utilisation.py` and identical to the scorecard's `gpu_busy`
+  measure, so the two tables can never disagree; an hour with no observed
+  instants reads `unknown`, never a fabricated `0 %` (LP-0MWG7KQVZ008DBZM) —
+  plus seven per-hour **activity** columns
   counted by each event's own timestamp within the bucket: `Requests started`
   (all `Stream started` events), `Local attempts` (`Stream started` with
   `provider=local`), `Local served` (`Stream finished` with
   `provider=local`), `Fallbacks` (`Fallback triggered` events), and
   `Local-skip` (`routing_skip_local` events); a **Totals** row gives the
-  window busy totals plus the sum of each activity column over the window.
+  window-level attributable share plus the sum of each activity column over
+  the window.
   **Chain-hold de-duplication (LP-0MUIEO6IP0030CT3):** the `Local-skip`
   columns count only genuine demand — a held request re-emitted across
   chain-hold cycles (`chain_hold_cycle>0`, LP-0MU5AIAAY003KVM0) is counted
@@ -393,11 +398,12 @@ Outputs written to:
   request counted N+1 times); the intended count drop is therefore an
   accuracy fix, not lost data.
   Absolute-hour buckets keep the two edge partials of a rolling window
-  distinct, so no busy duration is double-counted and no row exceeds 100%
+  distinct, so no duration is double-counted and no row exceeds 100%
   (the previous hour-of-day keying could collide them and emit impossible
   >100% rows, LP-0MTYAZFGN003BYQS); the `--json` summary exposes the same
   per-hour activity as `hourly_activity`, plus `hourly_busy` and
-  `hourly_session_classification`, all keyed by absolute hour. Each
+  `hourly_session_classification`, all keyed by absolute hour, and the
+  per-hour attributable share as `gpu_busy.hourly`. Each
   `hourly_activity` entry (LP-0MVKUKG3F0035I85) carries `state` (the
   `+`-joined availability label), `states` (the ordered tuple), and the raw
   evidence counters `local_dispatch_attempts`, `local_denials`,
@@ -405,9 +411,10 @@ Outputs written to:
   can audit the availability verdict instead of trusting it, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
-  fast/cheap split, plus the hardware-side **GPU busy — power-based** row when
-  Prometheus is reachable — see [GPU busy time from power](#gpu-busy-time-from-power-prometheus)
-  — when the window has local traffic) followed by
+  fast/cheap split, plus the attributable **GPU computing — attributable**
+  row when GPU telemetry is reachable — see
+  [GPU computing from power](#gpu-computing-from-power-prometheus) — when the
+  window has local traffic) followed by
   **Local contention prediction vs reality** (LP-0MVGR2OXT0096OGK, when the
   window has a denial or status poll): M1 per-hour denial attribution by
   derived pool state plus the guard-reason and `capacity_hint` splits; M2 the
@@ -704,7 +711,7 @@ the renderer.
 
 | Metric | Baseline | Target | Tolerance | Actual | Result |
 |---|---|---|---|---|---|
-| GPU activity — power-based, any consumer | 18.4 % (2026-11-03) | n/a | ±10 % | 18.4 % | Insufficient history |
+| GPU computing — attributable (power ≥ 90 W and a busy local slot) | 18.4 % (2026-11-03) | n/a | ±10 % | 18.4 % | Insufficient history |
 | Fallback rate | 87.9 % of requests (2026-11-03) | n/a | ±10 % | 87.9 % of requests | Insufficient history |
 | Decode speed | 32.1 tok/s (2026-11-03) | n/a | ±10 % | 32.1 tok/s | Insufficient history |
 …one row per registered metric, in registry order…
@@ -792,7 +799,7 @@ key, the `--json` key and the detail-subsection prefix.
 
 | id | Label | Unit | Direction | Data source |
 |---|---|---|---|---|
-| `gpu_busy` | GPU activity — power-based, any consumer | % | higher is better | GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer) |
+| `gpu_busy` | GPU computing — attributable (power ≥ 90 W and a busy local slot) | % | higher is better | GPU telemetry power and busy-slot samples (gpu:computing_workload:bool, via scripts/gpu_utilisation.py) |
 | `fallback_rate` | Fallback rate | % of requests | lower is better | `Fallback triggered` log events |
 | `decode_speed` | Decode speed | tok/s | higher is better | `Stream finished` token counts |
 | `prompt_eval_speed` | Prompt eval speed | tok/s | higher is better | llama-server prompt eval timing |
@@ -806,16 +813,19 @@ key, the `--json` key and the detail-subsection prefix.
 How each value is calculated (`aggregation.performance_metric_inputs` is the
 single roll-up that produces exactly these keys):
 
-- **`gpu_busy`** — coverage-honest power-based computing share from the GPU
-  telemetry sampler. Every expected 15-second instant across the window is
-  classified `computing`, `idle` or `unknown` from the `gpu:computing:bool`
-  recording rule, with the unobserved share reported as `unknown` (never
+- **`gpu_busy`** — the attributable GPU-activity share from the single
+  producer (`scripts/gpu_utilisation.py`): every expected 15-second instant
+  across the window is classified `computing`, `idle` or `unknown` from the
+  `gpu:computing_workload:bool` recording rule (power ≥ 90 W **and** ≥ 1 busy
+  local slot), with the unobserved share reported as `unknown` (never
   renormalised away, never counted as `idle`, and never added to the
   numerator); corroborated by log-derived local busy time for the same window.
-  This is the **hardware** figure the **Local model utilization** section
-  renders, and it counts **any GPU consumer** — **not** a local-utilisation
-  signal: decisions still use the log-derived `local_busy` (see [Which busy
-figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
+  This is the **one reported GPU-activity measure** the **Local model
+  utilization** row and the **Summary by hour** column both render, bucketed
+  per hour, so they cannot disagree. It measures *our local model's* GPU work,
+  not any arbitrary consumer, and it is **not** slot occupancy: the log-derived
+  `local_busy` remains the capacity/contention figure gates quote (see [Which
+  busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
   `n/a` when Prometheus was unreachable or the window had no observed
   instants.
 - **`fallback_rate`** — share of the window's requests that produced
@@ -1599,20 +1609,22 @@ Measured usage makes the first limit honest: a turn whose measurement is
 missing is priced as fully cold (`cached_ratio = 0.0`), which is what pushed
 large-context sessions permanently onto remote providers.
 
-### GPU busy time from power (Prometheus)
+### GPU computing from power (Prometheus)
 
-The **Local model utilization** table's primary busy figures are derived from
-proxy logs (the dispatch → finish slot union). Alongside them, when Prometheus
-is reachable, the report adds a **GPU busy — power-based (hardware)** row and
-exposes the same data under `--json`'s `gpu_busy` key. It is a **scoped
-derivation** of the one-measure doctrine in
+The **Local model utilization** table's busy figures are derived from proxy logs
+(the dispatch → finish slot union) — that is `local_busy`, the capacity and
+contention figure. Alongside them, when GPU telemetry is reachable, the report
+adds the **GPU computing — attributable (power ≥ 90 W and a busy local slot)**
+row and exposes the same data under `--json`'s `gpu_busy` key. This row is the
+**one reported GPU-activity measure** of the doctrine in
 [monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure):
-the single reported GPU-activity figure is the attributable
-`gpu:computing_workload:bool` share produced **only** by
-`scripts/gpu_utilisation.py`, while this row is the power-only
-`gpu:computing:bool` share (any GPU consumer). It does **not** depend on the
-proxy's stream-lifecycle logging — but it is **not** the local model
-utilisation figure: decisions use the log-derived `local_busy` (see
+the attributable `gpu:computing_workload:bool` share produced **only** by
+`scripts/gpu_utilisation.py` and consumed here, never re-derived. It measures
+*our local model's* GPU work — power ≥ 90 W **and** ≥ 1 busy local slot — not
+any arbitrary consumer's, and it does **not** depend on the proxy's
+stream-lifecycle logging for its numerator. It is not slot occupancy either:
+the log-derived `local_busy` remains the capacity/contention figure gates quote
+(see
 [Which busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
 
 Why power rather than `gpu_busy_percent`: on this Strix Halo APU that counter
@@ -1630,38 +1642,48 @@ is not a utilisation signal. AMD's own tooling is not an alternative either:
 `rocm-smi` or `amdtop`?*, which carries the measurement, the pre/post-reboot
 comparison and the PromQL recipe that recomputes every band). Power draw
 discriminates
-cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing:bool`
-recording rule (`gpu:power_watts:amdgpu >= bool 90`) is evaluated by Prometheus
-every **15 s** from the node_exporter hwmon series. Over the window the report
-classifies **every expected instant on a 15 s grid** as `computing`, `idle` or
-`unknown`: an instant is observed only when a sentinel proves the sampling
-pipeline was alive there (`up{job="llama-proxy"}`, `up{job="node-exporter"}`
-or a fresh `llama_slots_sample_timestamp_seconds` heartbeat) **and** the rule
-has a sample; the remainder is `unknown`. Absence is never folded into `idle`
-and never into the numerator, so a monitoring gap cannot inflate the figure
-(a rolling average over only the present samples would). The three shares
+cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing_workload:bool`
+recording rule (power ≥ 90 W **and** `llama_slots_busy ≥ 1`) is evaluated by
+Prometheus every **15 s** from the node_exporter hwmon and proxy slot series.
+Over the window, `scripts/gpu_utilisation.py` classifies **every expected
+instant on a 15 s grid** as `computing`, `idle` or `unknown`: an instant is
+observed only when a sentinel proves the sampling pipeline was alive there
+(`up{job="llama-proxy"}`, `up{job="node-exporter"}` or a fresh
+`llama_slots_sample_timestamp_seconds` heartbeat) **and** the rule has a
+sample; the remainder is `unknown`. Absence is never folded into `idle` and
+never into the numerator, so a monitoring gap cannot inflate the figure (a
+rolling average over only the present samples would). The three shares
 therefore cover the window exactly — `computing_seconds + idle_seconds +
 unknown_seconds == window_seconds` and the percentages sum to 100 %.
 
-- The figure measures **hardware activity for any GPU consumer**
-  (`gpu:computing:bool`), not only the local model's work; that scope is named
-  in the scorecard label and the row's note.
+- The figure measures **our local model's GPU work** (power ≥ 90 W **and** a
+  busy local slot), not any GPU consumer's; the scope is named in the scorecard
+  label and the row's note. The retired power-only `gpu:computing:bool` share is
+  no longer reported as a GPU-usage figure anywhere.
+- **Per hour as well as per window.** The same computation is bucketed by
+  absolute hour in Python (no second PromQL aggregation) and rendered in the
+  **Summary by hour** `GPU computing (attributable)` column, so the scorecard
+  and the hourly table can never disagree; an hour with no observed instants
+  reads `unknown`, never a fabricated `0 %`.
 - The 15 s cadence is comfortably finer than the workload timescales (median
 decode 2.4 s, worst prefill 108 s), so sub-15-second sampling would add no
-accuracy.
+accuracy; a short task inside one sample fills the whole instant, so no
+surface claims sub-15-second precision.
 - The row is **best-effort**: if Prometheus is unreachable the query returns
-  `None`, the row is omitted from the report, and `--json`'s `gpu_busy` is
-  `null`. A report run never fails because monitoring is down. A window with
-  **no observed instants at all** keeps that same "no row" behaviour rather
-  than reporting a fabricated `0 %`; a partially observed window keeps the row
-  and names its `unknown` share.
+  `None`, the row is omitted from the report (and every hourly cell reads
+  `unknown`), and `--json`'s `gpu_busy` is `null`. A report run never fails
+  because monitoring is down. A window with **no observed instants at all**
+  keeps that same "no row" behaviour rather than reporting a fabricated
+  `0 %`; a partially observed window keeps the row and names its `unknown`
+  share.
 - The `gpu_busy` block carries `computing_fraction` (0–1), `busy_pct`,
   `busy_seconds`, `idle_pct`, `idle_seconds`, `unknown_pct`, `unknown_seconds`,
   `total_seconds`, a `coverage` block (`expected_samples`, `observed_samples`,
   `computing_samples`, `idle_samples`, `unknown_samples`), the three
-  `shares_pct` values, and `smoothed_power` — the `gpu:power_watts:avg5m` trace
-  at 1-minute resolution, derived from the 15 s raw series by a 5-minute
-  rolling average, for warm-up/cooldown context.
+  `shares_pct` values, `hourly` (one entry per absolute hour: `attributable_pct`
+  is `null` for an unobserved hour, with its own `coverage` block) and
+  `smoothed_power` — 1-minute means of the producer's 15 s power series, for
+  warm-up/cooldown context.
 
 #### Which busy figure is authoritative for decisions
 
@@ -1678,19 +1700,18 @@ The one reported GPU-activity measure is the attributable
 `gpu:computing_workload:bool` share produced **only** by
 `scripts/gpu_utilisation.py` (the doctrine in
 [monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure));
-the report's `gpu_busy` row is a **scoped derivation** of it — the power-only
-`gpu:computing:bool` share (any GPU consumer) — and `llama_slots_busy` is the
-rule's input. The two `--json` keys state their scope in one sentence each:
+the report's `gpu_busy` row **is** that measure — not a derivation of it — and
+`llama_slots_busy` is the rule's input. The two `--json` keys state their scope
+in one sentence each:
 
 - `local_busy` — the log-derived `dispatch → finish` slot-union share measuring local capacity/contention (the figure gates and alerts quote), not a GPU measurement.
-- `gpu_busy` — the power-derived `gpu:computing:bool` share measuring hardware activity for any GPU consumer, not local model utilisation.
+- `gpu_busy` — the attributable `gpu:computing_workload:bool` share (power ≥ 90 W and a busy local slot) measuring our local model's GPU work, not slot occupancy.
 
-**Prefer `gpu_busy` for hardware questions only** — was the GPU computing at
-all, is another workload using it, is it power/thermally limited. The row is
-**hardware activity, not local model utilisation**: it counts any GPU draw
-≥ 90 W (other workloads, requests the proxy never served) and misses
-proxy-served work during log gaps, so it must never be presented as the local
-utilisation figure, and no gate or alert may quote it as the busy %.
+**The attributable share answers the GPU question; `local_busy` answers the
+capacity question.** "How much of the window did our slots keep the GPU
+computing?" is `gpu_busy`; "was local capacity contended?" is `local_busy`.
+Neither is a substitute for the other, and no gate or alert may quote the
+attributable share as the busy %.
 
 The two figures legitimately diverge by design — see [Why the two figures
 diverge](#why-the-two-figures-diverge) for the causes (single source; not
@@ -1699,12 +1720,13 @@ repeated here).
 #### Why the two figures diverge
 
 The log union measures *slot occupancy* (including queued time and excluding
-any work the proxy did not log); the power figure measures when the
-*hardware* actually computed. A persistent gap between them usually means log
-gaps, unfinished streams, or GPU work outside the proxy's slot accounting, so
-the same window can legitimately report `local_busy` 12.6 % next to a
-power-based 39.3 % — and only the former answers whether local capacity was
-contended.
+any work the proxy did not log); the attributable share measures when the
+*hardware* actually computed on **our** slots. A persistent gap between them
+usually means log
+gaps, unfinished streams, or gpu work outside the proxy's slot accounting, so
+the same window can legitimately report `local_busy` 12.6 % next to an
+attributable share on a different scale — and only the former answers whether
+local capacity was contended.
 
 ## Contention-queue Prometheus series (LP-0MVWPJW2700966ZU)
 
@@ -1880,7 +1902,7 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   decode, LP-0MVJN9H2I00116FP); the retained decode-only figure is its
   labelled lower bound, and a stream with no first-byte line never inflates
   it. This is the **decision figure** — gates and alerts quote it, not the
-  power-based `gpu_busy` row (see [Which busy figure is authoritative for
+  attributable GPU `gpu_busy` row (see [Which busy figure is authoritative for
   decisions](#which-busy-figure-is-authoritative-for-decisions)). The **Prefill vs decode** section then splits the *phase* slot time
   into prefill (dispatch → first byte) and decode (first byte → finish) as
   slot-seconds and as a share of combined phase slot time (always 100%
@@ -2105,7 +2127,7 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   engine total that covers more than the window (engine ≫ proxy, a windowing
   artefact rather than unattributed traffic). Deriving wall-clock GPU busy time
   from these logs is impossible by construction and is out of scope (the
-  power-based `gpu_busy` telemetry covers hardware utilisation).
+  attributable `gpu_busy` telemetry covers GPU computing).
 - **Hold-cycle re-emissions are excluded from local-skip demand counters
   (LP-0MUIEO6IP0030CT3).** A held request re-emitted across chain-hold
   cycles (`chain_hold_cycle>0`) counts once (its cycle-0 occurrence) in the

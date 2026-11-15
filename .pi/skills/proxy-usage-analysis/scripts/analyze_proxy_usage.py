@@ -452,13 +452,14 @@ def _run(args: argparse.Namespace) -> int:
             )
             gpu = data.get("gpu_busy")
             if gpu:
-                # Hardware activity, not served local work (LP-0MVUIM7A50053EFN
-                # AC2): the power figure is supplementary telemetry and must
-                # never read as the local model utilisation figure, which is
-                # the log-derived ``local_busy`` printed above.
+                # The one reported GPU-activity measure (LP-0MWG7KQVZ008DBZM):
+                # the attributable share (power ≥ 90 W AND a busy local slot),
+                # produced only by ``scripts/gpu_utilisation.py``. Named by its
+                # scope so it is never read as the log-derived ``local_busy``
+                # capacity figure printed above.
                 busy_summary += (
-                    f", GPU busy — power-based (hardware, not local model "
-                    f"utilisation) {gpu['busy_pct']:.1f}% "
+                    f", GPU computing — attributable (power ≥ 90 W and a busy "
+                    f"local slot) {gpu['busy_pct']:.1f}% "
                     f"({gpu['busy_seconds']:.0f}s"
                     + (
                         f", unknown {gpu['unknown_pct']:.1f}%"

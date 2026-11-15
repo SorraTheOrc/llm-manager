@@ -30,8 +30,8 @@ metrics:
   gpu_busy:
     tolerance_pct: 10
     measurements: []
-    why: "GPU activity shows whether the hardware is actually computing, so a quiet GPU is the first sign that local capacity is going unused — but the figure counts any GPU consumer, not only the local model, so it is read as hardware activity rather than local utilisation."
-    calculation: "Coverage-honest power-based computing share from GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer): every 15-second instant across the window is classified computing / idle / unknown, with the unobserved share reported as unknown instead of being renormalised away; corroborated by log-derived local busy time for the same window."
+    why: "GPU activity shows whether the hardware is actually computing our local model's work, so a quiet GPU is the first sign that local capacity is going unused — the figure counts compute-level power *and* a busy local slot, so it is attributable to our model rather than to any GPU consumer."
+    calculation: "Attributable computing share from GPU telemetry power and busy-slot samples (gpu:computing_workload:bool, via scripts/gpu_utilisation.py): every 15-second instant across the window is classified computing / idle / unknown, with the unobserved share reported as unknown instead of being renormalised away; the same computation is bucketed per hour for the hourly column and corroborated by log-derived local busy time for the same window."
     levers: "Slot pool size and context geometry, the local admission policy, prompt-cache retention and the routing thresholds that decide when a request is served locally."
     trade_offs: "Pushing utilisation higher by admitting more work per slot raises queueing delay and time to first token; widening context per slot reduces the number of concurrent slots."
     data_section_anchor: "## Local model utilization"

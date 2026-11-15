@@ -3323,33 +3323,37 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
 
     One row per **absolute wall-clock hour** of the report window
     (window-bounded buckets, partial first/last hours truncated to the
-    window edges, idle hours listed as ``0s``), with busy time / busy-%
-    columns (busy seconds ÷ window-bounded bucket duration, defensively
-    clamped to 100%) and seven per-hour **activity** columns counted by each
+    window edges, idle hours listed), with a **GPU computing (attributable)**
+    column carrying the per-hour `gpu:computing_workload:bool` share (power
+    ≥ 90 W **and** ≥ 1 busy local slot) produced only by
+    `scripts/gpu_utilisation.py` — the same measure as the scorecard's
+    `gpu_busy` row, so the two tables cannot disagree; an hour with no observed
+    instants reads `unknown`, never a fabricated `0 %` (LP-0MWG7KQVZ008DBZM).
+    Seven per-hour **activity** columns are counted by each
     event's own timestamp (LP-0MTYAZFGN003BYQS): ``Requests started`` (all
     ``Stream started`` events), ``Local attempts`` (``Stream started`` with
     ``provider=local``), ``Local served`` (``Stream finished`` with
     ``provider=local``), ``Fallbacks`` (``Fallback triggered`` events), and
-    ``Local-skip`` (``routing_skip_local`` events) — replacing the previous
-    session-first-hour classification columns. ``Local dispatch`` (every
+    ``Local-skip`` (``routing_skip_local`` events). ``Local dispatch`` (every
     ``[local] POST`` attempt to llama-server, LP-0MVKUKG3F0035I85) and
     ``Lease denials`` (``local_dispatch_denied`` refusals) were added so the
     ``State`` column's verdict is auditable from the row itself. A **State**
     column (LP-0MVKUKG3F0035I85) sits next to ``Hour``, carrying the
     availability classification (``serving`` / ``prefill-only-no-decode`` /
     ``lease-blocked`` / ``idle``, ``+``-joined when several apply) so an hour
-    whose gate was wedged no longer reads as ``0s / 0.0%`` idle; the state
+    whose gate was wedged no longer reads as an idle hour; the state
     vocabulary is defined in the footnote printed after the table. Buckets are
     keyed by absolute hour, so a rolling window that straddles an hour emits
     two distinct edge partials rather than two rows sharing one hour-of-day
-    bucket. Always rendered — also when the window has no local traffic (busy
-    columns then read ``0s`` / ``0.0%``); with no events at all the body shows
-    a ``No data`` note. Ends with a Totals row: the window-level state (the
-    classification of the summed window evidence), window busy totals and the
-    sum of each activity column over the window.
+    bucket. Always rendered — also when the window has no local traffic (the
+    attributable column then reads ``unknown`` without GPU telemetry); with no
+    events at all the body shows a ``No data`` note. Ends with a Totals row:
+    the window-level state (the classification of the summed window evidence),
+    the window-level attributable share, and the sum of each activity column
+    over the window.
     """
     sessions = list(summary.sessions.values())
-    hourly = dict(summary.busy.hourly_busy) if summary.busy else {}
+    attributable_by_hour = _hourly_attributable(summary.gpu_busy)
     end = summary.window_end
     has_data = bool(sessions) or bool(summary.hourly_activity)
 
@@ -3358,32 +3362,32 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
     ap("")
     # State column (LP-0MVKUKG3F0035I85): per-hour availability classification
     # derived only from the logs (serving / prefill-only-no-decode /
-    # lease-blocked / idle), so a wedged gate stops reading as ``0s / 0.0%``
-    # idle. Placed next to ``Hour`` so the operator sees the outage before the
-    # busy columns.
-    ap("| Hour | State | Busy | % | " + " | ".join(label for _, label in ACTIVITY_COLUMNS) + " |")
-    ap("|" + "---|" * (4 + len(ACTIVITY_COLUMNS)))
+    # lease-blocked / idle), so a wedged gate stops reading as an idle hour.
+    # Placed next to ``Hour`` so the operator sees the outage before the
+    # activity columns. ``GPU computing (attributable)`` replaces the former
+    # log-derived ``Busy``/``%`` pair (LP-0MWG7KQVZ008DBZM): the hourly "how
+    # much GPU did we use" figure is now the same attributable share the
+    # scorecard reports, not a second, log-only definition.
+    ap(
+        "| Hour | State | GPU computing (attributable) | "
+        + " | ".join(label for _, label in ACTIVITY_COLUMNS)
+        + " |"
+    )
+    ap("|" + "---|" * (3 + len(ACTIVITY_COLUMNS)))
     activity_totals: Counter = Counter()
     window_evidence = Counter()
     if not has_data:
-        ap("| _No session data in window._ |" + " - |" * (3 + len(ACTIVITY_COLUMNS)))
+        ap("| _No session data in window._ |" + " - |" * (2 + len(ACTIVITY_COLUMNS)))
     else:
         # Window-bounded hour buckets keyed by ABSOLUTE hour
         # (LP-0MTYAZFGN003BYQS): each bucket's key is the top of its hour, so
         # the two edge partials of a rolling window never share a key and no
-        # busy duration is double-counted. Busy seconds come from
-        # ``BusyStats.hourly_busy`` (absolute hour -> seconds), already
-        # window-correct because intervals are clipped to the window before
-        # attribution.
+        # duration is double-counted. The attributable share covers the same
+        # absolute-hour buckets, produced by ``scripts/gpu_utilisation.py``.
         cursor = summary.window_start
         while cursor < end:
             bucket_key = cursor.replace(minute=0, second=0, microsecond=0)
             bucket_end = min(bucket_key + timedelta(hours=1), end)
-            duration = (bucket_end - cursor).total_seconds()
-            seconds = hourly.get(bucket_key, 0.0)
-            # Defensive clamp: absolute-hour keys make a >100% row
-            # impossible, but never emit one even if inputs drift.
-            pct = min(100.0, (seconds / duration * 100.0)) if duration else 0.0
             counts = summary.hourly_activity.get(bucket_key, Counter())
             state = aggregation.hour_availability(bucket_key, counts).label
             for key in aggregation.AVAILABILITY_COUNTERS:
@@ -3393,15 +3397,16 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
                 value = counts.get(key, 0)
                 activity_totals[key] += value
                 cells.append(str(value))
+            gpu_cell = _hourly_attributable_cell(
+                attributable_by_hour.get(int(bucket_key.timestamp()))
+            )
             ap(
-                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {state} | {_fmt_duration(seconds)} | {pct:.1f}% | "
+                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {state} | {gpu_cell} | "
                 + " | ".join(cells)
                 + " |"
             )
             cursor = bucket_end
 
-    busy_seconds = summary.busy.busy_seconds if summary.busy else 0.0
-    busy_pct = summary.busy.busy_pct if summary.busy else 0.0
     window_state = aggregation.classify_hour(
         summary.window_start,
         local_dispatch_attempts=window_evidence.get("local_dispatch_attempts", 0),
@@ -3409,15 +3414,67 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
         local_denials=window_evidence.get("local_denials", 0),
         lease_active_fallbacks=window_evidence.get("lease_active_fallbacks", 0),
     ).label
+    window_gpu = summary.gpu_busy
+    window_gpu_cell = (
+        f"{window_gpu.busy_pct:.1f}%" if window_gpu is not None
+        else HOURLY_ATTRIBUTABLE_UNKNOWN
+    )
     ap(
-        f"| Totals | {window_state} | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
+        f"| Totals | {window_state} | {window_gpu_cell} | "
         + " | ".join(str(activity_totals.get(key, 0)) for key, _label in ACTIVITY_COLUMNS)
         + " |"
+    )
+    ap("")
+    ap(
+        "`GPU computing (attributable)` is the share of that hour in which the "
+        "GPU drew ≥ 90 W **and** at least one local llama-server slot was "
+        "busy (`gpu:computing_workload:bool`, on a 15 s grid) — our local "
+        "model's GPU work, produced only by `scripts/gpu_utilisation.py`. It "
+        "is the same measure as the scorecard's `gpu_busy` row, bucketed per "
+        "hour, so the two tables cannot disagree. An hour with no observed "
+        "instants reads `unknown` (never a fabricated `0 %`), and the "
+        "`Totals` cell is the window-level attributable share. The `State` "
+        "column and the activity columns remain log-derived from proxy events; "
+        "the log-derived `local_busy` (`dispatch → finish`) capacity figure is "
+        "reported in the Local model utilization section, not here."
     )
     ap("")
     ap(AVAILABILITY_FOOTNOTE)
     for state_name, note in AVAILABILITY_STATE_NOTES:
         ap(f"- `{state_name}` — {note}")
+
+
+#: The row label carrying the one reported GPU-activity measure. The docs
+#: quote it verbatim (``proxy/tests/test_monitoring_deployment.py``), so it is
+#: defined once here rather than repeated in renderers.
+GPU_ATTRIBUTABLE_ROW_LABEL = (
+    "GPU computing — attributable (power ≥ 90 W and a busy local slot)"
+)
+
+#: Rendered in the hourly table when an hour has no observed GPU instants —
+#: never a fabricated ``0 %`` (coverage honesty).
+HOURLY_ATTRIBUTABLE_UNKNOWN = "unknown"
+
+
+def _hourly_attributable(gpu: object | None) -> dict[int, object]:
+    """Map each absolute hour's unix start to its attributable share.
+
+    The shares come from the single producer via :mod:`gpu_busy`
+    (``GpuBusyResult.hourly_shares``), never re-derived here. Empty when the
+    window had no GPU telemetry, so every hour reads ``unknown``.
+    """
+    shares = getattr(gpu, "hourly_shares", None) or []
+    return {int(share.hour_start): share for share in shares}
+
+
+def _hourly_attributable_cell(share: object | None) -> str:
+    """Render one hour's attributable figure, or ``unknown`` when unobserved."""
+    if share is None:
+        return HOURLY_ATTRIBUTABLE_UNKNOWN
+    pct = getattr(share, "attributable_pct", None)
+    if pct is None:
+        return HOURLY_ATTRIBUTABLE_UNKNOWN
+    return f"{pct:.1f}%"
 
 
 def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSchedule) -> None:
@@ -3468,14 +3525,16 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
     ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
-    # GPU-based busy time from Prometheus power consumption (hardware-side).
+    # Attributable GPU computing (power ≥ 90 W and a busy local slot), the one
+    # reported GPU-activity measure (LP-0MWG7KQVZ008DBZM). Produced only by
+    # ``scripts/gpu_utilisation.py`` and consumed here, never re-derived.
     gpu = summary.gpu_busy
     if gpu is not None:
         gpu_cell = _busy_cell(gpu.busy_seconds, gpu.total_seconds)
         unknown_pct = getattr(gpu, "unknown_pct", 0.0)
         if unknown_pct > 0:
             gpu_cell += f", unknown {unknown_pct:.1f}%"
-        ap(f"| GPU busy — power-based (hardware) | {gpu_cell} | - | - |")
+        ap(f"| {GPU_ATTRIBUTABLE_ROW_LABEL} | {gpu_cell} | - | - |")
     ap("")
     ap(f"_Bounds: lower = {aggregation.BUSY_LOWER_BOUND_LABEL}; upper = "
        f"{aggregation.BUSY_UPPER_BOUND_LABEL}. {b.prefill_extended_streams} of "
@@ -3507,22 +3566,23 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
        "started inside the window or within its 1h busy-pairing margin with no "
        "logged finish (earlier starts are pre-window leftovers); fast/cheap split "
        "follows the slot schedule.")
-    # GPU-based busy-time note (hardware signal, not log-derived).
+    # GPU-based attributable computing note (the single reported measure).
     if gpu is not None:
         ap("")
-        ap("_The **GPU busy** row uses Prometheus power-consumption data "
-           "(`gpu:computing:bool`, evaluated every 15 s): 1 while the GPU "
-           "draws ≥ 90 W (the recording-rule threshold), 0 otherwise. Each "
-           "15 s instant across the window is counted as computing, idle or "
-           "**unknown**, so a monitoring gap cannot inflate the figure; the "
-           "row names the unknown share whenever the window is not fully "
-           "observed. It is **hardware activity, not local model "
-           "utilisation**: `gpu:computing:bool` counts any GPU consumer "
-           "(other workloads, non-local requests) and misses proxy-served "
-           "work during log gaps. The decision figure for local model "
-           "utilisation is the log-derived `local_busy` (`dispatch → "
-           "finish`) above; this row is supplementary hardware telemetry and "
-           "does not depend on the proxy's stream lifecycle logs._")
+        ap("_The **GPU computing — attributable** row is the one reported "
+           "GPU-activity measure: the share of the window in which the GPU "
+           "drew ≥ 90 W **and** at least one local llama-server slot was "
+           "busy (`gpu:computing_workload:bool`, evaluated every 15 s) — that "
+           "is, our local model's work, not any GPU consumer's. It is "
+           "produced only by `scripts/gpu_utilisation.py` and consumed here. "
+           "Each 15 s instant across the window is counted as computing, "
+           "idle or **unknown**, so a monitoring gap cannot inflate the "
+           "figure; the row names the unknown share whenever the window is "
+           "not fully observed. A single short task also fills a whole 15 s "
+           "instance, so this is not sub-15-second precision. It is "
+           "**hardware activity for our workload, not slot occupancy**: the "
+           "log-derived `local_busy` (`dispatch → finish`) above is the "
+           "capacity/contention figure that gates and alerts quote.")
 
 
 def _phase_cell(value: float | None) -> str:
@@ -4768,7 +4828,9 @@ def run_analysis(
         llama_files, window_start, window_end, schedule, mode_map, log_dir=llama_log_dir
     )
 
-    # GPU busy-time from Prometheus power consumption (best-effort).
+    # Attributable GPU-activity share via the single producer
+    # (``scripts/gpu_utilisation.py``), best-effort: an unreachable store or a
+    # window with no observed instants simply yields no row.
     if summary.busy is not None:
         ws = window_start.timestamp()
         we = window_end.timestamp()
@@ -5302,18 +5364,20 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
 
 
 def _gpu_busy_json(gpu: object | None) -> dict | None:
-    """JSON-friendly GPU busy-time from Prometheus power consumption.
+    """JSON-friendly attributable GPU-activity share (the one reported measure).
 
-    Supplementary hardware telemetry, **not** a local-utilisation signal:
-    measures when the GPU drew compute-level power (``gpu:computing:bool`` —
-    any GPU consumer), independent of proxy log events, so it counts GPU work
-    outside the proxy's slot accounting. Coverage is grid-honest: the
-    ``coverage`` block names the expected/observed/computing/idle/unknown
-    sample counts and the ``unknown_*`` fields carry the unobserved share, so
-    a monitoring gap can never read as idle or inflate the busy figure.
-    Decisions use the log-derived ``local_busy`` (``dispatch → finish``); this
-    block is its hardware-side complement. Returns ``None`` when the query
-    fails or the window has no observed instants.
+    The attributable share — ``gpu:computing_workload:bool`` (power ≥ 90 W
+    **and** ≥ 1 busy local slot), produced only by
+    ``scripts/gpu_utilisation.py`` — is the report's sole GPU-usage figure
+    (LP-0MWG7KQVZ008DBZM). Coverage is grid-honest: the ``coverage`` block names
+    the expected/observed/computing/idle/unknown sample counts and the
+    ``unknown_*`` fields carry the unobserved share, so a monitoring gap can
+    never read as idle or inflate the figure. ``hourly`` carries the same
+    measure bucketed per absolute hour (``attributable_pct`` is ``null`` for an
+    hour with no observed instants). The log-derived ``local_busy``
+    (``dispatch → finish``) is a separate ``--json`` key and the capacity figure
+    gates quote. Returns ``None`` when the query fails or the window has no
+    observed instants.
     """
     if gpu is None:
         return None
@@ -5339,7 +5403,12 @@ def _gpu_busy_json(gpu: object | None) -> dict | None:
             "idle": round(gpu.idle_pct, 1),
             "unknown": round(gpu.unknown_pct, 1),
         },
-        # Smoothed power trace (1-min samples, derived from 15-s raw).
+        # Per-hour attributable share (the same measure, bucketed by absolute
+        # hour): the machine-readable twin of the ``## Summary by hour`` column.
+        "hourly": [
+            share.to_dict() for share in getattr(gpu, "hourly_shares", None) or []
+        ],
+        # Smoothed power trace (1-min means of the producer's 15-s series).
         "smoothed_power": [
             {"timestamp": int(ts), "power_watts": round(w, 2)}
             for ts, w in gpu.smoothed_power_values

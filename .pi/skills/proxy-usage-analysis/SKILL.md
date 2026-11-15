@@ -66,7 +66,7 @@ Options:
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
 | `--stale-rate-target` | `0.05` | Target share of status polls allowed to report `slots_stale=true`; drives the **Local capacity signals** section's met/unmet outcome and `--json`'s `capacity_signals.slots_stale.passed`. Mirrors `scripts/capacity_signal_verification.py --stale-rate-target` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `idle_pct`, `unknown_pct`, the three `shares_pct` values, a `coverage` sample block and `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings — plus `performance_metrics` — the scorecard block keyed by metric id and its `performance_metrics_counts` totals, and `wasted_compute` — the wasted-GPU-compute block, `null` when the analysis was not produced) |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — the attributable `gpu:computing_workload:bool` share (power ≥ 90 W and a busy local slot) produced only by `scripts/gpu_utilisation.py`, with `computing_fraction`, `busy_pct`, `idle_pct`, `unknown_pct`, the three `shares_pct` values, a `coverage` sample block, `hourly` per-hour shares and `smoothed_power`, **not** slot occupancy — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings — plus `performance_metrics` — the scorecard block keyed by metric id and its `performance_metrics_counts` totals, and `wasted_compute` — the wasted-GPU-compute block, `null` when the analysis was not produced) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 | `--metrics-config` | `metrics/performance_metrics.yaml` | Path to the committed performance-metric defaults (metric detail copy and any seeded history); read-only at runtime, never written |
 | `--metrics-state` | `<output-dir>/performance_metrics_state.yaml` | Path to the live performance-metric history file this run records its window in |
@@ -242,11 +242,13 @@ Markdown.
 Metric definitions, the two file schemas and a worked backfill run:
 [REFERENCE.md § Performance metrics scorecard](REFERENCE.md#performance-metrics-scorecard-lp-0mw0fu5z6006a4p3).
 
-## GPU busy time from power (Prometheus)
+## GPU computing from power (Prometheus)
 
-When Prometheus is reachable, the **Local model utilization** section adds a
-**GPU busy — power-based (hardware)** row that measures when the GPU actually
-drew compute-level power (≥ 90 W), instead of relying on the proxy's
+When GPU telemetry is reachable, the **Local model utilization** section adds
+a
+**GPU computing — attributable (power ≥ 90 W and a busy local slot)** row
+that measures when our local model actually kept the GPU computing, from
+Prometheus rather than the proxy's
 stream-lifecycle logs. On this Strix Halo APU `gpu_busy_percent` is a two-state
 detector whose step sits at **~30 W** — below the idle-with-display band, so it
 reads 99.2 % while idling with a display against 98.7 % while computing and
@@ -255,45 +257,55 @@ so power draw is the discriminating signal; `amdtop`/`rocm-smi` show the same
 counter (see [monitoring/README.md](../../../monitoring/README.md),
 *Why not `amd-smi`, `rocm-smi` or `amdtop`?*, for the measurement and its
 PromQL recipe; re-measured 2026-11-06 in LP-0MW5K7WKZ005VJXA). The figure is
-computed over the raw **15-second** hwmon series (`monitoring/gpu_compute_rules.yaml`)
-by classifying **every expected 15 s instant** across the window as
+computed over the raw **15-second** hwmon series
+(`monitoring/gpu_compute_rules.yaml`) by classifying **every expected 15 s
+instant** across the window as
 `computing`, `idle` or `unknown`: an instant is observed only when a sentinel
 proves the sampling pipeline was alive there (`up{job="llama-proxy"}`,
-`up{job="node-exporter"}` or a fresh `llama_slots_sample_timestamp_seconds`
+`up{job="node-exporter"}` or a fresh
+`llama_slots_sample_timestamp_seconds`
 heartbeat) and the rule has a sample. Absence is never counted as `idle` and
 never added to the numerator, so a monitoring gap cannot inflate the figure;
 the `computing` + `idle` + `unknown` shares cover the window exactly and sum
 to 100 %. A window with no observed instants at all keeps the best-effort
 "no row" behaviour rather than reporting a fabricated 0 %. The report also
-adds the 5-minute-smoothed power trace for context. Best-effort: if Prometheus
+adds the 1-minute-mean power trace for context. Best-effort: if Prometheus
 is down the row is omitted and `--json`'s `gpu_busy` is `null` — the report
 never fails. Full pipeline and rationale:
 [monitoring/README.md](../../../monitoring/README.md) and
-[REFERENCE.md](REFERENCE.md#gpu-busy-time-from-power-prometheus).
+[REFERENCE.md](REFERENCE.md#gpu-computing-from-power-prometheus).
 
-**This row is hardware activity, not local model utilisation.** It counts any
-GPU consumer (`gpu:computing:bool`) — including work the proxy never served —
-and misses proxy-served work during log gaps, so it must never be read (or
-quoted) as the local model utilisation figure. **Decisions use the log-derived
-`local_busy`** (the `dispatch → finish` slot union: the report's `Busy time —
-upper bound (dispatch → finish)` row and `--json`'s `local_busy` key); quote
-`gpu_busy` only for hardware questions (was the GPU computing at all,
-thermals, power draw). The decision rule, the preference rule and the causes
-of the gap:
+**This is the one reported GPU-activity measure.** It is the attributable
+share — power ≥ 90 W **and** at least one busy local slot — produced **only**
+by `scripts/gpu_utilisation.py` and consumed by the report, never re-derived.
+The same computation is bucketed per hour for the **Summary by hour** `GPU
+computing (attributable)` column, so the scorecard and the hourly table can
+never disagree; an hour with no observed instants reads `unknown`. The retired
+power-only
+`gpu:computing:bool` share (any GPU consumer) is no longer a reported
+GPU-usage figure.
+
+**The attributable share answers the GPU question; `local_busy` answers the
+capacity question.** **Decisions use the log-derived `local_busy`** (the
+`dispatch → finish`
+slot union: the report's `Busy time — upper bound (dispatch → finish)` row and
+`--json`'s `local_busy` key), the **decision figure** gates and alerts quote
+for local capacity/contention; it is not a GPU measurement. The attributable
+share is not slot occupancy and must not be quoted as the busy %. The decision
+rule, the preference rule and the causes of the gap:
 [REFERENCE.md § Which busy figure is authoritative for decisions](REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
 
 **The one reported GPU-activity measure.**
 [monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure)
 defines exactly one reported GPU-activity figure: the attributable
 `gpu:computing_workload:bool` share produced **only** by
-`scripts/gpu_utilisation.py`. `gpu_busy` here is a **scoped derivation** of
-that doctrine — the power-only `gpu:computing:bool` share (any GPU consumer) —
-and `llama_slots_busy` is the rule's input; `local_busy` is local
-capacity/contention (a proxy-accounting question, the figure gates quote). The
-`--json` key scope, one sentence each:
+`scripts/gpu_utilisation.py`. `gpu_busy` here **is** that measure (not a
+derivation of it), and `llama_slots_busy` is the rule's input; `local_busy` is
+local capacity/contention (a proxy-accounting question, the figure gates
+quote). The `--json` key scope, one sentence each:
 
 - `local_busy` — the log-derived `dispatch → finish` slot-union share measuring local capacity/contention (the figure gates and alerts quote), not a GPU measurement.
-- `gpu_busy` — the power-derived `gpu:computing:bool` share measuring hardware activity for any GPU consumer, not local model utilisation.
+- `gpu_busy` — the attributable `gpu:computing_workload:bool` share (power ≥ 90 W and a busy local slot) measuring our local model's GPU work, not slot occupancy.
 
 ## Engine cross-check (slot-time vs llama-server eval timings)
 
