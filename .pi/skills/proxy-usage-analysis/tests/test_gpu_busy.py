@@ -34,14 +34,14 @@ sys.path.insert(0, str(SCRIPTS))
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-import aggregation
-import bucketing
-import gpu_busy
-import gpu_utilisation
-import log_parser
-import reporting
+import aggregation  # noqa: E402
+import bucketing  # noqa: E402
+import gpu_busy  # noqa: E402
+import gpu_utilisation  # noqa: E402
+import log_parser  # noqa: E402
+import reporting  # noqa: E402
 
-from tests import fixtures
+from tests import fixtures  # noqa: E402
 
 #: The authored two-hour store bundle with its deliberate 10-minute hole.
 #: ``monitoring/tests/fixtures/window_with_gap.json`` is shared with the
