@@ -1,163 +1,175 @@
-"""Prometheus-based GPU busy-time measurement (coverage-honest).
+"""Attributable GPU-activity share for the usage report (single producer).
 
-GPU busy time is measured from power draw via the ``gpu:computing:bool``
-recording rule (1 ≥ 90 W, 0 otherwise), evaluated every 15 s by Prometheus.
+The report reports **one** GPU-activity figure, and it is the attributable
+share the doctrine designates: ``gpu:computing_workload:bool`` — the GPU drew
+compute-level power (≥ 90 W) **and** at least one local llama-server slot was
+processing. That is *our* local model's work, not any GPU consumer's, so it is
+the only power-derived figure that answers "how much of the window did our
+local model keep the GPU computing?".
 
-The driver's ``gpu_busy_percent`` cannot serve as a utilisation signal on this
-Strix Halo APU: it is a **two-state detector, not a percentage**, whose step
-sits at **~30 W** — it reads 1–10 % below 30 W and 92–99 % from 30 W upward.
-Because the step is below the idle-with-display band (p50 45 W), idle-with-
-context and computing both read ~99 % and the counter *inverts* across the band
-that matters: re-measured 2026-11-06 on kernel 7.0.0-38 it read 99.2 % at
-40–60 W (idle with a display) against 98.7 % at 90–100 W (computing), with
-7.9 % false-busy and 1.7 % false-idle over the whole post-boot window
-(LP-0MW5K7WKZ005VJXA; supersedes the retired 20 W latch claim of
-LP-0MS9GA6QL007XTBP and LP-0MVSQQO910077LYL). AMD's own tooling offers no
-alternative here: ``amd-smi``
-reports ``N/A`` for every metric this module needs on this APU, and
-``amdtop``/``rocm-smi`` merely display the same counter — so this
-module reads Prometheus and must never shell out to an AMD tool (see
-``monitoring/README.md``, "Why not amd-smi, rocm-smi or amdtop?", for the
-measurement and the PromQL recipe that recomputes every band).
+Single-producer contract (LP-0MW5K90EQ001W0R1 AC2, LP-0MWG7KQVZ008DBZM)
+-----------------------------------------------------------------------
+``scripts/gpu_utilisation.py`` is the **only** surface allowed to turn
+``gpu:computing_workload:bool`` into a busy figure. This module therefore
+**imports that producer** and reuses its series loading, its grid-honest
+classification and its per-hour bucketing; it performs no PromQL aggregation of
+its own (a second derivation is a guard failure — see
+``proxy/tests/test_monitoring_deployment.py::TestAttributableShareSingleProducer``).
+That keeps the report's scorecard, its per-hour column and the CLI's own output
+in exact agreement instead of deriving the same number three ways.
 
-The recording rules live in monitoring/gpu_compute_rules.yaml and are
-evaluated at ``evaluation_interval = 15 s``.  The 15 s cadence is
-comfortably finer than the workload timescales (median decode 2.4 s, worst
-prefill 108 s), so sub-15-second sampling adds no value.
+The power-only ``gpu:computing:bool`` share (any GPU consumer) is **not** a
+reported GPU-usage figure any more. It survives only inside the producer as a
+cross-check input and is never rendered by the report.
 
-Coverage, and why absence is never idle
----------------------------------------
-The naive rolling-window average over whatever samples happen to be present
-renormalises coverage away, so a sampling gap reads as "not applicable" and
-*inflates* the busy fraction — a window where the sampler was down for 38 h
-reported 51.3 % against a grid-honest 37.9 % for the same store and window
-(51.3 % × 0.74 observed coverage; LP-0MW5K8YE9001QO39). This module
-therefore classifies **every expected instant on a grid over the window**
-instead: ``floor(window / step) + 1`` instants at ``step = 15 s`` starting at
-the window start. Each instant is one of
+Why power rather than the driver's ``gpu_busy_percent``: on this Strix Halo APU
+that counter is a two-state detector whose step sits at **~30 W**, so it
+inverts across the idle-with-display band and cannot separate idle from
+computing. See ``monitoring/README.md`` (and the GPU computing section of
+``REFERENCE.md``) for that measurement and its PromQL recipe; the reason is
+stated once there and not repeated here.
 
-- ``computing`` — the ``gpu:computing:bool`` rule has a sample ``≥ 0.5`` and
-  the pipeline was demonstrably alive;
-- ``idle`` — the rule has a sample ``0`` and the pipeline was demonstrably
-  alive;
+Coverage honesty
+----------------
+The share is computed over **every expected instant on a 15 s grid** across the
+window (``floor(window / step) + 1`` instants). Each instant is one of
+
+- ``computing`` — the workload rule has a sample ``≥ 0.5`` and the pipeline was
+  demonstrably alive;
+- ``idle`` — the pipeline was alive and the rule is ``0`` (no *our-work*
+  computing at that instant);
 - ``unknown`` — everything else. Absence is never folded into ``idle`` and
   never into the numerator.
 
-An instant is **observed** only when a sentinel proves the sampling pipeline
-was alive at that instant — ``up{job="llama-proxy"} == 1``,
-``up{job="node-exporter"} == 1``, or a
-``llama_slots_sample_timestamp_seconds`` heartbeat no older than one scrape
-interval — **and** the ``gpu:computing:bool`` rule actually has a sample
-there. A stale heartbeat proves the sampler stopped reporting, so it does not
-count.
-
-By construction the three shares cover the window exactly:
-``computing_seconds + idle_seconds + unknown_seconds == window_seconds`` and
-``shares_pct`` sums to 100 %. Each grid instant has duration
-``window_seconds / expected_samples``, so the seconds identity holds for the
-grid the shares are computed on.
-
-A window with **no observed instants at all** returns ``None`` — the pre-fix
-"no row" behaviour is kept: the report omits the GPU row and ``--json``'s
+The three shares therefore cover the window exactly
+(``computing + idle + unknown == 100 %``). A window with **no observed
+instants at all** returns ``None`` — the report omits the row and ``--json``'s
 ``gpu_busy`` is ``null``, never a fabricated ``0 %``. A partially observed
-window keeps the row and reports its unobserved share as ``unknown``.
+window keeps the row and reports its unobserved share as ``unknown``, and a
+per-hour bucket with no observed instants reads ``unknown`` (never ``0 %``).
 
-What this measures — and what it is not
----------------------------------------
-The decision figure for local model utilisation is the report's log-based
-``local_busy`` (``BusyStats``, ``dispatch → finish``): it measures *slot
-occupancy* from proxy events, i.e. the work the proxy actually served. This
-module measures something different — when the *hardware* actually drew
-compute-level power, from the 15 s hwmon series — independent of proxy
-logging gaps and of how the proxy accounts for its own slots.
+Resolution honesty
+------------------
+The share binarises on the producer's 15 s grid: a short task inside one sample
+fills the whole instant. No surface may claim sub-15-second precision.
 
-That makes this **supplementary hardware telemetry, not a local-utilisation
-signal**: ``gpu:computing:bool`` counts any GPU consumer (other workloads,
-non-local requests) and misses proxy-served work during log gaps, so it can
-read far higher or lower than ``local_busy``. Use it for hardware questions —
-was the GPU computing at all? what did it draw? — never as the local busy
-figure.
+What the figures mean
+---------------------
+- ``gpu_busy`` (this module) — the attributable share: hardware power **and**
+  a busy local slot, i.e. our local model's GPU work.
+- ``local_busy`` (``BusyStats``, ``dispatch → finish``) — the log-derived slot
+  occupancy / capacity-contention figure that gates and alerts quote. It is a
+  proxy-accounting question, not a GPU measurement, and is retained where it is
+  correctly scoped (the ``## Local model utilization`` busy rows, the
+  ``local_busy`` ``--json`` key and the ``> 60 %`` local-busy capacity gate).
 """
 
 from __future__ import annotations
 
-import json
-import urllib.request
-from dataclasses import dataclass
+import importlib.util
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import ModuleType
 
 # Prometheus instance — loopback only; the monitoring README documents the
 # exposure boundary (tailnet / loopback, no auth).
 PROMETHEUS_URL = "http://127.0.0.1:9090"
 
-# HTTP timeout for each Prometheus call (seconds).
-_TIMEOUT_SECONDS = 5
-
-#: Grid resolution and the recording rules' evaluation interval (15 s).
+#: Grid resolution and the recording rules' evaluation interval (15 s). Shared
+#: with the producer so the report and the CLI measure the same instants.
 STEP_SECONDS = 15
 
 #: Freshness bound for the slot heartbeat: a sample older than one scrape
 #: interval proves the sampler stopped reporting, so the instant is unknown.
 SCRAPE_INTERVAL_SECONDS = 15
 
-#: Query expressions this module issues for one window.
-BOOL_QUERY = "gpu:computing:bool"
-UP_LLAMA_PROXY_QUERY = 'up{job="llama-proxy"}'
-UP_NODE_EXPORTER_QUERY = 'up{job="node-exporter"}'
-HEARTBEAT_QUERY = "llama_slots_sample_timestamp_seconds"
-POWER_QUERY = "gpu:power_watts:avg5m"
+#: Repository root, from ``.pi/skills/proxy-usage-analysis/scripts/gpu_busy.py``.
+#: The producer lives at ``<root>/scripts/gpu_utilisation.py`` and is imported
+#: from there rather than re-implemented here.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_PRODUCER_PATH = _REPO_ROOT / "scripts" / "gpu_utilisation.py"
+
+_producer_module: ModuleType | None = None
 
 
-def _share_pct(seconds: float, total_seconds: float) -> float:
-    """Percentage *seconds* is of *total_seconds* (``0`` for a non-positive total)."""
-    if total_seconds <= 0:
-        return 0.0
-    return seconds / total_seconds * 100.0
+def _producer() -> ModuleType:
+    """Load ``scripts/gpu_utilisation.py`` once and return it.
+
+    Loaded by file path (not ``sys.path``) so the report never depends on the
+    caller's import path, and cached so the module body runs once per process.
+    """
+    global _producer_module
+    if _producer_module is None:
+        spec = importlib.util.spec_from_file_location(
+            "_gpu_utilisation_producer", _PRODUCER_PATH
+        )
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive
+            raise ImportError(
+                f"cannot load the GPU-utilisation producer at {_PRODUCER_PATH}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        # Register before executing: ``from __future__ import annotations`` makes
+        # the producer's dataclass fields string annotations, and dataclasses
+        # resolves them through ``sys.modules[cls.__module__]``.
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _producer_module = module
+    return _producer_module
 
 
 @dataclass
 class GpuBusyResult:
-    """GPU busy-time measured from power consumption, with explicit coverage.
+    """Attributable GPU-activity share for the window, with explicit coverage.
 
     ``computing_fraction`` is the share of the window's **expected** grid
-    instants on which the GPU drew ≥ 90 W (the recording-rule threshold that
-    matches the proxy's wedge detector). It is computed over the full grid, so
-    an unobserved instant lowers the fraction as ``unknown`` rather than
+    instants on which the GPU drew ≥ 90 W *and* a local slot was busy
+    (``gpu:computing_workload:bool``, produced only by
+    ``scripts/gpu_utilisation.py``). It is computed over the full grid, so an
+    unobserved instant lowers the fraction as ``unknown`` rather than
     renormalising it upward. ``busy_seconds`` (the ``computing`` share) plus
     ``idle_seconds`` plus ``unknown_seconds`` equals ``total_seconds`` by
     construction.
 
-    This is supplementary hardware telemetry, **not** a local-utilisation
-    signal: ``gpu:computing:bool`` counts any GPU consumer. Decisions use the
-    log-derived ``local_busy`` (``dispatch → finish``) slot occupancy, of which
-    this is a hardware-side complement.
+    ``hourly_shares`` carries one
+    :class:`gpu_utilisation.HourlyAttributable` per absolute hour intersecting
+    the window, so the report's ``## Summary by hour`` column is the same
+    measure bucketed by hour — not a second definition.
 
-    ``smoothed_power_values`` carries the ``gpu:power_watts:avg5m`` trace
-    (1-min samples, derived from the 15-s raw series via a 5-min rolling
-    average) over the same window; useful for identifying warm-up and
-    cooldown transitions.
+    ``smoothed_power_values`` is the 1-minute mean of the producer's 15 s power
+    series (``gpu:power_watts:amdgpu``) over the window; useful for identifying
+    warm-up and cooldown transitions.
     """
 
     computing_fraction: float  # 0.0–1.0, over the expected grid
     total_seconds: float  # window length in seconds
     busy_seconds: float  # computing share of total_seconds
     idle_seconds: float  # idle share of total_seconds
-    smoothed_power_values: list[tuple[float, float]]  # (unix_ts, avg5m_watts)
+    smoothed_power_values: list[tuple[float, float]]  # (unix_ts, mean_watts)
     unknown_seconds: float = 0.0  # unobserved share of total_seconds
     expected_samples: int = 0  # grid instants the window should contain
     observed_samples: int = 0  # computing + idle
     computing_samples: int = 0
     idle_samples: int = 0
     unknown_samples: int = 0
+    hourly_shares: list = field(default_factory=list)  # list[HourlyAttributable]
 
     @property
     def busy_pct(self) -> float:
-        """The ``computing`` share of the window, in percent."""
+        """The attributable (``computing``) share of the window, in percent."""
         return self.computing_fraction * 100.0
+
+    @property
+    def attributable_pct(self) -> float:
+        """Alias for :attr:`busy_pct` naming the measure explicitly."""
+        return self.busy_pct
 
     @property
     def idle_pct(self) -> float:
         """The ``idle`` share of the window, in percent."""
-        return _share_pct(self.idle_seconds, self.total_seconds)
+        if self.total_seconds <= 0:
+            return 0.0
+        return self.idle_seconds / self.total_seconds * 100.0
 
     @property
     def unknown_pct(self) -> float:
@@ -178,110 +190,37 @@ class GpuBusyResult:
         }
 
 
-def _get_json(url: str) -> dict | None:
-    """GET *url* and parse JSON; ``None`` on any network/parse error."""
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read())
-    except Exception:
-        return None
+def _minute_means(points: dict[int, float]) -> list[tuple[float, float]]:
+    """Collapse the 15 s power series into 1-minute means (``(ts, watts)``).
 
-
-def query_prometheus(
-    query: str,
-    start: int,
-    end: int,
-    step: str = "60",
-) -> dict | None:
-    """Fire an instant query (``start == end``) or range query to Prometheus.
-
-    Returns the raw JSON dict, or ``None`` on any network or parse error
-    (best-effort: a report run must never fail because Prometheus is down).
+    Derived from the producer's own ``power_watts`` series — no extra PromQL is
+    issued, so the report never becomes a second query surface.
     """
-    if start == end:
-        endpoint = "query"
-        url = (
-            f"{PROMETHEUS_URL}/api/v1/{endpoint}"
-            f"?query={urllib.request.quote(query)}"
-            f"&time={end}"
-        )
-    else:
-        endpoint = "query_range"
-        url = (
-            f"{PROMETHEUS_URL}/api/v1/{endpoint}"
-            f"?query={urllib.request.quote(query)}"
-            f"&start={start}"
-            f"&end={end}"
-            f"&step={step}"
-        )
-    return _get_json(url)
-
-
-def _parse_matrix(payload: dict | None) -> dict[int, float]:
-    """Flatten a ``query_range`` matrix payload into ``{unix_ts: value}``.
-
-    Multiple series are collapsed by their maximum: this host exposes one GPU
-    and one llama-proxy, and "any target is up" is the honest reduction for a
-    sentinel. Malformed samples are skipped rather than guessed.
-    """
-    points: dict[int, float] = {}
-    if not isinstance(payload, dict):
-        return points
-    result = payload.get("data", {}).get("result")
-    for series in result or []:
-        for sample in series.get("values") or []:
-            try:
-                timestamp = int(float(sample[0]))
-                value = float(sample[1])
-            except (TypeError, ValueError, IndexError):
-                continue
-            previous = points.get(timestamp)
-            points[timestamp] = value if previous is None else max(previous, value)
-    return points
-
-
-def _expected_sample_count(start: int, end: int, step: int) -> int:
-    """Number of grid instants a coverage-honest window must account for."""
-    return (end - start) // step + 1
-
-
-def _align_to_grid(
-    points: dict[int, float], *, start: int, step: int, expected: int
-) -> dict[int, float]:
-    """Snap samples onto the query grid, dropping anything out of the window.
-
-    Prometheus returns samples on the requested grid, but a live store can hand
-    back timestamps a fraction of a step off. A sample within half a step of a
-    grid instant is attributed to it; anything further away, and anything out
-    of the window, is dropped rather than silently shifting the coverage
-    arithmetic.
-    """
-    tolerance = step / 2
-    aligned: dict[int, float] = {}
-    for raw_timestamp, value in points.items():
-        index = round((raw_timestamp - start) / step)
-        if index < 0 or index >= expected:
-            continue
-        grid_timestamp = start + index * step
-        if abs(raw_timestamp - grid_timestamp) > tolerance:
-            continue
-        previous = aligned.get(grid_timestamp)
-        aligned[grid_timestamp] = value if previous is None else max(previous, value)
-    return aligned
+    buckets: dict[int, list[float]] = {}
+    for timestamp, value in sorted(points.items()):
+        buckets.setdefault(timestamp - timestamp % 60, []).append(value)
+    return [
+        (float(minute), sum(values) / len(values))
+        for minute, values in sorted(buckets.items())
+    ]
 
 
 def compute_gpu_busy(
     window_start: float,  # unix timestamp
     window_end: float,    # unix timestamp
+    *,
+    getter=None,
+    series: dict | None = None,
 ) -> GpuBusyResult | None:
-    """Compute coverage-honest GPU busy time from power consumption.
+    """Compute the attributable GPU-activity share via the single producer.
 
-    Every expected grid instant is classified ``computing``, ``idle`` or
-    ``unknown`` (see the module docstring). Returns ``None`` when Prometheus is
-    unreachable, when the queries yield no usable result, or when the window
-    has **no observed instants at all** (a fully-absent window keeps the
-    pre-fix "no row" behaviour rather than reporting a fabricated ``0 %``).
+    ``getter`` overrides the producer's HTTP getter (``getter(url) -> payload``)
+    for tests. ``series`` short-circuits the Prometheus load entirely — pass the
+    producer's ``{query_key: {unix_ts: value}}`` mapping to compute from a
+    recorded bundle. Returns ``None`` when Prometheus is unreachable, when the
+    queries yield no usable result, or when the window has **no observed
+    instants at all** (a fully-absent window keeps the "no row" behaviour
+    rather than reporting a fabricated ``0 %``).
     """
     total = window_end - window_start
     if total <= 0:
@@ -291,74 +230,52 @@ def compute_gpu_busy(
     end = int(round(window_end))
     if end <= start:
         return None
-    step = STEP_SECONDS
-    expected = _expected_sample_count(start, end, step)
 
-    # 1. Every series in one query_range call, on the same window.
-    bool_data = query_prometheus(BOOL_QUERY, start, end, step=str(step))
-    if bool_data is None:
-        return None
-    up_llama = query_prometheus(UP_LLAMA_PROXY_QUERY, start, end, step=str(step))
-    up_node = query_prometheus(UP_NODE_EXPORTER_QUERY, start, end, step=str(step))
-    heartbeat = query_prometheus(HEARTBEAT_QUERY, start, end, step=str(step))
+    producer = _producer()
+    window = producer.Window(start=start, end=end)
 
-    computing_bool = _align_to_grid(
-        _parse_matrix(bool_data), start=start, step=step, expected=expected
-    )
-    up_llama_points = _align_to_grid(
-        _parse_matrix(up_llama), start=start, step=step, expected=expected
-    )
-    up_node_points = _align_to_grid(
-        _parse_matrix(up_node), start=start, step=step, expected=expected
-    )
-    heartbeat_points = _align_to_grid(
-        _parse_matrix(heartbeat), start=start, step=step, expected=expected
-    )
+    if series is None:
+        expected = producer.expected_sample_count(start, end, STEP_SECONDS)
+        try:
+            series = producer.load_series(
+                getter=getter,
+                prometheus_url=PROMETHEUS_URL,
+                window=window,
+                step_seconds=STEP_SECONDS,
+                expected_samples=expected,
+            )
+        except producer.PrometheusError:
+            return None
 
-    # 2. Classify every expected instant on the grid.
-    computing = idle = 0
-    for index in range(expected):
-        timestamp = start + index * step
-        flag = computing_bool.get(timestamp)
-        alive = (
-            up_llama_points.get(timestamp) == 1
-            or up_node_points.get(timestamp) == 1
-        )
-        if not alive:
-            beat = heartbeat_points.get(timestamp)
-            alive = beat is not None and abs(timestamp - beat) <= SCRAPE_INTERVAL_SECONDS
-        if not alive or flag is None:
-            continue  # unknown: absence is never idle and never the numerator
-        if flag >= 0.5:
-            computing += 1
-        else:
-            idle += 1
-
-    observed = computing + idle
-    unknown = expected - observed
-    if observed == 0:
+    utilisation = producer.compute_utilisation(
+        series,
+        window=window,
+        step_seconds=STEP_SECONDS,
+        scrape_interval_seconds=SCRAPE_INTERVAL_SECONDS,
+    )
+    if utilisation.observed_samples == 0:
         # Fully-absent window: keep the "no row" behaviour, never 0 %.
         return None
 
-    # Each grid instant stands for window_seconds / expected_samples seconds,
-    # so the three shares account for the whole window by construction.
-    instant_seconds = total / expected
-    computing_fraction = computing / expected
-
-    # 3. Smoothed power trace (1-min samples) for the transition context.
-    power_data = query_prometheus(POWER_QUERY, start, end, step="60")
-    power_values = sorted(_parse_matrix(power_data).items())
+    hourly = producer.hourly_attributable_shares(
+        series,
+        window=window,
+        step_seconds=STEP_SECONDS,
+        scrape_interval_seconds=SCRAPE_INTERVAL_SECONDS,
+    )
+    computing_fraction = utilisation.computing_samples / utilisation.expected_samples
 
     return GpuBusyResult(
         computing_fraction=computing_fraction,
         total_seconds=total,
         busy_seconds=computing_fraction * total,
-        idle_seconds=idle * instant_seconds,
-        smoothed_power_values=power_values,
-        unknown_seconds=unknown * instant_seconds,
-        expected_samples=expected,
-        observed_samples=observed,
-        computing_samples=computing,
-        idle_samples=idle,
-        unknown_samples=unknown,
+        idle_seconds=utilisation.idle_pct / 100.0 * total,
+        smoothed_power_values=_minute_means(series.get("power_watts", {})),
+        unknown_seconds=utilisation.unknown_pct / 100.0 * total,
+        expected_samples=utilisation.expected_samples,
+        observed_samples=utilisation.observed_samples,
+        computing_samples=utilisation.computing_samples,
+        idle_samples=utilisation.idle_samples,
+        unknown_samples=utilisation.unknown_samples,
+        hourly_shares=hourly,
     )

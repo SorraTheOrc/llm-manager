@@ -900,6 +900,17 @@ every turn) routed remote invisibly turn after turn.
   successful local dispatch resets the streak (only unbroken same-session 400
   runs escalate). No cooldown is applied either way — the local provider
   stays eligible for the next request.
+- **Typed error, then a terminal breaker
+  (LP-0MW95BDJQ002DSVI / LP-0MW95BE7X00574OL):** a resend of a history already
+  rejected is answered immediately with the typed `deterministic_client_error`
+  (HTTP 400, `Retry-After`, `X-Deterministic-Client-Error: identical_history`),
+  and after `deterministic_client_error_escalation_threshold` resends (default
+  `5`, read top-level or inside `server`) with the terminal `session_wedged`
+  error (`X-Session-Wedged`, `Retry-After` >= 60 s,
+  `proxy_http_errors_total{reason="session_wedged"}`). Neither consumes a
+  chain-hold cycle nor dispatches remote. A successful local stream or a
+  changed history resets the count. See
+  [`docs/routing.md`](docs/routing.md#terminal-breaker-session_wedged-lp-0mw95be7x00574ol).
 
 #### All Providers Exhausted
 
@@ -2248,6 +2259,37 @@ still refusing the re-dispatch it was armed for
 (LP-0MVRMI5HK00558TB; details in
 [docs/routing.md](docs/routing.md#post-deadline-prefill-thrash-cooldown-lp-0mvkukfhh005udwl-rescoped-by-lp-0mvt2ksxy002o75c)).
 
+#### Cross-host Audit Admission Budget
+
+(LP-0MW95FYMH006XYNK, parent epic LP-0MW0KZUJP0019SLS.) Audit sessions run
+against the one local `llama-server` GPU that **every host and project
+shares**, so the proxy owns the audit cap and the live lease registry (at most
+`audit_admission.max_audits` — default 1 — live leases across all client
+hosts). The herdr dispatcher consumes this lease-derived availability signal
+instead of a per-host `budget.json` assertion:
+
+```bash
+# Availability read (the dispatcher's capacity signal)
+curl http://localhost:8000/llama/local/audit/availability
+# -> {"cap": 1, "live": 0, "available": 1, "leases": []}
+
+# Acquire / renew / release an audit-tier lease
+curl -X POST http://localhost:8000/llama/local/audit/lease \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id": "audit-LP-0MW0KZUJP0019SLS-ctx-deadbeef"}'
+curl -X POST http://localhost:8000/llama/local/audit/lease/renew \
+  -d '{"session_id": "audit-LP-0MW0KZUJP0019SLS-ctx-deadbeef"}'
+curl -X DELETE http://localhost:8000/llama/local/audit/lease/audit-LP-0MW0KZUJP0019SLS-ctx-deadbeef
+```
+
+A second **different** audit session is refused (`reason:
+audit-budget-saturated` + bounded `retry_after_s`) and waits; the same
+holder's re-acquire/renew is idempotent. Expired leases are reclaimed
+(`audit_lease_reclaimed reason=expired`) and expiry compares on the proxy's
+clock only. The per-host ContextHub `~/.herdr/downtime/budget.json`
+(`maxAudit`) is no longer authoritative — a conflicting value logs a startup
+WARNING. Full contract: [docs/routing.md](docs/routing.md#cross-host-audit-admission-budget-lp-0mw95fymh006xynk).
+
 This endpoint requires no authentication (internal) and is rate-unlimited.
 
 **Per-dispatch live-work attribution (LP-0MVYZEYZY003IQAH).** `local_in_flight_requests`,
@@ -3275,6 +3317,15 @@ See [monitoring/README.md](../monitoring/README.md) for step-by-step deployment
 instructions covering Prometheus and Grafana binary installation, systemd user
 service setup, Grafana datasource and dashboard provisioning, and
 verification steps.
+
+Grafana is deployed with one host script,
+[`scripts/deploy_grafana.sh`](../scripts/deploy_grafana.sh): it installs the
+pinned Grafana release, provisions the Prometheus datasource and the
+`LLama Server Memory` dashboard, installs the systemd user unit, binds it to
+`127.0.0.1:3000` (tailnet via `tailscale serve --tcp=3000`), generates the
+admin password file at `~/.config/grafana/admin.pass`, and verifies the
+result. Run `scripts/deploy_grafana.sh --check` to verify without changing
+anything (`--check --allow-absent` reports an undeployed host as exit 0).
 
 ### Runbook
 

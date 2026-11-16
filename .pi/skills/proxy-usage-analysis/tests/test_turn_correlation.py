@@ -31,6 +31,12 @@ from tests.fixtures import (  # noqa: E402
     DISPATCH_DENIED,
     DISPATCH_FIRST_BYTE_COLD,
     FALLBACK_SESSION,
+    LATE_FALLBACK_FINISHED,
+    LATE_FALLBACK_REMOTE_POST,
+    LATE_FALLBACK_SESSION,
+    LATE_FALLBACK_STARTED,
+    LATE_FALLBACK_TRIGGERED,
+    LATE_FALLBACK_TURN,
     ROUTING_SKIP_CONTEXT_TOO_LARGE,
     ROUTING_SKIP_PROVIDER_CONTEXT,
     TURN_A,
@@ -374,3 +380,459 @@ def test_session_stats_attribution_is_exact_with_interleaved_turns():
     assert session.fallback_reason == "context_too_large"
     assert session.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_SKIP
     assert session.remote_requests == 2
+
+
+# ---------------------------------------------------------------------------
+# Late own fallback line (pre-flight stream buffering)
+# ---------------------------------------------------------------------------
+#
+# LP-0MW8U39FH005GWHY: the proxy logs ``Fallback triggered`` *after* the remote
+# stream it describes has started **and finished** (pre-flight buffering), so a
+# timestamp-first filter drops the session's own, exactly-matching line and the
+# session reads ``unattributed``. The turn id is the exact join key here, so it
+# must win over the timestamp.
+
+LATE_WINDOW_START = datetime(2026, 11, 5, 15, 0, 0)
+LATE_WINDOW_END = datetime(2026, 11, 5, 16, 0, 0)
+# ``Stream started`` of the session's first remote stream: the move time is
+# anchored here, never on the later fallback line.
+LATE_FIRST_REMOTE_TS = datetime(2026, 11, 5, 15, 50, 10, 341000)
+
+
+def test_late_own_fallback_is_attributed_by_its_turn_id():
+    """AC1/AC2: the fallback line arrives after the remote stream, same turn."""
+    lines = [
+        LATE_FALLBACK_REMOTE_POST,
+        LATE_FALLBACK_STARTED,
+        LATE_FALLBACK_FINISHED,
+        LATE_FALLBACK_TRIGGERED,
+    ]
+    schedule = bucketing.schedule_from_entries([("23:59", 8)])
+
+    result = aggregation.aggregate(
+        _events(lines), LATE_WINDOW_START, LATE_WINDOW_END, schedule
+    )
+
+    session = result.sessions[LATE_FALLBACK_SESSION]
+    assert session.fallback_reason == "local_concurrency_limit"
+    assert (
+        session.fallback_attribution
+        == aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK
+    )
+    # The move time never moves later than the first remote stream: the matched
+    # line (15:50:11,243) is reported as the stream's own start (15:50:10,341).
+    assert session.remote_move_time == LATE_FIRST_REMOTE_TS
+
+
+def test_late_own_fallback_keeps_context_anchored_on_the_remote_stream():
+    """A late matched line does not move the ``context_at_fallback`` anchor.
+
+    With the anchor clamped at the first remote stream, the context is the
+    prompt of that remote stream (1000). An anchor left on the late fallback
+    line (15:50:11,243) finds no ``Stream finished`` at/after it and silently
+    falls back to the local turn's prompt (700).
+    """
+    local_started = (
+        "2026-11-05 15:50:00,000 - INFO - Stream started: provider=local "
+        "model=Qwen3 "
+        f"session={LATE_FALLBACK_SESSION} request=[{{'type': 'text', 'text': 'x'}}] "
+        f"turn={LATE_FALLBACK_TURN}"
+    )
+    local_finished = (
+        "2026-11-05 15:50:02,000 - INFO - Stream finished: reason=stop "
+        "tokens=700/50/750 "
+        f"session={LATE_FALLBACK_SESSION} provider=local model=Qwen3 "
+        f"turn={LATE_FALLBACK_TURN}"
+    )
+    lines = [
+        local_started,
+        local_finished,
+        LATE_FALLBACK_REMOTE_POST,
+        LATE_FALLBACK_STARTED,
+        LATE_FALLBACK_FINISHED,
+        LATE_FALLBACK_TRIGGERED,
+    ]
+    schedule = bucketing.schedule_from_entries([("23:59", 8)])
+
+    result = aggregation.aggregate(
+        _events(lines), LATE_WINDOW_START, LATE_WINDOW_END, schedule
+    )
+
+    session = result.sessions[LATE_FALLBACK_SESSION]
+    assert session.remote_move_time == LATE_FIRST_REMOTE_TS
+    assert session.context_at_fallback == 1000
+    assert (
+        session.context_at_fallback_source
+        == aggregation.CONTEXT_AT_FALLBACK_REMOTE_STREAM
+    )
+
+
+def test_own_fallback_picker_prefers_the_turn_even_when_it_is_early():
+    """The picker is timestamp-agnostic only for an exact turn match.
+
+    An at/before line of another turn no longer wins over the turn's own line,
+    and turn-less evidence keeps the historical ``e.ts <= first_remote_ts``
+    rule (latest line wins).
+    """
+    first_remote_ts = datetime(2026, 10, 25, 10, 0, 10)
+    early_other_turn = _event(
+        "2026-10-25 10:00:09,000 - INFO - Fallback triggered for "
+        "model=v1/chat/completions, from=local-qwen3, to=opencode-go, "
+        f"reason=context_too_large session={TURN_SESSION} attempt=1 turn={TURN_A}"
+    )
+    late_own_turn = _event(
+        "2026-10-25 10:00:15,000 - INFO - Fallback triggered for "
+        "model=v1/chat/completions, from=local-qwen3, to=opencode-go, "
+        f"reason=local_concurrency_limit session={TURN_SESSION} attempt=2 "
+        f"turn={TURN_B}"
+    )
+    legacy_own = _event(
+        "2026-10-25 10:00:08,000 - INFO - Fallback triggered for "
+        "model=v1/chat/completions, from=local-qwen3, to=opencode-go, "
+        f"reason=lease_active_legacy session={TURN_SESSION} attempt=1"
+    )
+
+    by_turn = aggregation._attribute_fallback(
+        TURN_SESSION,
+        first_remote_ts,
+        {},
+        [early_other_turn, late_own_turn, legacy_own],
+        turn=TURN_B,
+    )
+    without_turn = aggregation._attribute_fallback(
+        TURN_SESSION, first_remote_ts, {}, [early_other_turn, legacy_own]
+    )
+
+    assert by_turn[1] == "local_concurrency_limit"
+    assert by_turn[2] == aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK
+    # No ids: the latest own line at/before the first remote stream still wins.
+    assert without_turn[1] == "context_too_large"
+
+
+# ---------------------------------------------------------------------------
+# Turn-first skip evidence and precedence guards (LP-0MW8U39ZQ007MPQO)
+# ---------------------------------------------------------------------------
+#
+# The turn-first picker from the own-fallback tier (LP-0MW8U39FH005GWHY)
+# applies to the ``routing_skip_local`` and ``routing_skip_provider_context``
+# tiers too: no tier keeps a timestamp filter ahead of an exact ``turn=``
+# match, so late-arriving evidence of the session's own turn is attributed
+# while the documented precedence order and the no-inheritance guarantee stay
+# unchanged (parent LP-0MW0FFW8K002U0KQ AC3).
+
+PRECEDENCE_SESSION = "herdr-precedence-0001"
+PRECEDENCE_TURN = "aa11bb22"
+PRECEDENCE_FIRST_REMOTE = datetime(2026, 11, 6, 12, 0, 10)
+
+
+def _late_skip():
+    return log_parser.LogEvent(
+        "routing_skip",
+        PRECEDENCE_FIRST_REMOTE + timedelta(seconds=1),
+        session=PRECEDENCE_SESSION,
+        reason="context_too_large",
+        estimated_tokens=40000,
+        turn=PRECEDENCE_TURN,
+    )
+
+
+def _late_provider_skip():
+    return log_parser.LogEvent(
+        "provider_context_skip",
+        PRECEDENCE_FIRST_REMOTE + timedelta(seconds=2),
+        session=PRECEDENCE_SESSION,
+        reason="provider_context_exceeded",
+        estimated_tokens=153917,
+        limit=150000,
+        turn=PRECEDENCE_TURN,
+    )
+
+
+def _late_own_fallback():
+    return log_parser.LogEvent(
+        "fallback",
+        PRECEDENCE_FIRST_REMOTE + timedelta(seconds=3),
+        session=PRECEDENCE_SESSION,
+        reason="local_concurrency_limit",
+        turn=PRECEDENCE_TURN,
+    )
+
+
+def _legacy_nearest():
+    return log_parser.LogEvent(
+        "fallback",
+        PRECEDENCE_FIRST_REMOTE - timedelta(seconds=5),
+        session=None,
+        reason="legacy_stream_busy",
+        turn=None,
+    )
+
+
+def test_own_skip_tier_picks_the_turns_late_skip_line():
+    """A ``routing_skip_local`` line logged **after** the first remote stream
+    still wins when it carries the same ``turn=`` (turn-first, AC1).
+
+    The historical ``e.ts <= first_remote_ts`` filter would drop the line and
+    read the session as unattributed; without a turn id the same line keeps
+    the historical rule (not matched).
+    """
+    move_ts, reason, attribution = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {PRECEDENCE_SESSION: [_late_skip()]},
+        [],
+        turn=PRECEDENCE_TURN,
+    )
+    no_turn = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {PRECEDENCE_SESSION: [_late_skip()]},
+        [],
+    )
+
+    assert reason == "context_too_large"
+    assert attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_SKIP
+    # The move time never lands after the first remote stream.
+    assert move_ts == PRECEDENCE_FIRST_REMOTE
+    assert no_turn[2] == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+
+
+def test_own_provider_skip_tier_picks_the_turns_late_line():
+    """``routing_skip_provider_context`` uses the same turn-first rule (AC1)."""
+    move_ts, reason, attribution = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {},
+        [],
+        provider_context_skips={PRECEDENCE_SESSION: [_late_provider_skip()]},
+        turn=PRECEDENCE_TURN,
+    )
+    no_turn = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {},
+        [],
+        provider_context_skips={PRECEDENCE_SESSION: [_late_provider_skip()]},
+    )
+
+    assert reason == "provider_context_exceeded"
+    assert (
+        attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
+    )
+    assert move_ts == PRECEDENCE_FIRST_REMOTE
+    assert no_turn[2] == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+
+
+def test_provider_skip_tier_prefers_an_exact_late_turn_over_an_early_other_turn():
+    """An at/before line of another turn no longer wins the provider tier.
+
+    The move time discriminates which line was picked: the early other-turn
+    line (if chosen) reports its own at/before time, while the exact late
+    match is clamped to the first remote stream. Without a ``turn=`` the
+    historical rule still picks the early line.
+    """
+    early_other_turn = log_parser.LogEvent(
+        "provider_context_skip",
+        PRECEDENCE_FIRST_REMOTE - timedelta(seconds=2),
+        session=PRECEDENCE_SESSION,
+        reason="provider_context_exceeded",
+        estimated_tokens=100000,
+        limit=110000,
+        turn="deadbeef",  # a *different* turn
+    )
+    late_own_turn = _late_provider_skip()
+
+    move_ts, reason, attribution = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {},
+        [],
+        provider_context_skips={
+            PRECEDENCE_SESSION: [early_other_turn, late_own_turn]
+        },
+        turn=PRECEDENCE_TURN,
+    )
+    historical = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {},
+        [],
+        provider_context_skips={
+            PRECEDENCE_SESSION: [early_other_turn, late_own_turn]
+        },
+    )
+
+    assert reason == "provider_context_exceeded"
+    assert (
+        attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
+    )
+    # The exact late match was picked (clamped), not the early other-turn line.
+    assert move_ts == PRECEDENCE_FIRST_REMOTE
+    # Without ids the latest at/before line still wins, reporting its own time.
+    assert historical[0] == PRECEDENCE_FIRST_REMOTE - timedelta(seconds=2)
+    assert (
+        historical[2] == aggregation.FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
+    )
+
+
+@pytest.mark.parametrize(
+    "with_skip,with_provider,with_fallback,with_legacy,denied,"
+    "expected_attr,expected_reason",
+    [
+        # Every own tier's evidence for this turn is timestamped *after* the
+        # first remote stream; the documented precedence still decides (AC2).
+        (True, True, True, True, True, "own_skip", "context_too_large"),
+        (False, True, True, True, True, "own_provider_skip", "provider_context_exceeded"),
+        (False, False, True, True, True, "own_fallback", "local_concurrency_limit"),
+        (False, False, False, True, True, "legacy_nearest", "legacy_stream_busy"),
+        (False, False, False, False, True, "lease_denied", "local_lease_active"),
+        (False, False, False, False, False, "unattributed", None),
+    ],
+)
+def test_precedence_order_holds_with_late_turn_evidence(
+    with_skip,
+    with_provider,
+    with_fallback,
+    with_legacy,
+    denied,
+    expected_attr,
+    expected_reason,
+):
+    """own_skip > own_provider_skip > own_fallback > legacy_nearest >
+    lease_denied > unattributed, unchanged while late evidence is accepted."""
+    routing_skips = {PRECEDENCE_SESSION: [_late_skip()]} if with_skip else {}
+    provider_ctx = (
+        {PRECEDENCE_SESSION: [_late_provider_skip()]} if with_provider else None
+    )
+    fallbacks = []
+    if with_fallback:
+        fallbacks.append(_late_own_fallback())
+    if with_legacy:
+        fallbacks.append(_legacy_nearest())
+
+    move_ts, reason, attribution = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        routing_skips,
+        fallbacks,
+        dispatch_denied=1 if denied else 0,
+        provider_context_skips=provider_ctx,
+        turn=PRECEDENCE_TURN,
+    )
+
+    assert attribution == expected_attr
+    assert reason == expected_reason
+    # A move time is only reported when a timestamped line was matched; the
+    # legacy tier's line is at/before the stream, so its time is its own.
+    if expected_attr in ("unattributed", "lease_denied"):
+        assert move_ts is None
+    elif expected_attr == "legacy_nearest":
+        assert move_ts == PRECEDENCE_FIRST_REMOTE - timedelta(seconds=5)
+    else:
+        assert move_ts == PRECEDENCE_FIRST_REMOTE  # clamped late evidence
+
+
+def test_late_fallback_of_another_session_is_never_borrowed():
+    """No-inheritance (AC3): a late ``Fallback triggered`` belonging to a
+    different ``session=`` is never used, even with an exact ``turn=`` match."""
+    other_session_late = log_parser.LogEvent(
+        "fallback",
+        PRECEDENCE_FIRST_REMOTE + timedelta(seconds=5),
+        session="herdr-other-session",
+        reason="local_concurrency_limit",
+        turn=PRECEDENCE_TURN,
+    )
+
+    move_ts, reason, attribution = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {},
+        [other_session_late],
+        turn=PRECEDENCE_TURN,
+    )
+
+    assert move_ts is None
+    assert reason is None
+    assert attribution == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+
+
+def test_late_fallback_of_another_session_never_shadows_own_evidence():
+    """Positive control: the session's own late line still wins when a
+    neighbour's late line is present."""
+    own_late = _late_own_fallback()
+    other_late = log_parser.LogEvent(
+        "fallback",
+        PRECEDENCE_FIRST_REMOTE + timedelta(seconds=6),
+        session="herdr-other-session",
+        reason="local_concurrency_limit",
+        turn=PRECEDENCE_TURN,
+    )
+
+    _, reason, attribution = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {},
+        [own_late, other_late],
+        turn=PRECEDENCE_TURN,
+    )
+
+    assert reason == "local_concurrency_limit"
+    assert attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK
+
+
+def test_late_fallback_of_a_later_turn_is_not_matched_to_this_turn():
+    """Bounded match (AC4): a ``Fallback triggered`` for a **later** turn of
+    the same session (different ``turn=``) is not matched to the first remote
+    stream."""
+    later_turn_late = log_parser.LogEvent(
+        "fallback",
+        PRECEDENCE_FIRST_REMOTE + timedelta(seconds=7),
+        session=PRECEDENCE_SESSION,
+        reason="local_concurrency_limit",
+        turn="99ffeedd",  # a later turn of the same session
+    )
+
+    move_ts, reason, attribution = aggregation._attribute_fallback(
+        PRECEDENCE_SESSION,
+        PRECEDENCE_FIRST_REMOTE,
+        {},
+        [later_turn_late],
+        turn=PRECEDENCE_TURN,
+    )
+
+    assert move_ts is None
+    assert reason is None
+    assert attribution == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+
+
+def test_turnless_evidence_keeps_the_historical_timestamp_rule():
+    """Legacy heuristic (AC5): turn-less rotated-log evidence attributes
+    exactly as before — an own fallback before the stream is ``own_fallback``
+    and one after the stream is not matched."""
+    first_remote_ts = datetime(2026, 10, 25, 10, 0, 10)
+    own_before = log_parser.LogEvent(
+        "fallback",
+        first_remote_ts - timedelta(seconds=3),
+        session=TURN_SESSION,
+        reason="context_too_large",
+        turn=None,
+    )
+    own_after = log_parser.LogEvent(
+        "fallback",
+        first_remote_ts + timedelta(seconds=3),
+        session=TURN_SESSION,
+        reason="local_concurrency_limit",
+        turn=None,
+    )
+
+    before = aggregation._attribute_fallback(
+        TURN_SESSION, first_remote_ts, {}, [own_before], turn=None
+    )
+    after_only = aggregation._attribute_fallback(
+        TURN_SESSION, first_remote_ts, {}, [own_after], turn=None
+    )
+
+    assert before[1] == "context_too_large"
+    assert before[2] == aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK
+    assert before[0] == first_remote_ts - timedelta(seconds=3)
+    assert after_only[2] == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED

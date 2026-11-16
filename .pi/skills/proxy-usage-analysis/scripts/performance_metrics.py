@@ -31,9 +31,11 @@ Retention, target and verdict rules
   ``None`` below three. With less evidence there is no target, and the report
   says ``Insufficient history`` rather than inventing one.
 - **Verdict** — :func:`derive_verdict` compares this window's actual against
-  that target (equality counts as met) and returns ``Met``/``Unmet``; fewer
-  than three measurements always returns ``Insufficient history``, and an
-  unmeasurable actual (``None``) returns ``n/a`` and is never recorded as
+  that target inside the metric's tolerance band
+  (:func:`tolerance_for`, default :data:`DEFAULT_TOLERANCE_PCT` = 10 % of the
+  target, direction-aware, both edges met) and returns ``Met``/``Unmet``;
+  fewer than three measurements always returns ``Insufficient history``, and
+  an unmeasurable actual (``None``) returns ``n/a`` and is never recorded as
   ``0``.
 
 State schema
@@ -100,6 +102,10 @@ NOT_AVAILABLE = "n/a"
 #: Measurements retained behind a target (best 3, direction-aware).
 RETENTION_LIMIT = 3
 
+#: Default relative tolerance band around a target, as a percentage. A metric
+#: may override it with ``tolerance_pct`` in the committed defaults file.
+DEFAULT_TOLERANCE_PCT = 10.0
+
 #: Fingerprint recorded when the configuration era is unknown (backfill).
 UNKNOWN_FINGERPRINT = ""
 
@@ -117,6 +123,9 @@ DETAIL_FIELDS = (
     "trade_offs",
     "data_section_anchor",
 )
+
+#: Per-metric tolerance override key in the committed defaults file.
+TOLERANCE_FIELD = "tolerance_pct"
 
 
 @dataclass(frozen=True)
@@ -138,10 +147,10 @@ class Metric:
 METRIC_REGISTRY: tuple[Metric, ...] = (
     Metric(
         id="gpu_busy",
-        label="GPU activity — power-based, any consumer",
+        label="GPU computing — attributable (power ≥ 90 W and a busy local slot)",
         unit="%",
         direction=HIGHER,
-        source="GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer)",
+        source="GPU telemetry power and busy-slot samples (gpu:computing_workload:bool, via scripts/gpu_utilisation.py)",
     ),
     Metric(
         id="fallback_rate",
@@ -285,14 +294,32 @@ def baseline_from(measurements: Iterable[Mapping], direction: str) -> dict | Non
 
 
 def derive_verdict(
-    actual: float | None, measurements: Iterable[Mapping], direction: str
+    actual: float | None,
+    measurements: Iterable[Mapping],
+    direction: str,
+    tolerance_pct: float = DEFAULT_TOLERANCE_PCT,
 ) -> str:
     """Direction-aware verdict of *actual* against the best-3 target.
 
+    The target is met when the actual lies **inside the tolerance band**
+    around it, not only when it beats the target exactly, so run-to-run
+    measurement noise is not reported as a regression:
+
+    - higher-is-better: ``actual >= target * (1 - tolerance)``
+    - lower-is-better:  ``actual <= target * (1 + tolerance)``
+
+    Both band edges count as met, and any actual better than the target is
+    met. A zero target therefore has a zero-width band (10 % of zero is
+    zero): only an actual of zero qualifies, which the documentation states
+    rather than substituting an invented absolute epsilon.
+
     Returns ``"n/a"`` when the window has no actual value, ``"Insufficient
     history"`` when fewer than three measurements are recorded (never a
-    misleading Met/Unmet), and otherwise ``"Met"``/``"Unmet"``. Equality with
-    the target counts as met.
+    misleading Met/Unmet), and otherwise ``"Met"``/``"Unmet"``.
+
+    *tolerance_pct* is the metric's relative band width (see
+    :func:`tolerance_for`); an absent, non-numeric or negative value falls
+    back to :data:`DEFAULT_TOLERANCE_PCT` and never raises.
     """
     if actual is None:
         return NOT_AVAILABLE
@@ -300,8 +327,12 @@ def derive_verdict(
     target = target_from(measurements, direction)
     if target is None:
         return INSUFFICIENT
+    shift = _normalise_tolerance(tolerance_pct) / 100.0
     actual_value = float(actual)
-    met = actual_value >= target if direction == HIGHER else actual_value <= target
+    if direction == HIGHER:
+        met = actual_value >= target * (1.0 - shift)
+    else:
+        met = actual_value <= target * (1.0 + shift)
     return MET if met else UNMET
 
 
@@ -333,8 +364,16 @@ def is_cross_era(measurements: Iterable[Mapping]) -> bool:
 
 
 def new_state() -> dict:
-    """An empty state covering every registered metric."""
-    return {"metrics": {metric.id: {"measurements": []} for metric in METRIC_REGISTRY}}
+    """An empty state covering every registered metric.
+
+    ``notes`` records deliberate discontinuity events (a metric's definition
+    changed and its history was reset), so a future reader can tell a reset
+    from a data loss.
+    """
+    return {
+        "metrics": {metric.id: {"measurements": []} for metric in METRIC_REGISTRY},
+        "notes": {},
+    }
 
 
 def _normalise_measurement(raw: Mapping) -> dict:
@@ -384,16 +423,22 @@ def load_state(path: str | Path | None, *, defaults_path: str | Path | None = No
     """
     state = new_state()
     if defaults_path is not None:
-        for metric_id, measurements in _history_entries(
-            config_loader.load_yaml_mapping(defaults_path)
-        ).items():
-            state["metrics"][metric_id]["measurements"] = measurements
+        defaults = config_loader.load_yaml_mapping(defaults_path)
+        _merge_history(state, defaults)
     if path is not None and Path(path).is_file():
-        for metric_id, measurements in _history_entries(
-            config_loader.load_yaml_mapping(path)
-        ).items():
-            state["metrics"][metric_id]["measurements"] = measurements
+        _merge_history(state, config_loader.load_yaml_mapping(path))
     return state
+
+
+def _merge_history(state: dict, data: Mapping) -> None:
+    """Merge one loaded mapping's measurements and definition-change notes."""
+    for metric_id, measurements in _history_entries(data).items():
+        state["metrics"][metric_id]["measurements"] = measurements
+    notes = data.get("notes") if isinstance(data, Mapping) else None
+    if isinstance(notes, Mapping):
+        for metric_id, events in notes.items():
+            if metric_id in _METRICS_BY_ID and isinstance(events, list):
+                state["notes"][metric_id] = [dict(event) for event in events]
 
 
 def save_state(state: Mapping, path: str | Path) -> None:
@@ -409,7 +454,52 @@ def save_state(state: Mapping, path: str | Path) -> None:
             if isinstance(measurement, Mapping)
         ]
         payload["metrics"][registered.id] = {"measurements": measurements}
+    notes = state.get("notes") if isinstance(state, Mapping) else None
+    if isinstance(notes, Mapping) and notes:
+        payload["notes"] = {
+            metric_id: [dict(event) for event in events]
+            for metric_id, events in notes.items()
+            if metric_id in _METRICS_BY_ID and events
+        }
     config_loader.dump_yaml_mapping(payload, path)
+
+
+def reset_metric_history(
+    state: dict,
+    metric_id: str,
+    *,
+    note: str,
+    reset_at: str | None = None,
+) -> int:
+    """Clear a metric's recorded measurements, documenting *why*.
+
+    A metric whose definition changed must not be compared across the two
+    definitions, so its history is reset rather than silently continued; the
+    ``note`` (a definition-change note) is stored alongside the empty history so
+    the reset is a recorded discontinuity, not an apparent data loss. Returns
+    the number of measurements removed.
+    """
+    if metric_id not in _METRICS_BY_ID:
+        raise ValueError(f"unknown metric id {metric_id!r}")
+    previous = state["metrics"][metric_id]["measurements"]
+    removed = len(previous)
+    state["metrics"][metric_id]["measurements"] = []
+    events = state.setdefault("notes", {}).setdefault(metric_id, [])
+    events.append(
+        {
+            "event": "definition_change",
+            "note": str(note),
+            "at": str(reset_at or ""),
+        }
+    )
+    return removed
+
+
+def metric_notes(state: Mapping, metric_id: str) -> list[dict]:
+    """Definition-change notes recorded for *metric_id* (empty when none)."""
+    notes = state.get("notes") if isinstance(state, Mapping) else None
+    events = notes.get(metric_id) if isinstance(notes, Mapping) else None
+    return [dict(event) for event in events] if isinstance(events, list) else []
 
 
 def record_measurement(
@@ -478,11 +568,55 @@ def detail_copy(metric_id: str, defaults: Mapping | None = None) -> dict:
     }
 
 
+def _normalise_tolerance(value: object) -> float:
+    """A usable tolerance percentage, falling back to the default.
+
+    ``10 %`` is the default band, so a missing, non-numeric, boolean, NaN or
+    negative value is the default rather than a failure: the scorecard must
+    never stop a reporting run because one hand-edited number is wrong.
+    """
+    if isinstance(value, bool):
+        return DEFAULT_TOLERANCE_PCT
+    try:
+        tolerance = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_TOLERANCE_PCT
+    if tolerance != tolerance or tolerance < 0:  # NaN or negative
+        return DEFAULT_TOLERANCE_PCT
+    return tolerance
+
+
+def tolerance_for(metric_id: str, defaults: Mapping | None = None) -> float:
+    """The relative tolerance band (percentage) for *metric_id*.
+
+    Read from the committed defaults file's ``metrics.<id>.tolerance_pct`` when
+    present and valid, otherwise :data:`DEFAULT_TOLERANCE_PCT`. The file is
+    read-only at runtime, so this never writes. An unregistered metric id
+    raises, matching :func:`record_measurement` and :func:`detail_copy`.
+    """
+    if metric_id not in _METRICS_BY_ID:
+        raise ValueError(f"unknown metric id {metric_id!r}")
+    data = load_defaults() if defaults is None else defaults
+    metrics = data.get("metrics") if isinstance(data, Mapping) else None
+    entry = metrics.get(metric_id) if isinstance(metrics, Mapping) else None
+    raw = entry.get(TOLERANCE_FIELD) if isinstance(entry, Mapping) else None
+    return _normalise_tolerance(raw)
+
+
 # ---------------------------------------------------------------------------
 # Archived-report parsing and backfill
 # ---------------------------------------------------------------------------
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_DURATION_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([A-Za-z]+)?\s*$")
+#: Duration suffix -> milliseconds multiplier. A bare number is milliseconds,
+#: matching the earliest milliseconds-era archived reports.
+_DURATION_TO_MS = {
+    "": 1.0,
+    "ms": 1.0,
+    "s": 1000.0,
+    "sec": 1000.0,
+}
 _GENERATED_DATE_RE = re.compile(r"(?m)^-\s*Generated:\s*(\d{4}-\d{2}-\d{2})")
 _FALLBACK_RATE_RE = re.compile(
     r"Fallback events:\s*\*\*[\d,]+\*\*\s*\(([\d.]+)% of requests\)"
@@ -496,6 +630,34 @@ def _number(text: object) -> float | None:
         return float(text)
     match = _NUMBER_RE.search(str(text).replace(",", ""))
     return float(match.group(0)) if match else None
+
+
+def _duration_ms(text: object, *, bare_unit: str = "ms") -> float | None:
+    """A rendered duration cell as milliseconds, or ``None`` when not understood.
+
+    Archived reports render duration percentiles with a per-cell unit — the
+    middle-era ``## Time to first token`` rows say ``43.7s`` while later ones
+    say ``670ms`` — so a unit-blind read of ``43.7s`` would be ``43.7`` ms, a
+    sub-second value that then won the lower-is-better best-3 forever
+    (LP-0MW20RKLE006TG4M). The suffix is therefore converted to the registry's
+    ``ms`` unit here, and an unrecognised suffix is refused rather than guessed.
+
+    *bare_unit* is what a cell **without** a suffix means, because each table
+    declares its unit in the header: the ``## Time to first token`` table is in
+    milliseconds (the earliest reports leave the suffix off a ``670``), while
+    ``## Prefill vs decode`` declares its percentile columns in seconds (a bare
+    ``33.5`` is 33.5 s). It defaults to the milliseconds reading.
+    """
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        return float(text)
+    match = _DURATION_RE.match(str(text).replace(",", ""))
+    if not match:
+        return None
+    suffix = (match.group(2) or "").lower()
+    multiplier = _DURATION_TO_MS.get(suffix if suffix else bare_unit)
+    if multiplier is None:
+        return None
+    return float(match.group(1)) * multiplier
 
 
 def _section(report_text: str, title: str) -> str | None:
@@ -560,25 +722,60 @@ def _parse_speed(report_text: str, section_title: str) -> float | None:
 
 
 def _parse_time_to_first_token(report_text: str) -> float | None:
-    section = _section(report_text, "Time to first token")
+    """Local-only p90 time to first token (ms) from ``## Prefill vs decode``.
+
+    The archived report renders **two** first-token p90s over different
+    populations: the ``## Time to first token`` ``| Total |`` row is the
+    **combined local + remote** population (remote ``ttft_seconds=`` samples
+    dominate its sample count and drag the p90 down to single-digit seconds),
+    while the scorecard metric is the **local-only** p90
+    (``aggregation.ttft_p90_ms(..., include_remote=False)``). Only the
+    ``## Prefill vs decode`` ``Prefill (dispatch → first byte)`` ``p90 (s)``
+    column is local-only — one sample per local stream, percentile in the
+    column's declared seconds — so the seed derives the value from it and
+    **never** falls back to the combined row: a combined value must not be
+    seeded as if it were local-only, because it would install a
+    lower-is-better best-3 target an order of magnitude below every actual
+    (LP-0MWBLZ8HP005F6KO).
+
+    A report without that row (earlier eras render no such section) or whose
+    prefill row has no samples contributes nothing, so the caller reports the
+    metric as skipped instead of guessing.
+    """
+    section = _section(report_text, "Prefill vs decode")
     if section is None:
         return None
     rows = _table_rows(section)
     if not rows:
         return None
     p90_column = _column_index(rows[0], "p90")
-    row = _row_for_bucket(rows, "total")
-    if p90_column is None or row is None or p90_column >= len(row):
+    if p90_column is None:
         return None
-    return _number(row[p90_column])
+    for row in rows[1:]:
+        if not row or not row[0].strip().lower().startswith("prefill"):
+            continue
+        if p90_column >= len(row):
+            return None
+        return _duration_ms(row[p90_column], bare_unit="s")
+    return None
 
 
 def _parse_gpu_busy(report_text: str) -> float | None:
+    """Read the attributable GPU row of ``## Local model utilization``.
+
+    Only the row whose label names the **attributable** scope is read, so an
+    archived report rendering the retired power-only figure seeds **nothing**:
+    the two definitions are never compared across the reset
+    (LP-0MWG7KQVZ008DBZM Q4).
+    """
     section = _section(report_text, "Local model utilization")
     if section is None:
         return None
     for row in _table_rows(section):
-        if not row or not row[0].strip().lower().startswith("gpu busy"):
+        if not row:
+            continue
+        label = row[0].strip().lower()
+        if not label.startswith("gpu") or "attributable" not in label:
             continue
         for cell in row[1:]:
             percent = _PERCENT_IN_TEXT_RE.search(cell)

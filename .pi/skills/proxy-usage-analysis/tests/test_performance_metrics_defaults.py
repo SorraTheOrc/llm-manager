@@ -66,13 +66,19 @@ def test_each_calculation_copy_names_the_registered_data_source():
         )
 
 
-def test_gpu_busy_detail_copy_describes_coverage_and_hardware_scope():
-    """AC4/AC5 (LP-0MW5K8YE9001QO39): the why/calculation copy states the
-    coverage-honest grid and that the figure counts any GPU consumer."""
+def test_gpu_busy_detail_copy_describes_the_attributable_scope():
+    """LP-0MWG7KQVZ008DBZM: the why/calculation copy states the attributable
+    scope (power ≥ 90 W **and** a busy local slot), the coverage-honest grid
+    and the unknown handling — not the retired power-only figure."""
     copy = pm.detail_copy("gpu_busy", pm.load_defaults())
     text = _norm(f"{copy['why']} {copy['calculation']}")
 
-    assert "any gpu consumer" in text
+    assert "busy local slot" in text
+    assert "attributable" in text
+    # The retired power-only measure is gone; the copy may still contrast it
+    # ("rather than any GPU consumer") but must not define the figure by it.
+    assert "power-only" not in text
+    assert "gpu:computing:bool" not in text
     assert "15-second instant" in text
     assert "unknown" in text
 

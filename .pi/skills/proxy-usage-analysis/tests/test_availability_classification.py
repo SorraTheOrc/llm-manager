@@ -186,10 +186,11 @@ def test_wedged_hour_fixture_end_to_end():
     }
     md = reporting.build_report(summary, None)
     section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-    # Hour | State | Busy | % | Requests started | Local attempts | Local served |
-    # Local dispatch | Lease denials | Fallbacks | Local-skip
+    # Hour | State | GPU computing (attributable) | Requests started |
+    # Local attempts | Local served | Local dispatch | Lease denials |
+    # Fallbacks | Local-skip
     assert (
-        "| 02:00-03:00 | prefill-only-no-decode+lease-blocked | 0s | 0.0% | 1 | 0 | 0 | 2 | 2 | 1 | 0 |"
+        "| 02:00-03:00 | prefill-only-no-decode+lease-blocked | unknown | 1 | 0 | 0 | 2 | 2 | 1 | 0 |"
         in section
     ), section
     # The footnote defines the vocabulary in the same section.
@@ -219,7 +220,7 @@ def test_genuinely_idle_hour_classifies_idle():
     assert av.states == (aggregation.AVAILABILITY_IDLE,)
     md = reporting.build_report(summary, None)
     section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-    assert "| 02:00-03:00 | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+    assert "| 02:00-03:00 | idle | unknown | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
 
 
 def test_serving_hour_with_zero_busy_never_classifies_idle():

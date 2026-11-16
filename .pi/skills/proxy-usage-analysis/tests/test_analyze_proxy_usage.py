@@ -3243,17 +3243,17 @@ class TestBusyStats:
         assert set(hourly) == {datetime(2026, 8, 2, 9, 0, 0), datetime(2026, 8, 2, 10, 0, 0)}
 
     def test_report_summary_by_hour_table_window_bounded_with_pct_and_totals(self):
-        # Regression (LP-0MSVMLM7G009N74N) extended by LP-0MTFO210Q0044TTF and
-        # reworked by LP-0MTYAZFGN003BYQS: the hourly profile is the
-        # ``## Summary by hour`` table (after the performance scorecard,
-        # LP-0MW1BUA2M0005QRV) — it spans exactly the
+        # Regression (LP-0MSVMLM7G009N74N) extended by LP-0MTFO210Q0044TTF,
+        # reworked by LP-0MTYAZFGN003BYQS and by LP-0MWG7KQVZ008DBZM: the
+        # hourly profile is the ``## Summary by hour`` table (after the
+        # performance scorecard, LP-0MW1BUA2M0005QRV) — it spans exactly the
         # report window (partial first/last rows truncated to the window
-        # edges), lists every hour including idle ones, carries a % column
-        # (busy / window-bounded bucket duration, clamped to 100%), and its
-        # per-hour columns are now activity counts keyed by event timestamp
-        # rather than session-first-hour journey classifications. It ends with
-        # a totals row: window busy totals plus the sum of each activity
-        # column over the window.
+        # edges), lists every hour including idle ones, and its per-hour
+        # columns are now activity counts keyed by event timestamp rather than
+        # session-first-hour journey classifications. The former log-derived
+        # ``Busy``/``%`` pair is replaced by the **attributable** GPU share
+        # (``gpu:computing_workload:bool`` from ``scripts/gpu_utilisation.py``);
+        # with no GPU telemetry stubbed here every hour reads ``unknown``.
         start = datetime(2026, 8, 2, 9, 30, 0)
         end = datetime(2026, 8, 2, 11, 45, 0)
         lines = [
@@ -3272,15 +3272,16 @@ class TestBusyStats:
         # performance scorecard (LP-0MW1BUA2M0005QRV).
         assert "Busy time by hour:" not in md
         assert md.index("## Summary by hour") < md.index("## Session summary")
-        # AC2/AC1: window-bounded rows with a % column; idle middle hour
-        # listed; activity columns replace the classification columns.
-        assert "| Hour | State | Busy | % | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |" in section
-        assert "| 09:30-10:00 | serving | 30s | 1.7% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | idle | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
-        assert "| 11:00-11:45 | serving | 15s | 0.6% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
-        # AC3: totals row = total busy over the window and overall busy % plus
-        # the sum of each activity column over the window.
-        assert "| Totals | serving | 45s | 0.6% | 2 | 2 | 2 | 0 | 0 | 0 | 0 |" in section
+        # AC2/AC1: window-bounded rows with the attributable GPU column; idle
+        # middle hour listed; activity columns replace the classification
+        # columns.
+        assert "| Hour | State | GPU computing (attributable) | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |" in section
+        assert "| 09:30-10:00 | serving | unknown | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | idle | unknown | 0 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| 11:00-11:45 | serving | unknown | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        # AC3: totals row = window-level state and attributable share plus the
+        # sum of each activity column over the window.
+        assert "| Totals | serving | unknown | 2 | 2 | 2 | 0 | 0 | 0 | 0 |" in section
         # The Local model utilization section no longer hosts the hourly table.
         util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
         assert "| Hour | Busy |" not in util
@@ -4102,11 +4103,13 @@ class TestDispatchToFinishBusy:
         assert first == second
         assert "1 of 1 stream(s) contributed a measured prefill" in first
 
-    def test_report_renders_gpu_power_busy_row(self):
-        """The ``## Local model utilization`` table gains a hardware-side
-        GPU busy row when Prometheus power data is available, and omits it
-        when it is not. The row is the power-based busy fraction
-        (``gpu:computing:bool``), distinct from the log-derived slot union.
+    def test_report_renders_gpu_attributable_row(self):
+        """The ``## Local model utilization`` table gains the attributable GPU
+        computing row when GPU telemetry is available, and omits it when it is
+        not. The row is the attributable share
+        (``gpu:computing_workload:bool`` — power ≥ 90 W **and** a busy local
+        slot), distinct from the log-derived slot union and never the retired
+        power-only figure.
         """
         lines = [
             "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
@@ -4115,12 +4118,15 @@ class TestDispatchToFinishBusy:
         summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
         assert summary.busy is not None
 
-        # Without Prometheus data the row is absent.
+        # Without GPU telemetry the row is absent from the utilization table
+        # (the scorecard always lists the registered metric, with ``n/a``).
         assert summary.gpu_busy is None
         no_gpu = reporting.build_report(summary, None)
+        no_gpu_util = no_gpu.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert reporting.GPU_ATTRIBUTABLE_ROW_LABEL not in no_gpu_util
         assert "GPU busy — power-based" not in no_gpu
 
-        # With a GpuBusyResult the row appears with the hardware figure.
+        # With a GpuBusyResult the row appears with the attributable figure.
         summary.gpu_busy = gpu_busy.GpuBusyResult(
             computing_fraction=0.50,
             total_seconds=3600.0,
@@ -4130,15 +4136,16 @@ class TestDispatchToFinishBusy:
         )
         with_gpu = reporting.build_report(summary, None)
         section = with_gpu.split("## Local model utilization", 1)[1].split("## ", 1)[0]
-        assert "GPU busy — power-based (hardware)" in section
+        assert reporting.GPU_ATTRIBUTABLE_ROW_LABEL in section
         # 1800 s of 3600 s = 30m 00s (50.0%) via _busy_cell.
         assert "30m 00s (50.0%)" in section
-        # The hardware-method note describes the grid-honest coverage and the
-        # any-GPU-consumer scope, and the renormalising query is gone.
-        assert "gpu:computing:bool" in section
+        # The note describes the grid-honest coverage and the attributable
+        # scope, and never the retired power-only series.
+        assert "gpu:computing_workload:bool" in section
         assert "computing, idle or" in section
-        assert "any GPU consumer" in section
+        assert "not any GPU consumer" in section
         assert "avg_over_time" not in section
+        assert "gpu:computing:bool" not in section
 
     def test_gpu_busy_json_round_trip(self):
         """``summary_to_json`` exposes the GPU block under ``gpu_busy``."""
@@ -4459,15 +4466,16 @@ class TestSummaryByHourActivity:
         assert h11["local_served"] == 0
 
     def test_table_renders_activity_per_hour(self):
-        # Rows carry the five activity columns; busy % stays busy /
-        # window-bounded bucket duration.
+        # Rows carry the seven activity columns; the GPU column is the
+        # attributable share (``unknown`` without GPU telemetry) and the old
+        # log-derived Busy/% pair is gone (LP-0MWG7KQVZ008DBZM).
         md = reporting.build_report(self._summary(), None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| Hour | State | Busy | % | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |" in section
-        assert "| 09:00-10:00 | serving | 30s | 0.8% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | serving | 5s | 0.1% | 2 | 1 | 1 | 0 | 0 | 1 | 1 |" in section
-        assert "| 11:00-12:00 | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
-        assert "| Totals | serving | 35s | 0.3% | 4 | 2 | 2 | 0 | 0 | 1 | 1 |" in section
+        assert "| Hour | State | GPU computing (attributable) | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |" in section
+        assert "| 09:00-10:00 | serving | unknown | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | serving | unknown | 2 | 1 | 1 | 0 | 0 | 1 | 1 |" in section
+        assert "| 11:00-12:00 | idle | unknown | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| Totals | serving | unknown | 4 | 2 | 2 | 0 | 0 | 1 | 1 |" in section
 
     def test_long_running_session_contributes_to_each_hour(self):
         # A single session whose requests start in different hours: the second
@@ -4485,12 +4493,12 @@ class TestSummaryByHourActivity:
         assert summary.hourly_activity[datetime(2026, 8, 2, 10, 0, 0)]["requests_started"] == 1
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 09:00-10:00 | serving | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | serving | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 09:00-10:00 | serving | unknown | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | serving | unknown | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
 
     def test_multiple_requests_same_hour_sum_activity(self):
         # Two local requests in hour 10 (s2 + s4): activity columns sum the
-        # events, while the busy column reflects the merged local time.
+        # events.
         lines = self._lines() + [
             "2026-08-02 10:45:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s4 request=[]",
             "2026-08-02 10:45:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s4 provider=local model=Qwen3 request=[]",
@@ -4498,14 +4506,15 @@ class TestSummaryByHourActivity:
         summary = aggregation.aggregate(_events(lines), self.WINDOW_START, self.WINDOW_END, _schedule())
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 10:00-11:00 | serving | 15s | 0.4% | 3 | 2 | 2 | 0 | 0 | 1 | 1 |" in section
-        assert "| Totals | serving | 45s | 0.4% | 5 | 3 | 3 | 0 | 0 | 1 | 1 |" in section
+        assert "| 10:00-11:00 | serving | unknown | 3 | 2 | 2 | 0 | 0 | 1 | 1 |" in section
+        assert "| Totals | serving | unknown | 5 | 3 | 3 | 0 | 0 | 1 | 1 |" in section
 
     def test_renders_without_local_traffic(self):
         # No local streams (busy is None): the table still renders at the top
-        # of the report with 0s busy / 0.0% and the classification columns
-        # populated (LP-0MTFO210Q0044TTF AC1 — renders regardless of local
-        # traffic); the Local model utilization section is omitted.
+        # of the report with the attributable GPU column reading ``unknown``
+        # and the activity columns populated (LP-0MTFO210Q0044TTF AC1 — renders
+        # regardless of local traffic); the Local model utilization section is
+        # omitted.
         lines = [
             "2026-08-02 10:00:00,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=r1 request=[]",
             "2026-08-02 10:00:10,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=r1 provider=opencode-go model=deepseek-v4-flash request=[]",
@@ -4515,8 +4524,8 @@ class TestSummaryByHourActivity:
         md = reporting.build_report(summary, None)
         assert md.index("## Summary by hour") < md.index("## Session summary")
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 10:00-11:00 | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
-        assert "| Totals | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | idle | unknown | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| Totals | idle | unknown | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
         assert "## Local model utilization" not in md
 
     def test_no_sessions_renders_no_data_note(self):
@@ -4525,8 +4534,8 @@ class TestSummaryByHourActivity:
         summary = aggregation.aggregate([], self.WINDOW_START, self.WINDOW_END, _schedule())
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| _No session data in window._ | - | - | - | - | - | - | - | - | - | - |" in section
-        assert "| Totals | idle | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| _No session data in window._ | - | - | - | - | - | - | - | - | - |" in section
+        assert "| Totals | idle | unknown | 0 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
 
     def test_json_summary_exposes_hourly_activity_and_classification(self):
         # The machine-readable summary exposes per-hour activity (matching the
@@ -4703,41 +4712,47 @@ class TestHourlyRollingWindow:
         return rows
 
     def test_afternoon_rows_non_zero_and_requests_total_matches_fixture(self):
-        # (a) The 12:00–18:00 rows are non-zero and their Requests started
-        # total matches the fixture (7 afternoon streams, one per hour).
+        # (a) The 12:00–18:00 rows are present and their Requests started
+        # total matches the fixture (7 afternoon streams, one per hour). The
+        # GPU column is the attributable share, ``unknown`` without telemetry.
         rows = self._rows()
-        expected_busy = {
-            "12:00-13:00": "30s",
-            "13:00-14:00": "1m 00s",
-            "14:00-15:00": "2m 00s",
-            "15:00-16:00": "10s",
-            "16:00-17:00": "20s",
-            "17:00-18:00": "40s",
-            "18:00-19:00": "5s",
-        }
-        for hour, busy in expected_busy.items():
+        expected_hours = [
+            "12:00-13:00", "13:00-14:00", "14:00-15:00", "15:00-16:00",
+            "16:00-17:00", "17:00-18:00", "18:00-19:00",
+        ]
+        for hour in expected_hours:
             assert hour in rows, f"missing row {hour}"
-            assert rows[hour][2] == busy, f"{hour} busy {rows[hour][2]} != {busy}"
-            # Hour | State | Busy | % | Requests started | Local attempts | Local served |
-            # Local dispatch | Lease denials | Fallbacks | Local-skip
-            assert rows[hour][4:11] == ["1", "1", "1", "0", "0", "0", "0"], hour
-        afternoon_started = sum(int(rows[h][4]) for h in expected_busy)
+            assert rows[hour][2] == "unknown", hour
+            # Hour | State | GPU computing (attributable) | Requests started |
+            # Local attempts | Local served | Local dispatch | Lease denials |
+            # Fallbacks | Local-skip
+            assert rows[hour][3:10] == ["1", "1", "1", "0", "0", "0", "0"], hour
+        afternoon_started = sum(int(rows[h][3]) for h in expected_hours)
         assert afternoon_started == 7
 
     def test_no_row_exceeds_100_percent_and_no_duplicate_busy_duration(self):
-        # (b) No row busy% exceeds 100%, and the two hour-of-day-11 edge
-        # partials do not share a busy duration (7s vs 3m 00s), proving
-        # absolute-hour keying rather than hour-of-day collision.
+        # (b) The two hour-of-day-11 edge partials keep distinct rows and
+        # distinct busy durations, proving absolute-hour keying rather than
+        # hour-of-day collision. The per-hour busy duration is no longer a
+        # table column (LP-0MWG7KQVZ008DBZM), so the proof is taken from the
+        # ``--json`` ``local_busy.hourly_busy`` block, which is keyed by the
+        # same absolute hours.
+        summary = aggregation.aggregate(
+            _events(self._lines()), self.WINDOW_START, self.WINDOW_END, _schedule()
+        )
         rows = self._rows()
-        assert rows["11:04-12:00"][2] == "7s"
-        assert rows["11:04-12:00"][3] == "0.2%"
-        assert rows["11:00-11:04"][2] == "3m 00s"
-        assert rows["11:00-11:04"][3] == "75.0%"
-        pcts = [float(cell.rstrip("%")) for cell in (r[3] for r in rows.values())]
-        assert pcts and all(p <= 100.0 for p in pcts)
-        busy_cells = [r[2] for label, r in rows.items() if label != "Totals"]
-        non_zero = [b for b in busy_cells if b != "0s"]
-        assert len(non_zero) == len(set(non_zero))
+        assert "11:04-12:00" in rows and "11:00-11:04" in rows
+        assert rows["11:04-12:00"][2] == "unknown"
+        assert rows["11:00-11:04"][2] == "unknown"
+        hourly = {
+            entry["hour"]: entry["seconds"]
+            for entry in reporting.summary_to_json(summary)["local_busy"]["hourly_busy"]
+        }
+        assert hourly["2026-09-11 11:00:00"] == 7.0
+        assert hourly["2026-09-12 11:00:00"] == 180.0
+        # The two edge partials never collapse onto one bucket.
+        busy_durations = [seconds for seconds in hourly.values() if seconds]
+        assert len(busy_durations) == len(set(busy_durations))
 
 
 class TestIterEventsMargin:
@@ -7403,10 +7418,16 @@ class TestMachineReadablePrefillAndBusyJson:
             )
         assert rc == 0
         out = capsys.readouterr().out
-        # The decision position carries the log-derived figure (7 s of the
-        # 3600 s window = 0.2 %), never the stubbed 50 % hardware figure.
+        # The log-derived capacity figure (7 s of the 3600 s window = 0.2 %) is
+        # stated separately from the attributable GPU share (the stubbed
+        # 50 %), which is named by its scope so neither can be read as the
+        # other.
         assert "local model busy (dispatch → finish) 0.2%" in out
-        assert "GPU busy — power-based (hardware, not local model utilisation) 50.0%" in out
+        assert (
+            "GPU computing — attributable (power ≥ 90 W and a busy local "
+            "slot) 50.0%" in out
+        )
+        assert "GPU busy — power-based" not in out
         assert "GPU busy (power-based, 15s sampling)" not in out
 
 

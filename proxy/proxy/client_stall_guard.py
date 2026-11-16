@@ -73,7 +73,7 @@ STREAM_IDLE_TIMEOUT_CONFIG_KEY = "stream_idle_timeout_seconds"
 CLIENT_STALL_SIGNAL = "client_stall"
 
 
-class ClientStallAbort(Exception):
+class ClientStallError(Exception):
     """Raised internally when a stalled write aborts the response."""
 
 
@@ -247,7 +247,7 @@ class ClientStallGuardMiddleware:
             started = self._clock()
             try:
                 await asyncio.wait_for(send(message), timeout)
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 already_aborted = state.aborted
                 state.mark_aborted(
                     stall_seconds=max(0.0, self._clock() - started),
@@ -258,11 +258,11 @@ class ClientStallGuardMiddleware:
                     # that swallows the abort (and keeps "sending") must still
                     # produce exactly one stall record.
                     self._record(state, scope)
-                raise ClientStallAbort() from None
+                raise ClientStallError() from None
 
         try:
             await self.app(scope, receive, guarded_send)
-        except ClientStallAbort:
+        except ClientStallError:
             # The response is abandoned: returning releases the request and the
             # server closes the connection (uvicorn logs its own "returned
             # without completing response" for the forfeited body).

@@ -18,9 +18,9 @@ Markdown (``reporting.build_report``)::
     - <existing header bullets>
     ## Performance metrics summary              <- first "##" section
 
-    | Metric | Baseline | Target | Actual | Result |
-    |---|---|---|---|---|
-    | <Metric.label> | ... | ... | ... | Met / Unmet / Insufficient history |
+    | Metric | Baseline | Target | Tolerance | Actual | Result |
+    |---|---|---|---|---|---|
+    | <Metric.label> | ... | ... | ±10 % | ... | Met / Unmet / Insufficient history |
 
     ## Performance metric details                <- immediately after the table
 
@@ -116,7 +116,7 @@ DEFAULTS_PATH = SKILL_ROOT / "metrics" / "performance_metrics.yaml"
 
 SUMMARY_HEADING = "## Performance metrics summary"
 DETAILS_HEADING = "## Performance metric details"
-TABLE_COLUMNS = ["Metric", "Baseline", "Target", "Actual", "Result"]
+TABLE_COLUMNS = ["Metric", "Baseline", "Target", "Tolerance", "Actual", "Result"]
 DETAIL_LABELS = ("Importance", "Calculation", "Levers", "Trade-offs")
 STATE_FILENAME = "performance_metrics_state.yaml"
 VERDICTS = ("Met", "Unmet", "Insufficient history")
@@ -361,13 +361,23 @@ class TestSummaryTable:
         assert len(rows) == len(pm.METRIC_REGISTRY) == 10
         for cells in rows:
             assert len(cells) == len(TABLE_COLUMNS)
-            assert cells[4] in VERDICTS, f"{cells[0]}: unexpected result {cells[4]!r}"
+            assert cells[5] in VERDICTS, f"{cells[0]}: unexpected result {cells[5]!r}"
 
     def test_one_row_per_metric_in_registry_order(self):
         labels = _metric_labels()
 
         assert len(labels) == len(set(labels)) == 10
         assert [cells[0] for cells in _summary_rows(_report())] == labels
+
+    def test_every_row_renders_the_default_tolerance_band(self):
+        # LP-0MWADHS83006QFQS AC3: the band that decided each verdict is
+        # visible, so a reader can tell a within-tolerance miss from a
+        # regression.
+        rows = _summary_rows(_report())
+
+        assert len(rows) == len(pm.METRIC_REGISTRY)
+        for cells in rows:
+            assert cells[3] == "±10 %", cells[0]
 
     def test_metrics_without_three_measurements_report_insufficient_history(self):
         # The committed defaults file is a template: it carries no measurement
@@ -379,10 +389,10 @@ class TestSummaryTable:
         verdicts = {}
 
         for metric, cells in zip(pm.METRIC_REGISTRY, rows):
-            verdicts[metric.id] = cells[4]
+            verdicts[metric.id] = cells[5]
             recorded = _measurements(defaults, metric.id)
             if len(recorded) < 3:
-                assert cells[4] == "Insufficient history", f"{metric.id} must not guess a verdict"
+                assert cells[5] == "Insufficient history", f"{metric.id} must not guess a verdict"
                 assert cells[2] == "n/a", f"{metric.id} has no target below three measurements"
             if not recorded:
                 assert cells[1] == "n/a", f"{metric.id} has no baseline without a measurement"
@@ -643,7 +653,7 @@ class TestEndToEndDefaultRuns:
 
         # 5.0 / 10.0 / 20.0 seeded plus this window's 0.0 -> best three are
         # 0.0, 5.0, 10.0, so the target moves to their mean.
-        assert first_rows["stream_error_rate"][3] == "0.0 %"
+        assert first_rows["stream_error_rate"][4] == "0.0 %"
         assert first_rows["stream_error_rate"][2] == f"{sum([0.0, 5.0, 10.0]) / 3:.1f} %"
         # 10.0 / 20.0 / 30.0 stay the best three behind a 33.3% window.
         assert first_rows["fallback_rate"][2] == f"{sum([10.0, 20.0, 30.0]) / 3:.1f} % of requests"
@@ -681,9 +691,9 @@ class TestEndToEndDefaultRuns:
         assert _run_cli(log_dir, out_dir, "--quiet") == 0
         cells = _rows_by_metric_id((out_dir / "report.md").read_text())["gpu_busy"]
 
-        assert cells[3] == "n/a", "an unmeasured window must not render as 0"
-        assert cells[4] == "Insufficient history"
-        assert cells[4] not in ("Met", "Unmet")
+        assert cells[4] == "n/a", "an unmeasured window must not render as 0"
+        assert cells[5] == "Insufficient history"
+        assert cells[5] not in ("Met", "Unmet")
         # The baseline and target still come from the seeded history, so the
         # missing figure is named as missing rather than blanking the row.
         assert cells[1] != "n/a" and cells[2] != "n/a"
@@ -780,9 +790,10 @@ class TestJsonBlock:
             assert {"baseline", "target", "actual", "verdict"} <= set(entry), metric_id
             assert entry["verdict"] in VERDICTS, metric_id
             assert entry["actual"] is None or isinstance(entry["actual"], (int, float))
+            assert entry["tolerance_pct"] == pytest.approx(10.0), metric_id
 
         by_label = {metric.label.strip(): metric.id for metric in pm.METRIC_REGISTRY}
-        table = {by_label[cells[0]]: cells[4] for cells in _summary_rows((out_dir / "report.md").read_text())}
+        table = {by_label[cells[0]]: cells[5] for cells in _summary_rows((out_dir / "report.md").read_text())}
         assert table == {metric_id: entry["verdict"] for metric_id, entry in block.items()}
 
         state = pm.load_state(out_dir / STATE_FILENAME)
@@ -794,6 +805,19 @@ class TestJsonBlock:
         assert insufficient, "the single-window fixture must not have a three-measurement history"
         for metric_id in insufficient:
             assert block[metric_id]["verdict"] == "Insufficient history", metric_id
+
+    def test_json_block_carries_an_additive_tolerance_pct(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+
+        assert _run_cli(log_dir, out_dir, "--json") == 0
+        block = json.loads(capsys.readouterr().out)["performance_metrics"]
+
+        assert set(block) == {metric.id for metric in pm.METRIC_REGISTRY}
+        for metric_id, entry in block.items():
+            assert entry["tolerance_pct"] == pytest.approx(10.0), metric_id
+            # The pre-existing keys keep their meaning and type.
+            assert {"baseline", "target", "actual", "verdict"} <= set(entry), metric_id
 
     def test_json_block_carries_baseline_target_and_verdict_from_history(self, tmp_path, capsys):
         log_dir = _write_log_dir(tmp_path)
@@ -829,7 +853,7 @@ class TestJsonBlock:
 
         by_label = {metric.label.strip(): metric.id for metric in pm.METRIC_REGISTRY}
         table = {by_label[cells[0]]: cells for cells in _summary_rows((out_dir / "report.md").read_text())}
-        assert table["fallback_rate"][4] == "Met"
+        assert table["fallback_rate"][5] == "Met"
         assert table["fallback_rate"][2] != "n/a"
 
         # --metrics-state relocates the live state file; the output directory

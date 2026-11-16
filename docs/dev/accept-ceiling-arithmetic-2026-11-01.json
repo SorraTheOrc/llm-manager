@@ -1,0 +1,607 @@
+{
+  "schema_version": 1,
+  "work_item": "LP-0MWCEI8QV007NIC0",
+  "parent_work_item": "LP-0MVXY8ZBZ0003042",
+  "title": "Accept-the-ceiling arithmetic (spike AC1d)",
+  "generated_at": "2026-11-11",
+  "purpose": "Cost the 'accept the ceiling' option with explicit arithmetic: the hardware prefill ceiling, the share ceiling under each fixed denominator, what a >=10 % target would require, and the bounded combined upside of the lever children.",
+  "read_only": true,
+  "provenance_classes": {
+    "measured": "Copied verbatim from the named source register; not re-derived here.",
+    "derived": "Arithmetic over measured figures registered here, with the formula and inputs recorded."
+  },
+  "sources": {
+    "local_share_baseline": {
+      "path": "docs/dev/local-share-baseline-2026-11-01.json"
+    },
+    "single_slot_throughput": {
+      "path": "docs/dev/single-slot-throughput-baseline-2026-10-31.json"
+    },
+    "prefill_concurrency": {
+      "path": "docs/dev/prefill-concurrency-baseline-2026-11-11.json"
+    },
+    "compaction": {
+      "path": "docs/dev/compaction-benefit-estimate-2026-11-01.json"
+    },
+    "quantisation": {
+      "path": "docs/dev/quantisation-cost-2026-11-11.json"
+    }
+  },
+  "model": {
+    "prefill_seconds": "window_seconds x (1 - decode_share_of_busy)",
+    "prefill_capacity_tokens": "prefill_seconds x engine_rate_tok_s",
+    "delivered_tokens": "prefill_capacity_tokens / (1 - reuse_fraction)",
+    "token_share_pct": "100 x delivered_tokens / offered_prompt_tokens",
+    "stream_share_pct": "100 x (delivered_tokens / local_prompt_tokens_per_stream) / offered_streams",
+    "reuse_point": "1 - (local_busy_seconds x (1 - decode_share) x engine_rate_point) / local_prompt_tokens",
+    "notes": [
+      "The denominator is fixed by LP-0MWCEGJDP009WURD: offered prompt tokens for the token share, offered streams for the stream share. Never mixed.",
+      "The engine rate is the measured aggregate prefill rate; the delivered blend rate (717.8 tok/s) is not a capacity figure because cache hits cost no gate time.",
+      "The decode reserve is scale-invariant: it is a share of gate time, so extrapolating the window to 100 % duty keeps it constant."
+    ]
+  },
+  "inputs": {
+    "window": {
+      "start": "2026-11-01 13:12:48",
+      "end": "2026-11-01 14:00:03",
+      "seconds": 2835.0,
+      "source": "docs/dev/local-share-baseline-2026-11-01.json"
+    },
+    "measured": {
+      "offered_prompt_tokens": 125577780.0,
+      "offered_streams": 1788.0,
+      "local_prompt_tokens": 877908.0,
+      "local_streams": 46.0,
+      "local_busy_seconds": 1223.0,
+      "local_completion_tokens": 5027.0,
+      "local_prompt_tokens_per_stream": 19084.956521739132,
+      "offered_prompt_tokens_per_stream": 70233.65771812081,
+      "local_rate_tok_s": 717.8315617334423,
+      "offered_prompt_tok_s": 44295.51322751323,
+      "canonical_ceiling_tokens": 2035052.4775143089,
+      "canonical_token_share_pct": 1.6205514044875686,
+      "canonical_stream_share_pct": 5.963715585505989,
+      "source": "docs/dev/local-share-baseline-2026-11-01.json"
+    },
+    "engine": {
+      "rate_min_tok_s": 156.2,
+      "rate_min_label": "sustained serial prefill at 44 770-token prompts (engine probe, live traffic sharing the GPU)",
+      "rate_point_tok_s": 242.25,
+      "rate_point_label": "mean of the P1/P2 re-measured 20k-40k aggregate prefill rates (under the shipped serialised gate)",
+      "rate_max_tok_s": 253.8,
+      "rate_max_label": "W3 solo-prefill p50 aggregate (best measured aggregate)",
+      "solo_p50_tok_s": 253.8,
+      "paired_aggregate_tok_s": 254.0,
+      "source": "docs/dev/prefill-concurrency-baseline-2026-11-11.json"
+    },
+    "decode": {
+      "rate_tok_s": 30.7,
+      "slot_seconds": 163.7459283387622,
+      "share_of_busy_pct": 13.389,
+      "source": "docs/dev/quantisation-cost-2026-11-11.json"
+    },
+    "duty_context": {
+      "spike_window_busy_pct": 43.14,
+      "w1_busy_pct": 10.2,
+      "w2_busy_pct": 18.5,
+      "w1_avg_concurrency_while_busy": 1.04,
+      "w1_peak_concurrency": 2.0,
+      "headroom_factor": 2.3181,
+      "note": "The measured duty cycle (43.1 % in the spike window, 10.2 % over W1 and 18.5 % over W2) sets the headroom the ceiling extrapolates across; it is not part of the ceiling. Concurrency while busy (1.04, peak 2) confirms the single prefill gate is the resource.",
+      "source": "docs/dev/single-slot-throughput-baseline-2026-10-31.json"
+    },
+    "reuse": {
+      "reuse_min": 0.261,
+      "reuse_min_label": "W4 measured aggregate prefix reuse (26.1 % of prompt tokens reused) \u2014 the pessimistic marginal-mix assumption",
+      "reuse_max": 0.9,
+      "reuse_max_label": "admitted-population warmth (new tokens ~ 10 % of the prompt, compaction register) \u2014 an upper bound, not sustainable at scale",
+      "source": "docs/dev/single-slot-throughput-baseline-2026-10-31.json"
+    },
+    "denominators": {
+      "token": {
+        "label": "offered prompt tokens in the window",
+        "value": 125577780.0
+      },
+      "stream": {
+        "label": "offered streams in the window",
+        "value": 1788.0,
+        "tokens_per_stream": 19084.956521739132
+      },
+      "ruled_out": {
+        "uncached_prompt_tokens": "an uncached denominator would have to be 27.8 % of offered (cached_ratio 0.72) against a project-level measured median of 0.952, which would put the ceiling near 34 %",
+        "peak_offered_load": "neither published figure uses a peak: both divide by the window mean and the model is already at 100 % duty cycle"
+      },
+      "source": "docs/dev/local-share-baseline-2026-11-01.json"
+    },
+    "levers": {
+      "compaction": {
+        "label": "cold-prefill budget (local_cold_prefill_budget_tokens)",
+        "cap_tokens": 25000,
+        "added_tokens": 409125.6,
+        "served_streams": 16.4,
+        "idle_gate_seconds": 1612.0,
+        "token_share_delta_pp": 0.326,
+        "stream_share_delta_pp": 0.915,
+        "per_slot_cost": {
+          "summarizer_model": "Qwen2.5-7B",
+          "quantisation": "Q4_K_M",
+          "parallel": 1,
+          "ctx_size": 32768,
+          "max_output_tokens": 512,
+          "weights_gb": 4.5,
+          "kv_cache_bytes_per_token": 57344,
+          "kv_cache_gib": 1.75,
+          "total_vram_gb_estimate": 6.25,
+          "vram_share_pct": 5.2,
+          "prompt_prefill_seconds_estimate": [
+            16.4,
+            32.8
+          ],
+          "generation_seconds_estimate": [
+            8.5,
+            12.8
+          ],
+          "gpu_seconds_per_compaction_estimate": [
+            24.9,
+            45.6
+          ],
+          "documented_typical_latency": "typically < 2 s (models.ini [Qwen2.5-7B])",
+          "notes": "The summariser runs on the same GPU as the main model, so its GPU-seconds compete with the serialised prefill gate; VRAM is held for the lifetime of the server (parallel=1, ctx 32768)."
+        },
+        "source": "docs/dev/compaction-benefit-estimate-2026-11-01.json"
+      },
+      "parallel_prefill": {
+        "verdict": "rejected \u2014 aggregate ratio 1.00 (wall 2.00x, per-request 0.81x)",
+        "prefill_gain_pct": 0.0,
+        "source": "docs/dev/prefill-concurrency-baseline-2026-11-11.json"
+      },
+      "quantisation": {
+        "prefill_gain_high_pct": 1.898,
+        "prefill_gain_low_pct": 1.425,
+        "capacity_token_share_after_pct": 0.7188,
+        "capacity_stream_share_after_pct": 2.6452,
+        "source": "docs/dev/quantisation-cost-2026-11-11.json"
+      },
+      "geometry": {
+        "verdict": "no aggregate throughput: the gate is GPU memory-bandwidth bound (parallel prefill 1.00x), so slot geometry trades concurrency and prefix reuse, not tok/s",
+        "prefill_gain_pct": 0.0,
+        "source": "docs/dev/quantisation-cost-2026-11-11.json"
+      }
+    },
+    "base_shares": {
+      "token_share_pct": 0.6990950150576002,
+      "stream_share_pct": 2.5727069351230427,
+      "source": "docs/dev/local-share-baseline-2026-11-01.json"
+    },
+    "published": {
+      "stream_ceiling_pct": 5.8,
+      "stream_definition_pct": 5.964,
+      "token_definition_pct": 1.621
+    },
+    "parent_targets": {
+      "ac9_local_share_baseline_pct": 2.8,
+      "ac9_denominator": "local share of streams (165 local vs 5 707 remote)",
+      "ac1_target_pct": 10.0,
+      "ac1_denominator": "local share of streams (LP-0MVXWQQ20002HAX4 AC1, e.g. >=10 %)"
+    }
+  },
+  "derived": {
+    "prefill_seconds_available": 2455.42,
+    "prefill_seconds_used": 1059.25,
+    "decode_share_of_busy_pct": 13.389,
+    "engine_rates_tok_s": {
+      "min": 156.2,
+      "point": 242.25,
+      "max": 253.8
+    },
+    "implied_prefilled_tokens_used": 256603.9,
+    "reuse_fractions": {
+      "min": 0.261,
+      "point": 0.70771,
+      "max": 0.9
+    },
+    "hardware_prefill_ceiling": {
+      "label": "share of offered prompt tokens the gate can prefill",
+      "min_pct": 0.3054,
+      "point_pct": 0.4737,
+      "max_pct": 0.4963,
+      "prefill_tokens": {
+        "min": 383536.9,
+        "point": 594825.9,
+        "max": 623186.1
+      },
+      "note": "tokens the gate originates, before any cache hit is counted; the delivered-share tier is this divided by (1 - reuse)"
+    },
+    "ceiling": {
+      "min": {
+        "engine_rate_tok_s": 156.2,
+        "reuse_fraction": 0.261,
+        "prefill_capacity_tokens": 383536.9,
+        "delivered_tokens": 518994.4,
+        "servable_streams": 27.194,
+        "prefill_share_pct_of_offered": 0.3054,
+        "token_share_pct": 0.4133,
+        "stream_share_pct": 1.5209
+      },
+      "point": {
+        "engine_rate_tok_s": 242.25,
+        "reuse_fraction": 0.70771,
+        "prefill_capacity_tokens": 594825.9,
+        "delivered_tokens": 2035052.5,
+        "servable_streams": 106.631,
+        "prefill_share_pct_of_offered": 0.4737,
+        "token_share_pct": 1.6206,
+        "stream_share_pct": 5.9637
+      },
+      "max": {
+        "engine_rate_tok_s": 253.8,
+        "reuse_fraction": 0.9,
+        "prefill_capacity_tokens": 623186.1,
+        "delivered_tokens": 6231860.7,
+        "servable_streams": 326.533,
+        "prefill_share_pct_of_offered": 0.4963,
+        "token_share_pct": 4.9626,
+        "stream_share_pct": 18.2625
+      }
+    },
+    "grid": {
+      "min": {
+        "reuse_min": {
+          "engine_rate_tok_s": 156.2,
+          "reuse_fraction": 0.261,
+          "prefill_capacity_tokens": 383536.9,
+          "delivered_tokens": 518994.4,
+          "servable_streams": 27.194,
+          "prefill_share_pct_of_offered": 0.3054,
+          "token_share_pct": 0.4133,
+          "stream_share_pct": 1.5209
+        },
+        "reuse_point": {
+          "engine_rate_tok_s": 156.2,
+          "reuse_fraction": 0.70771,
+          "prefill_capacity_tokens": 383536.9,
+          "delivered_tokens": 1312178.3,
+          "servable_streams": 68.755,
+          "prefill_share_pct_of_offered": 0.3054,
+          "token_share_pct": 1.0449,
+          "stream_share_pct": 3.8453
+        },
+        "reuse_max": {
+          "engine_rate_tok_s": 156.2,
+          "reuse_fraction": 0.9,
+          "prefill_capacity_tokens": 383536.9,
+          "delivered_tokens": 3835368.9,
+          "servable_streams": 200.963,
+          "prefill_share_pct_of_offered": 0.3054,
+          "token_share_pct": 3.0542,
+          "stream_share_pct": 11.2395
+        }
+      },
+      "point": {
+        "reuse_min": {
+          "engine_rate_tok_s": 242.25,
+          "reuse_fraction": 0.261,
+          "prefill_capacity_tokens": 594825.9,
+          "delivered_tokens": 804906.6,
+          "servable_streams": 42.175,
+          "prefill_share_pct_of_offered": 0.4737,
+          "token_share_pct": 0.641,
+          "stream_share_pct": 2.3588
+        },
+        "reuse_point": {
+          "engine_rate_tok_s": 242.25,
+          "reuse_fraction": 0.70771,
+          "prefill_capacity_tokens": 594825.9,
+          "delivered_tokens": 2035052.5,
+          "servable_streams": 106.631,
+          "prefill_share_pct_of_offered": 0.4737,
+          "token_share_pct": 1.6206,
+          "stream_share_pct": 5.9637
+        },
+        "reuse_max": {
+          "engine_rate_tok_s": 242.25,
+          "reuse_fraction": 0.9,
+          "prefill_capacity_tokens": 594825.9,
+          "delivered_tokens": 5948259.4,
+          "servable_streams": 311.673,
+          "prefill_share_pct_of_offered": 0.4737,
+          "token_share_pct": 4.7367,
+          "stream_share_pct": 17.4314
+        }
+      },
+      "max": {
+        "reuse_min": {
+          "engine_rate_tok_s": 253.8,
+          "reuse_fraction": 0.261,
+          "prefill_capacity_tokens": 623186.1,
+          "delivered_tokens": 843282.9,
+          "servable_streams": 44.186,
+          "prefill_share_pct_of_offered": 0.4963,
+          "token_share_pct": 0.6715,
+          "stream_share_pct": 2.4712
+        },
+        "reuse_point": {
+          "engine_rate_tok_s": 253.8,
+          "reuse_fraction": 0.70771,
+          "prefill_capacity_tokens": 623186.1,
+          "delivered_tokens": 2132079.7,
+          "servable_streams": 111.715,
+          "prefill_share_pct_of_offered": 0.4963,
+          "token_share_pct": 1.6978,
+          "stream_share_pct": 6.2481
+        },
+        "reuse_max": {
+          "engine_rate_tok_s": 253.8,
+          "reuse_fraction": 0.9,
+          "prefill_capacity_tokens": 623186.1,
+          "delivered_tokens": 6231860.7,
+          "servable_streams": 326.533,
+          "prefill_share_pct_of_offered": 0.4963,
+          "token_share_pct": 4.9626,
+          "stream_share_pct": 18.2625
+        }
+      }
+    },
+    "reconciliation": {
+      "canonical_ceiling_tokens": 2035052.4775143089,
+      "modelled_delivered_tokens": 2035052.5,
+      "token_share_delta_pct": 0.0,
+      "canonical_token_share_pct": 1.6205514044875686,
+      "modelled_token_share_pct": 1.6206,
+      "canonical_stream_share_pct": 5.963715585505989,
+      "modelled_stream_share_pct": 5.9637
+    },
+    "targets": {
+      "parent_ac9_stream": {
+        "denominator": "stream",
+        "target_pct": 2.8,
+        "required_tokens": 955469.3,
+        "factor_vs_point_capacity": 0.47,
+        "reuse_needed_at_point_rate": 0.3775,
+        "rate_needed_at_point_reuse_tok_s": 113.7,
+        "rate_factor_vs_measured_max": 0.45,
+        "reachable_at_point": true,
+        "reachable_within_measured_band": true
+      },
+      "parent_ac9_token": {
+        "denominator": "token",
+        "target_pct": 2.8,
+        "required_tokens": 3516177.8,
+        "factor_vs_point_capacity": 1.728,
+        "reuse_needed_at_point_rate": 0.8308,
+        "rate_needed_at_point_reuse_tok_s": 418.6,
+        "rate_factor_vs_measured_max": 1.65,
+        "reachable_at_point": false,
+        "reachable_within_measured_band": true
+      },
+      "spike_ac1_stream": {
+        "denominator": "stream",
+        "target_pct": 10.0,
+        "required_tokens": 3412390.2,
+        "factor_vs_point_capacity": 1.677,
+        "reuse_needed_at_point_rate": 0.8257,
+        "rate_needed_at_point_reuse_tok_s": 406.2,
+        "rate_factor_vs_measured_max": 1.6,
+        "reachable_at_point": false,
+        "reachable_within_measured_band": true
+      },
+      "spike_ac1_token": {
+        "denominator": "token",
+        "target_pct": 10.0,
+        "required_tokens": 12557778.0,
+        "factor_vs_point_capacity": 6.171,
+        "reuse_needed_at_point_rate": 0.9526,
+        "rate_needed_at_point_reuse_tok_s": 1494.9,
+        "rate_factor_vs_measured_max": 5.89,
+        "reachable_at_point": false,
+        "reachable_within_measured_band": false
+      }
+    }
+  },
+  "levers_bound": {
+    "rate_factors": {
+      "quantisation_high": 1.01898,
+      "quantisation_low": 1.01425,
+      "parallel_prefill": 1.0,
+      "geometry": 1.0,
+      "combined": 1.01898
+    },
+    "combined_low": {
+      "compaction_added_tokens": 414955.6,
+      "quantisation_freed_capacity_tokens": 24745.1,
+      "token_share_delta_pp": 0.3501,
+      "stream_share_delta_pp": 0.9897,
+      "token_share_after_pct": 1.0492,
+      "stream_share_after_pct": 3.5624
+    },
+    "combined_high": {
+      "compaction_added_tokens": 416890.8,
+      "quantisation_freed_capacity_tokens": 24745.1,
+      "token_share_delta_pp": 0.3517,
+      "stream_share_delta_pp": 0.9897,
+      "token_share_after_pct": 1.0508,
+      "stream_share_after_pct": 3.5624
+    },
+    "gap_to_target": {
+      "token": {
+        "target_pct": 10.0,
+        "gap_pp": 9.3009,
+        "gap_closed_pp": 0.3517,
+        "gap_closed_pct_of_gap": 3.781,
+        "remaining_factor": 9.517,
+        "closed": false
+      },
+      "stream": {
+        "target_pct": 10.0,
+        "gap_pp": 7.4273,
+        "gap_closed_pp": 0.9897,
+        "gap_closed_pct_of_gap": 13.325,
+        "remaining_factor": 2.807,
+        "closed": false
+      }
+    },
+    "caveats": [
+      "Compaction's gain rides on idle gate seconds (56.9 % of the window); it does not raise the ceiling and would displace delivery in a saturated window.",
+      "Quantisation's prefill bound is the measured-share end (1.1-1.9 %), not the 20-27 % byte-ratio ceiling, which needs the prefill pass to be weight-bound and it is not (6.3 GB/s against the 88 GB/s decode already sustains).",
+      "No local quality delta exists for either lower-quant candidate; switching preset without a quality gate is out of scope.",
+      "Parallel prefill is measured at 1.00x aggregate, and slot geometry does not move aggregate throughput, so both contribute zero."
+    ]
+  },
+  "accept_option": {
+    "label": "AC1d \u2014 accept the ceiling (re-scope the target)",
+    "throughput_tok_s": {
+      "delivered_prompt_tok_s": 717.83,
+      "prefill_ceiling_tok_s_min": 156.2,
+      "prefill_ceiling_tok_s_point": 242.25,
+      "prefill_ceiling_tok_s_max": 253.8,
+      "rate_added_by_option_tok_s": 0.0,
+      "note": "measured ceiling, unchanged: the option buys no throughput, it re-scopes the target to what the measured engine already sustains"
+    },
+    "per_slot_resource_cost": {
+      "gpu_memory_gib": 0.0,
+      "gpu_seconds_per_window": 0.0,
+      "config_changes": 0,
+      "note": "no new model, no summariser slot, no config edit"
+    },
+    "local_share_pct": {
+      "token_point": 1.6206,
+      "stream_point": 5.9637
+    }
+  },
+  "checks": [
+    {
+      "claim": "the point model reproduces the committed token-denominated ceiling (1.62 %)",
+      "reproduced": {
+        "modelled": 2035052.5,
+        "canonical": 2035052.4775143089,
+        "delta_pct": 0.0
+      },
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "formula-regression guard, not independent validation: the equality is algebraic (R cancels once r is implied from occupancy), so it pins the wiring and records that the ceiling of record assumes reuse scales"
+    },
+    {
+      "claim": "the point model reproduces the committed stream-denominated ceiling (5.96 %)",
+      "reproduced": {
+        "modelled": 5.9637,
+        "canonical": 5.963715585505989
+      },
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "the ceiling band is ordered min < point < max on both denominators",
+      "reproduced": {
+        "hardware_prefill_pct": {
+          "min": 0.3054,
+          "point": 0.4737,
+          "max": 0.4963
+        },
+        "token_pct": {
+          "min": 0.4133,
+          "point": 1.6206,
+          "max": 4.9626
+        },
+        "stream_pct": {
+          "min": 1.5209,
+          "point": 5.9637,
+          "max": 18.2625
+        }
+      },
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "cache reuse dominates the gate rate as the ceiling's driver",
+      "reproduced": {
+        "reuse_only_factor": 7.39,
+        "rate_only_factor": 1.625
+      },
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "the marginal stream's cache-reuse fraction moves the ceiling further than the whole measured engine-rate band does"
+    },
+    {
+      "claim": "the delivered volume implies a cache-reuse fraction between the two measurements",
+      "reproduced": {
+        "aggregate_measured": 0.261,
+        "implied_by_window": 0.70771,
+        "admitted_population": 0.9
+      },
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "the window ran at higher reuse than the aggregate measurement and below the admitted population's warmth, as an admitted-population bias requires"
+    },
+    {
+      "claim": "the decode reserve is below a quarter of the gate's time",
+      "reproduced": 13.389,
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "measured local decode slot-seconds (completion tokens / 30.7 tok/s) over busy seconds"
+    },
+    {
+      "claim": "one prefill gate is the resource: measured concurrency while busy is near one",
+      "reproduced": {
+        "avg_concurrency_while_busy": 1.04,
+        "peak_concurrency": 2.0,
+        "headroom_factor": 2.3181
+      },
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "so the ceiling extrapolates a single gate's rate over the window's spare duty, and the measured duty (43.1 % here, 10.2 %/18.5 % on W1/W2) is the headroom that extrapolation crosses, not part of the ceiling"
+    },
+    {
+      "claim": ">=10 % prompt-token share is unreachable inside the measured band",
+      "reproduced": {
+        "factor_vs_point": 6.171,
+        "rate_needed_tok_s": 1494.9,
+        "reuse_needed": 0.9526
+      },
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": ">=10 % stream share needs capacity beyond the point ceiling",
+      "reproduced": {
+        "factor_vs_point": 1.677,
+        "rate_needed_tok_s": 406.2,
+        "reuse_needed": 0.8257,
+        "reachable_within_measured_band": true
+      },
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "within the band only at the optimistic corner (90 % cache reuse at the best measured rate), which admission selection cannot sustain at scale"
+    },
+    {
+      "claim": "the parent AC9 2.8 % stream baseline is below the point stream ceiling",
+      "reproduced": {
+        "factor_vs_point": 0.47,
+        "required_tokens": 955469.3
+      },
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "so AC9 is already reachable inside the measured ceiling; it is the >=10 % proposal that is not"
+    },
+    {
+      "claim": "the combined levers do not close the gap to >=10 % under either denominator",
+      "reproduced": {
+        "token_gap_closed_pct_of_gap": 3.781,
+        "stream_gap_closed_pct_of_gap": 13.325,
+        "token_remaining_factor": 9.517,
+        "stream_remaining_factor": 2.807
+      },
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "the levers' added tokens stay inside the point ceiling's headroom",
+      "reproduced": {
+        "lever_tokens": 441635.9,
+        "ceiling_headroom_tokens": 1157144.5
+      },
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "the levers convert existing headroom; they do not raise the ceiling"
+    }
+  ]
+}

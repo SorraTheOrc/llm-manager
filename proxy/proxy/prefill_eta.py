@@ -134,6 +134,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 logger = logging.getLogger("llama-proxy")
@@ -187,6 +188,27 @@ MIN_CALIBRATION_SAMPLES = 5
 #: make them unservable; keeping their pricing byte-for-byte unchanged is the
 #: parent scope guardrail (``cached_ratio`` / coded-token path untouched).
 WARM_CACHE_RATIO = 0.9
+
+#: Cold-sample predicate (Q410 AC1): a sample enters the COLD window only
+#: when the MEASURED cache reuse is below 10 % AND at least 32 000 tokens
+#: were actually processed — i.e. a genuinely-cold large prefill. Cache-hit
+#: samples (``processed`` near 0, first byte < 1 s) are excluded by the same
+#: predicate.
+COLD_MAX_CACHED_RATIO = 0.10
+COLD_MIN_PROCESSED_TOKENS = 32_000
+COLD_MIN_FIRST_BYTE_MS = 1_000.0
+
+#: Rollback key for the ABANDONED-prefill sample source
+#: (LP-0MWGAEBWJ00334W2, option 1). An abandoned prefill (a dispatch the
+#: prefill deadline or the max-prefill ceiling cancels) never emits a first
+#: byte, so it can never feed the cold window from the first-byte path. The
+#: eviction path therefore records one sample from the LATEST ``prompt_progress``
+#: observation (``total``/``cache``/``processed``/``time_ms``) instead. Setting
+#: this key to ``0``/``false``/``off`` restores the pre-change sample source
+#: exactly (completed prefills only). Absent keeps the target behaviour enabled;
+#: a present-but-unreadable value fails open to the pre-change behaviour,
+#: mirroring ``measured_cache_abort.AbortSettings.from_config``.
+EVICTION_COLD_SAMPLE_KEY = "local_deadline_cold_sample_enabled"
 
 #: Rolling-window size per ``(model, bucket)``.
 WINDOW_SAMPLES = 200
@@ -279,6 +301,45 @@ DEFAULT_FREE_GATE_DEADLINE_BUDGET = False
 CLIENT_QUEUE_DEADLINE_SECONDS = 900.0
 
 # ---------------------------------------------------------------------------
+# Deadline token capacity (LP-0MW957RB3000ER79)
+# ---------------------------------------------------------------------------
+
+#: Distinct admission reason for the deadline token capacity bound. The bound
+#: expresses ``local_prefill_deadline_seconds`` as an explicit number of cold
+#: tokens, so a prompt whose cold prefill (whole prompt when residency is
+#: unmeasured; measured new tokens when a measured prefill record exists)
+#: cannot finish inside the deadline is refused up front with its own reason
+#: instead of being relabelled as a deadline/safety-budget miss. Waiting
+#: cannot help a request that is itself too large, so the reason is a
+#: request-property (``too_large``) refusal — see
+#: ``admission_reserve.CAPACITY_TOO_LARGE_REASONS``.
+REASON_DEADLINE_CAPACITY = "prefill_eta_exceeds_capacity"
+
+
+@dataclass(frozen=True)
+class DeadlineCapacity:
+    """Explicit cold token capacity derived from the prefill deadline.
+
+    ``tokens`` is ``floor(deadline_seconds * 1000 / cold_ms_per_token)`` — the
+    largest whole prompt the priced cold rate proves can finish inside
+    ``local_prefill_deadline_seconds``. It is derived from the **same** cold
+    calibration the admission guard prices cold large prompts with (cold
+    window fit, conservatism factor and any conservative percentile uplift),
+    so the published capacity and the enforced ordinary ETA cannot drift.
+
+    ``tokens`` is ``None`` when no deadline is configured or the rate is
+    unusable. ``calibrated`` records whether the cold window held enough
+    MEASURED samples: an uncalibrated cold window never manufactures a
+    refusal (fail-open), while the default-rate number is still published so
+    operators can see the capacity a fresh process approaches.
+    """
+
+    tokens: int | None
+    cold_ms_per_token: float | None
+    calibrated: bool
+    deadline_seconds: float
+
+# ---------------------------------------------------------------------------
 # Rolling calibration window (module scope = one proxy process)
 # ---------------------------------------------------------------------------
 
@@ -293,6 +354,15 @@ _samples: dict[tuple[str, int], deque] = {}
 #: slower distribution (measured 2-4x lower t/s). Pricing a contended
 #: admission from the mixed solitary-dominated window is therefore optimistic.
 _contended_samples: dict[tuple[str, int], deque] = {}
+#: ``(model, bucket) -> deque[(coded, new, ms)]`` — the genuinely-cold
+#: calibration window (Q410 AC1). Fed ONLY from MEASURED cold prefill records
+#: (``MeasuredPrefill.measured_cached_ratio < 0.10`` and ``processed``
+#: ``>= 32 000`` via :func:`record_cold_measured_sample`), so a
+#: cache-hit-polluted mixed window can never price a large cold prompt
+#: optimistically. When the window is uncalibrated, large-prompt pricing is
+#: inert (AC2): it admits exactly like an uncalibrated bucket, never a
+#: fallback to the mixed window's optimistic rate.
+_cold_samples: dict[tuple[str, int], deque] = {}
 #: ``model -> prompt_tokens`` of the most recent observed dispatch.
 _last_prompt_tokens: dict[str, int] = {}
 #: ``model -> deque[prompt_tokens]`` of recent dispatch prompt sizes, the
@@ -304,6 +374,7 @@ def reset() -> None:
     """Clear all calibration state (test helper / config reload)."""
     _samples.clear()
     _contended_samples.clear()
+    _cold_samples.clear()
     _last_prompt_tokens.clear()
     _recent_prompt_tokens.clear()
 
@@ -669,6 +740,210 @@ def record_dispatch_sample(
         logger.debug("record_dispatch_sample failed", exc_info=True)
 
 
+def record_cold_measured_sample(
+    model: str | None,
+    prompt_tokens: int,
+    measured_cached_ratio: float | None,
+    processed_tokens: int | None,
+    service_ms: float,
+) -> None:
+    """Record one genuinely-cold MEASURED prefill into the cold window.
+
+    Q410 AC1/Q2(option a): the sample is fed from the measured-prefill
+    capture (``measured_prefill.MeasuredPrefill.measured_cached_ratio`` /
+    ``processed``) at the point the measurement is finalised, keeping the
+    existing priced window (:func:`record_dispatch_sample`) untouched.
+
+    Cold predicate (AC1): ``measured_cached_ratio < COLD_MAX_CACHED_RATIO``
+    AND ``processed_tokens >= COLD_MIN_PROCESSED_TOKENS``, excluding
+    cache-hit samples (``processed`` near 0, first byte < 1 s). Samples that
+    do not satisfy the predicate are silently dropped — the cold window only
+    ever contains genuinely-cold large prefill observations, so a fit from it
+    cannot be polluted by cache-hit optimism.
+
+    Identical fail-open contract to :func:`record_dispatch_sample`: never
+    raises, invalid inputs are ignored, and the priced window is not
+    touched.
+    """
+    try:
+        model_key = str(model or "").strip()
+        if not model_key:
+            return
+        tokens = int(prompt_tokens or 0)
+        if tokens <= 0:
+            return
+        ms = float(service_ms)
+        if not math.isfinite(ms) or ms <= 0:
+            return
+        try:
+            ratio = float(measured_cached_ratio)
+        except (TypeError, ValueError):
+            ratio = 1.0
+        if not math.isfinite(ratio):
+            ratio = 1.0
+        processed = int(processed_tokens or 0)
+        # Cold predicate (AC1): measured-cold AND genuinely large. A cache
+        # hit (``measured_cached_ratio`` >= 0.10, or ``processed`` ~ 0 / a
+        # sub-second first byte) must never price the cold rate.
+        if ratio >= COLD_MAX_CACHED_RATIO or processed < COLD_MIN_PROCESSED_TOKENS:
+            return
+        if ms < COLD_MIN_FIRST_BYTE_MS:
+            return
+        coded = int(tokens * ratio)
+        new = processed
+        bucket = bucket_for(tokens)
+        window = _cold_samples.get((model_key, bucket))
+        if window is None:
+            window = deque(maxlen=WINDOW_SAMPLES)
+            _cold_samples[(model_key, bucket)] = window
+        window.append((coded, new, ms))
+        # The sample is an observed dispatch: keep the published reference
+        # statistic (``reference_tokens``) fed from genuinely-cold samples
+        # too, mirroring the priced path so a cold-heavy window still
+        # publishes a truthful reference prompt size.
+        _last_prompt_tokens[model_key] = tokens
+        history = _recent_prompt_tokens.get(model_key)
+        if history is None:
+            history = deque(maxlen=REFERENCE_HISTORY_SAMPLES)
+            _recent_prompt_tokens[model_key] = history
+        history.append(tokens)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("record_cold_measured_sample failed", exc_info=True)
+
+
+def record_abandoned_prefill_sample(
+    model: str | None,
+    prompt_tokens: int | None,
+    cache_tokens: int | None,
+    processed_tokens: int | None,
+    service_ms: float | None,
+) -> bool:
+    """Record one cold sample from a prefill abandoned at the deadline/ceiling.
+
+    LP-0MWGAEBWJ00334W2 (option 1, producer-confirmed). The certified window
+    proves the shipped source can never calibrate the large-prompt buckets: a
+    dispatch the prefill deadline cancels never emits a first byte, so
+    :func:`record_cold_measured_sample`'s first-byte call site can never see it,
+    and bucket 2 (65k+) can never supply the sample that would let the capacity
+    bound refuse its own prompts. This entry point is the missing source: it is
+    called on the abandonment path with the **latest** ``prompt_progress``
+    observation of that dispatch.
+
+    The four arguments are exactly the fields a ``prompt_progress`` event
+    carries (``total``, ``cache``, ``processed``, ``time_ms``), so the sample is
+    built only from evidence the proxy observes in production:
+
+    ``prompt_tokens``
+        The prompt's whole size (``total``). It selects the context bucket, so
+        a 90k dispatch feeds bucket 2 even when it only prefilled part of it.
+    ``cache_tokens``
+        The reused prefix (``cache``). A dispatch measured at/above
+        :data:`WARM_CACHE_RATIO` reuse is warm *by the codebase's own
+        definition* (it is priced on the warm path), so its abandonment is not
+        cold evidence and the sample is dropped.
+    ``processed_tokens``
+        The position the prefill reached (``processed``, which includes the
+        reused prefix — llama-server reports ``n_prompt_tokens_processed``).
+        This is the "tokens actually prefilled" the work item cites (the
+        certified window's 180 s eviction reached 43 414); it must clear
+        :data:`COLD_MIN_PROCESSED_TOKENS`.
+    ``service_ms``
+        The dispatch's own measured elapsed (``time_ms``). It must clear
+        :data:`COLD_MIN_FIRST_BYTE_MS`, and the progress must exceed the reused
+        prefix — a run that only replayed its cached prefix measured nothing
+        about the cold rate.
+
+    The sample is recorded as ``(cached=0, new=processed, ms=time_ms)``: no
+    cache credit is claimed, because ``time_ms`` already covers every position
+    traversed and every position is charged the one fitted rate. Claiming a
+    separate cached term for the same tokens would double-count them and make
+    the cold window *more optimistic* than the prior it exists to correct
+    (the shipped first-byte path has that shape only because its ``processed``
+    is the completed total and its cache share is below
+    :data:`COLD_MAX_CACHED_RATIO`).
+
+    Fail-open contract identical to :func:`record_cold_measured_sample`: never
+    raises, invalid/inconsistent inputs are ignored, the priced window
+    (:func:`record_dispatch_sample`) is untouched. Returns ``True`` when the
+    sample entered the cold window (tests and the log line use it).
+    """
+    try:
+        model_key = str(model or "").strip()
+        if not model_key:
+            return False
+        total = int(prompt_tokens or 0)
+        if total <= 0:
+            return False
+        try:
+            ms = float(service_ms)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(ms) or ms < COLD_MIN_FIRST_BYTE_MS:
+            return False
+        positions = int(processed_tokens or 0)
+        if positions < COLD_MIN_PROCESSED_TOKENS:
+            return False
+        cache = int(cache_tokens or 0)
+        # Inconsistent observations are ignored, never guessed at.
+        if cache < 0 or cache > total or positions > total or positions <= cache:
+            return False
+        if cache / total >= WARM_CACHE_RATIO:
+            return False
+        bucket = bucket_for(total)
+        window = _cold_samples.get((model_key, bucket))
+        if window is None:
+            window = deque(maxlen=WINDOW_SAMPLES)
+            _cold_samples[(model_key, bucket)] = window
+        window.append((0, positions, ms))
+        # Mirror the other recorders: an abandoned dispatch is still an
+        # observed dispatch, so it keeps the published reference statistic fed.
+        _last_prompt_tokens[model_key] = total
+        history = _recent_prompt_tokens.get(model_key)
+        if history is None:
+            history = deque(maxlen=REFERENCE_HISTORY_SAMPLES)
+            _recent_prompt_tokens[model_key] = history
+        history.append(total)
+        return True
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("record_abandoned_prefill_sample failed", exc_info=True)
+        return False
+
+
+def eviction_cold_sample_enabled(config: dict | None) -> bool:
+    """Whether an abandoned prefill may feed the cold window (rollback key).
+
+    Reads :data:`EVICTION_COLD_SAMPLE_KEY` from the ``server`` section
+    (tolerating a flat dict and ``None``). Absent keeps the target behaviour
+    enabled so a partially configured deploy does not silently leave the
+    defect in place; a present-but-unreadable or explicitly false value
+    restores the pre-change sample source (completed prefills only).
+    """
+    try:
+        if config is None:
+            return True
+        if not isinstance(config, Mapping):
+            return False
+        server_cfg = config.get("server", config)
+        if not isinstance(server_cfg, Mapping):
+            return False
+        if EVICTION_COLD_SAMPLE_KEY not in server_cfg:
+            return True
+        value = server_cfg.get(EVICTION_COLD_SAMPLE_KEY)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalised = value.strip().lower()
+            if normalised in {"1", "true", "yes", "on", "enabled"}:
+                return True
+            if normalised in {"0", "false", "no", "off", "disabled", ""}:
+                return False
+        return False
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 @dataclass(frozen=True)
 class Coefficients:
     """Fitted (or default) per-token prefill coefficients, in milliseconds.
@@ -699,6 +974,10 @@ class Coefficients:
     #: Number of samples in the contended window for this ``(model, bucket)``
     #: — always reported for diagnosis, independent of ``rate_bucket``.
     contended_samples: int = 0
+    #: Number of samples in the genuinely-cold (MEASURED) window for this
+    #: ``(model, bucket)`` (Q410 AC1) — always reported for diagnosis,
+    #: independent of ``rate_bucket``.
+    cold_samples: int = 0
 
 
 def _solve(
@@ -770,12 +1049,15 @@ def _fit_coefficients_from_samples(
     prompt_tokens: int,
     rate_bucket: str,
     contended_samples: int,
+    cold_samples: int = 0,
 ) -> Coefficients:
     """Fit coefficients from a given sample list and compute diagnostics.
 
-    Shared by :func:`coefficients` for both the solitary and contended windows
-    (LP-0MVS9Y76R004B5M8), so the conservative-uplift and clamp logic is
-    applied identically regardless of which window priced the estimate.
+    Shared by :func:`coefficients` for the solitary, contended and genuinely-
+    cold windows (LP-0MVS9Y76R004B5M8, Q410 AC1), so the conservative-uplift
+    and clamp logic is applied identically regardless of which window priced
+    the estimate. ``cold_samples`` reports the genuinely-cold window's sample
+    count for diagnosis (Q410), independent of ``rate_bucket``.
     """
     if len(samples) < guard_cfg.min_samples:
         return Coefficients(
@@ -786,6 +1068,7 @@ def _fit_coefficients_from_samples(
             eta_percentile=guard_cfg.eta_percentile,
             rate_bucket=rate_bucket,
             contended_samples=contended_samples,
+            cold_samples=cold_samples,
         )
     fitted = _fit(samples)
     if fitted is None:
@@ -797,6 +1080,7 @@ def _fit_coefficients_from_samples(
             eta_percentile=guard_cfg.eta_percentile,
             rate_bucket=rate_bucket,
             contended_samples=contended_samples,
+            cold_samples=cold_samples,
         )
     fitted_coded, fitted_prefill = fitted
     coded_ms = (
@@ -866,6 +1150,7 @@ def _fit_coefficients_from_samples(
         uplift=uplift,
         rate_bucket=rate_bucket,
         contended_samples=contended_samples,
+        cold_samples=cold_samples,
     )
 
 
@@ -874,6 +1159,7 @@ def coefficients(
     prompt_tokens: int,
     config: dict | None = None,
     contended: bool = False,
+    cached_ratio: float = 0.0,
 ) -> Coefficients:
     """Return the coefficients to use for *model* at *prompt_tokens*.
 
@@ -888,6 +1174,12 @@ def coefficients(
     change (LP-0MVKUKF65008D5UN). Smaller prompts and ``eta_percentile: 0``
     (rollback) return the un-uplifted point estimate byte-for-byte.
 
+    *cached_ratio* (Q410 AC2) distinguishes a genuinely-cold large prompt
+    (priced from the cold window) from a WARM large prompt (``ratio``
+    ``>= WARM_CACHE_RATIO``), which keeps the pre-change mixed/contended
+    selection byte-for-byte so a calibrated warm admit can never turn inert
+    (parent warm-prompt guardrail).
+
     *contended* (LP-0MVS9Y76R004B5M8) selects the co-residency window: when
     True the estimate is priced from the contended window if it holds
     ``min_samples`` observations, else it falls back to the solitary window
@@ -899,6 +1191,38 @@ def coefficients(
     guard_cfg = resolve_config(config)
     model_key = str(model or "").strip()
     bucket = bucket_for(prompt_tokens)
+    try:
+        ratio = min(1.0, max(0.0, float(cached_ratio)))
+    except (TypeError, ValueError):
+        ratio = 0.0
+    # Q410 AC2: for COLD prompts at/above the conservative percentile floor
+    # (the large-prompt regime this feature corrects) the estimate is priced
+    # from the genuinely-COLD window ONLY, never the mixed window's
+    # optimistic rate. When the cold window is uncalibrated, large-prompt
+    # pricing is INERT (admit, exactly today's uncalibrated behaviour) and
+    # reports ``rate_bucket=cold`` with the observed ``cold_samples`` so the
+    # reason is legible. WARM prompts (``cached_ratio >= WARM_CACHE_RATIO``)
+    # keep the pre-change mixed/contended selection byte-for-byte: their
+    # expensive ``new_tokens`` term is already small, so cold-window routing
+    # could only ever turn a calibrated warm admit into an inert one (parent
+    # warm-prompt guardrail). Small prompts (below the floor) likewise keep
+    # the existing selection (parent AC1 "small-prompt calibration must not be
+    # degraded").
+    cold_window = _cold_samples.get((model_key, bucket))
+    cold = list(cold_window) if cold_window else []
+    cold_count = len(cold)
+    if (
+        prompt_tokens >= guard_cfg.eta_percentile_min_tokens
+        and ratio < WARM_CACHE_RATIO
+    ):
+        return _fit_coefficients_from_samples(
+            cold,
+            guard_cfg,
+            prompt_tokens,
+            "cold",
+            _contended_count(guard_cfg, model_key, bucket),
+            cold_samples=cold_count,
+        )
     solitary_window = _samples.get((model_key, bucket))
     solitary = list(solitary_window) if solitary_window else []
     contended_window = _contended_samples.get((model_key, bucket))
@@ -922,6 +1246,92 @@ def coefficients(
         )
     return _fit_coefficients_from_samples(
         solitary, guard_cfg, prompt_tokens, "solitary", contended_count,
+    )
+
+
+def _contended_count(
+    guard_cfg: GuardConfig, model_key: str, bucket: int
+) -> int:
+    """Sample count of the contended window (diagnostic, never a decision)."""
+    contended_window = _contended_samples.get((model_key, bucket))
+    return len(contended_window) if contended_window else 0
+
+
+def _cold_coefficients_for(
+    model: str | None, prompt_tokens: int, config: dict | None
+) -> Coefficients:
+    """Cold-window coefficients for *prompt_tokens*' ``(model, bucket)``.
+
+    Always prices from the genuinely-cold MEASURED window (never the mixed or
+    contended windows), applying the same conservatism factor and conservative
+    percentile uplift the guard applies to a cold large prompt. This is the
+    single rate basis for the deadline token capacity
+    (LP-0MW957RB3000ER79), so the capacity can never drift from the ordinary
+    cold priced ETA.
+    """
+    guard_cfg = resolve_config(config)
+    model_key = str(model or "").strip()
+    bucket = bucket_for(prompt_tokens)
+    cold_window = _cold_samples.get((model_key, bucket))
+    cold = list(cold_window) if cold_window else []
+    return _fit_coefficients_from_samples(
+        cold,
+        guard_cfg,
+        prompt_tokens,
+        "cold",
+        _contended_count(guard_cfg, model_key, bucket),
+        cold_samples=len(cold),
+    )
+
+
+def deadline_capacity(
+    model: str | None,
+    prompt_tokens: int,
+    config: dict | None = None,
+) -> DeadlineCapacity:
+    """Derive the explicit cold token capacity from the prefill deadline.
+
+    ``deadline_capacity_tokens = floor(local_prefill_deadline_seconds * 1000 /
+    cold_ms_per_token)`` where ``cold_ms_per_token`` is the rate the admission
+    guard prices cold large prompts with (cold-window fit, conservatism factor
+    and conservative percentile uplift included). The result is published on
+    ``/llama/local/status`` and carried on every admission decision, so the
+    number an operator reads and the number the guard enforces are derived
+    from one place (LP-0MW957RB3000ER79 AC1).
+
+    Fail-open: a zero/absent deadline, or an unusable rate, yields
+    ``tokens=None``. An uncalibrated cold window yields a number derived from
+    the default rate but ``calibrated=False`` — callers must never refuse on
+    an uncalibrated capacity (AC5).
+    """
+    guard_cfg = resolve_config(config)
+    try:
+        deadline = float(guard_cfg.prefill_deadline_seconds or 0.0)
+    except (TypeError, ValueError):
+        deadline = 0.0
+    try:
+        tokens = max(0, int(prompt_tokens or 0))
+    except (TypeError, ValueError):
+        tokens = 0
+    coeffs = _cold_coefficients_for(model, tokens, config)
+    try:
+        rate = float(coeffs.prefill_ms_per_token or 0.0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    usable_rate = math.isfinite(rate) and rate > 0.0
+    if deadline <= 0.0 or not usable_rate:
+        return DeadlineCapacity(
+            tokens=None,
+            cold_ms_per_token=(rate if usable_rate else None),
+            calibrated=bool(coeffs.calibrated),
+            deadline_seconds=deadline,
+        )
+    capacity = int(math.floor((deadline * 1000.0) / rate))
+    return DeadlineCapacity(
+        tokens=max(0, capacity),
+        cold_ms_per_token=rate,
+        calibrated=bool(coeffs.calibrated),
+        deadline_seconds=deadline,
     )
 
 
@@ -954,7 +1364,7 @@ def estimate_prefill_seconds(
         ratio = min(1.0, max(0.0, float(cached_ratio)))
     except (TypeError, ValueError):
         ratio = 0.0
-    coeffs = coefficients(model, tokens, config, contended=contended)
+    coeffs = coefficients(model, tokens, config, contended=contended, cached_ratio=ratio)
     coded = tokens * ratio
     new = tokens - coded
     seconds = (
@@ -1117,6 +1527,30 @@ class AdmissionDecision:
     #: Samples in the contended window for the priced ``(model, bucket)`` at
     #: decision time (always reported; 0 when none observed).
     contended_samples: int = 0
+    #: Samples in the genuinely-cold (MEASURED) window for the priced
+    #: ``(model, bucket)`` at decision time (Q410 AC1; always reported, 0 when
+    #: none observed) — the count that justifies a ``rate_bucket=cold``
+    #: decision, or the reason a large prompt went inert (fewer than
+    #: ``min_samples``).
+    cold_samples: int = 0
+    #: Deadline token capacity published/enforced by this decision
+    #: (LP-0MW957RB3000ER79): ``floor(local_prefill_deadline_seconds * 1000 /
+    #: cold_ms_per_token)``. Carried on EVERY decision so the log line and the
+    #: ``/llama/local/status`` payload are derived from one number.
+    deadline_capacity_tokens: int | None = None
+    #: Whether the cold window behind ``deadline_capacity_tokens`` was
+    #: calibrated. An uncalibrated window never refuses (fail-open).
+    deadline_capacity_calibrated: bool = False
+    #: The cold prefill rate (ms/token) the capacity was derived from.
+    cold_ms_per_token: float | None = None
+    #: Basis on which the capacity was compared: ``measured`` (measured new
+    #: tokens) or ``cold`` (whole-prompt cold projection, residency
+    #: unmeasured). ``legacy`` when the caller supplied no residency signal
+    #: and the bound was therefore not enforced (byte-for-byte legacy path).
+    capacity_basis: str = "cold"
+    #: The token count actually compared against ``deadline_capacity_tokens``
+    #: (whole prompt for ``cold``, measured new tokens for ``measured``).
+    capacity_priced_tokens: int = 0
     #: The **measured** occupant hold this decision priced into its occupancy
     #: term (LP-0MVV29YDQ00437N6): the live prefilling occupants' remaining
     #: prefill service or dispatch-lease hold, whichever is larger, read from
@@ -1136,6 +1570,7 @@ class AdmissionDecision:
             "prefill_eta_exceeds_deadline",
             "prefill_budget_exceeded",
             "prefill_eta_exceeds_safety_budget",
+            REASON_DEADLINE_CAPACITY,
         )
 
 
@@ -1181,6 +1616,7 @@ def evaluate_admission(
     occupant_prefill_seconds: float | None = None,
     contended: bool | None = None,
     capacity_admitted: bool = False,
+    residency_measured: bool | None = None,
 ) -> AdmissionDecision:
     """Decide whether a local dispatch can finish inside the wait budget.
 
@@ -1251,8 +1687,33 @@ def evaluate_admission(
     (LP-0MVZF3JZ9009LTN2): it never queues, so only the queue-wait comparison
     is inapplicable — the prefill deadline and the safety budget still apply,
     because those are what actually cancel an accepted dispatch.
+
+    *residency_measured* (LP-0MW957RB3000ER79) is the caller's residency
+    signal for the deadline token capacity. ``True`` prices this request's
+    **measured new tokens** (``prompt * (1 - cached_ratio)``); ``False`` prices
+    the **whole prompt cold** because residency is unmeasured (the predicted
+    warm ratio is not evidence); ``None`` (the default) leaves the capacity
+    bound inert, preserving the byte-for-byte legacy behaviour for callers
+    that have no residency signal. When the capacity is calibrated and the
+    priced tokens exceed it, the request is refused with the distinct
+    :data:`REASON_DEADLINE_CAPACITY` before the calibration-dependent bounds,
+    because a request that is itself too large cannot be healed by waiting
+    (AC1/AC2/AC3).
     """
     guard_cfg = resolve_config(config)
+    # Deadline token capacity (LP-0MW957RB3000ER79). Initialised inert and
+    # computed after the policy gate so ``policy: off`` never evaluates it.
+    capacity = DeadlineCapacity(
+        tokens=None,
+        cold_ms_per_token=None,
+        calibrated=False,
+        deadline_seconds=float(guard_cfg.prefill_deadline_seconds or 0.0),
+    )
+    capacity_basis = (
+        "legacy" if residency_measured is None
+        else ("measured" if residency_measured else "cold")
+    )
+    capacity_priced_tokens = 0
 
     try:
         ratio = min(1.0, max(0.0, float(cached_ratio or 0.0)))
@@ -1310,9 +1771,47 @@ def evaluate_admission(
             contended_samples=(
                 adjudicated.contended_samples if adjudicated else 0
             ),
+            cold_samples=adjudicated.cold_samples if adjudicated else 0,
             occupant_hold_seconds=(
                 projected.measured_occupancy_seconds if projected else None
             ),
+            deadline_capacity_tokens=capacity.tokens,
+            deadline_capacity_calibrated=capacity.calibrated,
+            cold_ms_per_token=capacity.cold_ms_per_token,
+            capacity_basis=capacity_basis,
+            capacity_priced_tokens=capacity_priced_tokens,
+        )
+
+    def _capacity_refusal() -> AdmissionDecision:
+        """Build the deadline-token-capacity refusal decision.
+
+        A request whose cold basis exceeds the capacity cannot be served
+        locally at all, so the verdict is ``too_large`` and, like the flat
+        cold-prefill cap, carries the token evidence instead of a priced ETA
+        (``observe`` logs it without refusing).
+        """
+        return AdmissionDecision(
+            admit=guard_cfg.policy == POLICY_OBSERVE,
+            reason=REASON_DEADLINE_CAPACITY,
+            eta_prefill_seconds=None,
+            budget_seconds=wait_budget_seconds(config, priority),
+            policy=guard_cfg.policy,
+            calibrated=True,
+            samples=0,
+            projected_wait_seconds=None,
+            eta_occupancy_seconds=None,
+            busy_slots=occupancy,
+            in_flight_prefills=in_flight,
+            gate_occupancy=gate_occupancy,
+            prefill_deadline_seconds=guard_cfg.prefill_deadline_seconds,
+            new_tokens=new_tokens,
+            budget_tokens=guard_cfg.cold_prefill_budget_tokens,
+            deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
+            deadline_capacity_tokens=capacity.tokens,
+            deadline_capacity_calibrated=capacity.calibrated,
+            cold_ms_per_token=capacity.cold_ms_per_token,
+            capacity_basis=capacity_basis,
+            capacity_priced_tokens=capacity_priced_tokens,
         )
 
     if guard_cfg.policy == POLICY_OFF:
@@ -1344,6 +1843,30 @@ def evaluate_admission(
             new_tokens=new_tokens,
             budget_tokens=guard_cfg.cold_prefill_budget_tokens,
             deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
+        )
+    # Deadline token capacity (LP-0MW957RB3000ER79). The bound is expressed in
+    # cold tokens (``local_prefill_deadline_seconds * 1000 / cold_ms_per_token``)
+    # and priced against the whole prompt when residency is unmeasured or the
+    # measured new tokens when a measured prefill record exists. It is only
+    # evaluated when the caller supplied a residency signal (``None`` keeps the
+    # legacy behaviour byte-for-byte) and the cold window is calibrated
+    # (``AC5`` fail-open). The refusal is a request-property (``too_large``)
+    # bound: it overrides the *temporal* queue-budget reason, but the ordinary
+    # deadline and deadline-relative safety bounds keep their own (already
+    # binding) reason when they fire — in that case the capacity is redundant,
+    # so reporting the deadline is the truthful attribution.
+    capacity_exceeded = False
+    if residency_measured is not None:
+        capacity = deadline_capacity(model, prompt_tokens, config)
+        try:
+            whole_tokens = max(0, int(prompt_tokens or 0))
+        except (TypeError, ValueError):
+            whole_tokens = 0
+        capacity_priced_tokens = new_tokens if residency_measured else whole_tokens
+        capacity_exceeded = (
+            capacity.tokens is not None
+            and capacity.calibrated
+            and capacity_priced_tokens > capacity.tokens
         )
     budget = wait_budget_seconds(config, priority)
     # No queue-wait budget means the caller never queues (``high`` priority, or
@@ -1383,6 +1906,11 @@ def evaluate_admission(
     coeffs = projected.coefficients
     eta = projected.own_prefill_seconds
     if not coeffs.calibrated:
+        # A calibrated cold capacity still refuses an otherwise-inert prompt:
+        # the capacity is derived from the cold window, independent of the
+        # priced bucket's coefficient fit.
+        if capacity_exceeded:
+            return _capacity_refusal()
         return _inert("insufficient_samples", eta, budget, coeffs, projected)
     deadline = guard_cfg.prefill_deadline_seconds
     deadline_budget = _deadline_budget_seconds(guard_cfg)
@@ -1410,6 +1938,8 @@ def evaluate_admission(
         # refuse the dispatch and the guard stays inert — the documented
         # rollback path keeps its exact pre-change meaning.
         if deadline <= 0 and deadline_budget <= 0.0:
+            if capacity_exceeded:
+                return _capacity_refusal()
             return _inert("no_budget")
         within = True
         # Report the bound actually enforced: the tighter time bound, since
@@ -1437,6 +1967,17 @@ def evaluate_admission(
     if deadline_budget > 0.0 and eta > deadline_budget:
         reason = "prefill_eta_exceeds_safety_budget"
         admit = guard_cfg.policy == POLICY_OBSERVE
+    # Deadline token capacity (LP-0MW957RB3000ER79): a request-property bound
+    # overrides a temporal one. When the deadline or safety budget already
+    # fires on the same cold price the capacity is redundant, so the deadline
+    # reason is the truthful attribution; otherwise the capacity is the
+    # binding constraint and gets its own distinct reason.
+    if capacity_exceeded and reason not in (
+        "prefill_eta_exceeds_deadline",
+        "prefill_eta_exceeds_safety_budget",
+    ):
+        reason = REASON_DEADLINE_CAPACITY
+        admit = guard_cfg.policy == POLICY_OBSERVE
     return AdmissionDecision(
         admit=admit,
         reason=reason,
@@ -1457,7 +1998,13 @@ def evaluate_admission(
         deadline_budget_seconds=deadline_budget,
         rate_bucket=coeffs.rate_bucket,
         contended_samples=coeffs.contended_samples,
+        cold_samples=coeffs.cold_samples,
         occupant_hold_seconds=projected.measured_occupancy_seconds,
+        deadline_capacity_tokens=capacity.tokens,
+        deadline_capacity_calibrated=capacity.calibrated,
+        cold_ms_per_token=capacity.cold_ms_per_token,
+        capacity_basis=capacity_basis,
+        capacity_priced_tokens=capacity_priced_tokens,
     )
 
 
@@ -1657,6 +2204,11 @@ def status_estimate(
         except Exception:  # pragma: no cover - defensive
             budget = 0.0
         budget_published = round(float(budget), 1) if float(budget) > 0 else None
+        # Deadline token capacity (LP-0MW957RB3000ER79): the deadline expressed
+        # as an explicit number of cold tokens, derived from the same cold
+        # calibration the guard prices with, so a dispatcher can compare a
+        # prompt's size against it before launching a session.
+        capacity = deadline_capacity(model, tokens, config)
         return {
             "prefill_eta_seconds": round(eta, 1),
             "queue_eta_seconds": round(queue_eta.projected_seconds, 1),
@@ -1671,7 +2223,20 @@ def status_estimate(
             "prefill_eta_calibrated": coeffs.calibrated,
             "prefill_eta_rate_bucket": coeffs.rate_bucket,
             "prefill_eta_contended_samples": coeffs.contended_samples,
+            "prefill_eta_cold_samples": coeffs.cold_samples,
             "prefill_budget_seconds": budget_published,
+            # Deadline token capacity (LP-0MW957RB3000ER79 AC1): published next
+            # to the reference prompt so a dispatcher can see how many cold
+            # tokens the deadline buys. ``deadline_capacity_calibrated`` says
+            # whether the cold window has enough MEASURED samples; an
+            # uncalibrated number is informational and never enforced.
+            "deadline_capacity_tokens": capacity.tokens,
+            "deadline_capacity_calibrated": capacity.calibrated,
+            "deadline_capacity_cold_ms_per_token": (
+                round(capacity.cold_ms_per_token, 4)
+                if capacity.cold_ms_per_token is not None
+                else None
+            ),
         }
     except Exception:  # pragma: no cover - defensive
         logger.debug("status_estimate failed", exc_info=True)
@@ -1687,7 +2252,11 @@ def status_estimate(
             "prefill_eta_calibrated": False,
             "prefill_eta_rate_bucket": "solitary",
             "prefill_eta_contended_samples": 0,
+            "prefill_eta_cold_samples": 0,
             "prefill_budget_seconds": None,
+            "deadline_capacity_tokens": None,
+            "deadline_capacity_calibrated": False,
+            "deadline_capacity_cold_ms_per_token": None,
         }
 
 
@@ -1749,10 +2318,13 @@ def record_guard_decision(
     """
     # A cold-prefill budget refusal is logged even though it carries no ETA:
     # the cap is calibration-independent, so its evidence is the token counts
-    # (AC7, LP-0MVN4LBZ500281Z7), not a priced estimate.
+    # (AC7, LP-0MVN4LBZ500281Z7), not a priced estimate. The deadline token
+    # capacity (LP-0MW957RB3000ER79) is likewise a token-count refusal that
+    # carries no priced ETA, so it must be logged too.
     if not decision.active or (
         decision.eta_prefill_seconds is None
-        and decision.reason != "prefill_budget_exceeded"
+        and decision.reason
+        not in ("prefill_budget_exceeded", REASON_DEADLINE_CAPACITY)
     ):
         return
     # The logged ``decision`` is the guard's *verdict* (admit/reject); the
@@ -1765,6 +2337,7 @@ def record_guard_decision(
         or str(decision.reason).startswith("prefill_eta_exceeds_deadline")
         or str(decision.reason).startswith("prefill_eta_exceeds_safety_budget")
         or str(decision.reason).startswith("prefill_budget_exceeded")
+        or str(decision.reason).startswith(REASON_DEADLINE_CAPACITY)
         else "admit"
     )
     projected = (
@@ -1783,7 +2356,7 @@ def record_guard_decision(
     effective_label = reason_label
     if reason_label and str(decision.reason).startswith(
         ("prefill_eta_exceeds_deadline", "prefill_eta_exceeds_safety_budget",
-         "prefill_budget_exceeded")
+         "prefill_budget_exceeded", REASON_DEADLINE_CAPACITY)
     ):
         effective_label = decision.reason
     logger.info(
@@ -1792,7 +2365,9 @@ def record_guard_decision(
         "projected_wait_s=%.1f "
         "budget_s=%.1f bound_s=%.1f deadline_s=%.1f deadline_budget_s=%.1f "
         "new_tokens=%d budget_tokens=%d "
-        "rate_bucket=%s contended_samples=%d "
+        "deadline_capacity_tokens=%s capacity_basis=%s cold_ms_per_token=%s "
+        "capacity_priced_tokens=%d "
+        "rate_bucket=%s contended_samples=%d cold_samples=%d "
         "busy_slots=%d in_flight_prefills=%d gate_occupancy=%d "
         "free_slot=%s priority=%s policy=%s model=%s samples=%d provider=%s "
         "session=%s",
@@ -1815,8 +2390,21 @@ def record_guard_decision(
         float(decision.deadline_budget_seconds or 0.0),
         int(decision.new_tokens or 0),
         int(decision.budget_tokens or 0),
+        (
+            str(decision.deadline_capacity_tokens)
+            if decision.deadline_capacity_tokens is not None
+            else "unknown"
+        ),
+        decision.capacity_basis or "cold",
+        (
+            f"{float(decision.cold_ms_per_token):.4f}"
+            if decision.cold_ms_per_token is not None
+            else "unknown"
+        ),
+        int(decision.capacity_priced_tokens or 0),
         decision.rate_bucket or "solitary",
         int(decision.contended_samples or 0),
+        int(decision.cold_samples or 0),
         int(decision.busy_slots or 0),
         int(decision.in_flight_prefills or 0),
         int(decision.gate_occupancy or 0),

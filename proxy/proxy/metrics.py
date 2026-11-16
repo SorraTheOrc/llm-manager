@@ -24,6 +24,14 @@ LP-0MVVCY3HQ0009F0K):
   distinguishable in /metrics from a poll that was never attempted, so the
   unloaded-model noise origin is verifiable post-deploy).
 
+Extended by LP-0MW8VPH2Q007XPHQ (measured prefill progress, parent
+LP-0MW7V2DK400365ER):
+- proxy_prefill_progress_unobservable_total{reason="..."} (counter) — lease
+  polls where no numeric prefill progress could be observed from any source
+  (per-slot /slots, the log-derived tail, or the aggregate /status). Turns the
+  previously log-only ``prefill_progress_unobservable`` warning into a
+  countable rate.
+
 Extended by LP-0MVT1O0VG00905EL (slot occupancy, parent LP-0MVNWUEY8008XM6W):
 - llama_slots_total (gauge) — slots reported by the last successful sample
 - llama_slots_busy (gauge) — slots with ``is_processing`` true
@@ -143,6 +151,13 @@ llama_slots_child_port_fallbacks_total = None
 # genuine child-port-discovery regression signal
 # (llama_slots_child_port_fallbacks_total).
 llama_slots_child_port_skipped_total = None
+# Prefill-progress unobservable (LP-0MW8VPH2Q007XPHQ AC2, parent AC11). One
+# increment per lease poll where no numeric prefill progress could be observed
+# from any source (per-slot /slots, log-derived tail, aggregate /status). This
+# turns the previously log-only ``prefill_progress_unobservable`` warning into
+# a countable rate, so a persistently blind progress source is visible in
+# /metrics instead of only in the log.
+prefill_progress_unobservable_total = None
 # Slot occupancy (LP-0MVT1O0VG00905EL). Power/VRAM/GTT already reach Prometheus
 # through node_exporter, but nothing published llama-server *workload*, so "the
 # GPU drew 115 W" could not be attributed to llama-server. These gauges carry
@@ -315,6 +330,16 @@ if _enabled:
             'llama_slots_child_port_skipped_total',
             'Proxy /slots polls skipped without a request because the router '
             'definitively reports the model as not loaded, by reason',
+            ['reason'],
+        )
+        # Prefill-progress unobservable (LP-0MW8VPH2Q007XPHQ AC2). Labelled by
+        # reason so "why was it blind" stays attributable while the total stays
+        # a single named counter; the co-occurring throttled warning carries
+        # the human context.
+        prefill_progress_unobservable_total = Counter(
+            'proxy_prefill_progress_unobservable_total',
+            'Lease polls where no numeric prefill progress could be observed '
+            'from any source (per-slot, log tail, aggregate), by reason',
             ['reason'],
         )
         # Slot occupancy (LP-0MVT1O0VG00905EL). Deliberately no ``slot=`` label
@@ -683,6 +708,32 @@ def record_slots_child_port_skipped(reason: str):
         return
     try:
         llama_slots_child_port_skipped_total.labels(reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_prefill_progress_unobservable(reason: str = "no_source"):
+    """Increment ``proxy_prefill_progress_unobservable_total{reason}``.
+
+    LP-0MW8VPH2Q007XPHQ AC2 (parent AC11): called once per lease poll where
+    no numeric prefill progress could be observed from any source (per-slot
+    ``/slots``, the log-derived tail, or the aggregate ``/status``). The
+    existing throttled ``prefill_progress_unobservable`` WARNING still fires
+    (at most once per ``_PREFILL_WARN_INTERVAL``), so operators get both a
+    countable \"how often is progress blind?\" rate and the log context. The
+    increment is deliberately NOT throttled: the count is the signal.
+
+    Args:
+        reason: Why progress was unobservable — ``no_source`` when every
+            source returned nothing usable. A label keeps the counter
+            aggregatable while still attributable.
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or prefill_progress_unobservable_total is None:
+        return
+    try:
+        prefill_progress_unobservable_total.labels(reason=reason).inc()
     except Exception:
         pass
 

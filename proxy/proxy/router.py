@@ -191,6 +191,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _decrement_active_queries,
     _decrement_local_active_queries,
     _decrement_per_model_query,
+    _dispatch_credit_tokens,
     _dispatch_lease_key,
     _estimate_tokens_sent,
     _extend_lease_during_prefill,
@@ -213,6 +214,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _occupancy_divergence_reason,
     _prefetch_measured_cache_abort,
     _prefill_thrash_fingerprint,
+    _record_abandoned_prefill_cold_sample,
     _record_prefill_thrash_cooldown,
     _release_client_disconnect_dispatch,
     _release_completed_dispatch,
@@ -909,7 +911,21 @@ async def _cleanup_after_request(
                     async with lock:
                         records = getattr(srv, "local_dispatch_records", {})
                         record_key = _dispatch_lease_key(backend, session_id)
-                        if record_key in records:
+                        # LP-0MW0TLPOR002TAFO: a non-explicit session has no
+                        # cooldown lease to keep, so its record is dropped at
+                        # completion — but ONLY once this request's decrement
+                        # left no outstanding credits on it. A record shared by
+                        # overlapping dispatches of one session (a queued
+                        # sibling already holds a credit) is the live-work
+                        # evidence the recovery loops rely on; popping it while
+                        # a sibling is in flight stranded that sibling's
+                        # counter/record attribution and made the next tick
+                        # reclaim live work as stale (the measured
+                        # ``local_generating_queries`` / ``local_active_queries``
+                        # / ``active_queries`` recoveries).
+                        if record_key in records and not _dispatch_credit_tokens(
+                            records.get(record_key)
+                        ):
                             removed_record = records.pop(record_key, None)
                             try:
                                 srv.logger.info(
@@ -966,7 +982,13 @@ async def _cleanup_after_request(
                 async with lock:
                     records = getattr(srv, "local_dispatch_records", {})
                     record_key = _dispatch_lease_key(backend, session_id)
-                    if record_key in records:
+                    # LP-0MW0TLPOR002TAFO: same credit guard as the
+                    # non-explicit pop above — a disconnect must not delete a
+                    # record another in-flight dispatch of this session still
+                    # owns.
+                    if record_key in records and not _dispatch_credit_tokens(
+                        records.get(record_key)
+                    ):
                         removed_record = records.pop(record_key, None)
                         try:
                             srv.logger.info(
@@ -1791,6 +1813,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             # LP-0MVODJ3P6000AIUM AC1: same admission-time snapshot for the
             # anonymous-session path (verbatim; never a recompute).
             admission_evidence=getattr(request, "_local_admission_evidence", None),
+            # LP-0MW0TLPOR002TAFO: stamp this request with its credit token so
+            # its cancellation/teardown release is scoped to its own credit.
+            request=request,
         )
 
     # Token accounting
@@ -2021,6 +2046,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         _prefetched_chunks: list[bytes] = []
                         _prefetched_aiter = None
                         _prefetch_error = None
+                        # Latest ``prompt_progress`` observation of this dispatch
+                        # (LP-0MWGAEBWJ00334W2): refreshed on every progress
+                        # event so the abandonment cold sample still has it when
+                        # the prefill deadline cancels the peek.
+                        _prefetched_latest: list = []
                         if (
                             _prompt_progress_capture_enabled
                             and _measured_abort_settings is not None
@@ -2087,6 +2117,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                         # Keep every raw read even if the
                                         # monitor cancels the peek.
                                         chunks_sink=_prefetched_chunks,
+                                        # ...and the latest progress observation,
+                                        # for the abandonment cold sample.
+                                        latest_sink=_prefetched_latest,
                                     ),
                                     timeout=_prefetch_timeout,
                                     poll_seconds=_first_byte_poll_seconds,
@@ -2506,6 +2539,29 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # slot to the release so the real task is cancelled and
                         # the slot is recorded as abandoned for the status
                         # annotation.
+                        # LP-0MWGAEBWJ00334W2: a prefill the deadline (or the
+                        # max-prefill ceiling) abandons is the ONLY evidence the
+                        # cold calibration window can get for the buckets that
+                        # carry large cold prompts — it never emits a first byte,
+                        # so the first-byte sample site below can never see it.
+                        # Record one cold sample from the latest progress the
+                        # peek observed (tokens actually prefilled against the
+                        # dispatch's own measured elapsed). Fail-open: no
+                        # observation, the rollback key off, or any problem
+                        # simply records nothing.
+                        if isinstance(_exc, asyncio.TimeoutError):
+                            try:
+                                _record_abandoned_prefill_cold_sample(
+                                    srv,
+                                    model_name,
+                                    _prefetched_latest
+                                    if "_prefetched_latest" in locals()
+                                    else None,
+                                    server_config,
+                                    session_id=session_id,
+                                )
+                            except Exception:
+                                pass
                         if _prefill_deadline_fired:
                             # LP-0MVSAMN14001DMTY AC2: the deadline detour is
                             # TERMINAL for local inside this request. Marking
@@ -3229,6 +3285,43 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                         _first_byte_service_ms,
                                                         contended=_is_contended,
                                                     )
+                                                    # Q410 AC1 / Q2(option a):
+                                                    # feed the genuinely-cold
+                                                    # MEASURED window from the
+                                                    # measured-prefill record
+                                                    # at the point the
+                                                    # measurement is finalised
+                                                    # (first-byte time, where
+                                                    # both the measured record
+                                                    # and the service time
+                                                    # exist). The existing
+                                                    # priced window above stays
+                                                    # untouched. Fail-open: no
+                                                    # measurement (feature
+                                                    # disabled / no progress
+                                                    # observed) simply records
+                                                    # nothing.
+                                                    try:
+                                                        from proxy.measured_prefill import (
+                                                            get_measured_prefill,
+                                                        )
+                                                        from proxy.prefill_eta import (
+                                                            record_cold_measured_sample,
+                                                        )
+
+                                                        _cold_measured = get_measured_prefill(
+                                                            model_name, session_id
+                                                        )
+                                                        if _cold_measured is not None:
+                                                            record_cold_measured_sample(
+                                                                model_name,
+                                                                _estimated_tokens,
+                                                                _cold_measured.measured_cached_ratio,
+                                                                _cold_measured.processed,
+                                                                _first_byte_service_ms,
+                                                            )
+                                                    except Exception:
+                                                        pass
                                                 except Exception:
                                                     pass
                                             _first_byte_emitted = True

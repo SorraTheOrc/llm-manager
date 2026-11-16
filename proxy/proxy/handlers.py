@@ -455,6 +455,8 @@ async def get_llama_local_status(request: Request):
          "prefill_eta_reference_tokens": int | None,
          "queue_eta_seconds": float | None,
          "prefill_budget_seconds": float | None,
+         "deadline_capacity_tokens": int | None,
+         "deadline_capacity_calibrated": bool,
          "capacity_hint": str,
          "local_route_available": bool,
          "local_route_reason": str | None,
@@ -1284,6 +1286,29 @@ async def get_llama_local_status(request: Request):
         if isinstance(_slot, dict) and _slot.get("abandoned") is True:
             abandoned_slots += 1
 
+    # -- measured backend occupancy (LP-0MW8VP0XR007UGQF, parent AC3) ------
+    # The second slot's occupancy must be visible from the SAME measured
+    # progress path that drives the lease, even when /slots times out under a
+    # long prefill (that is what made 51 of 60 deadline events read as
+    # ``available_slots=0`` with no attribution). ``slots`` may be the fresh
+    # detail or the last-known cache; the log-derived ``_slot_progress_cache``
+    # supplies the per-slot occupancy the /slots read could not. Refreshing the
+    # tail here (off the event loop) makes the status poll self-contained and
+    # keeps the analyser and the availability checker on the same data.
+    measured_in_flight_requests = None
+    try:
+        import asyncio as _asyncio
+
+        from proxy.observability import (
+            _update_slot_progress_from_log,
+            count_measured_occupancy,
+        )
+
+        await _asyncio.to_thread(_update_slot_progress_from_log)
+        measured_in_flight_requests = count_measured_occupancy(slots)
+    except Exception:
+        measured_in_flight_requests = None
+
     # -- local-route availability (LP-0MVWFKIKJ005XHAY, parent AC10) -------
     # READ-ONLY observability: the routing decision never reads these values
     # (AC10c). ``available_slots``/``capacity_hint`` say whether the ENGINE is
@@ -1441,11 +1466,24 @@ async def get_llama_local_status(request: Request):
         "prefill_eta_rate_bucket": prefill_eta.get(
             "prefill_eta_rate_bucket", "solitary"
         ),
+        # Deadline token capacity (LP-0MW957RB3000ER79 AC1): the published
+        # capacity is part of the poll line too, from the same derivation as
+        # the payload so the two can never drift.
+        "deadline_capacity_tokens": prefill_eta.get("deadline_capacity_tokens"),
+        "deadline_capacity_calibrated": bool(
+            prefill_eta.get("deadline_capacity_calibrated", False)
+        ),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         "local_idle_seconds": published_idle_seconds,
         "capacity_hint": capacity_hint,
         "local_in_flight_requests": live_local_requests,
+        # LP-0MW8VP0XR007UGQF AC2/AC3: backend slots the measured signals report
+        # as occupied (union of /slots is_processing and fresh log progress).
+        # Additive: an older analyser ignores it; the residual analyser takes
+        # max(local_in_flight_requests, measured_in_flight_requests) so a busy
+        # second slot is no longer under-counted.
+        "measured_in_flight_requests": measured_in_flight_requests,
         "local_abandoned_slots": abandoned_slots,
         "slots_detail_stale": detail_stale,
         # LP-0MVWFKIKJ005XHAY AC10: the same route-availability evidence the
@@ -1512,6 +1550,10 @@ async def get_llama_local_status(request: Request):
         # records (``None`` in legacy mode with no record registry).
         # ``local_active_query`` mirrors ``> 0``; ``Null`` is never emitted.
         "local_in_flight_requests": live_local_requests,
+        # LP-0MW8VP0XR007UGQF: measured backend occupancy (same source as the
+        # status_request log line) so the analyser and the availability check
+        # cannot drift.
+        "measured_in_flight_requests": measured_in_flight_requests,
         # Per-slot details (LP-0MSORPUMX002LLIA): compact slot dicts from
         # llama-server's /slots endpoint, falling back to the last-known
         # detail cache on a transient failure (LP-0MUFSVXID0039ZAQ); empty
@@ -1541,6 +1583,20 @@ async def get_llama_local_status(request: Request):
         # shared prefill_eta calibration: the wait a prefill must fit inside
         # (``None`` when unresolvable — never a fabricated 0).
         "prefill_budget_seconds": prefill_eta.get("prefill_budget_seconds"),
+        # Deadline token capacity (LP-0MW957RB3000ER79 AC1): the prefill
+        # deadline expressed as an explicit number of cold tokens, derived
+        # from the same cold calibration the admission guard prices with, so
+        # a dispatcher can compare a prompt's size against it before
+        # launching. ``deadline_capacity_calibrated`` says whether the cold
+        # window has enough MEASURED samples; an uncalibrated number is
+        # informational and the bound is not enforced.
+        "deadline_capacity_tokens": prefill_eta.get("deadline_capacity_tokens"),
+        "deadline_capacity_calibrated": bool(
+            prefill_eta.get("deadline_capacity_calibrated", False)
+        ),
+        "deadline_capacity_cold_ms_per_token": prefill_eta.get(
+            "deadline_capacity_cold_ms_per_token"
+        ),
         # Whether the local pool is genuinely working (LP-0MVGDUVGE0024YAI
         # AC4): ``idle`` | ``prefill_bound`` | ``saturated`` | ``abandoned_busy``
         # (LP-0MVRMI5HK00558TB AC1 — occupied only by work the proxy abandoned).
@@ -1608,6 +1664,11 @@ async def get_llama_local_status(request: Request):
         # reserved_used - reserved_cancelled - reserved_expired`` is the
         # reserved-but-unused signal the work item asks to monitor.
         **(admission_reserve_stats()),
+        # Cross-host audit admission budget (LP-0MW95FYMH006XYNK): live /
+        # issued / reclaimed / released audit leases + saturated/unavailable
+        # refusal counters — the observable shadow of the lease-based gate
+        # that serialises audits across hosts at the shared local GPU.
+        **(audit_budget_stats()),
     }
 
 
@@ -1709,6 +1770,117 @@ async def cancel_reservation(reservation_id: str):
     from proxy import admission_reserve
 
     status, payload = admission_reserve.cancel(reservation_id)
+    return JSONResponse(status_code=status, content=payload)
+
+
+# ---------------------------------------------------------------------------
+# /llama/local/audit — cross-host audit admission budget
+# (LP-0MW95FYMH006XYNK, parent LP-0MW0KZUJP0019SLS AC1)
+#
+# A long-TTL audit-tier lease serialises audits ACROSS client hosts at the
+# shared local GPU: at most ``audit_admission.max_audits`` (default 1) live
+# leases exist at once, and a second different audit session is refused with
+# the stable token ``audit-budget-saturated`` plus a bounded retry hint. The
+# availability read is the lease-derived signal the herdr dispatcher consumes
+# (parent AC3) so dispatcher admission and proxy refusal can never disagree.
+# ---------------------------------------------------------------------------
+
+def audit_budget_stats() -> dict:
+    """Audit-budget counters for the status payload (fail-open)."""
+    try:
+        from proxy.audit_budget import stats
+
+        return stats()
+    except Exception:
+        return {}
+
+
+@router.get("/llama/local/audit/availability")
+async def get_audit_budget_availability():
+    """Publish the audit budget: ``{cap, live, available, leases}``.
+
+    The read is the dispatcher's lease-derived availability signal: it never
+    asserts capacity on an internal error (reports ``error:
+    registry_unavailable`` instead) and compares on the proxy's clock only.
+    """
+    from proxy import audit_budget
+
+    srv = _srv()
+    config = getattr(srv, "config", {})
+    if not isinstance(config, dict):
+        config = {}
+    return JSONResponse(audit_budget.availability(config))
+
+
+@router.post("/llama/local/audit/lease")
+async def acquire_audit_lease(request: Request):
+    """Acquire (or idempotently renew) an audit-tier lease for a session.
+
+    Body: ``{"session_id": "audit-...", "cap": <optional requested cap>}``.
+
+    - ``200`` — lease acquired (or the session's existing lease renewed).
+    - ``429`` — the budget is saturated by a different session
+      (``reason: audit-budget-saturated`` + bounded ``retry_after_s``); the
+      audit waits and retries instead of competing.
+    - ``503`` — internal registry failure (fail-safe token
+      ``audit-budget-unavailable``; the client falls back after a bounded
+      wait, per the documented fallback).
+    """
+    from proxy import audit_budget
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    session_id = body.get("session_id")
+    client_ip, _source = _resolve_client_ip(request)
+    requested_cap = body.get("cap")
+    srv = _srv()
+    config = getattr(srv, "config", {})
+    if not isinstance(config, dict):
+        config = {}
+    status, payload = audit_budget.acquire(
+        config, session_id, client_ip, requested_cap=requested_cap
+    )
+    headers: dict[str, str] = {"Cache-Control": "no-store"}
+    if status == 429:
+        headers["Retry-After"] = str(payload.get("retry_after_s", 1))
+        headers["X-Audit-Admission"] = "reject"
+        headers["X-Audit-Admission-Reason"] = str(payload.get("reason", ""))
+    elif status == 200:
+        headers["X-Audit-Admission"] = "admit"
+    return JSONResponse(status_code=status, content=payload, headers=headers)
+
+
+@router.post("/llama/local/audit/lease/renew")
+async def renew_audit_lease(request: Request):
+    """Extend the audit lease of *session_id* (body ``{"session_id": ...}``)."""
+    from proxy import audit_budget
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    session_id = body.get("session_id")
+    client_ip, _source = _resolve_client_ip(request)
+    srv = _srv()
+    config = getattr(srv, "config", {})
+    if not isinstance(config, dict):
+        config = {}
+    status, payload = audit_budget.renew(config, session_id, client_ip=client_ip)
+    return JSONResponse(status_code=status, content=payload)
+
+
+@router.delete("/llama/local/audit/lease/{session_id}")
+async def release_audit_lease(session_id: str):
+    """Release the audit lease of *session_id* (clean run exit)."""
+    from proxy import audit_budget
+
+    status, payload = audit_budget.release(session_id)
     return JSONResponse(status_code=status, content=payload)
 
 

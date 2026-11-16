@@ -1816,6 +1816,16 @@ server:
   #   value and ``local_prefill_deadline_seconds`` below, so by default the
   #   deadline (90 s) is the bound that fires; setting the deadline to 0
   #   restores this ceiling unchanged.
+  # local_prefill_eta_factor: Runaway-prefill ETA factor (default 2.0; 0
+  #   disables; LP-0MW8VOKB9002W2C1 AC4, parent AC14). A dispatch whose elapsed
+  #   time exceeds its admission prefill estimate (``eta_prefill_s``) multiplied
+  #   by this factor is released EARLY with the distinct reason
+  #   ``prefill_eta_exceeded`` (recorded with ``elapsed_s`` and ``stalled_for_s``
+  #   on the ``lease_released`` line) instead of waiting out the full hard
+  #   deadline. The ETA bound is the earliest evidence of a runaway; the
+  #   no-progress watchdog (``prefill_stalled``) and the max-prefill ceiling
+  #   (``prefill_max_exceeded``) remain the fallback backstops. A record without
+  #   a positive ``eta_prefill_s`` is unaffected.
   # local_prefill_deadline_seconds: Prefill deadline — a hard backstop
   #   INDEPENDENT of ETA-estimator quality (default 90 s; 0 disables;
   #   LP-0MVIQ0G2M0006QF6 AC3). If a local dispatch has produced no first byte
@@ -2320,6 +2330,50 @@ server:
   # ``budget_s``, ``busy_slots``, ``in_flight_prefills`` and (since
   # LP-0MVS9Y76R004B5M8) ``rate_bucket`` / ``contended_samples``.
   #
+  # COLD (MEASURED) RATE BUCKET (Q410 / LP-0MW957Q41002EXE2). The mixed
+  # calibration window is dominated by instant cache hits (measured: 85 751
+  # tokens in 2.6 s), which makes the coefficient fit 1.4-1.7x optimistic for
+  # the cold large-prompt regime (measured 3.81-4.26 ms/token vs the ETA's
+  # 342-424 tok/s). A separate window therefore holds ONLY genuinely-cold
+  # MEASURED samples (``measured_cached_ratio < 0.10`` AND ``processed``
+  # ``>= 32 000``, first byte >= 1 s), fed from the measured-prefill capture
+  # (``prefill_progress_measured`` / MeasuredPrefill) when the measurement is
+  # finalised; the existing priced window is untouched. Large prompts
+  # (>= ``local_admission_guard_eta_percentile_min_tokens``) are priced from
+  # the cold window when calibrated; when it is NOT yet calibrated,
+  # large-prompt pricing is INERT (guard admits — today's uncalibrated
+  # behaviour) rather than falling back to the mixed window's optimistic
+  # rate. Decisions/log lines carry ``rate_bucket=cold`` and
+  # ``cold_samples=<n>`` so the honest split is legible. Small prompts below
+  # the percentile floor keep the existing mixed/contended calibration
+  # byte-for-byte.
+  #
+  # HOW THE COLD WINDOW FILLS (LP-0MWGAEBWJ00334W2). Two sources, both built
+  # only from evidence the proxy observes in production:
+  #   1. COMPLETED genuinely-cold prefills — the first-byte branch of
+  #      ``router.proxy_to_local`` records the measured-prefill record
+  #      (measured reuse < 0.10, >= 32 000 positions prefilled).
+  #   2. ABANDONED prefills — a dispatch the prefill deadline (or the
+  #      max-prefill ceiling) cancels never emits a first byte, so source 1 can
+  #      never see it. The eviction path records one sample from the LATEST
+  #      ``prompt_progress`` observation of that dispatch (tokens actually
+  #      prefilled against the dispatch's own measured elapsed), bucketed by the
+  #      PROMPT size — that is the only way bucket 2 (65k+) can ever calibrate,
+  #      because a 65k+ cold prefill cannot complete inside the deadline and so
+  #      can never supply a completed sample. Such a dispatch is admitted on the
+  #      abandonment evidence (it demonstrably was not cache-served); a dispatch
+  #      measured at/above ``WARM_CACHE_RATIO`` (0.90) reuse is warm by
+  #      definition and is not cold evidence. Each recorded sample logs one
+  #      ``cold_sample_abandoned total=… cache=… processed=… time_ms=…`` line.
+  # ROLLBACK for source 2 — set this key to 0/false/off to restore the
+  # pre-change sample source exactly (completed prefills only; the cold window
+  # then returns to its uncalibrated, inert behaviour for the large buckets).
+  # Absent keeps the target behaviour enabled; an unreadable value fails open to
+  # the pre-change behaviour. Turning the whole capture off
+  # (``local_measured_cache_abort_enabled: 0``) also disables source 2, because
+  # no ``prompt_progress`` observation is captured at all.
+  local_deadline_cold_sample_enabled: 1
+  #
   # Local admission reservations + fallback intent
   # ----------------------------------------------
   # (LP-0MVIKPCSG002B0NL) A dispatcher can claim local capacity ATOMICALLY
@@ -2439,6 +2493,54 @@ server:
   # local_prefill_deadline_seconds, so a band-slow prompt cannot slip past the
   # flat token cap.
   local_cold_prefill_budget_tokens: 25000
+  # DEADLINE TOKEN CAPACITY (LP-0MW957RB3000ER79, AC5): the flat cap above is
+  # the tighter bound for an ordinary cold prompt (a request over 25000 NEW
+  # tokens is refused as ``prefill_budget_exceeded`` first). The capacity
+  # (``local_prefill_deadline_seconds * 1000 / cold_ms_per_token``, derived
+  # below at ``local_prefill_deadline_seconds``) governs the WHOLE-PROMPT cold
+  # price when residency is unmeasured and any deployment that raises or
+  # disables this flat cap (``0``). Both refuse at admission with their own
+  # reason and detour to remote, so they can never contradict each other.
+
+  # ---------------------------------------------------------------------
+  # Cross-host audit admission budget (LP-0MW95FYMH006XYNK)
+  # ---------------------------------------------------------------------
+  # At most ``max_audits`` audit-tier sessions may hold a live audit lease
+  # ACROSS ALL client hosts at once — the single shared resource audits
+  # actually contend for is the one local llama-server GPU, and per-host
+  # guards (the ContextHub ``~/.herdr/downtime/budget.json`` ``maxAudit``
+  # ledger) cannot serialise two servers that each believe they are under
+  # cap. The proxy owns this cap and the live lease registry; every
+  # dispatcher queries ``GET /llama/local/audit/availability`` for the
+  # lease-derived signal instead of asserting its own cap (parent AC3).
+  #
+  # The gate is a long-TTL audit-tier lease (the audit skill's
+  # acquire/renew/release loop): a second DIFFERENT audit session is refused
+  # with ``reason: audit-budget-saturated`` + ``retry_after_s`` and waits,
+  # while the same holder's re-acquire/renew is idempotent. A lease older
+  # than its TTL is reclaimed (``audit_lease_reclaimed reason=expired``), so
+  # a crashed holder cannot wedge the budget; clock comparisons use the
+  # proxy's clock only. Fail-safe: an internal registry error returns the
+  # stable token ``audit-budget-unavailable`` with a bounded retry hint and
+  # the availability read reports ``error: registry_unavailable`` — never a
+  # fabricated capacity.
+  #
+  # Endpoints:
+  #   GET    /llama/local/audit/availability  -> {cap, live, available, leases}
+  #   POST   /llama/local/audit/lease         -> acquire {"session_id", "cap"?}
+  #   POST   /llama/local/audit/lease/renew   -> renew   {"session_id"}
+  #   DELETE /llama/local/audit/lease/<sid>   -> release
+  #
+  # ROLLBACK / kill switch: ``max_audits: 0`` disables audit admission
+  # entirely (mirrors the ContextHub ``maxAudit: 0`` kill switch). Default 1
+  # preserves today's single-flight audit behaviour at the cap.
+  audit_admission:
+    max_audits: 1
+    # Long lease TTL (seconds): a whole audit (multi-phase, dozens of Pi
+    # calls) can last tens of minutes, so a per-request TTL would reclaim a
+    # live holder mid-run. The holder renews periodically; a crashed holder
+    # is reclaimed this long after its last renew.
+    lease_ttl_seconds: 3600
   # Fraction of local_prefill_deadline_seconds a budgeted prompt's conservative
   # p75 ETA must fit inside before it is admitted (default 0.0 = DISABLED =
   # documented rollback). CANONICAL DERIVATION for the "safety budget" — the
@@ -2487,6 +2589,58 @@ server:
   # admission behaviour (the comparator derived from that deadline); no code
   # change is needed.
   local_prefill_deadline_seconds: 180
+  # DEADLINE TOKEN CAPACITY (LP-0MW957RB3000ER79). The deadline above is also
+  # expressed as an explicit number of COLD tokens, derived from the same cold
+  # calibration the admission guard prices cold large prompts with (the cold
+  # MEASURED window, the conservatism factor and any p75 uplift):
+  #
+  #     deadline_capacity_tokens =
+  #         local_prefill_deadline_seconds * 1000 / cold_ms_per_token
+  #
+  # It is published on ``/llama/local/status`` (``deadline_capacity_tokens``,
+  # ``deadline_capacity_calibrated``, ``deadline_capacity_cold_ms_per_token``)
+  # and on EVERY ``local_admission_guard`` decision line, so the number an
+  # operator reads and the number the guard enforces are derived from one
+  # place. A request whose cold basis exceeds the capacity is refused at
+  # admission with its own reason ``prefill_eta_exceeds_capacity`` and detours
+  # to the next provider; it is never dispatched and then cancelled at the
+  # deadline.
+  #
+  # COLD BASIS / MEASURED RESIDENCY (LP-0MW957RB3000ER79 AC3). When a MEASURED
+  # residency record exists for the session (a captured ``prompt_progress``
+  # measurement or a cached ratio recorded from a previous local response's
+  # usage data) the capacity is compared against the MEASURED NEW tokens, so a
+  # measured-warm large prompt is not refused for its prompt size (the
+  # warm-prompt guardrail). When residency is UNMEASURED the WHOLE PROMPT is
+  # priced cold — a predicted/credited warm ratio is not evidence — so the
+  # predicted-warm cold prompts that slip past the ordinary ETA bound are
+  # refused here. The bound is enforced on every admission path the flat
+  # cold-prefill cap guards (queue entry, direct/free-slot dispatch, idle /
+  # economic bypass) and on the capacity-gate path, because it lives in the
+  # shared ``evaluate_admission`` decision.
+  #
+  # INTERACTION WITH local_cold_prefill_budget_tokens (AC5). The flat cap
+  # (25000 new tokens) stays the TIGHTER bound for an ordinary cold prompt: a
+  # prompt with more than 25000 NEW tokens is refused by
+  # ``prefill_budget_exceeded`` before the capacity is reached. The capacity
+  # governs (a) whole-prompt cold pricing when residency is unmeasured — where
+  # the flat cap sees only the predicted new tokens — and (b) any deployment
+  # that RAISES or DISABLES the flat cap (``0``), where the capacity is the
+  # only token-shaped deadline bound left. The two never contradict each
+  # other: both derive from the same deadline and both detour to remote.
+  #
+  # ROLLBACK (AC4). The guard policy is the single switch:
+  #   local_admission_guard_policy: observe  — log the would-be capacity
+  #       refusal (``enforced=false``) but never refuse;
+  #   local_admission_guard_policy: off      — do not evaluate the guard at
+  #       all (the capacity is inert);
+  #   local_admission_guard_eta_percentile: 0 — derive the capacity from the
+  #       cold point estimate instead of the p75 uplift;
+  #   local_prefill_deadline_seconds: 0      — no deadline, therefore no
+  #       capacity.
+  # Each is a pure value change; no code change and no restart-ordering
+  # constraint beyond the usual process restart.
+  #
   # Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL): when a
   # local dispatch is cancelled by the prefill deadline
   # (``prefill_deadline_exceeded``) or by the measured-cache early abort

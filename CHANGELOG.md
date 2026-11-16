@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.1.30 (2026-11-16)
+### Features
+- [impl] Cold-regime prefill-ETA calibration and an explicit deadline token capacity (LP-0MW7V2D13004ZO65)
+- Bug: backfill parser ignores unit suffixes, so seconds-era TTFT values are seeded as milliseconds (LP-0MW20RKLE006TG4M)
+- [impl] Feed measured prefill progress into lease extension and occupancy attribution (LP-0MW7V2DK400365ER)
+- Provide a script to deploy Grafana safely so the memory dashboard is viewable (LP-0MVWUTC2J006PKBJ)
+### Bug Fixes
+- Unnattributed Reason for remote fallback (LP-0MW0FFW8K002U0KQ)
+- Local dispatch counters leak: 24 self-healing recoveries in 36 min under a 27 req/min burst (LP-0MW0TLPOR002TAFO)
+- Typed deterministic client error and fingerprint circuit breaker for wedged sessions (LP-0MW0KZU86008PD8J)
+- Local route starves: stale slots snapshot alone yields reason=backend_unreachable and blocks dispatch to a healthy idle backend (LP-0MWCOMI160011F6C)
+- Bug: TTFT backfill seeds the combined local+remote p90 while the scorecard metric is the local-only p90 (LP-0MWBLZ8HP005F6KO)
+- Group-1 dispatch deadlock: validation item waits on an impl epic whose verification child waits on the validation item (LP-0MW9XD2T90014ZAT)
+- Usage report is still reporting different values for GPU usage (LP-0MWG7KQVZ008DBZM)
+- [impl] Assign the local slot before the admission verdict so prefix residency is measured, not predicted (LP-0MW7V29MA009MCPI)
+- Contended-pricing: abandoned-queue-wait share regressed to 60.7% vs the 52.6% diurnally matched baseline (24 h post-change) (LP-0MVV1V213002QAIR)
+### Other
+- Refactor: F811 dead app = None assignment in proxy/tests/test_slots_busy_engine_policy.py (LP-0MW8QY8HE0051UNZ)
+- Refactor: Unused Import in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVYVWS4U008UC5N-test-first-contract-suite-for-known-unti/proxy/tests/test_planned_unavailable_classification.py (LP-0MW305AJ80085AEK)
+- Tolerances in usage report (LP-0MWADHS83006QFQS)
+- [spike] Local prefill throughput caps proxy local share at ~5.8%: evaluate the costed levers (LP-0MVXY8ZBZ0003042)
+- ruff: 4 new lint findings in tracked source (N818, UP041, I001 x2 - client_stall_guard) (LP-0MVYLWYU4002QCG4)
+- Deploy the GPU slot sampler and workload rule so live utilisation is measurable (LP-0MVWWK4CN007Q7VI)
+- Refactor: Modernization in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVZ810NG008A3EW-proxy-killed-by-global-oom-gpu-backed-am/proxy/proxy/host_pressure.py (LP-0MVZA6FV20077E6I)
+- Refactor: Modernization in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVT1O0VG00905EL-publish-slot-occupancy-metrics-from-the/proxy/tests/test_measured_cache_abort_wiring.py (LP-0MVWOK763006YGHJ)
+
 ## v0.1.29 (2026-11-10)
 ### Features
 - Return a meaningful retryable error (real retry_at) when a model's whole chain is blocked by scheduled gates, instead of an opaque 503 retried for hours (LP-0MVWC9CZH004OZYN)

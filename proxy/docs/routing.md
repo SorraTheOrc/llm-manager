@@ -161,30 +161,67 @@ logged once as `local_dispatch_completed_record_reaped
 reason=completed_record_in_sweep`, so a missed completion release is
 diagnosable from the log alone.
 
-#### Counter/record contention invariant (LP-0MVYWKX7200880QX)
+#### Counter/credit contention invariant (LP-0MVYWKX7200880QX, LP-0MW0TLPOR002TAFO)
 
-`local_active_queries` must equal the number of `active` dispatch records at
-every step of a contended local workload — admission, first byte, per chunk,
-a measured cache-deficit eviction, a client cancel and completion. That
-equality is the definition of done for exactly-once release accounting, and
-it is the condition under which the self-healing clamp
+`local_active_queries` must equal the number of **outstanding dispatch
+credits** at every step of a contended local workload — admission, first byte,
+per chunk, a measured cache-deficit eviction, a client cancel and completion.
+That equality is the definition of done for exactly-once release accounting,
+and it is the condition under which the self-healing clamp
 (`_recover_stuck_local_active_queries`) has nothing to repair: an over-count
 is what makes `/llama/local/status` report a busy GPU that is idle
 (LP-0MVKSXR4P001V0CM).
 
+A dispatch record is keyed `(endpoint, session)` and holds one credit per
+in-flight dispatch in `dispatch_credits` (LP-0MVWF78QK0060TZH), so the
+counter counts **credits**, not records: two overlapping dispatches of one
+session are legitimately `counter == 2` with **one** active record. Every
+consumer must therefore use `_outstanding_dispatch_credits`, never
+`_count_active_local_dispatch_records` (they are equal only for one-credit
+records).
+
+LP-0MW0TLPOR002TAFO closed the last record-count assumptions:
+
+- `_increment_local_active_queries` (the anonymous/non-explicit increment
+  path) **appends** a credit to a live record instead of overwriting it — the
+  explicit path (`_try_acquire_local_dispatch`) already did. Overwriting
+  dropped a sibling's credit from the record set, so `counter (2)` no longer
+  matched the record's credits `(1)`.
+- `_increment_local_active_queries` also **stamps its request** with the
+  credit token (`request._local_dispatch_token`), exactly as the explicit path
+  does, so an anonymous dispatch's teardown or cancellation release is
+  token-scoped instead of consuming a sibling's credit via the untracked
+  (`dispatch_token=None`) path.
+- `_cleanup_after_request` drops a non-explicit (or disconnected) session's
+  record only when it holds **no** remaining credits; a record shared with a
+  still-in-flight sibling is kept, because it is the live-work evidence the
+  recovery loops read.
+- `_release_client_disconnect_dispatch` (the client-cancel, prefill-deadline
+  and reaper-cancellation release) keeps a record that another in-flight
+  dispatch still holds a credit on, instead of popping the whole shared
+  record; the paired cleanup releases this request's own token-scoped credit
+  and leaves the sibling intact.
+- `_recover_stuck_local_active_queries` clamps to the outstanding-credit count,
+  not the active-record count.
+
+Without these, the recovery loop *destroyed live state* during a healthy
+burst — the measured `local_active_queries 2→1` / `1→0`, `active_queries 1→0`
+and `local_generating_queries reclaimed 1 stale session` recoveries, while the
+dispatch was still running.
+
 `proxy/tests/test_local_active_queries_invariant.py` drives three concurrent
 local streams with distinct outcomes through the real `proxy_to_local`
 (paced SSE success, measured-deficit abort, pre-first-byte client cancel) and
-samples `local_active_queries == _count_active_local_dispatch_records(srv)`
+samples `local_active_queries == _outstanding_dispatch_credits(srv)`
 at each quiescent checkpoint under the production
 `local_active_queries_lock` → `local_dispatch_records_lock` order, then runs
-the real clamp and asserts zero `counter recovered` warnings. Adding a
-duplicate fan-out of an in-flight prompt (the audited leak: the streaming
-single-flight detour runs `_cleanup_after_request(decrement_local=False)`
-after the lease was re-acquired) is expected to fail both assertions until
-the exactly-once fix lands — encoded `xfail(strict=True)` naming
-LP-0MVYWLBV70018ZZB, so the assertion is pinned and the marker cannot be
-forgotten.
+the real clamp and asserts zero `counter recovered` warnings.
+`proxy/tests/test_local_dispatch_counter_credit_accounting.py` pins the
+credit-aware behaviour for each exit path — success, client disconnect,
+**deadline cancel** and error all restore `local_active_queries`,
+`active_queries`, `local_generating_queries` and `local_generating_sessions` —
+plus a concurrently-acquired, mixed-exit burst that must settle to zero with no
+`counter recovered` line.
 
 #### The recovery WARNING names the request it could not account for
 
@@ -702,6 +739,182 @@ models:
 - `{"model": "claude-3-opus"}` → matches `anthropic` config via exact alias → routes to Anthropic API
 - No model specified + `current_model` is set → uses the currently loaded local model
 
+## Prefill progress signal provenance (LP-0MW7V2DK400365ER)
+
+During a large local prefill no stream chunk is emitted, so the dispatch lease
+and the occupancy surface need a *measured* prefill progress signal to tell
+"still working" apart from "stalled". This section records where that signal
+comes from, in the order the proxy consults it.
+
+### Sources, in preference order
+
+The probe is `proxy.router_helpers._query_prefill_progress`, polled every
+`local_dispatch_lease_prefill_poll_seconds` while the dispatch awaits its first
+byte. Each source is bounded by `STATUS_QUERY_TIMEOUT` (default 1 s) and never
+blocks the stream loop.
+
+1. **Per-slot `/slots`** (`proxy.observability._query_slots_progress`), on the
+discovered model-child port (never the router). A slot's progress is the
+maximum of `n_past` and `n_prompt_tokens_processed`; liveness is
+`is_processing`. Older llama.cpp builds publish these per-slot fields firmly.
+2. **Per-slot log tail** (`proxy.observability.get_slot_prefill_progress`).
+   llama-server writes, for every prompt-processing batch:
+
+   ```
+   slot update_slots: id  0 | task 2833255 | prompt processing progress, n_tokens = 17690, batch.n_tokens = 1024, progress = 0.999774
+   ```
+
+   stderr, which the proxy redirects into `llama-server.log` and parses into
+   `_slot_progress_cache` (see `_update_slot_progress_from_log`). The measured
+   token count is `n_tokens`; an entry is trusted while the log's mtime is
+   within `SLOT_PROGRESS_MAX_AGE_SECONDS` (60 s). This source is what makes
+   progress observable on builds that dropped the `/slots` fields (below).
+3. **Aggregate `/status`** (`proxy.observability.query_llama_status`), reading
+   `kv_cache_tokens` (or `n_past` when present) from `/model`, `/status`,
+   `/models`, `/v1/models`. It is a whole-server aggregate, not per-slot, so it
+   is the last resort.
+
+### Build-specific caveats
+
+- The deployed llama.cpp **b8782** build removed `n_past` /
+  `n_prompt_tokens_processed` / `context_tokens` from the `/slots` response.
+  Observed 2026-11-08 on the live child: `/slots` returns `id`, `n_ctx`,
+  `is_processing`, `id_task`, `params` and `next_token.{n_decoded,n_remain}` —
+  **no per-slot prompt-progress field**.
+- That build still emits the `slot update_slots … n_tokens = N` stderr line,
+  so source 2 is the supported measured signal there. Nothing in the proxy
+  fabricates `n_past` when a build omits it (a fabricated context size would
+  mis-price the ETA).
+- `query_llama_status`'s `kv_cache_tokens` is build-dependent; `/status`
+  itself is *not* a llama.cpp endpoint (it 404s), so the aggregate reads the
+  model-list endpoints and returns `null` when the field is absent.
+
+### Unobservable case (fail-safe)
+
+When all three sources yield nothing **and** the slot is not observed
+processing, progress is *unobservable*. The proxy then:
+
+- leaves the lease at its adaptive acquisition estimate (no unbounded
+  extension — a genuinely progress-less dispatch is still released by
+  `local_dispatch_no_progress_timeout_seconds` and the
+  `local_dispatch_max_prefill_seconds` ceiling);
+- keeps the liveness-only extension path (`is_processing`) as the fail-safe;
+- emits a throttled `prefill_progress_unobservable` WARNING (at most once per
+  `_PREFILL_WARN_INTERVAL`, 60 s); and
+- increments the `proxy_prefill_progress_unobservable_total{reason="no_source"}`
+  counter on **every** blind poll, so a persistent rate is visible in
+  `/metrics` and not only in the log
+  (LP-0MW8VPH2Q007XPHQ, parent AC6/AC11).
+
+### How the signal is consumed
+
+- **Lease extension** (`_extend_lease_during_prefill`): a numeric advance
+  refreshes `last_progress_ts` and logs
+  `lease_extended_on_measured_progress` / `reason=measured_progress`; liveness
+  or an in-flight own-session request extends without refreshing the clock.
+- **Early abort** (`_watchdog_release_reason`): `prefill_eta_exceeded` when
+  elapsed > `eta_prefill_s * local_prefill_eta_factor` (default 2×),
+  `prefill_stalled` when no progress for
+  `local_dispatch_no_progress_timeout_seconds`, and `prefill_max_exceeded` at
+  the hard ceiling. The `lease_released` WARNING records the reason plus
+  `elapsed_s` / `stalled_for_s` (parent AC4/AC14).
+- **Occupancy** (`measured_occupied_slot_ids`): the union of `/slots`
+  `is_processing` and fresh log-derived progress; published additively as
+  `measured_in_flight_requests` so the residual analyser no longer under-counts
+  a busy second slot (LP-0MW8VP0XR007UGQF).
+
+## Cold (measured) prefill calibration (LP-0MW957Q41002EXE2)
+
+Q410 makes the large-prompt rate honest: the mixed calibration window is
+polluted by instant cache hits (measured: 85 751 tokens in 2.6 s), which puts
+the fitted rate 1.4–1.7× above the genuinely-cold regime (measured
+3.81–4.26 ms/token ≈ 235–295 tok/s). The fix is a third per-`(model, bucket)`
+window that only ever holds **measured** cold prefill samples.
+
+### Sample predicate
+
+A sample enters the cold window only when `measured_cached_ratio < 0.10`
+**and** `processed_tokens >= 32 000` (first byte `>= 1 s`), so instant
+cache-hit completions can never price the cold rate. The samples come from
+the measured-prefill capture (`MeasuredPrefill.measured_cached_ratio` /
+`processed`, the same `prefill_progress_measured` flow documented above) at
+the point the measurement is finalised — the existing priced window
+(`record_dispatch_sample`, `dispatch_first_byte_ms`) is untouched. (That
+predicate governs the *completed*-prefill source; the abandoned-prefill source
+below replaces the reuse-ratio test with the warm boundary and keeps both
+floors — see “How the window actually fills”.)
+
+### How the window actually fills (LP-0MWGAEBWJ00334W2)
+
+The completed-prefill source above can never calibrate the large buckets: a
+dispatch the prefill deadline cancels never emits a first byte, and a 65k+
+cold prompt cannot finish inside the deadline at all. In the certified window
+(2026-11-06 14:15:50 → 2026-11-08 00:00) that left bucket 1 with one
+qualifying sample and bucket 2 with **zero**, so `DeadlineCapacity.calibrated`
+was permanently `False` and the capacity bound never refused anything.
+
+The cold window therefore has **two** sources, both built only from evidence
+the proxy observes in production:
+
+| Source | Where | Evidence |
+|---|---|---|
+| completed cold prefill | first-byte branch of `router.proxy_to_local` | `prompt_progress_measured` at first byte (measured reuse < 0.10, ≥ 32 000 positions) |
+| **abandoned** prefill | the deadline / max-prefill-ceiling eviction path | the LATEST `prompt_progress` observation the peek saw: tokens actually prefilled (`processed`) against the dispatch's own measured elapsed (`time_ms`) |
+
+The peek (`_prefetch_measured_cache_abort`) refreshes that latest observation
+on **every** progress event into a cancellation-safe sink, so the observation
+survives the deadline cancelling the peek. The eviction path then calls
+`prefill_eta.record_abandoned_prefill_sample`, which:
+
+- buckets the sample by the **prompt** size (`total`) — bucketing by the
+  progress reached would put every abandoned large prefill in bucket 1 and
+  leave bucket 2 empty again;
+- requires `processed >= 32 000` positions and a measured elapsed
+  `>= 1 s`, exactly the floors the completed source uses;
+- drops a dispatch whose measured reuse is at/above `WARM_CACHE_RATIO`
+  (0.90) — it is warm by the codebase's own definition, so its abandonment is
+  not cold evidence;
+- records the sample as `(cached=0, new=processed, ms=time_ms)`: the elapsed
+  already covers every position traversed, so claiming a cache credit for the
+  same tokens would double-count them and make the cold window *more
+  optimistic* than the prior it exists to correct.
+
+A dispatch abandoned mid-prefill is admitted as cold evidence because it
+demonstrably was **not** cache-served (a cache-served dispatch returns in
+milliseconds). Each recorded sample emits one
+`cold_sample_abandoned session=… model=… total=… cache=… processed=… time_ms=…`
+line, so the new source is watchable in production.
+
+**Rollback:** `server.local_deadline_cold_sample_enabled: 0` restores the
+completed-only source exactly (the cold window then returns to its
+uncalibrated, inert behaviour for the large buckets). Absent keeps the target
+behaviour; an unreadable value fails open to the pre-change behaviour.
+Disabling the whole measured-prefill capture
+(`local_measured_cache_abort_enabled: 0`) disables it too, because no
+`prompt_progress` observation is captured at all.
+
+### Selection
+
+- Prompts **below** `local_admission_guard_eta_percentile_min_tokens` keep the
+existing mixed/contended calibration byte-for-byte (no small-prompt
+regression).
+- Prompts **at or above** the percentile floor are priced from the cold window
+only. When the cold window is not yet calibrated (`cold_samples`
+`< local_admission_guard_min_samples`), large-prompt pricing is **inert** —
+the guard admits exactly like an uncalibrated bucket, it never falls back to
+the mixed window's optimistic rate. The conservative percentile path
+(`local_admission_guard_eta_percentile`, default p75, never below the cold
+window's p50) still applies, now to the cold distribution; a percentile of
+`0` restores the point estimate byte-for-byte.
+
+### Observability
+
+`rate_bucket=cold cold_samples=<n>` on the admission decision/log line and
+`prefill_eta_cold_samples` on `/llama/local/status` make the honest split
+legible: a `cold_samples` count below the minimum explains an inert
+large-prompt admission, and a calibrated `rate_bucket=cold` decision states
+exactly which window priced it.
+
 ## Large-Context Routing: Mode-Dependent Economic Bypass (LP-0MU5A4QBR003YJM0)
 
 When a request's estimated token count exceeds the cold-cache threshold
@@ -1155,6 +1368,30 @@ backend. Measured 2026-10-19 → 10-20 over 460 paired local dispatches:
 47.8 % of prefills shared the GPU with at least one other and aggregate
 throughput stayed flat (~254 tok/s) — i.e. concurrency added latency, not
 capacity, and inflated total prefill wall time 2.3×.
+
+**Re-measured 2026-11-11 (LP-0MWCEHDRV000B7HD).** With the gate closed, the
+20k–40k production bucket sustained 241.0–243.5 tok/s aggregate (per-request p50
+258.0–273.2 tok/s, 12 and 13 requests over two windows) — the recorded ceiling,
+reproduced. Forcing two concurrent prefills at the engine (gate bypassed, unique
+44,770-token prompts, three interleaved rounds) gave aggregate **156.1 tok/s**
+vs **156.2 tok/s** serial: ratio 1.00, wall window 2.00×, slowest request 0.81×.
+So the flat aggregate is a property of the GPU, not of serialisation —
+concurrency remains a latency expense and not a throughput lever. Record:
+`docs/dev/prefill-concurrency-2026-11-11.md`,
+`docs/dev/prefill-concurrency-baseline-2026-11-11.json`.
+
+The four prefill-share lever families (session compaction, prefill concurrency,
+model/quantisation/slot geometry, accept-the-ceiling) are costed on one unit set
+— prefill tok/s added, per-slot resource cost, and *both* local-share
+denominators — in
+`docs/dev/local-prefill-lever-comparison-2026-11-11.md`
+(LP-0MWCEII0V003V76A). Two results matter when reading any share number below:
+no family adds aggregate prefill rate (the all-lever bound is 1.019× on the gate
+rate), and a share figure is meaningless without its denominator — offered
+**prompt tokens** (0.41–1.62 % ceiling) and offered **streams** (1.52–5.96 %
+ceiling) differ by the 3.68× prompt-size mix. The local-share target it
+recommends for the recovery criterion is **≥ 3.5 % of locally served streams**
+(= 0.951 % of offered prompt tokens), 0.587× the point ceiling.
 
 At most `server.local_max_concurrent_prefills` prefills now run at once:
 
@@ -2575,7 +2812,8 @@ Each row's **Outcome** column says what a pinned `local-preferred` request does
 with that exit: `refusing` rows end in the retryable `429` deferral, while
 `promoting` rows leave the local chain and are served remotely. The promoting
 set is exactly `admission_reserve.CAPACITY_TOO_LARGE_REASONS` —
-`prefill_budget_exceeded` and `context_too_large` (the latter also carrying the
+`prefill_budget_exceeded`, `prefill_eta_exceeds_capacity` and
+`context_too_large` (the latter also carrying the
 per-entry `max_context_tokens` ceiling, which composes into the same skip);
 every other row is a temporal (deferrable) exit and therefore refuses.
 
@@ -2585,7 +2823,8 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
 | Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
 | Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`): the prompt outgrows the local serving envelope | `prefill_budget_exceeded` | promoting | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
-| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` — **only** when the free-slot ETA/budget bound is itself the cause; a deadline, deadline-relative safety-budget or flat cold-prefill refusal keeps its own governing token (`prefill_eta_exceeds_deadline` / `prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded`), so the direct path never relabels a non-ETA bound (`prefill_budget_exceeded` is a `too_large` verdict there: the pin declines and a remote tier serves the request — see [Promoted](#promoted-a-too-large-request-leaves-the-local-chain)) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`remote-ok` / absent header — the immediate-step default) |
+| Admission guard, queue path — deadline token capacity (`local_prefill_deadline_seconds * 1000 / cold_ms_per_token`): the request's cold whole-prompt projection (residency unmeasured) or measured new tokens (measured residency) cannot finish inside the deadline, so waiting cannot help | `prefill_eta_exceeds_capacity` | promoting | `local_admission_guard ... reason=prefill_eta_exceeds_capacity ... deadline_capacity_tokens=<n> capacity_basis=cold\|measured capacity_priced_tokens=<n> ...` |
+| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` — **only** when the free-slot ETA/budget bound is itself the cause; a deadline, deadline-relative safety-budget, flat cold-prefill or deadline-capacity refusal keeps its own governing token (`prefill_eta_exceeds_deadline` / `prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded` / `prefill_eta_exceeds_capacity`), so the direct path never relabels a non-ETA bound (`prefill_budget_exceeded` and `prefill_eta_exceeds_capacity` are `too_large` verdicts there: the pin declines and a remote tier serves the request — see [Promoted](#promoted-a-too-large-request-leaves-the-local-chain)) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`remote-ok` / absent header — the immediate-step default) |
 | Local entry in cooldown (chain resolution) | `local_provider_cooldown` | refusing | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
 | Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap — the prompt can never fit local, however long it waits | `context_too_large` | promoting | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
@@ -2855,7 +3094,8 @@ and header a client must honour:
   compaction half (resend at `budget_tokens` or less) as the actionable remedy.
 - `verdict` — `deferrable` when the block is temporal (waiting can help) or
   `too_large` when the request itself exceeds the local serving envelope
-  (`prefill_budget_exceeded` / `context_too_large`). Additive: every other
+  (`prefill_budget_exceeded` / `prefill_eta_exceeds_capacity` /
+  `context_too_large`). Additive: every other
   field/header keeps its value. It is computed exactly once by
   `admission_reserve.local_capacity_verdict` in the pin-local refusal builder,
   which is the only verdict computation in `provider.py`
@@ -2909,6 +3149,7 @@ and header a client must honour:
 | Reason | `Retry-After` | `retryable` | `retry_at` | Client action |
 |---|---|---|---|---|
 | `prefill_budget_exceeded` | absent | `false` | absent | compact the prompt |
+| `prefill_eta_exceeds_capacity` | absent | `false` | absent | compact the prompt |
 | `context_too_large` | absent | `false` | absent | compact the prompt |
 | `eta_exceeds_budget` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
 | `eta_exceeds_budget_direct` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
@@ -2919,9 +3160,10 @@ and header a client must honour:
 
 **The dispatch path never changes the reason.** `eta_exceeds_budget_direct` is
 the free-slot *label* of the ETA/budget bound **only**: a deadline,
-deadline-relative safety-budget or flat cold-prefill refusal keeps its
-governing reason (`prefill_eta_exceeds_deadline` /
-`prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded`) on **both**
+deadline-relative safety-budget, flat cold-prefill or deadline-capacity refusal
+keeps its governing reason (`prefill_eta_exceeds_deadline` /
+`prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded` /
+`prefill_eta_exceeds_capacity`) on **both**
 the queue and the free-slot path, so the row above applies to it unchanged
 wherever it fires. Relabelling a non-ETA bound as the ETA/budget reason would
 advertise a timer for a prompt that waiting cannot heal — the 2026-10-25
@@ -3007,6 +3249,78 @@ choice — a client that wants the proxy to wait opts in with `local-preferred`.
 (`reserved_outstanding`, `reserved_issued`, `reserved_used`,
 `reserved_cancelled`, `reserved_expired`) — `issued − used − cancelled −
 expired` is the reserved-but-unused signal for ticket hoarding.
+
+## Cross-host audit admission budget (LP-0MW95FYMH006XYNK)
+
+Audits run against the **one local `llama-server` GPU that every host and
+project shares**, and per-host guards cannot serialise them: with two agent
+hosts and four projects, the per-host one-audit-per-host guards permitted
+five audits plus a plan run to overlap on the single GPU (2026-11-03
+08:30–09:10: 592,452 prompt tokens / 4,345 decoded tokens across 30 streams
+in 40 minutes). The proxy is the one component every host talks to, so it
+owns the audit cap and the live lease registry (`proxy/proxy/audit_budget.py`):
+the ContextHub per-host `budget.json` (`maxAudit`) is **no longer
+authoritative** for audit admission.
+
+### The gate: a long-TTL audit-tier lease
+
+The proxy issues **audit-tier leases** — long-TTL (default 1 h), renewable,
+releasable — keyed by audit session (`X-Session-Id` prefix `audit-`). At most
+`audit_admission.max_audits` (default 1) leases are live at once, so a second
+**different** audit session is refused with a stable token and waits instead
+of competing:
+
+```
+GET /llama/local/audit/availability
+  -> {cap: 1, live: 0, available: 1, leases: []}
+  -> {cap: 1, live: 1, available: 0,
+     leases: [{session_id, client_ip, acquired_at, expires_at, expires_in_s}]}
+
+POST /llama/local/audit/lease  {"session_id": "audit-...", "cap": 1}
+  -> 200 {admit: true, lease_id, cap, live, available, ttl_s, expires_at, ...}
+  -> 429 {admit: false, reason: "audit-budget-saturated", cap, live,
+         available: 0, retry_after_s: <bounded>}
+
+POST   /llama/local/audit/lease/renew   {"session_id": "audit-..."}
+  -> 200 {renewed: true, lease_id, live, cap, expires_at, ...}
+       # no live lease -> 200 {renewed: false} (next acquire starts fresh)
+
+DELETE /llama/local/audit/lease/<session_id>
+  -> 200 {released: true, live}   |   200 {released: false} (no-op)
+```
+
+- **Single mutation path.** Acquire/renew/release are the only ways to change
+the live lease set; a refused acquire performs no partial state change.
+- **Idempotent re-acquire.** The same session re-acquiring (or renewing) its
+own lease is a renew — never a self-refusal. A lease older than its TTL is
+reclaimed (`audit_lease_reclaimed reason=expired`), so a crashed holder can
+never wedge the budget.
+- **Proxy clock only.** Expiry comparisons use the proxy's monotonic clock, so
+a skewed client host cannot hold a stale lease.
+- **Client cap clamped.** A client may send a requested `cap`; it is clamped
+to the proxy's configured `audit_admission.max_audits` (never honoured above
+it, never a capacity grant the proxy does not own).
+- **Fail-safe.** An internal registry failure returns the stable token
+`audit-budget-unavailable` with a bounded `retry_after_s`; the availability
+read reports `error: registry_unavailable` instead of asserting capacity. The
+audit skill's documented fallback is a bounded wait then legacy per-host
+behaviour — a proxy error never blocks every audit indefinitely.
+- **Kill switch.** `audit_admission.max_audits: 0` disables audit admission
+entirely (mirrors the ContextHub `maxAudit: 0` kill switch).
+
+### Dispatcher integration (parent AC3)
+
+The herdr dispatcher's capacity decision consumes this **lease-derived
+availability signal** (`GET /llama/local/audit/availability`) instead of raw
+version counts or a per-host `budget.json` assertion, so dispatcher admission
+and proxy refusal can never disagree — even when ContextHub runs on several
+servers. `budget.json` is read for a startup migration warning only
+(`conflicting client-side cap`), never for admission.
+
+`/llama/local/status` publishes the audit-budget counters
+(`audit_leases_live`, `audit_leases_issued`, `audit_leases_reclaimed`,
+`audit_leases_released`, `audit_refused_saturated`,
+`audit_refused_unavailable`).
 
 ## Stream Error Handling (recovery-first + informative-error fallback)
 
@@ -3244,6 +3558,64 @@ no code change): `local_prefill_deadline_seconds: 90`,
 `local_admission_guard_eta_percentile_min_tokens: 32768` (the old floor),
 `local_admission_guard_budget_safety_fraction: 0.0` (bound disabled) and
 `local_admission_guard_reference_tokens: 32000`.
+
+#### Deadline token capacity (LP-0MW957RB3000ER79)
+
+The prefill deadline is also expressed as an explicit number of **cold
+tokens**, derived from the same cold calibration the admission guard prices
+cold large prompts with:
+
+    deadline_capacity_tokens =
+        local_prefill_deadline_seconds * 1000 / cold_ms_per_token
+
+`cold_ms_per_token` is the cold MEASURED window's fitted rate after the
+conservatism factor (and the p75 uplift, when engaged), so the capacity is the
+token form of the same price the guard enforces — the published number and the
+priced ETA cannot drift. It is published on `/llama/local/status`
+(`deadline_capacity_tokens`, `deadline_capacity_calibrated`,
+`deadline_capacity_cold_ms_per_token`) and on every `local_admission_guard`
+decision line (`deadline_capacity_tokens=`, `capacity_basis=`,
+`cold_ms_per_token=`, `capacity_priced_tokens=`).
+
+**Cold basis, measured residency honoured.** The capacity is compared against
+the **whole prompt priced cold** when residency is unmeasured (a
+predicted/credited warm ratio is not evidence) and against the **measured new
+tokens** when a measured prefill record exists (`prompt_progress` capture or a
+cached ratio recorded from a previous local response's usage data). A
+measured-warm large prompt is therefore *not* refused for its prompt size — the
+warm-prompt guardrail. The bound is a **request-property** refusal: the request
+itself is too large to finish inside the deadline, so it is classified
+`too_large`, detours to the next provider, and is never advertised with a
+`Retry-After`.
+
+**Enforcement.** It lives in the shared `prefill_eta.evaluate_admission`, so it
+applies on every admission path the flat cold-prefill cap guards — queue entry,
+direct/free-slot dispatch, idle/economic bypass — and on the capacity-gate path
+(the capacity gate's admitted request still reaches the dispatch guard). When
+the capacity is exceeded the refusal reason is `prefill_eta_exceeds_capacity`.
+
+**Interaction with the flat cap (AC5).** `local_cold_prefill_budget_tokens`
+(shipped **25 000**) is the *tighter* bound for an ordinary cold prompt: a
+request over 25 000 **new** tokens is refused as `prefill_budget_exceeded`
+first. The capacity governs (a) whole-prompt cold pricing when residency is
+unmeasured — where the flat cap sees only the predicted new tokens — and (b)
+any deployment that raises or disables the flat cap (`0`). Both derive from the
+same deadline and both detour to remote, so they never contradict each other.
+
+**Rollback** (values only, no code change): the guard policy is the single
+switch —
+
+- `local_admission_guard_policy: observe` — log the would-be capacity refusal
+  (`enforced=false`) but never refuse;
+- `local_admission_guard_policy: off` — do not evaluate the guard at all (the
+  capacity is inert; tested);
+- `local_admission_guard_eta_percentile: 0` — derive the capacity from the cold
+  point estimate instead of the p75 uplift (tested);
+- `local_prefill_deadline_seconds: 0` — no deadline, therefore no capacity.
+
+An uncalibrated cold window never manufactures a refusal either: the published
+number is informational (`deadline_capacity_calibrated=false`) and the bound is
+not enforced.
 
 Note: the existing `stream_heartbeat_interval_seconds` (default 10 s) emits
 `data: {"type":"heartbeat",…}` frames during prefill **after** the upstream
@@ -3517,6 +3889,21 @@ the paths that actually produce the releases, not on the deadline path alone:
 - **The stop is bounded.** `cancel → stop processing` p90 **6.585 s**, exactly
   one `--ubatch-size 1024` at the window's measured **155.51 tok/s**. The
   recorded bound is **6.6 s**.
+
+The measured rate (`seconds_basis_tok_s`) is **Qwen3-only**. The analyser
+attributes every `prompt eval time = … tokens per second` line to a model port
+from the router spawn line (`name=Qwen3 on port <n>` /
+`name=mxbai-embed on port <m>`), falling back to a single otherwise-unannounced
+port when the spawn line was rotated away; if the port cannot be resolved the
+basis is `null` with a reason, never a median over mixed models. The rule
+mirrors `.pi/skills/proxy-usage-analysis/scripts/llama_log_parser.py`. It
+exists because a glob that carries both servers mixes the embeddings child's
+~100 tok/s lines with Qwen3's ~250 tok/s — a polluted `128.4 tok/s` was
+recorded (`LP-0MW7V2D13004ZO65`) and mis-prices the cancel bound
+(`LP-0MW957SKX0079QKC`). The report's `seconds_basis` block publishes the rate,
+the Qwen3 and excluded ports, the contributing/excluded line counts and, when
+the rate is `null`, the reason; single-server (Qwen3-only) windows keep the
+previously published value.
 
 The 2026-10-28 sampler (**42 of 82** `Connection handling canceled` events,
 never reaching `prompt processing done`) is retained here as history: it was
@@ -4158,3 +4545,174 @@ Adding an always-on remote provider to cover the scheduled gaps was
 windows some requests *must* be deferred; this response makes that deferral
 honest and actionable rather than appearing as a failure. Do not re-time a
 provider's `available_times` to hide a gap either — the gap is the design.
+
+## Per-prompt-fingerprint backoff for deterministic local 400s (LP-0MW95BCVV004LO0K)
+
+A local 400 is a request-shape incompatibility, so it falls back to the next
+provider *without* cooling the local entry down. That is right for a one-off,
+but wrong for a history llama-server rejects every time (the compacted-pointer
+shape from LP-0MTXEBQ4E001BMI2): the client re-sends a byte-identical
+conversation, gets the same 400, and the proxy routes remote again — forever,
+with no state that says "this exact history is provably rejected".
+
+`proxy/fingerprint_backoff.py` supplies the missing identity and throttle:
+
+- **Fingerprint.** `compute_prompt_fingerprint(messages)` is a SHA-256 hash
+  chain over the canonical message array with the per-send fields
+  (`timestamp`, `request_id`, `id`) stripped at every depth, so a resend of
+  the same history fingerprints identically across processes and sessions.
+- **Backoff keyed by the fingerprint, not the session.** Two sessions looping
+  on the same bad conversation share one verdict
+  (`{fingerprint, session_id, retry_after, resend_count}`); the ladder is
+  1 min → 5 min → 15 min, capped at 15 min.
+- **Reset rules.** A successful **local** stream clears the verdict for the
+  history it served; a session that sends a *different* history drops its
+  previous verdict and starts at the bottom of the ladder. A remote success
+  deliberately does **not** reset: the wedged loop is local 400 → remote
+  success → local 400, so counting the remote success as recovery would stop
+  the ladder advancing.
+- **Hot path.** The fingerprint is cached per session as a hash chain: a
+  byte-identical resend hashes nothing, an appended turn hashes only the new
+  messages, and a rewritten history (compaction) is re-hashed from scratch.
+- **In-memory and bounded.** Both the verdict table and the session cache are
+  capped and pruned, like the sibling cooldown and streak state. A proxy
+  restart loses them — acceptable, because a restart also loses the wedged
+  client's in-flight request.
+
+Wiring in `provider.py`:
+
+- `_observe_local_http_error_400` records the verdict on every local 400 and
+  **extends** the pre-existing `_local_http_400_streaks` entry with
+  `fingerprint`, `backoff_resend_count`, `backoff_retry_after` and
+  `backoff_until` (the per-(session, provider) streak semantics are unchanged,
+  LP-0MTXEBQ4E001BMI2). The deterministic-repeat WARNING carries the
+  fingerprint prefix, the resend count and the current `retry_after`.
+- `_reset_local_http_400_streak` clears the verdict on the same two local
+  success paths that reset the streak.
+- `fingerprint_backoff_state(session_id, body_json)` is the read side the
+  typed-error layer (LP-0MW95BDJQ002DSVI) and the terminal breaker
+  (LP-0MW95BE7X00574OL) consume: it reports `{fingerprint, entry, expired,
+  remaining_seconds}` (or `None` when the request carries no history), and it
+  reports an expired entry too, because the resend that follows continues the
+  ladder rather than restarting it.
+
+Bodies without a `messages` array record no verdict: there is no conversation
+to fingerprint.
+
+## Typed deterministic client error before fallback (LP-0MW95BDJQ002DSVI)
+
+Backoff alone still leaves the wedged session waiting on a remote fallback for
+a request the local model rejects *every* time. The typed error closes that
+loop: when the same history is provably rejected (see the section above), the
+local-400 path answers the client directly instead of routing on.
+
+**When it fires.** Both halves of the evidence are required, and the pair is
+what keeps the error honest:
+
+- the per-`(session, provider)` streak has reached
+  `_DETERMINISTIC_LOCAL_400_THRESHOLD` — these are not one-off 400s, and
+- the per-prompt-fingerprint entry's `resend_count` has reached the same
+  threshold — *this history* was already rejected. The streak alone is not
+  enough: a session can repeat 400s with a changed history (a compaction
+  rewrite, a new user turn), and calling that `identical_history` would be a
+  lie, so the fresh fingerprint's count of 1 filters it out.
+
+A body without a `messages` array has no fingerprint and therefore never
+produces the typed error.
+
+**What the client gets.** HTTP `400` with
+
+```json
+{
+  "error": "deterministic_client_error",
+  "reason": "identical_history",
+  "retry_after": 300,
+  "body_snippet": "<first 512 chars of the llama-server rejection>"
+}
+```
+
+plus a `Retry-After` header carrying the same seconds, `X-Provider` naming the
+local provider that rejected it, and
+`X-Deterministic-Client-Error: identical_history` so a client can branch
+without parsing the body. `retry_after` is the fingerprint ladder's remaining
+window (or its next rung when the window has just expired), so the header, the
+body and the enforced backoff always agree. The error also increments
+`proxy_http_errors_total{status="400", reason="deterministic_client_error"}`
+as a distinct reason from `local_http_400` and `local_http_400_deterministic`.
+
+**Why before fallback matters.** The response is returned from the local-4xx
+branch *before* the `continue` that would move to the next provider, so:
+
+- no remote dispatch happens (a remote cannot fix a request-shape rejection
+  that is deterministic for this history; routing remote only spends quota),
+- no `chain_hold_cycle` is consumed — the request never reaches the
+  `ChainExhaustedError` path the hold wrapper reacts to, so a wedged session
+  cannot hold the chain and starve audit or other sessions (the 2026-11-03
+  incident shape), and
+- the local provider is still not cooled down: the next request — with a
+  compacted or otherwise changed history — dispatches local normally.
+
+**Single 400s are unchanged.** A first local 400 still logs the body snippet,
+increments `local_http_400` and falls back to the next provider exactly as
+before. Only a repeat of a history already known to be rejected is answered
+with the typed error.
+
+## Terminal breaker: `session_wedged` (LP-0MW95BE7X00574OL)
+
+The typed error tells a client its history is provably rejected; a client that
+ignores it and keeps resending the *same* bytes has no path left, so the proxy
+stops answering with a retryable verdict and says the session is wedged
+(parent AC3).
+
+**When it fires.** The terminal error is checked on the same evidence as the
+typed error (it is reached from `_build_typed_400_response`, before the typed
+response is built) and needs one thing more: the history's shared
+`resend_count` must reach
+`deterministic_client_error_escalation_threshold` — default `5`, read at the
+top level of the proxy config or inside its `server` section, exactly like the
+other proxy knobs. A non-positive, non-integer or boolean value falls back to
+the default, so a mistyped knob can neither disable the breaker nor convict a
+fresh session. Because the typed evidence is a prerequisite, even a threshold
+of `1` never convicts a lone 400.
+
+**What the client gets.** HTTP `400` with
+
+```json
+{
+  "error": "session_wedged",
+  "cause": "repeated_deterministic_400",
+  "hint": "compaction may help",
+  "retry_after": 900,
+  "resend_count": 5
+}
+```
+
+plus a `Retry-After` header carrying the same seconds, `X-Provider` naming the
+local provider, and — so a client can tell the two errors apart **without
+parsing the body** (parent AC5) —
+`X-Session-Wedged: repeated_deterministic_400` alongside
+`X-Deterministic-Client-Error: session_wedged` (the typed error's value there
+is `identical_history`). It also increments
+`proxy_http_errors_total{status="400", reason="session_wedged"}`, distinct
+from `local_http_400`, `local_http_400_deterministic` and
+`deterministic_client_error`.
+
+**How long it asks the client to wait.** `retry_after` is the ladder's
+remaining window, floored at `SESSION_WEDGED_MIN_RETRY_AFTER_SECONDS` (60 s)
+and capped by the ladder's 15-minute ceiling (900 s): a wedged session must
+not be told to retry immediately, and the number always agrees between the
+header and the body.
+
+**What resets it.** Exactly the events that end the loop: a successful **local**
+stream (which also clears the backoff) and a **different** history (compaction,
+truncation, a new conversation). The counter is shared by fingerprint across
+sessions — two workers resending the same bad history trip one breaker — and
+is in-memory only, so a proxy restart clears it along with the backoff state.
+Until it fires, resends keep receiving the typed `deterministic_client_error`,
+and the request still never reaches the fallback chain or a chain-hold cycle.
+
+**Wiring.** `provider._build_session_wedged_response` builds the terminal
+response from `fingerprint_backoff.session_wedged_error`; the threshold and
+key live in `proxy/fingerprint_backoff.py`
+(`DETERMINISTIC_CLIENT_ERROR_ESCALATION_THRESHOLD`,
+`ESCALATION_THRESHOLD_CONFIG_KEY`).
