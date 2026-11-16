@@ -2651,6 +2651,94 @@ def _wc_share(value: float) -> str:
     return f"{value * 100.0:.0f}%"
 
 
+def _wc_stall_rate(value: float | None, digits: int = 1) -> str:
+    """A stall-weighted rate, always in ``s/h`` (never bare ``/h``)."""
+    return "unknown" if value is None else f"{value:.{digits}f} s/h"
+
+
+def _wc_seconds(value: float | None, digits: int = 1) -> str:
+    return "unknown" if value is None else f"{value:.{digits}f} s"
+
+
+def _append_stall_cost_detail(ap, stall: wasted_compute.StallCost | None) -> None:
+    """Append the per-reason stall-cost table to the wasted-compute section.
+
+    LP-0MW7V30AZ007JB5Z AC1/AC2: the event counts either side of it are the
+    same events, priced in seconds of user waiting. One row per reason with the
+    stall-weighted rate, the p50/p90/p95/p99 stall and the share of events that
+    were a sub-second detour rather than a wait.
+    """
+    if stall is None:
+        return
+    ap("")
+    ap("#### Stall cost (what the event rate cannot see)")
+    ap("")
+    ap(
+        "The rows above count events; these price them in **seconds a user "
+        "waited**. A `measured_cache_deficit` detour that aborts inside a "
+        "second and a `prefill_deadline` stall that burns the whole "
+        f"{stall.deadline_seconds:g} s backstop are +1 each to the rate and "
+        "orders of magnitude apart here — which is why making aborts faster "
+        "cannot move the rate but does move this table."
+    )
+    ap("")
+    ap(
+        "| Reason | Events (user / audit) | User stall | User s/h | p50 | p90 "
+        "| p95 | p99 | Under 1 s | Under 5 s | At/near deadline |"
+    )
+    ap("|---|---|---|---|---|---|---|---|---|---|---|")
+    for row in stall.rows:
+        pct = row.user_percentiles or {}
+        ap(
+            f"| `{row.reason}` | {row.events} ({row.user_events} / "
+            f"{row.audit_events}) | {_wc_seconds(row.user_stall_seconds)} | "
+            f"{_wc_stall_rate(row.user_stall_seconds_per_hour)} | "
+            f"{_wc_seconds(pct.get('p50'))} | {_wc_seconds(pct.get('p90'))} | "
+            f"{_wc_seconds(pct.get('p95'))} | {_wc_seconds(pct.get('p99'))} | "
+            f"{_wc_bucket_cell(row.user_buckets, 'under_1s')} | "
+            f"{_wc_bucket_cell(row.user_buckets, 'under_5s')} | "
+            f"{_wc_bucket_cell(row.user_buckets, 'at_or_near_deadline')} |"
+        )
+    ap("")
+    composite_pct = stall.composite_user_percentiles or {}
+    ap(
+        "**User-class composite** (the (b2) population, stall-weighted): "
+        f"{stall.composite_user_events} event(s), "
+        f"{_wc_seconds(stall.composite_user_stall_seconds)} of user waiting, "
+        f"**{_wc_stall_rate(stall.composite_user_stall_seconds_per_hour)}** — "
+        f"p50 {_wc_seconds(composite_pct.get('p50'))}, "
+        f"p90 {_wc_seconds(composite_pct.get('p90'))}, "
+        f"p95 {_wc_seconds(composite_pct.get('p95'))}, "
+        f"p99 {_wc_seconds(composite_pct.get('p99'))}; under 1 s "
+        f"{_wc_bucket_cell(stall.composite_user_buckets, 'under_1s')}, under "
+        f"5 s {_wc_bucket_cell(stall.composite_user_buckets, 'under_5s')}, "
+        "at/near the deadline "
+        f"{_wc_bucket_cell(stall.composite_user_buckets, 'at_or_near_deadline')}."
+    )
+    ap("")
+    ap(
+        "**Whole window** (every reason, user + audit): "
+        f"{stall.total_events} event(s), "
+        f"{_wc_seconds(stall.total_stall_seconds)} of waiting, "
+        f"{_wc_stall_rate(stall.stall_seconds_per_hour)}."
+    )
+
+
+def _wc_bucket_cell(buckets: dict | None, key: str) -> str:
+    """``n (share%)`` for one stall bucket, or ``—`` when it was not reported."""
+    if not buckets:
+        return "—"
+    bucket = buckets.get(key)
+    if not isinstance(bucket, dict):
+        return "—"
+    count = bucket.get("count")
+    if count is None:
+        return "—"
+    share = bucket.get("share")
+    return f"{count}" if share is None else f"{count} ({_wc_share(share)})"
+
+
+
 def _append_wasted_compute_summary(ap, wasted: wasted_compute.WastedCompute | None) -> None:
     """Append the ``## Wasted GPU compute (summary)`` table near the start.
 
@@ -2710,6 +2798,19 @@ def _append_wasted_compute_summary(ap, wasted: wasted_compute.WastedCompute | No
     )
     ap(f"| Restart-free window | {restart} | required | "
        f"{'PASS' if wasted.restart_free else 'FAIL'} |")
+    stall = wasted.stall_cost
+    if stall is not None:
+        # LP-0MW7V30AZ007JB5Z: the same population the row above scores, priced
+        # in seconds of user waiting instead of events. It sits beside the
+        # per-event rate on purpose — the two answer different questions and
+        # neither replaces the other.
+        ap(
+            "| User-class prefill **stall** (Σ elapsed s/h, `prefill_deadline` "
+            "+ `measured_cache_deficit`) | "
+            f"{_wc_stall_rate(stall.composite_user_stall_seconds_per_hour)} "
+            f"({stall.composite_user_stall_seconds:.0f} s over "
+            f"{stall.composite_user_events} events) | minimise | — |"
+        )
     ap(f"| **Overall** | | | **{_wc_verdict_label(wasted.verdict)}** |")
     if wasted.caveats:
         ap("")
@@ -2781,9 +2882,80 @@ def _append_wasted_compute_section(ap, wasted: wasted_compute.WastedCompute | No
         f"| Abandoned-prefill overlap (basis `{wasted.overlap_basis}`) | "
         f"{wasted.overlap_events} of {wasted.overlap_total} deadline events |"
     )
+    _append_stall_cost_detail(ap, wasted.stall_cost)
     if wasted.caveats:
         ap("")
         ap("Caveats: " + "; ".join(wasted.caveats) + ".")
+
+
+def _append_stall_cost_definition(ap, stall: wasted_compute.StallCost | None) -> None:
+    """State the non-equivalence of the two eviction reasons (AC3).
+
+    LP-0MW7V30AZ007JB5Z AC3: the definitions appendix must say explicitly that a
+    ``measured_cache_deficit`` abort and a ``prefill_deadline`` stall are not
+    equivalent, why (an early detour versus a full-deadline wait), and back it
+    with this window's measured p50/p90 rather than an assertion.
+    """
+    ap("**`measured_cache_deficit` and `prefill_deadline` are not equivalent.**")
+    ap("")
+    ap(
+        "The user-class composite rate counts the two reasons together so that a "
+        "*conversion* between them cannot be mistaken for the defect "
+        "disappearing. That protects the count, but it deliberately treats every "
+        "event as equally costly, and they are not:"
+    )
+    ap("")
+    ap(
+        "- A **`measured_cache_deficit`** release is the early detector "
+        "**working**: the measured prefill contradicted the warm-cache price, so "
+        "the dispatch was abandoned and detoured after a short wait. Making it "
+        "faster is an improvement, and it leaves the event rate unchanged."
+    )
+    ap(
+        "- A **`prefill_deadline`** release is the client **waiting the whole "
+        "backstop** (180 s by default) and then being detoured anyway. It is the "
+        "worst outcome for the user and the one the deadline exists to bound."
+    )
+    if stall is None:
+        ap("")
+        ap(
+            "_This window carries no stall-cost block, so the measured contrast "
+            "cannot be quoted. Re-run the analysis with the current analyser to "
+            "publish it._"
+        )
+        return
+    deficit = stall.deficit_row
+    deadline = stall.deadline_row
+    if deficit is None or deadline is None:
+        ap("")
+        ap(
+            "_This window has only one of the two reasons, so no measured "
+            "contrast between them can be quoted._"
+        )
+        return
+    deficit_pct = deficit.user_percentiles or {}
+    deadline_pct = deadline.user_percentiles or {}
+    ap("")
+    ap(
+        "Measured in this window (user traffic, `elapsed_s` to the release): "
+        f"`measured_cache_deficit` p50 {_wc_seconds(deficit_pct.get('p50'))} / "
+        f"p90 {_wc_seconds(deficit_pct.get('p90'))} over {deficit.user_events} "
+        f"event(s), {_wc_bucket_cell(deficit.user_buckets, 'under_1s')} of them "
+        "under 1 s, "
+        f"**{_wc_stall_rate(deficit.user_stall_seconds_per_hour)}** in total; "
+        f"`prefill_deadline` p50 {_wc_seconds(deadline_pct.get('p50'))} / "
+        f"p90 {_wc_seconds(deadline_pct.get('p90'))} over "
+        f"{deadline.user_events} event(s), "
+        f"**{_wc_stall_rate(deadline.user_stall_seconds_per_hour)}** in total "
+        f"against a {stall.deadline_seconds:g} s backstop. The event counts are "
+        "comparable; the waiting is not."
+    )
+    ap("")
+    ap(
+        "Read the per-event rate for **whether the defect is occurring** and the "
+        "stall-weighted rate for **what it costs**. A re-scope choosing between "
+        "an event-rate target and a stall-cost target needs both."
+    )
 
 
 def _append_wasted_compute_appendix(ap, wasted: wasted_compute.WastedCompute | None) -> None:
@@ -2837,6 +3009,25 @@ def _append_wasted_compute_appendix(ap, wasted: wasted_compute.WastedCompute | N
         "restart both re-prices capacity and drops prefills, so a window with "
         "one cannot certify anything |"
     )
+    ap(
+        "| Stall-weighted rate | `Σ elapsed_s / window_hours` over the same "
+        "events the per-event rate counts, split by reason and by user / "
+        "`audit` session. It prices **how long users waited**, where the "
+        "per-event rate prices **how many dispatches failed**. Both are "
+        "reported because neither alone answers the residual question |"
+    )
+    ap(
+        "| Stall percentiles | p50 / p90 / p95 / p99 of `elapsed_s` per reason "
+        "for user traffic: the shape of the wait, not just its total |"
+    )
+    ap(
+        "| Under 1 s / under 5 s / at-near deadline | the share of a reason's "
+        "events that ended within 1 s, within 5 s, or at (within 1 s of) the "
+        "prefill deadline. A reason whose events are mostly under 1 s is the "
+        "early detector *working*, not a stall |"
+    )
+    ap("")
+    _append_stall_cost_definition(ap, wasted.stall_cost)
     ap("")
     ap("**Measurement basis.** "
        f"`{wasted.overlap_basis}` ("

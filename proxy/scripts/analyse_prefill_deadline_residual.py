@@ -22,7 +22,13 @@ closure verdict needs:
   with the evidence columns the rules consumed (AC4), including whether another
   tenant held the pool, whether the backend reported *any* prefill progress in
   the dispatch window, and whether the dispatch started inside an
-  abandoned-prefill backlog window.
+  abandoned-prefill backlog window;
+- a **stall-weighted rate** (``Σ elapsed_s / window_hours``, split by reason and
+  by user/audit) beside the per-event rate, with stall percentiles and the
+  share of aborts that were sub-second (LP-0MW7V30AZ007JB5Z). A count of
+  events cannot price a defect: a 0.4 s ``measured_cache_deficit`` detour and a
+  180 s ``prefill_deadline`` stall are the same +1 to the (b2) event rate and
+  wildly different to the user.
 
 Profile of the evidence, and why it is proxy-log-only
 -----------------------------------------------------
@@ -67,6 +73,13 @@ Usage::
 
     python3 proxy/scripts/analyse_prefill_deadline_residual.py \\
         --start "2026-10-29 14:08:10" --end "2026-10-30 14:08:10" --json
+
+    # stall-weighted cost: 180 s is the shipped backstop (AC2's ``>= deadline
+    # - 1 s`` bucket); pass --deadline-seconds if the deployed
+    # local_prefill_deadline_seconds differs (the analyser is log-only and
+    # never reads proxy config)
+    python3 proxy/scripts/analyse_prefill_deadline_residual.py \\
+        --start ... --end ... --deadline-seconds 180 --json
 
     # release→cancel accounting + corrected window model: point at the
     # llama-server log(s) covering exactly the same window (comma-separated
@@ -205,6 +218,46 @@ LLAMA_COVERAGE_NOTE = (
     "llama-server lines carry no wall-clock timestamp, so releases are joined "
     "to backend task segments in log order (a proxy line's explicit "
     "llama_task_id/slot_id takes precedence when present)."
+)
+
+#: The proxy's prefill-deadline backstop (``local_prefill_deadline_seconds`` in
+#: ``proxy/config.yaml``), used **only** to define the ``>= deadline - 1 s``
+#: stall bucket. This analyser is deliberately log-only — it never reads proxy
+#: configuration — so the value is an explicit, overridable argument
+#: (``--deadline-seconds``) and every payload names the threshold it used
+#: instead of silently inheriting a constant that a config change invalidated
+#: (the 2026-10-31 widening 120 s → 180 s is exactly such a change).
+DEFAULT_PREFILL_DEADLINE_S = 180.0
+
+#: Slack under the deadline that still counts as "the client waited the whole
+#: deadline" (AC2's ``>= deadline - 1 s`` bucket).
+NEAR_DEADLINE_SLACK_S = 1.0
+
+#: An abort faster than this is a *detour*, not a stall (AC2 ``< 1 s``).
+SUB_SECOND_STALL_S = 1.0
+
+#: A stall shorter than this is still materially different from a deadline wait
+#: (AC2 ``< 5 s``); the boundary exists so the report can name the fast class.
+SHORT_STALL_S = 5.0
+
+#: Percentiles published per reason and per session class (AC2).
+STALL_PERCENTILES = (50, 90, 95, 99)
+
+#: The eviction fields the stall cost reads. Every one already exists on
+#: :class:`EvictionEvent` and is already emitted on the
+#: ``local_eviction_after_acceptance`` line, so this surface adds no log field
+#: and cannot change proxy behaviour (AC6, asserted by a test).
+STALL_SOURCE_FIELDS = ("reason", "session", "elapsed_s")
+
+STALL_COST_NOTE = (
+    "Stall-weighted cost of the evictions in this window: Σ elapsed_s over the "
+    "window hours, split by reason and by session class, with per-reason stall "
+    "percentiles and the counts of aborts under 1 s, under 5 s and within "
+    f"{NEAR_DEADLINE_SLACK_S:g} s of the deadline. A "
+    "measured_cache_deficit detour is the early detector working; a "
+    "prefill_deadline stall is the client waiting the whole deadline. The two "
+    "are counted equally by an event rate and are not equivalent in cost, so "
+    "read this block beside the per-event rate rather than instead of it."
 )
 
 ATTRIBUTION_OCCUPANCY = "occupancy"
@@ -675,6 +728,123 @@ def _group_by(items, key) -> dict:
     for item in items:
         grouped[key(item)].append(item)
     return dict(grouped)
+
+
+def _share(part: int, total: int) -> float:
+    """A count's share of a total (0.0 for an empty population)."""
+    return round((part / total), 4) if total else 0.0
+
+
+def _elapsed_buckets(events, deadline_seconds: float) -> dict:
+    """The three stall buckets AC2 asks for, over one event population.
+
+    ``under_1s`` is the fast-detour class (``measured_cache_deficit`` does its
+    job here), ``under_5s`` widens it slightly, and ``at_or_near_deadline``
+    counts the clients that waited the whole backstop. Shares are of the
+    population passed in, so a reason with two events and one sub-second abort
+    reports 0.5 rather than diluting it against the whole window.
+    """
+    threshold = round(deadline_seconds - NEAR_DEADLINE_SLACK_S, 3)
+    total = len(events)
+    sub_second = sum(1 for e in events if e.elapsed_s < SUB_SECOND_STALL_S)
+    short = sum(1 for e in events if e.elapsed_s < SHORT_STALL_S)
+    near = sum(1 for e in events if e.elapsed_s >= threshold)
+    return {
+        "under_1s": {"count": sub_second, "share": _share(sub_second, total)},
+        "under_5s": {"count": short, "share": _share(short, total)},
+        "at_or_near_deadline": {
+            "count": near,
+            "share": _share(near, total),
+            "threshold_s": threshold,
+        },
+    }
+
+
+def _stall_row(events, hours: float, deadline_seconds: float, *, keep_values: bool) -> dict:
+    """One aggregate stall row: events, Σ seconds, the per-hour rate, shape.
+
+    ``keep_values`` adds the raw per-event ``elapsed_s`` list. Only the
+    per-reason-per-class rows keep it: the report layer composes the (b2)
+    composite (``prefill_deadline`` + ``measured_cache_deficit``) from those
+    two lists, which keeps the composite's definition in one place instead of
+    duplicating it here.
+    """
+    stalls = [float(event.elapsed_s) for event in events]
+    total_seconds = round(sum(stalls), 3)
+    row = {
+        "events": len(events),
+        "stall_seconds": total_seconds,
+        "stall_seconds_per_hour": (
+            round(total_seconds / hours, 3) if hours else 0.0
+        ),
+        "percentiles": _percentiles(stalls, STALL_PERCENTILES),
+        "buckets": _elapsed_buckets(events, deadline_seconds),
+    }
+    if keep_values:
+        row["values"] = [round(value, 3) for value in stalls]
+    return row
+
+
+def stall_cost(
+    evictions,
+    hours: float,
+    deadline_seconds: float = DEFAULT_PREFILL_DEADLINE_S,
+) -> dict:
+    """The stall-weighted cost of a window's post-acceptance evictions (AC1/AC2).
+
+    Publishes ``stall_seconds_per_hour = Σ elapsed_s / hours`` for the window,
+    for each reason and for each reason x session class, beside the existing
+    per-event rate (which stays in ``evictions.per_hour`` and ``reason_split``
+    unchanged). This is the figure that can reward making aborts faster: two
+    ``measured_cache_deficit`` aborts totalling 0.8 s and one
+    ``prefill_deadline`` stall totalling 180 s are 1 and 1 to the event rate
+    and 0.8 s/h and 180 s/h here.
+
+    Derived only from :data:`STALL_SOURCE_FIELDS`, every one of which the
+    ``local_eviction_after_acceptance`` line already carries, so nothing about
+    the proxy's emission changes (AC6).
+    """
+    deadline_seconds = float(deadline_seconds)
+    by_reason: dict[str, dict] = {}
+    for reason, group in sorted(_group_by(evictions, lambda e: e.reason).items()):
+        row = _stall_row(group, hours, deadline_seconds, keep_values=False)
+        row["by_session_class"] = {
+            cls: _stall_row(
+                [event for event in group if session_class(event.session) == cls],
+                hours,
+                deadline_seconds,
+                keep_values=True,
+            )
+            for cls in ("user", "audit")
+        }
+        by_reason[str(reason)] = row
+
+    # Any new eviction reason must reach the payload without a code change: the
+    # session-class buckets are built from the classifier, not from a reason
+    # allowlist.
+    total = _stall_row(evictions, hours, deadline_seconds, keep_values=False)
+    total["by_session_class"] = {
+        cls: _stall_row(
+            [event for event in evictions if session_class(event.session) == cls],
+            hours,
+            deadline_seconds,
+            keep_values=False,
+        )
+        for cls in ("user", "audit")
+    }
+    return {
+        "hours": round(hours, 3),
+        "deadline_seconds": deadline_seconds,
+        "buckets": {
+            "sub_second_s": SUB_SECOND_STALL_S,
+            "short_stall_s": SHORT_STALL_S,
+            "near_deadline_slack_s": NEAR_DEADLINE_SLACK_S,
+        },
+        "source_fields": list(STALL_SOURCE_FIELDS),
+        "total": total,
+        "by_reason": by_reason,
+        "note": STALL_COST_NOTE,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1694,6 +1864,7 @@ def build_report(
     *,
     log_dir: str | None = None,
     llama_log: str | None = None,
+    deadline_seconds: float = DEFAULT_PREFILL_DEADLINE_S,
 ) -> dict:
     hours = max((end - start).total_seconds() / 3600.0, 0.0)
     llama, llama_spec = _load_llama_lifecycle(llama_log)
@@ -1736,6 +1907,13 @@ def build_report(
             "per_hour": round(len(log.evictions) / hours, 3) if hours else None,
         },
         "reason_split": reason_split(log.evictions, hours),
+        # AC1/AC2 (LP-0MW7V30AZ007JB5Z): the stall-weighted rate and stall
+        # shape beside the per-event rate above. ``deadline_seconds`` is echoed
+        # so the ``>= deadline - 1 s`` bucket is always relative to a stated
+        # threshold rather than an assumed one.
+        "stall_cost": stall_cost(
+            log.evictions, hours, deadline_seconds=deadline_seconds
+        ),
         "distributions": {
             "prefill_deadline": distributions(deadline_events),
         },
@@ -1821,6 +1999,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output", help="write the JSON report here instead of stdout")
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=DEFAULT_PREFILL_DEADLINE_S,
+        help=(
+            "prefill-deadline backstop in seconds, used only to define the "
+            "'at or near deadline' stall bucket (default: %(default)s, the "
+            "shipped local_prefill_deadline_seconds); log-only analysis cannot "
+            "read proxy config, so pass the deployed value if it differs"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="emit the JSON dataset (default: a short text summary)")
     return parser.parse_args(argv)
 
@@ -1841,7 +2030,14 @@ def main(argv: list[str] | None = None) -> int:
     log.files_read = len(paths) - len(failures)
     for failed in failures:
         print(f"warning: unreadable log file skipped: {failed}", file=sys.stderr)
-    report = build_report(log, start, end, log_dir=args.log_dir, llama_log=args.llama_log)
+    report = build_report(
+        log,
+        start,
+        end,
+        log_dir=args.log_dir,
+        llama_log=args.llama_log,
+        deadline_seconds=args.deadline_seconds,
+    )
     if failures:
         report["source"]["unreadable_files"] = failures
     payload = json.dumps(report, indent=2, sort_keys=True)
@@ -1871,6 +2067,30 @@ def _text_summary(report: dict) -> str:
             f"(user {split['user']} / audit {split['audit']}) — "
             f"user {split['user_per_hour']}/h, audit {split['audit_per_hour']}/h"
         )
+    cost = report.get("stall_cost")
+    if cost:
+        total = cost["total"]
+        lines.append(
+            f"Stall cost: {total['stall_seconds']} s over {cost['hours']} h = "
+            f"{total['stall_seconds_per_hour']:.1f} s/h "
+            f"({total['events']} events; an event rate counts a 0.4 s detour and "
+            "a full-deadline stall equally, this does not)"
+        )
+        for reason, row in sorted(
+            cost["by_reason"].items(),
+            key=lambda item: -item[1]["stall_seconds"],
+        ):
+            user = row["by_session_class"]["user"]
+            pct = user["percentiles"]
+            lines.append(
+                f"  {reason}: user {user['stall_seconds']} s "
+                f"({user['stall_seconds_per_hour']:.1f} s/h) over "
+                f"{user['events']} event(s); p50={pct['p50']} p90={pct['p90']} "
+                f"p95={pct['p95']} p99={pct['p99']} s; "
+                f"{user['buckets']['under_1s']['count']} under 1 s, "
+                f"{user['buckets']['at_or_near_deadline']['count']} at/near the "
+                f"{cost['deadline_seconds']:g} s deadline"
+            )
     basis = report.get("seconds_basis")
     if basis is not None:
         if basis["tok_s"] is None:
