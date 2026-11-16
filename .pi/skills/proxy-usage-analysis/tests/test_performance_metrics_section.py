@@ -470,3 +470,82 @@ class TestToleranceColumn:
         assert outside_cells[RESULT] == "Unmet", (
             "33.3 % is outside the 30.0 % target's ±10 % band"
         )
+
+
+# ---------------------------------------------------------------------------
+# Strict Fallback-rate scorecard row (LP-0MWJOUTOV000G701)
+# ---------------------------------------------------------------------------
+#
+# The producer approved a strict verdict for the lower-is-better Fallback-rate
+# metric only: `Met` if and only if the window's actual is at or below the
+# target (`actual <= target`), no +tolerance band above the target (parent
+# LP-0MWEOGIUK006B1DD Q1 answer (a)). The strictness is what the scorecard
+# derives through the per-metric tolerance machinery — the committed defaults'
+# ``tolerance_pct`` read by ``performance_metrics.tolerance_for`` — so this
+# row's Result changes band for ``fallback_rate`` while every other row keeps
+# its band.
+#
+# These pin the rendered side of the rule; the engine boundary and the `--json`
+# parity are pinned in ``test_performance_metrics.py`` and
+# ``test_performance_metrics_report.py``.
+
+PENDING_STRICT_FALLBACK_VERDICT = (
+    "pending LP-0MWJOUY4E002FNHP (strict Fallback-rate verdict: committed "
+    "defaults narrow fallback_rate.tolerance_pct so only actual <= target "
+    "reads Met)"
+)
+
+
+class TestStrictFallbackRateRow:
+    """Rendered scorecard row for the lower-is-better Fallback-rate metric.
+
+    The fixture window's fallback rate is 33.3 % (see ``MEASURABLE``): a
+    seeded target below it exercises the above-target boundary, one above it
+    exercises the at/below-target side. The above-target row reads `Met`
+    against the current ±10 % band — the red-first case — and is marked
+    ``xfail(strict=True)`` until the implementation child narrows the band.
+    """
+
+    @pytest.mark.xfail(strict=True, reason=PENDING_STRICT_FALLBACK_VERDICT)
+    def test_row_reads_unmet_when_actual_is_above_the_target_inside_the_former_band(
+        self, tmp_path
+    ):
+        # Three 30.9 % windows give a 30.9 % target whose former ±10 % band
+        # edge is 33.99 %: the window's 33.3 % sits above the target yet inside
+        # the old band, so the row must read Unmet under the strict rule.
+        state_path = tmp_path / STATE_FILENAME
+        _seed(
+            state_path,
+            "fallback_rate",
+            [
+                ("2026-07-01", 30.9, FINGERPRINT),
+                ("2026-07-02", 30.9, FINGERPRINT),
+                ("2026-07-03", 30.9, FINGERPRINT),
+            ],
+        )
+
+        cells = _cells(_report(metrics_state=state_path), "Fallback rate")
+
+        assert cells[ACTUAL] == "33.3 % of requests"
+        assert cells[RESULT] == "Unmet", (
+            "33.3 % is above the 30.9 % target; only actual <= target is Met"
+        )
+
+    def test_row_reads_met_when_actual_is_below_the_target(self, tmp_path):
+        # Three windows averaging 42.0 % with the window's 33.3 % below it:
+        # Met under the band and under the strict rule.
+        state_path = tmp_path / STATE_FILENAME
+        _seed(
+            state_path,
+            "fallback_rate",
+            [
+                ("2026-07-01", 40.0, FINGERPRINT),
+                ("2026-07-02", 42.0, FINGERPRINT),
+                ("2026-07-03", 44.0, FINGERPRINT),
+            ],
+        )
+
+        cells = _cells(_report(metrics_state=state_path), "Fallback rate")
+
+        assert cells[ACTUAL] == "33.3 % of requests"
+        assert cells[RESULT] == "Met"

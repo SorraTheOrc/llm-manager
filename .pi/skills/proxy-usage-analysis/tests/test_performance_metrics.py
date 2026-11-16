@@ -390,6 +390,113 @@ def test_a_zero_target_has_a_zero_width_band():
     assert pm.derive_verdict(0.1, measurements, LOWER) == "Unmet"
 
 
+# --- Strict Fallback-rate rule (LP-0MWJOUTOV000G701) ------------------------
+#
+# The producer approved a strict verdict for the lower-is-better Fallback-rate
+# metric only: `Met` if and only if the window's actual is at or below the
+# target (`actual <= target`), no +tolerance band above the target, while every
+# other metric keeps its band (parent LP-0MWEOGIUK006B1DD Q1 answer (a)). The
+# strictness is expressed through the same per-metric tolerance machinery the
+# scorecard uses — the committed defaults' ``tolerance_pct`` read by
+# :func:`tolerance_for` and handed to :func:`derive_verdict` by
+# ``reporting._scorecard_rows`` — not a new comparison surface, so the
+# scorecard and the ``--json`` block cannot diverge.
+#
+# Red-first: the above-target assertion fails against the current ±10 % band
+# and is marked ``xfail(strict=True)`` naming the implementation child
+# (LP-0MWJOUY4E002FNHP) that narrows ``fallback_rate.tolerance_pct``; the tree
+# stays green for the dev-push gate. The at/below-target and per-metric-band
+# assertions pass under both bands and run unmarked — they pin the sides of
+# the boundary that must not move either way.
+
+PENDING_STRICT_FALLBACK_VERDICT = (
+    "pending LP-0MWJOUY4E002FNHP (strict Fallback-rate verdict: committed "
+    "defaults narrow fallback_rate.tolerance_pct so only actual <= target "
+    "reads Met)"
+)
+
+#: The decision example from the parent item: a 64.9 % target whose former
+#: ±10 % band edge is 71.39 % with the window's 66.3 % inside that band.
+FALLBACK_TARGET = 64.9
+FALLBACK_TARGET_MEASUREMENTS = [
+    measurement(FALLBACK_TARGET, "2026-09-01"),
+    measurement(FALLBACK_TARGET, "2026-09-02"),
+    measurement(FALLBACK_TARGET, "2026-09-03"),
+]
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_STRICT_FALLBACK_VERDICT)
+def test_fallback_rate_is_unmet_above_the_target_inside_the_former_band():
+    """The boundary the current ±10 % band gets wrong: 66.3 % against a
+    64.9 % target is below the 71.39 % band edge, so the lax rule reads `Met`;
+    the approved strict rule (at or below the target) reads `Unmet`."""
+    assert (
+        pm.derive_verdict(
+            66.3,
+            FALLBACK_TARGET_MEASUREMENTS,
+            LOWER,
+            tolerance_pct=pm.tolerance_for("fallback_rate"),
+        )
+        == "Unmet"
+    )
+
+
+def test_fallback_rate_is_met_when_the_actual_equals_the_target():
+    """Boundary equality stays `Met` under the band and under the strict rule.
+
+    Compared against the value the engine itself derives, re-summing the best
+    three in a test constant would make the verdict a float-associativity
+    problem rather than an equality-semantics one.
+    """
+    target = pm.target_from(FALLBACK_TARGET_MEASUREMENTS, LOWER)
+
+    assert (
+        pm.derive_verdict(
+            target,
+            FALLBACK_TARGET_MEASUREMENTS,
+            LOWER,
+            tolerance_pct=pm.tolerance_for("fallback_rate"),
+        )
+        == "Met"
+    )
+
+
+def test_fallback_rate_is_met_when_the_actual_is_below_the_target():
+    assert (
+        pm.derive_verdict(
+            FALLBACK_TARGET - 5.0,
+            FALLBACK_TARGET_MEASUREMENTS,
+            LOWER,
+            tolerance_pct=pm.tolerance_for("fallback_rate"),
+        )
+        == "Met"
+    )
+
+
+LOWER_IS_BETTER_IDS = [
+    metric.id
+    for metric in pm.METRIC_REGISTRY
+    if metric.direction == LOWER and metric.id != "fallback_rate"
+]
+
+
+@pytest.mark.parametrize("metric_id", LOWER_IS_BETTER_IDS)
+def test_every_other_lower_is_better_metric_keeps_its_tolerance_band(metric_id):
+    """The strictness is per-metric: 5 % above the target still reads `Met`
+    for every other lower-is-better metric under its own committed band."""
+    target = pm.target_from(LOWER_MEASUREMENTS, LOWER)
+
+    assert (
+        pm.derive_verdict(
+            target * 1.05,
+            LOWER_MEASUREMENTS,
+            LOWER,
+            tolerance_pct=pm.tolerance_for(metric_id),
+        )
+        == "Met"
+    )
+
+
 # --- Per-metric tolerance override -----------------------------------------
 
 

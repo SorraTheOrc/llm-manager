@@ -707,6 +707,83 @@ class TestEndToEndDefaultRuns:
 
 
 # ---------------------------------------------------------------------------
+# Strict Fallback-rate verdict on both surfaces (LP-0MWJOUTOV000G701)
+# ---------------------------------------------------------------------------
+#
+# The producer approved a strict verdict for the lower-is-better Fallback-rate
+# metric only: `Met` if and only if the window's actual is at or below the
+# target (`actual <= target`), no +tolerance band above the target (parent
+# LP-0MWEOGIUK006B1DD Q1 answer (a)). Both surfaces derive their verdict from
+# ``reporting._scorecard_rows`` (the single shared path), so they cannot
+# diverge; these tests pin the boundary on both at once.
+#
+# Red-first: the above-target case reads `Met` on both surfaces against the
+# current ±10 % band and is marked ``xfail(strict=True)`` naming the
+# implementation child (LP-0MWJOUY4E002FNHP) that narrows
+# ``fallback_rate.tolerance_pct``; the tree stays green for the dev-push gate.
+
+PENDING_STRICT_FALLBACK_VERDICT = (
+    "pending LP-0MWJOUY4E002FNHP (strict Fallback-rate verdict: committed "
+    "defaults narrow fallback_rate.tolerance_pct so only actual <= target "
+    "reads Met)"
+)
+
+
+@needs_cli
+class TestStrictFallbackRateSurfaces:
+    """Scorecard row and ``--json`` entry report the same strict verdict.
+
+    The fixture window's fallback rate is 33.3 %: a seeded target below it
+    (30.9 %) puts the window inside the former ±10 % band (edge 33.99 %) yet
+    above the target; a seeded target above it (42.0 %) exercises the
+    at/below-target side.
+    """
+
+    @staticmethod
+    def _agree(entry: dict, cells: list[str]) -> None:
+        assert entry["actual"] == pytest.approx(33.3)
+        assert cells[4] == "33.3 % of requests", cells
+        assert cells[5] == entry["verdict"], (
+            "scorecard row and --json entry must report the same verdict"
+        )
+
+    @pytest.mark.xfail(strict=True, reason=PENDING_STRICT_FALLBACK_VERDICT)
+    def test_unmet_when_above_the_target_inside_the_former_band(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+        out_dir.mkdir()
+        state_path = out_dir / STATE_FILENAME
+        _seed_history(state_path, {"fallback_rate": [30.9, 30.9, 30.9]})
+
+        assert _run_cli(log_dir, out_dir, "--json") == 0
+        data = json.loads(capsys.readouterr().out)
+        entry = data["performance_metrics"]["fallback_rate"]
+        cells = _rows_by_metric_id((out_dir / "report.md").read_text())["fallback_rate"]
+
+        self._agree(entry, cells)
+        assert cells[5] == "Unmet", (
+            "33.3 % is above the 30.9 % target; only actual <= target is Met"
+        )
+        assert entry["verdict"] == "Unmet"
+
+    def test_met_when_at_or_below_the_target(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+        out_dir.mkdir()
+        state_path = out_dir / STATE_FILENAME
+        _seed_history(state_path, {"fallback_rate": [40.0, 42.0, 44.0]})
+
+        assert _run_cli(log_dir, out_dir, "--json") == 0
+        data = json.loads(capsys.readouterr().out)
+        entry = data["performance_metrics"]["fallback_rate"]
+        cells = _rows_by_metric_id((out_dir / "report.md").read_text())["fallback_rate"]
+
+        self._agree(entry, cells)
+        assert cells[5] == "Met"
+        assert entry["verdict"] == "Met"
+
+
+# ---------------------------------------------------------------------------
 # --json contract
 # ---------------------------------------------------------------------------
 
