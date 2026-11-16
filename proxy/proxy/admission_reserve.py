@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from proxy.prefill_eta import (
+    REASON_DEADLINE_CAPACITY,
     AdmissionDecision,
     evaluate_admission,
     suggested_retry_after_seconds,
@@ -405,6 +406,9 @@ def local_capacity_verdict(
     budget_tokens: int | None = None,
     estimated_tokens: int | None = None,
     context_limit: int | None = None,
+    deadline_capacity_tokens: int | None = None,
+    capacity_priced_tokens: int | None = None,
+    deadline_capacity_calibrated: bool = False,
 ) -> CapacityVerdict:
     """Classify why the local route cannot serve this request right now.
 
@@ -414,12 +418,22 @@ def local_capacity_verdict(
     Verdict             Trigger
     =================== =====================================================
     ``too_large``       The reason is ``prefill_budget_exceeded`` (the guard's
-                        cold-prefill cap) or ``context_too_large`` (the local
-                        context/size skip).
+                        cold-prefill cap), ``prefill_eta_exceeds_capacity``
+                        (the deadline token capacity) or ``context_too_large``
+                        (the local context/size skip).
     ``too_large``       ``new_tokens > budget_tokens`` with ``budget_tokens >
                         0`` — the raw form of the cold-prefill cap.
     ``too_large``       ``estimated_tokens > context_limit`` with
                         ``context_limit > 0`` — the raw form of the size skip.
+    ``too_large``       ``capacity_priced_tokens > deadline_capacity_tokens``
+                        with ``deadline_capacity_calibrated`` — the raw form
+                        of the deadline token capacity (LP-0MW957RB3000ER79),
+                        and the same evidence read off the guard decision when
+                        one is supplied. A calibrated capacity that is
+                        exceeded is a request-property bound: waiting cannot
+                        help, so it stays ``too_large`` even if a coarse
+                        fallback reason is later recorded on the request
+                        (LP-0MWFN1DIL002TTSP AC2).
     ``deferrable``      A temporal reason: ``eta_exceeds_budget``,
                         ``eta_exceeds_budget_direct``,
                         ``prefill_eta_exceeds_deadline``,
@@ -430,15 +444,24 @@ def local_capacity_verdict(
                         stall/cooldown (``prefill_thrash_cooldown``). Waiting
                         can help, so the request stays pinned to local.
     ``deferrable``      Fail safe: an unknown or absent reason, or missing
-                        inputs. Never promotes a fits-local request.
+                        inputs. Never promotes a fits-local request. An
+                        uncalibrated deadline capacity is never enforced
+                        (AC5 fail-open).
     =================== =====================================================
 
     Args:
         decision: The guard decision already computed by
             :func:`proxy.prefill_eta.evaluate_admission` (read-only input).
+            The decision's own deadline-capacity evidence
+            (``deadline_capacity_tokens`` / ``capacity_priced_tokens`` /
+            ``deadline_capacity_calibrated``) is read when the caller does not
+            supply it, so a capacity refusal can never be misclassified as
+            deferrable through a coarse reason override.
         reason: A reason token for exits that produced no guard decision
             (non-guard temporal exits and routing/context skips). Overrides
-            ``decision.reason`` when supplied.
+            ``decision.reason`` when supplied — but the deadline-capacity
+            evidence takes precedence over a reason override, because it
+            describes a property of the request itself.
         new_tokens: New (uncached) tokens priced by the caller. Overrides
             ``decision.new_tokens`` when supplied.
         budget_tokens: The configured cold-prefill budget
@@ -448,6 +471,18 @@ def local_capacity_verdict(
             bound (the same number the size skip compared).
         context_limit: The local model's context limit; ``0``/``None``
             disables the bound.
+        deadline_capacity_tokens: The deadline token capacity
+            (``floor(local_prefill_deadline_seconds * 1000 /
+            cold_ms_per_token)``). Overrides ``decision.deadline_capacity_tokens``
+            when supplied.
+        capacity_priced_tokens: The token count priced against the deadline
+            capacity (whole prompt cold when residency is unmeasured, else
+            the measured new tokens). Overrides
+            ``decision.capacity_priced_tokens`` when supplied.
+        deadline_capacity_calibrated: Whether the cold window behind the
+            capacity is calibrated. An uncalibrated bound is never enforced
+            (AC5 fail-open); read from ``decision.deadline_capacity_calibrated``
+            when the caller does not supply it.
 
     Returns:
         :class:`CapacityVerdict` carrying the verdict and the reason token
@@ -465,10 +500,34 @@ def local_capacity_verdict(
     if resolved_budget_tokens is None and decision is not None:
         resolved_budget_tokens = decision.budget_tokens
 
+    resolved_capacity_tokens = deadline_capacity_tokens
+    resolved_capacity_priced = capacity_priced_tokens
+    resolved_capacity_calibrated = deadline_capacity_calibrated
+    # Decision-form rescue (LP-0MWFN1DIL002TTSP AC2): when the guard itself
+    # attributed the refusal to the deadline token capacity, its evidence must
+    # survive a later coarse fallback reason (``local_admission_guard``) so a
+    # capacity refusal is never rebuilt as ``deferrable`` with a retry timer.
+    # Only a capacity-ATTRIBUTED decision rescues: when the deadline or its
+    # safety budget fires on the same cold price the guard deliberately keeps
+    # that temporal attribution (the capacity is redundant there,
+    # LP-0MW957RB3000ER79), so reading its evidence would wrongly flip a
+    # ``prefill_eta_exceeds_deadline`` refusal to ``too_large``.
+    if decision is not None and decision.reason == REASON_DEADLINE_CAPACITY:
+        if resolved_capacity_tokens is None:
+            resolved_capacity_tokens = decision.deadline_capacity_tokens
+        if resolved_capacity_priced is None:
+            resolved_capacity_priced = decision.capacity_priced_tokens
+        if not resolved_capacity_calibrated:
+            resolved_capacity_calibrated = decision.deadline_capacity_calibrated
+
     too_large = (
         resolved_reason in CAPACITY_TOO_LARGE_REASONS
         or _exceeds(resolved_new_tokens, resolved_budget_tokens)
         or _exceeds(estimated_tokens, context_limit)
+        or (
+            resolved_capacity_calibrated
+            and _exceeds(resolved_capacity_priced, resolved_capacity_tokens)
+        )
     )
 
     return CapacityVerdict(

@@ -9143,6 +9143,7 @@ async def _promote_too_large_local_request(
     body_json: dict | None,
     routing_estimate,
     session_id: str | None = None,
+    priority: str | None = None,
 ) -> list[dict]:
     """Drop the local entry when a pin-local request is ``too_large`` (AC1).
 
@@ -9163,9 +9164,19 @@ async def _promote_too_large_local_request(
       prompt is not mistaken for a cold one,
     * ``server.local_cold_prefill_budget_tokens`` through
       :func:`_cold_prefill_budget_tokens` (i.e.
-      :data:`proxy.prefill_eta.COLD_PREFILL_BUDGET_KEY`), and
+      :data:`proxy.prefill_eta.COLD_PREFILL_BUDGET_KEY`),
     * the local entry's own context ceiling
-      (:func:`_provider_context_limit`).
+      (:func:`_provider_context_limit`), and
+    * the admission guard's own decision for the deadline token capacity
+      (LP-0MW957RB3000ER79, LP-0MWFN1DIL002TTSP AC1): ``evaluate_admission``
+      prices the whole prompt cold when residency is unmeasured and the
+      measured new tokens when a measured record exists, and attributes the
+      CAPACITY refusal only when the deadline / deadline-relative safety
+      budget is not the binding temporal bound on the same cold price — so a
+      prompt whose cold basis exceeds the capacity is promoted exactly like a
+      flat-cap ``prefill_budget_exceeded`` request, never kept pinned for a
+      retry waiting cannot help. An uncalibrated capacity stays fail-open
+      (AC5).
 
     The classification itself is delegated to
     :func:`admission_reserve.local_capacity_verdict` — the single verdict
@@ -9228,9 +9239,36 @@ async def _promote_too_large_local_request(
         new_tokens = int(estimated * (1 - float(cached_ratio or 0.0)))
     except (TypeError, ValueError):  # pragma: no cover - defensive
         new_tokens = 0
-    from proxy import admission_reserve
+    from proxy import admission_reserve, prefill_eta
+
+    # Deadline token capacity (LP-0MW957RB3000ER79, LP-0MWFN1DIL002TTSP AC1):
+    # the admission guard prices the whole prompt cold when residency is
+    # unmeasured and the measured new tokens when a measured record exists, and
+    # attributes the CAPACITY refusal only when neither the deadline nor its
+    # deadline-relative safety budget is the binding bound on the same cold
+    # price (the temporal deadline refusal is deliberately kept otherwise —
+    # the capacity would be redundant there). Let the guard's own decision
+    # classify the request instead of re-deriving a size table here, so the
+    # promotion can never disagree with the in-loop admission gate about
+    # whether a prompt's COLD basis exceeds the deadline capacity
+    # (single-implementation contract LP-0MVSLZY470051ZB2 AC3). An
+    # uncalibrated capacity stays fail-open (AC5).
+    model_name = local_entry.get("llama_model") or ""
+    try:
+        decision = prefill_eta.evaluate_admission(
+            config,
+            model_name,
+            estimated,
+            cached_ratio,
+            priority,
+            residency_measured=_residency_is_measured(model_name, session_id),
+        )
+    except Exception:  # pragma: no cover - defensive, mirrors the guard
+        logger.debug("too-large verdict: admission guard failed", exc_info=True)
+        decision = None
 
     verdict = admission_reserve.local_capacity_verdict(
+        decision,
         new_tokens=new_tokens,
         budget_tokens=_cold_prefill_budget_tokens(config),
         estimated_tokens=estimated,
@@ -9456,6 +9494,19 @@ def _build_local_only_refusal_response(
         reason=reason,
         new_tokens=new_tokens,
         budget_tokens=budget_tokens,
+        # Deadline capacity evidence (LP-0MW957RB3000ER79): threaded from the
+        # guard decision so a capacity refusal classifies ``too_large`` even
+        # under a coarse fallback reason, and never advertises a retry timer
+        # (LP-0MWFN1DIL002TTSP AC2).
+        deadline_capacity_tokens=_admission_token_evidence(
+            attempt, "deadline_capacity_tokens"
+        ),
+        capacity_priced_tokens=_admission_token_evidence(
+            attempt, "capacity_priced_tokens"
+        ),
+        deadline_capacity_calibrated=bool(
+            attempt.get("deadline_capacity_calibrated", False)
+        ),
     )
     timing = _refusal_retry_timing(
         reason,
@@ -10479,6 +10530,14 @@ def _local_admission_evidence(decision: Any) -> dict[str, Any]:
     capacity_priced = getattr(decision, "capacity_priced_tokens", None)
     if capacity_priced:
         evidence["capacity_priced_tokens"] = int(capacity_priced)
+    # LP-0MW957RB3000ER79 / LP-0MWFN1DIL002TTSP AC2: whether the capacity is
+    # calibrated decides whether it is enforceable — the refusal payload's
+    # verdict must classify a capacity refusal as ``too_large`` even when a
+    # coarse fallback reason masks the decision reason, so the flag is
+    # threaded with the token counts the verdict helper consumes.
+    calibrated = getattr(decision, "deadline_capacity_calibrated", False)
+    if capacity_tokens is not None:
+        evidence["deadline_capacity_calibrated"] = bool(calibrated)
     return evidence
 
 
@@ -15607,6 +15666,7 @@ async def _proxy_with_remote_fallback_cycle(
         body_json,
         _routing_estimate,
         session_id=_budget_session_id,
+        priority=_priority,
     )
     if _promoted_chain is not _chain:
         _chain = _promoted_chain
@@ -16503,6 +16563,7 @@ async def _proxy_with_fallback_cycle(
         body_json,
         _routing_estimate,
         session_id=_session_id,
+        priority=_priority,
     )
     if _promoted_chain is not _chain:
         _chain = _promoted_chain
