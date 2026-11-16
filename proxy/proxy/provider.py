@@ -44,6 +44,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from proxy import (
     admission_reserve,
     cold_start,
+    fingerprint_backoff,
     local_deferral,
     quota_pacing,
     quota_state,
@@ -585,6 +586,17 @@ _DETERMINISTIC_LOCAL_400_WINDOW_SECONDS = 600.0  # 10 minutes
 # stale ones (avoids unbounded growth on many short sessions).
 _MAX_LOCAL_HTTP_400_STREAK_ENTRIES = 1000
 
+# Per-prompt-fingerprint backoff ladder (LP-0MW95BCVV004LO0K): a local 400
+# that repeats on a byte-identical history backs *that history* off
+# exponentially (1 min -> 5 min -> 15 min cap) instead of being re-dispatched
+# every turn. The ladder itself lives in ``proxy.fingerprint_backoff`` so there
+# is one source of truth; these aliases are the names the 400 path reads.
+# Deliberately NOT called ``_BACKOFF_MAX_SECONDS``: that name already caps
+# *provider* cooldown at 45 s above, and reusing it would silently stretch
+# cooldowns to 15 minutes.
+_FINGERPRINT_BACKOFF_INITIAL_SECONDS = fingerprint_backoff.BACKOFF_INITIAL_SECONDS
+_FINGERPRINT_BACKOFF_MAX_SECONDS = fingerprint_backoff.BACKOFF_MAX_SECONDS
+
 # ---------------------------------------------------------------------------
 # Timed access to models (LP-0MS4ETBNO0022QAC)
 #
@@ -892,6 +904,36 @@ def _get_cached_ratio_source(model_name: str, session_id: str | None) -> str | N
     if not model_name or not session_id:
         return None
     return _cached_ratio_source.get((model_name, session_id))
+
+
+def _residency_is_measured(model_name: str | None, session_id: str | None) -> bool:
+    """Whether a MEASURED residency record exists for this session.
+
+    The deadline token capacity (LP-0MW957RB3000ER79 AC3) prices the whole
+    prompt cold when residency is *unmeasured* (a predicted/credited ratio is
+    not evidence) and the measured new tokens when a measured record exists.
+    A measurement is either the ``prompt_progress`` capture
+    (:mod:`proxy.measured_prefill`) or a cached ratio recorded from a previous
+    local response's usage data (``_CACHED_RATIO_SOURCE_USAGE``). A
+    slot-snapshot restore (``"restored"``/``"save"``) is a prediction, not a
+    measurement, so it does not count. Fail-open: any error reads as
+    unmeasured.
+    """
+    try:
+        from proxy.measured_prefill import get_measured_prefill
+
+        measured = get_measured_prefill(model_name, session_id)
+        if measured is not None and measured.measured_new_tokens is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        return (
+            _get_cached_ratio_source(model_name, session_id)
+            == _CACHED_RATIO_SOURCE_USAGE
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -4603,6 +4645,7 @@ def _evaluate_idle_admission_override(
     provider_cfg: dict,
     estimated_tokens: int,
     cached_ratio: float = 0.0,
+    session_id: str | None = None,
 ) -> dict | None:
     """Decide whether idle local capacity should serve a bypassed request.
 
@@ -4654,7 +4697,7 @@ def _evaluate_idle_admission_override(
         if idle_seconds < threshold:
             return None
         admission = _idle_admission_budget_verdict(
-            config, provider_cfg, estimated_tokens, cached_ratio
+            config, provider_cfg, estimated_tokens, cached_ratio, session_id
         )
         return {
             "admitted": admission is None or bool(admission.admit),
@@ -4674,6 +4717,7 @@ def _idle_admission_budget_verdict(
     provider_cfg: dict,
     estimated_tokens: int,
     cached_ratio: float,
+    session_id: str | None = None,
 ):
     """Run the shared cold-prefill admission guard for the idle bypass path.
 
@@ -4694,9 +4738,13 @@ def _idle_admission_budget_verdict(
         guard_cfg = prefill_eta.resolve_config(server_cfg)
         if guard_cfg.policy == prefill_eta.POLICY_OFF:
             return None
-        # Only the cold-prefill budget and its deadline-relative sibling are
-        # consulted here: the idle bypass exists precisely because the
-        # occupancy/queue bounds do not apply to an idle GPU.
+        # Only the cold-prefill budget and its deadline-relative sibling gate
+        # whether the idle bypass consults the guard at all: the idle bypass
+        # exists precisely because the occupancy/queue bounds do not apply to
+        # an idle GPU, and the documented "every knob disabled" rollback keeps
+        # it inert. When the guard IS consulted (the shipped flat cap is
+        # 25 000 > 0) the deadline token capacity applies here too
+        # (LP-0MW957RB3000ER79).
         if (
             guard_cfg.cold_prefill_budget_tokens <= 0
             and guard_cfg.budget_safety_fraction <= 0.0
@@ -4706,7 +4754,12 @@ def _idle_admission_budget_verdict(
             provider_cfg, dict
         ) else ""
         decision = prefill_eta.evaluate_admission(
-            config, model_name, estimated_tokens, cached_ratio, "medium"
+            config,
+            model_name,
+            estimated_tokens,
+            cached_ratio,
+            "medium",
+            residency_measured=_residency_is_measured(model_name, session_id),
         )
         # LP-0MVODJ3P6000AIUM AC1: return the decision for BOTH verdicts so
         # the idle-admit accept path can thread the ETA the guard actually
@@ -6294,12 +6347,13 @@ def _max_retry_after_seconds(config: dict | None) -> int:
 
 #: Reasons for which no amount of waiting can restore local service: the
 #: cause is a property of the *request* (a prompt permanently over the flat
-#: cold-prefill token cap, or one that cannot fit a KV slot), so a timer would
-#: only invite futile retries — the 2026-10-25 incident answered such a request
-#: with ``Retry-After: 1`` and the client backed off seven times before
-#: reporting the 429 as terminal (LP-0MVNTT4X8009IO2X AC1).
+#: cold-prefill token cap, over the deadline token capacity, or one that cannot
+#: fit a KV slot), so a timer would only invite futile retries — the
+#: 2026-10-25 incident answered such a request with ``Retry-After: 1`` and the
+#: client backed off seven times before reporting the 429 as terminal
+#: (LP-0MVNTT4X8009IO2X AC1).
 NOT_TIME_RETRYABLE_REFUSAL_REASONS = frozenset(
-    {"prefill_budget_exceeded", "context_too_large"}
+    {"prefill_budget_exceeded", "context_too_large", "prefill_eta_exceeds_capacity"}
 )
 
 #: Remedy advertised for a refusal waiting cannot fix.
@@ -10346,6 +10400,12 @@ async def _prefill_admission_guard(
             in_flight_prefills=in_flight_prefills,
             occupant_prefill_seconds=occupant_prefill_seconds,
             capacity_admitted=capacity_admitted,
+            # Deadline token capacity (LP-0MW957RB3000ER79 AC3): a measured
+            # residency record prices the measured new tokens; anything else
+            # (no measurement, a predicted/credited ratio) is priced as a cold
+            # whole prompt, so a predicted-warm prompt can never slip past the
+            # capacity on optimism.
+            residency_measured=_residency_is_measured(model_name, session_id),
         )
         if not decision.active:
             return None
@@ -10361,6 +10421,7 @@ async def _prefill_admission_guard(
                 "prefill_eta_exceeds_deadline",
                 "prefill_eta_exceeds_safety_budget",
                 "prefill_budget_exceeded",
+                "prefill_eta_exceeds_capacity",
             )
         ):
             log_label = decision.reason
@@ -10409,6 +10470,15 @@ def _local_admission_evidence(decision: Any) -> dict[str, Any]:
     budget_tokens = getattr(decision, "budget_tokens", None)
     if budget_tokens is not None:
         evidence["budget_tokens"] = int(budget_tokens)
+    # Deadline token capacity evidence (LP-0MW957RB3000ER79): a capacity
+    # refusal carries the token counts the guard actually compared, so the
+    # 429 body states the target size explicitly (like the flat cap does).
+    capacity_tokens = getattr(decision, "deadline_capacity_tokens", None)
+    if capacity_tokens is not None:
+        evidence["deadline_capacity_tokens"] = int(capacity_tokens)
+    capacity_priced = getattr(decision, "capacity_priced_tokens", None)
+    if capacity_priced:
+        evidence["capacity_priced_tokens"] = int(capacity_priced)
     return evidence
 
 
@@ -13605,7 +13675,69 @@ def _observe_http_error_400(
         pass
 
 
-def _reset_local_http_400_streak(session_id: str | None, provider_name: str) -> None:
+def _request_messages(body_json: Any) -> list[Any] | None:
+    """Return the request's non-empty ``messages`` array, else ``None``.
+
+    The fingerprint is only defined for a conversation, so a body without
+    ``messages`` (health probes, model-listing style calls, tests) records no
+    verdict at all rather than one for an empty history.
+    """
+    if not isinstance(body_json, dict):
+        return None
+    messages = body_json.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    return messages
+
+
+def fingerprint_backoff_state(
+    session_id: str | None,
+    body_json: Any,
+    *,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Return the per-prompt-fingerprint backoff verdict for this request.
+
+    Read-side entry point for the typed-error layer (LP-0MW95BDJQ002DSVI) and
+    the terminal breaker (LP-0MW95BE7X00574OL): they ask "is *this history* in
+    a backoff window?" without touching fingerprint internals.
+
+    Returns ``None`` when the request carries no conversation history (nothing
+    to fingerprint) or the history has no recorded verdict; otherwise a dict
+    with ``fingerprint``, ``entry`` (see
+    :func:`proxy.fingerprint_backoff.get_backoff_entry`), ``expired`` and
+    ``remaining_seconds``. An expired entry is still reported (``expired:
+    True``, ``remaining_seconds: 0.0``) because the resend that follows it
+    continues the ladder rather than restarting it.
+
+    Cheap on the hot path: the fingerprint comes from the per-session hash
+    chain (only appended messages are hashed, and a byte-identical resend
+    hashes nothing), and a session that moved to a different history drops its
+    previous entry as a side effect of resolving the new one (parent AC2's
+    "changed history resets the backoff").
+    """
+    messages = _request_messages(body_json)
+    if messages is None:
+        return None
+    fingerprint = fingerprint_backoff.fingerprint_for_session(session_id, messages)
+    entry = fingerprint_backoff.get_backoff_entry(fingerprint)
+    if entry is None:
+        return None
+    return {
+        "fingerprint": fingerprint,
+        "entry": entry,
+        "expired": fingerprint_backoff.check_backoff_expired(fingerprint, now=now),
+        "remaining_seconds": fingerprint_backoff.remaining_backoff_seconds(
+            fingerprint, now=now
+        ),
+    }
+
+
+def _reset_local_http_400_streak(
+    session_id: str | None,
+    provider_name: str,
+    body_json: Any | None = None,
+) -> None:
     """Reset the deterministic local-400 streak after a successful dispatch.
 
     A session whose local 400s are interspersed with successful local
@@ -13613,9 +13745,21 @@ def _reset_local_http_400_streak(session_id: str | None, provider_name: str) -> 
     400s escalates (LP-0MTXEBQ4E001BMI2, mirroring the sibling-failure
     streak semantics). Called from the local success paths of
     ``_proxy_with_fallback_cycle``.
+
+    LP-0MW95BCVV004LO0K: a local success also clears the per-prompt-fingerprint
+    backoff for the history that just succeeded, so a session that recovers
+    (or a history compacted into something llama-server accepts) restarts at
+    the bottom of the ladder — parent AC2's "resets on any successful stream".
+    Only a *local* success counts: the loop this guards is local 400 -> remote
+    success -> local 400, so treating the remote success as recovery would stop
+    the ladder ever advancing.
     """
     key = (session_id or "unknown", provider_name)
     _local_http_400_streaks.pop(key, None)
+    messages = _request_messages(body_json)
+    if messages is not None:
+        fingerprint = fingerprint_backoff.fingerprint_for_session(session_id, messages)
+        fingerprint_backoff.clear_backoff(fingerprint)
 
 
 def _prune_local_http_400_streaks(now: float) -> None:
@@ -13636,6 +13780,7 @@ def _observe_local_http_error_400(
     path: str,
     body_text: str,
     session_id: str | None = None,
+    body_json: Any | None = None,
 ) -> None:
     """Observability for local HTTP 400 fallbacks (LP-0MTXEBQ4E001BMI2).
 
@@ -13690,16 +13835,38 @@ def _observe_local_http_error_400(
             if len(_local_http_400_streaks) > _MAX_LOCAL_HTTP_400_STREAK_ENTRIES:
                 _prune_local_http_400_streaks(now)
         entry["count"] = int(entry.get("count", 0) or 0) + 1
+
+        # Per-prompt-fingerprint backoff (LP-0MW95BCVV004LO0K, parent AC2).
+        # The streak above is per (session, provider) and only makes the loop
+        # *visible*; the verdict that must actually throttle the request is
+        # keyed by the history itself, so two sessions resending the same bad
+        # conversation share one ladder (1 min -> 5 min -> 15 min cap). The
+        # entry is recorded on the first rejection — the typed-error layer
+        # (LP-0MW95BDJQ002DSVI) decides which resend it answers, and the
+        # terminal breaker (LP-0MW95BE7X00574OL) counts these resends.
+        messages = _request_messages(body_json)
+        if messages is not None:
+            fingerprint = fingerprint_backoff.fingerprint_for_session(session_id, messages)
+            backoff = fingerprint_backoff.record_backoff(fingerprint, session_id)
+            entry["fingerprint"] = fingerprint
+            entry["backoff_resend_count"] = int(backoff["resend_count"])
+            entry["backoff_retry_after"] = float(backoff["retry_after"])
+            entry["backoff_until"] = float(backoff["until"])
+
         if int(entry["count"]) >= _DETERMINISTIC_LOCAL_400_THRESHOLD:
             logger.warning(
                 "Deterministic local HTTP 400: provider=%s model=%s session=%s "
-                "consecutive=%d threshold=%d body_snippet=%s — local rejects this "
+                "consecutive=%d threshold=%d fingerprint=%s resend_count=%s "
+                "retry_after=%s body_snippet=%s — local rejects this "
                 "history every turn; inspect llama-server for the request-shape cause",
                 provider_name,
                 path,
                 session_id or "unknown",
                 int(entry["count"]),
                 _DETERMINISTIC_LOCAL_400_THRESHOLD,
+                (entry.get("fingerprint") or "unknown")[:12],
+                entry.get("backoff_resend_count"),
+                entry.get("backoff_retry_after"),
                 snippet,
             )
             try:
@@ -13710,6 +13877,248 @@ def _observe_local_http_error_400(
                 pass
     except Exception:
         pass
+
+
+#: Typed deterministic-client-error contract (LP-0MW95BDJQ002DSVI, parent AC1).
+#:
+#: A history llama-server rejects byte-identically is not a provider-health
+#: failure: retrying it — locally or on a remote — cannot succeed, so the
+#: CLIENT has to act (compact, then resend a *changed* history). The proxy
+#: therefore stops routing and says exactly that, in machine-readable form.
+DETERMINISTIC_CLIENT_ERROR = "deterministic_client_error"
+DETERMINISTIC_CLIENT_ERROR_REASON_IDENTICAL_HISTORY = "identical_history"
+#: Response header that lets a client detect the typed error without parsing
+#: the body (parent AC1's machine-readable contract).
+DETERMINISTIC_CLIENT_ERROR_HEADER = "X-Deterministic-Client-Error"
+
+#: Terminal breaker vocabulary (LP-0MW95BE7X00574OL, parent AC3/AC5). The
+#: values live beside the mechanism in ``fingerprint_backoff`` so the payload
+#: contract is stated once.
+SESSION_WEDGED = fingerprint_backoff.SESSION_WEDGED
+SESSION_WEDGED_CAUSE = fingerprint_backoff.SESSION_WEDGED_CAUSE
+#: Response header that distinguishes the terminal error from the typed one
+#: (parent AC5) for clients that branch on headers instead of parsing JSON.
+SESSION_WEDGED_HEADER = "X-Session-Wedged"
+
+
+def _deterministic_client_error_verdict(
+    session_id: str | None,
+    provider_name: str,
+    body_json: Any,
+    *,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Return the fingerprint verdict when this resend is provably identical.
+
+    The typed error may only be returned when *this exact history* is known to
+    be rejected, which needs both halves of the evidence:
+
+    1. the per-(session, provider) streak has reached
+       ``_DETERMINISTIC_LOCAL_400_THRESHOLD`` — this session's local 400s are
+       not a one-off (LP-0MTXEBQ4E001BMI2), and
+    2. the per-prompt-fingerprint entry's ``resend_count`` has reached the
+       same threshold — the *history* itself was rejected before. A session
+       can repeat 400s with a *changed* history (the streak is per session,
+       not per history); claiming ``identical_history`` for that would be
+       wrong, and the fresh fingerprint's count of 1 filters it out.
+
+    Returns ``None`` when either half is missing (no conversation history, no
+    streak, or a history seen only once) — i.e. when normal fallback must still
+    run. Read-only: the write side is
+    :func:`_observe_local_http_error_400`, which has already recorded this
+    occurrence before the caller asks.
+    """
+    streak = _local_http_400_streaks.get((session_id or "unknown", provider_name))
+    if streak is None or int(streak.get("count", 0) or 0) < _DETERMINISTIC_LOCAL_400_THRESHOLD:
+        return None
+    state = fingerprint_backoff_state(session_id, body_json, now=now)
+    if state is None:
+        return None
+    if int(state["entry"].get("resend_count", 0) or 0) < _DETERMINISTIC_LOCAL_400_THRESHOLD:
+        return None
+    return state
+
+
+def _deterministic_client_error_retry_after_seconds(state: dict[str, Any]) -> int:
+    """Return the ``Retry-After`` seconds advertised on the typed 400.
+
+    The value is the fingerprint ladder's remaining window, so the header and
+    the body always agree with the backoff the proxy actually enforces. When
+    the window has already expired the resend continues the ladder, so the
+    entry's *next* rung is advertised instead of a meaningless ``0``.
+    """
+    remaining = float(state.get("remaining_seconds") or 0.0)
+    if remaining <= 0.0:
+        remaining = float(
+            state["entry"].get("retry_after")
+            or fingerprint_backoff.BACKOFF_INITIAL_SECONDS
+        )
+    return max(1, int(math.ceil(remaining)))
+
+
+def _build_session_wedged_response(
+    path: str,
+    provider_name: str,
+    session_id: str | None,
+    state: dict[str, Any],
+    config: dict | None = None,
+    *,
+    now: float | None = None,
+) -> Response | None:
+    """Build the terminal ``session_wedged`` 400 once the breaker trips.
+
+    The typed ``deterministic_client_error`` (parent AC1) tells the client to
+    compact; this terminal error (parent AC3) is the answer when the client
+    ignored that and kept resending the *same* history after every backoff
+    window — ``deterministic_client_error_escalation_threshold`` resends
+    (default 5, read top-level or inside the ``server`` section).
+
+    Both are HTTP 400, so they are made distinguishable without parsing the
+    body (parent AC5): the terminal response carries
+    ``X-Session-Wedged: repeated_deterministic_400`` and
+    ``X-Deterministic-Client-Error: session_wedged`` rather than
+    ``identical_history``.
+
+    Returns ``None`` below the threshold, so the caller answers with the typed
+    error instead. The caller only reaches here with the typed error's
+    evidence in hand (this history was already rejected), so even a degenerate
+    threshold of 1 can never convict a lone 400 as wedged.
+
+    ``Retry-After`` is the ladder's remaining window floored at
+    :data:`proxy.fingerprint_backoff.SESSION_WEDGED_MIN_RETRY_AFTER_SECONDS`
+    (60 s): a wedged session must not be retried immediately. Best-effort like
+    its typed sibling: any failure returns ``None``.
+    """
+    try:
+        wedged = fingerprint_backoff.session_wedged_error(
+            state["fingerprint"], config=config, now=now
+        )
+        if wedged is None:
+            return None
+        retry_after = max(1, int(wedged.get("retry_after") or 0))
+        resend_count = int(wedged.get("resend_count") or 0)
+        logger.warning(
+            "Session wedged: provider=%s model=%s session=%s fingerprint=%s "
+            "resend_count=%s retry_after=%ss — this history has been resent "
+            "after every backoff window; returning the terminal "
+            "session_wedged error (compaction is the only way forward)",
+            provider_name,
+            path,
+            session_id or "unknown",
+            (state.get("fingerprint") or "unknown")[:12],
+            resend_count,
+            retry_after,
+        )
+        try:
+            from proxy.metrics import record_http_error
+
+            record_http_error(path, "400", SESSION_WEDGED)
+        except Exception:
+            pass
+        payload = {
+            "error": SESSION_WEDGED,
+            "cause": SESSION_WEDGED_CAUSE,
+            "hint": fingerprint_backoff.SESSION_WEDGED_HINT,
+            "retry_after": retry_after,
+            "resend_count": resend_count,
+        }
+        return Response(
+            content=json.dumps(payload),
+            status_code=400,
+            media_type="application/json",
+            headers={
+                "Retry-After": str(retry_after),
+                "X-Provider": provider_name,
+                SESSION_WEDGED_HEADER: SESSION_WEDGED_CAUSE,
+                DETERMINISTIC_CLIENT_ERROR_HEADER: SESSION_WEDGED,
+            },
+        )
+    except Exception:
+        return None
+
+
+def _build_typed_400_response(
+    path: str,
+    provider_name: str,
+    body_text: str,
+    session_id: str | None,
+    body_json: Any,
+    config: dict | None = None,
+    *,
+    now: float | None = None,
+) -> Response | None:
+    """Build the typed ``deterministic_client_error`` 400 for an identical resend.
+
+    Returns ``None`` when this local 400 is not a byte-identical resend of a
+    history already known to be rejected, so the caller keeps its unchanged
+    fallback behaviour (parent AC1's "single 400 falls back normally").
+
+    This is also the terminal breaker's entry point
+    (LP-0MW95BE7X00574OL): once this identical resend reaches
+    ``deterministic_client_error_escalation_threshold`` resends the client
+    gets the terminal ``session_wedged`` payload instead of another typed 400
+    it has already ignored.
+
+    The response is a plain ``Response`` (not a raise): the caller returns it
+    directly from the local-4xx branch, i.e. **before** any remote dispatch or
+    chain-hold cycle can run, so a wedged session can never starve the rest of
+    the proxy. Best-effort: any failure returns ``None`` rather than turning a
+    routing edge case into an error.
+    """
+    try:
+        state = _deterministic_client_error_verdict(
+            session_id, provider_name, body_json, now=now
+        )
+        if state is None:
+            return None
+        # Parent AC3: a client that ignored the typed error and resent the same
+        # history this many times gets the terminal verdict instead.
+        wedged = _build_session_wedged_response(
+            path, provider_name, session_id, state, config, now=now
+        )
+        if wedged is not None:
+            return wedged
+        retry_after = _deterministic_client_error_retry_after_seconds(state)
+        entry = state["entry"]
+        snippet = (body_text or "")[:512]
+        logger.warning(
+            "Deterministic client error: provider=%s model=%s session=%s "
+            "fingerprint=%s resend_count=%s retry_after=%ss — returning typed "
+            "HTTP 400 without remote fallback or chain hold (this exact "
+            "history is rejected every time; compaction may help)",
+            provider_name,
+            path,
+            session_id or "unknown",
+            (state.get("fingerprint") or "unknown")[:12],
+            entry.get("resend_count"),
+            retry_after,
+        )
+        try:
+            from proxy.metrics import record_http_error
+
+            record_http_error(path, "400", DETERMINISTIC_CLIENT_ERROR)
+        except Exception:
+            pass
+        payload = {
+            "error": DETERMINISTIC_CLIENT_ERROR,
+            "reason": DETERMINISTIC_CLIENT_ERROR_REASON_IDENTICAL_HISTORY,
+            "retry_after": retry_after,
+            "body_snippet": snippet,
+        }
+        return Response(
+            content=json.dumps(payload),
+            status_code=400,
+            media_type="application/json",
+            headers={
+                "Retry-After": str(retry_after),
+                "X-Provider": provider_name,
+                DETERMINISTIC_CLIENT_ERROR_HEADER: (
+                    DETERMINISTIC_CLIENT_ERROR_REASON_IDENTICAL_HISTORY
+                ),
+            },
+        )
+    except Exception:
+        return None
 
 
 def _handle_empty_response_with_cooldown(
@@ -16747,6 +17156,7 @@ async def _proxy_with_fallback_cycle(
                         provider_cfg,
                         _estimated_tokens,
                         _routing_cached_ratio,
+                        _session_id,
                     )
                     if _idle_admit is not None and not _idle_admit.get(
                         "admitted", True
@@ -17227,6 +17637,7 @@ async def _proxy_with_fallback_cycle(
                             "prefill_eta_exceeds_deadline",
                             "prefill_eta_exceeds_safety_budget",
                             "prefill_budget_exceeded",
+                            "prefill_eta_exceeds_capacity",
                         )
                     ):
                         _direct_reason = str(_direct_admission.reason)
@@ -17657,8 +18068,9 @@ async def _proxy_with_fallback_cycle(
             if stream_result is not None:
                 # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
                 # local-400 streak (only unbroken same-session 400 runs escalate).
+                # LP-0MW95BCVV004LO0K: and clears this history's backoff.
                 if provider_type == "local":
-                    _reset_local_http_400_streak(_session_id, provider_name)
+                    _reset_local_http_400_streak(_session_id, provider_name, body_json)
                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
                 _add_resolved_model_header(stream_result, provider_cfg)
                 if _pending_reroute:
@@ -18159,7 +18571,25 @@ async def _proxy_with_fallback_cycle(
                                 path,
                                 body_text,
                                 _session_id,
+                                body_json,
                             )
+                            # LP-0MW95BDJQ002DSVI (parent AC1): a
+                            # byte-identical resend of a history local
+                            # rejects every time is answered HERE, before any
+                            # remote dispatch and before the chain-hold
+                            # wrapper can consume a cycle — the error is
+                            # deterministic, so retrying it cannot help and
+                            # holding it would starve every other session.
+                            _typed_400 = _build_typed_400_response(
+                                path,
+                                provider_name,
+                                body_text,
+                                _session_id,
+                                body_json,
+                                config,
+                            )
+                            if _typed_400 is not None:
+                                return _typed_400
                         continue
 
                     # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
@@ -18432,8 +18862,9 @@ async def _proxy_with_fallback_cycle(
             )
             # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
             # local-400 streak (only unbroken same-session 400 runs escalate).
+            # LP-0MW95BCVV004LO0K: and clears this history's backoff.
             if provider_type == "local":
-                _reset_local_http_400_streak(_session_id, provider_name)
+                _reset_local_http_400_streak(_session_id, provider_name, body_json)
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
             return result

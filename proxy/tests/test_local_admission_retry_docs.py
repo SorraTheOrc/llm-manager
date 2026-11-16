@@ -50,6 +50,7 @@ EMITTED_REFUSAL_REASONS = {
     "prefill_eta_exceeds_deadline",
     "prefill_eta_exceeds_safety_budget",
     "prefill_budget_exceeded",
+    "prefill_eta_exceeds_capacity",
     "context_too_large",
     "cooldown",
 }

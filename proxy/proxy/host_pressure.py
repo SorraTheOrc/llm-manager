@@ -230,26 +230,26 @@ def evaluate_pressure(
     if available_fraction is not None:
         if available_fraction <= available_critical_fraction:
             critical.append(
-                "MemAvailable %.1f%% of MemTotal (critical threshold %.0f%%)"
-                % (available_fraction * 100, available_critical_fraction * 100)
+                f"MemAvailable {available_fraction * 100:.1f}% of MemTotal "
+                f"(critical threshold {available_critical_fraction * 100:.0f}%)"
             )
         elif available_fraction <= available_warn_fraction:
             warning.append(
-                "MemAvailable %.1f%% of MemTotal (warning threshold %.0f%%)"
-                % (available_fraction * 100, available_warn_fraction * 100)
+                f"MemAvailable {available_fraction * 100:.1f}% of MemTotal "
+                f"(warning threshold {available_warn_fraction * 100:.0f}%)"
             )
 
     gtt_fraction = snapshot.gtt_host_fraction
     if gtt_fraction is not None:
         if gtt_fraction >= gtt_critical_fraction:
             critical.append(
-                "GPU GTT %.1f%% of physical RAM (critical threshold %.0f%%)"
-                % (gtt_fraction * 100, gtt_critical_fraction * 100)
+                f"GPU GTT {gtt_fraction * 100:.1f}% of physical RAM "
+                f"(critical threshold {gtt_critical_fraction * 100:.0f}%)"
             )
         elif gtt_fraction >= gtt_warn_fraction:
             warning.append(
-                "GPU GTT %.1f%% of physical RAM (warning threshold %.0f%%)"
-                % (gtt_fraction * 100, gtt_warn_fraction * 100)
+                f"GPU GTT {gtt_fraction * 100:.1f}% of physical RAM "
+                f"(warning threshold {gtt_warn_fraction * 100:.0f}%)"
             )
 
     if critical:
@@ -265,16 +265,12 @@ def describe_snapshot(snapshot: MemorySnapshot) -> str:
     """Compact log representation of the measured series."""
 
     def _gib(value: int | None) -> str:
-        return "unknown" if value is None else "%.1f GiB" % (value / (1024**3))
+        return "unknown" if value is None else f"{value / (1024**3):.1f} GiB"
 
     return (
-        "MemAvailable %s of %s, GPU GTT %s of %s"
-        % (
-            _gib(snapshot.mem_available_bytes),
-            _gib(snapshot.mem_total_bytes),
-            _gib(snapshot.gtt_used_bytes),
-            _gib(snapshot.gtt_total_bytes),
-        )
+        f"MemAvailable {_gib(snapshot.mem_available_bytes)} of "
+        f"{_gib(snapshot.mem_total_bytes)}, GPU GTT "
+        f"{_gib(snapshot.gtt_used_bytes)} of {_gib(snapshot.gtt_total_bytes)}"
     )
 
 
@@ -293,10 +289,9 @@ def log_pressure(
     without sysfs does not spam the log. Never raises.
     """
     verdict = assessment if assessment is not None else evaluate_pressure(snapshot)
-    message = "Host memory pressure [%s]: %s — %s" % (
-        context,
-        verdict.level,
-        describe_snapshot(snapshot),
+    message = (
+        f"Host memory pressure [{context}]: {verdict.level} — "
+        f"{describe_snapshot(snapshot)}"
     )
     detail = "; ".join(verdict.reasons)
     try:
@@ -343,10 +338,10 @@ def apply_oom_score_adj(pid: int, value: int) -> tuple[int | None, str | None]:
     clamped = max(OOM_SCORE_ADJ_MIN, min(OOM_SCORE_ADJ_MAX, int(value)))
     path = _proc_path(pid, "oom_score_adj")
     try:
-        path.write_text("%d\n" % clamped, encoding="utf-8")
+        path.write_text(f"{clamped}\n", encoding="utf-8")
         error = None
     except OSError as exc:
-        error = "%s: %s" % (type(exc).__name__, exc.strerror or exc)
+        error = f"{type(exc).__name__}: {exc.strerror or exc}"
     return read_oom_score_adj(pid), error
 
 
@@ -982,12 +977,9 @@ def log_startup_gap(logger, log_dir, now: float | None = None) -> dict | None:
                 )
             return None
         message = (
-            "Recovery: previous proxy log write %s (%s), %.0fs before this start"
-            % (
-                measured["last_write"],
-                measured["source"],
-                measured["gap_seconds"],
-            )
+            f"Recovery: previous proxy log write {measured['last_write']} "
+            f"({measured['source']}), {measured['gap_seconds']:.0f}s before "
+            "this start"
         )
         if logger is not None:
             if measured["gap_seconds"] >= STARTUP_GAP_WARNING_SECONDS:

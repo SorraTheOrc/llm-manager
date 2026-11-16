@@ -345,6 +345,11 @@ CAPACITY_TOO_LARGE_REASONS: frozenset[str] = frozenset(
     {
         # ``prefill_eta`` cold-prefill cap (``new_tokens > budget_tokens``).
         "prefill_budget_exceeded",
+        # ``prefill_eta`` deadline token capacity (whole-prompt cold / measured
+        # new tokens over ``deadline_capacity_tokens``, LP-0MW957RB3000ER79):
+        # the request itself is too large to finish inside the deadline, so
+        # waiting cannot help and a remote tier must serve it.
+        "prefill_eta_exceeds_capacity",
         # Local context/size skip (router/priority and provider hard cap).
         "context_too_large",
     }
@@ -615,6 +620,11 @@ def reserve(
         busy_slots=busy_slots,
         in_flight_prefills=in_flight_prefills,
         occupant_prefill_seconds=occupant_prefill_seconds,
+        # Deadline token capacity (LP-0MW957RB3000ER79 AC3): a live residency
+        # view (``source == "live"``) measured a reusable prefix, so the
+        # measured new tokens are priced; a caller-supplied/predicted ratio is
+        # not evidence and is priced as a cold whole prompt.
+        residency_measured=(cached_ratio_source == "live"),
     )
 
     projected = (

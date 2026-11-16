@@ -18,6 +18,7 @@ import csv
 import json
 import math
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -273,6 +274,11 @@ ERROR_TYPE_LABELS = {
     "slot_save_error": "slot_save failed",
     "backend_retry": "backend_retry",
     "upstream_http_error": "upstream HTTP error",
+    # Typed deterministic-400 errors (LP-0MW959HRZ00231FN, parent AC5): labelled
+    # for what they are — a client resending a rejected history — so the row is
+    # never read as a provider outage.
+    "deterministic_client_error": "deterministic client error (identical history)",
+    "session_wedged": "session wedged (terminal)",
 }
 
 
@@ -460,6 +466,12 @@ class LocalTurnRow:
     # ``context size at fallback`` can read ``n/a`` — those lines carry
     # ``tokens=missing``, so they contribute no prompt tokens to any figure.
     streams_without_usage: int = 0
+    # New (uncached) prompt tokens on this session's final turn, with its
+    # provenance (LP-0MVZ6EAZR001DX5E). ``None`` means the final turn carried
+    # no token evidence — the banded table excludes the session from that
+    # column's mean and tallies it as ``n/a`` rather than counting a 0.
+    final_turn_new_tokens: int | None = None
+    final_turn_new_tokens_source: str | None = None
 
 
 NO_LOCAL_TURNS_TEXT = "No session in the window used the local model."
@@ -506,6 +518,10 @@ def local_turn_rows(
             context_at_fallback=s.context_at_fallback,
             context_source=s.context_at_fallback_source,
             streams_without_usage=getattr(s, "streams_without_usage", 0),
+            final_turn_new_tokens=getattr(s, "final_turn_new_tokens", None),
+            final_turn_new_tokens_source=getattr(
+                s, "final_turn_new_tokens_source", None
+            ),
         )
         for s in candidates
         if s.local_requests > 0
@@ -638,6 +654,170 @@ def local_turn_coverage(summary: AnalysisResult) -> dict:
 
 def _round1(value: float | None) -> float | None:
     return round(value, 1) if value is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Context size at fallback by percentile band (LP-0MVZ6EAZR001DX5E)
+# ---------------------------------------------------------------------------
+#
+# "Does the dominant reason for falling back change as context grows, and does
+# the uncached work per turn grow with it?" One derived, banded view rendered
+# immediately after ``## Local model usage by session`` so the answer is in the
+# nightly report instead of inferred by sorting the per-session table:
+#
+# - the cohort is that section's cohort (a session with >=1 local turn) further
+#   restricted to sessions with token evidence at their fallback, so the two
+#   sections cannot disagree about a session's context-at-fallback figure or
+#   its fallback reason — both call ``local_turn_rows`` /
+#   ``_fallback_reason_label``;
+# - the bands are DISJOINT deciles (`P0–P10` … `P90–P100`) cut at the same
+#   linear-interpolation percentile convention (``_percentile``) the sibling
+#   section's P10/P50/P90 rows use. Disjoint bands (not cumulative "<= Pk"
+#   cohorts) are what make a per-band reason share readable as a share of that
+#   band. A value exactly on a cut belongs to the HIGHER band, the cohort
+#   minimum to ``P0–P10`` and the maximum to ``P90–P100``;
+# - ``avg final-turn new tokens`` is the arithmetic mean over the band's
+#   sessions that carry the figure (``SessionStats.final_turn_new_tokens``,
+#   derived once in aggregation). A session without it is excluded from that
+#   column and tallied as ``n/a`` — never imputed as 0;
+# - an empty band renders ``-`` (no fabricated mean) and an empty cohort omits
+#   the whole section (the 05:00 cron must exit 0 on an empty window), while
+#   ``--json`` keeps the key with an empty band list and zero cohort counts.
+CONTEXT_AT_FALLBACK_SECTION_TITLE = "Context size at fallback by percentile band"
+CONTEXT_AT_FALLBACK_JSON_KEY = "context_at_fallback_by_percentile"
+
+#: Decile cut points between the bands: ``P0–P10`` … ``P90–P100``.
+CONTEXT_BAND_DECILES = (0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+#: How many fallback reasons each band shows (plus the ``other`` remainder).
+CONTEXT_BAND_TOP_REASONS = 2
+
+
+def _band_label(lower: int, upper: int) -> str:
+    """``P0–P10`` … ``P90–P100`` (an en dash, as the section heading names them)."""
+    return f"P{lower}\u2013P{upper}"
+
+
+def _band_index(value: float, cuts: list[float], minimum: float) -> int:
+    """Decile band index of *value*, given the nine interior cut points.
+
+    A value exactly on a cut belongs to the **higher** band: the index is the
+    number of cuts at or below it, so the cohort maximum lands in
+    ``P90–P100`` (every cut is below it). The cohort minimum is the one
+    exception — it always anchors ``P0–P10`` — because a cohort clustered at
+    its own minimum would otherwise have every decile cut equal that minimum
+    and push the whole cluster into the top band, where "the smallest contexts"
+    would read as "the largest".
+    """
+    if value <= minimum:
+        return 0
+    return sum(1 for cut in cuts if cut <= value)
+
+
+def context_at_fallback_by_percentile(summary: AnalysisResult) -> dict:
+    """Machine-readable banded context-at-fallback view (report + ``--json``).
+
+    Returns the cohort counts, the ten band rows (session count, mean context
+    at fallback, mean final-turn new tokens with its ``n/a`` tally) and the
+    per-band top-two fallback-reason shares with an ``other`` remainder, so the
+    Markdown section and the ``--json`` key can never disagree.
+    """
+    rows = local_turn_rows(summary.sessions)
+    with_local = len(rows)
+    sampled = [r for r in rows if r.context_at_fallback is not None]
+    values = sorted(float(r.context_at_fallback) for r in sampled)
+    cuts = [
+        _percentile(values, decile)
+        for decile in CONTEXT_BAND_DECILES[1:-1]
+    ]
+    bounds = {
+        decile: _percentile(values, decile) for decile in CONTEXT_BAND_DECILES
+    }
+
+    def _bound(decile: int) -> int | None:
+        value = bounds[decile]
+        return int(round(value)) if value is not None else None
+
+    members: dict[int, list[LocalTurnRow]] = {
+        index: [] for index in range(len(CONTEXT_BAND_DECILES) - 1)
+    }
+    minimum = values[0] if values else 0.0
+    for row in sampled:
+        members[
+            _band_index(float(row.context_at_fallback), cuts, minimum)
+        ].append(row)
+
+    bands: list[dict] = []
+    for index, (lower, upper) in enumerate(
+        zip(CONTEXT_BAND_DECILES, CONTEXT_BAND_DECILES[1:])
+    ):
+        band_rows = members[index]
+        contexts = [r.context_at_fallback for r in band_rows]
+        new_tokens = [
+            r.final_turn_new_tokens
+            for r in band_rows
+            if r.final_turn_new_tokens is not None
+        ]
+        reason_counts = Counter(r.reason for r in band_rows)
+        # Higher count first, then alphabetical: the row order is deterministic
+        # whatever order the sessions were parsed in.
+        ordered = sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        top = ordered[:CONTEXT_BAND_TOP_REASONS]
+        other = len(band_rows) - sum(count for _, count in top)
+        band_size = len(band_rows)
+        bands.append(
+            {
+                "label": _band_label(lower, upper),
+                "lower_decile": lower,
+                "upper_decile": upper,
+                "lower_bound": _bound(lower),
+                "upper_bound": _bound(upper),
+                "sessions": band_size,
+                "avg_context_at_fallback": (
+                    int(round(sum(contexts) / len(contexts)))
+                    if contexts
+                    else None
+                ),
+                "avg_final_turn_new_tokens": (
+                    int(round(sum(new_tokens) / len(new_tokens)))
+                    if new_tokens
+                    else None
+                ),
+                "final_turn_new_tokens_samples": len(new_tokens),
+                "final_turn_new_tokens_missing": band_size - len(new_tokens),
+                "reasons": [
+                    {
+                        "reason": reason,
+                        "sessions": count,
+                        "pct_of_band_sessions": round(
+                            count / band_size * 100.0, 1
+                        ),
+                    }
+                    for reason, count in top
+                ],
+                "other": {
+                    "sessions": other,
+                    "pct_of_band_sessions": (
+                        round(other / band_size * 100.0, 1) if band_size else 0.0
+                    ),
+                },
+            }
+        )
+
+    return {
+        "sessions_in_window": len(summary.sessions),
+        "sessions_with_local": with_local,
+        # Sessions within the banded figures (context-at-fallback evidence)…
+        "sessions_included": len(sampled),
+        # …and those excluded from them for missing token evidence. Never 0 as
+        # a stand-in for "unknown".
+        "sessions_excluded_no_context": with_local - len(sampled),
+        "sessions_without_final_turn_tokens": sum(
+            1 for r in sampled if r.final_turn_new_tokens is None
+        ),
+        # Empty cohort (no local turns at all) => no bands, so the key reports
+        # the empty window instead of ten fabricated rows.
+        "bands": bands if with_local else [],
+    }
 
 
 def _fmt_count(value: float | None) -> str:
@@ -820,6 +1000,114 @@ def _append_local_turn_coverage_section(
         )
 
 
+def _context_band_cell(band: dict) -> str:
+    """Band label plus its two context bounds, e.g. ``P10–P20 (3,347–5,120)``."""
+    cell = band["label"]
+    if band["lower_bound"] is not None:
+        cell += f" ({band['lower_bound']:,}\u2013{band['upper_bound']:,})"
+    return cell
+
+
+def _context_band_int_cell(value: int | None) -> str:
+    """A banded token figure, or an explicit ``-`` (an empty band, not a 0)."""
+    return "-" if value is None else f"{value:,}"
+
+
+def _append_context_at_fallback_band_section(
+    ap, summary: AnalysisResult
+) -> None:
+    """Append ``## Context size at fallback by percentile band``.
+
+    Two deterministic tables — the ten disjoint decile bands (session count,
+    mean context at fallback, mean final-turn new tokens) and the per-band
+    top-two fallback reasons with an ``other`` remainder — derived once by
+    ``context_at_fallback_by_percentile`` so this Markdown and the ``--json``
+    key cannot disagree (LP-0MVZ6EAZR001DX5E). Omitted entirely when no
+    session used local, so an empty window still renders a clean report.
+    """
+    data = context_at_fallback_by_percentile(summary)
+    if not data["sessions_with_local"]:
+        return
+    included = data["sessions_included"]
+    missing = data["sessions_without_final_turn_tokens"]
+
+    ap("")
+    ap(f"## {CONTEXT_AT_FALLBACK_SECTION_TITLE}")
+    ap("")
+    ap(
+        "Sessions with at least one local turn: "
+        f"**{data['sessions_with_local']} of "
+        f"{data['sessions_in_window']}** sessions. **{included}** carry token "
+        "evidence at their fallback and are banded below; "
+        f"**{data['sessions_excluded_no_context']} session(s) excluded for "
+        "missing token evidence** (never counted as 0)."
+    )
+    ap("")
+    ap(
+        "| Band | Sessions | Avg total context size | "
+        "Avg final-turn new tokens |"
+    )
+    ap("|---|---|---|---|")
+    for band in data["bands"]:
+        ap(
+            f"| {_context_band_cell(band)} | {band['sessions'] or '-'} | "
+            f"{_context_band_int_cell(band['avg_context_at_fallback'])} | "
+            f"{_context_band_int_cell(band['avg_final_turn_new_tokens'])} |"
+        )
+    ap("")
+    ap(
+        "Bands are disjoint deciles of context size at fallback, cut at the "
+        "P10–P90 percentiles (linear interpolation) over the "
+        f"{included} banded session(s); a session exactly on a cut sits in the "
+        "higher band, while the lowest value always anchors `P0–P10` and the "
+        "highest `P90–P100`. An empty band renders `-`, never a fabricated "
+        "mean."
+    )
+    if included:
+        ap("")
+        ap(
+            "`Avg final-turn new tokens` is the mean, over the band's sessions "
+            "with evidence, of the **final turn's** uncached prompt tokens — "
+            "its admission line's measured `new_tokens=`, else "
+            "`estimated_tokens= × (1 − cached_ratio=)`. "
+            f"**{missing} of {included}** banded session(s) are `n/a` "
+            "(excluded from that column's mean, never imputed as 0)."
+        )
+
+    ap("")
+    ap("### Top two fallback reasons per band")
+    ap("")
+    ap("| Band | Sessions | Most common reason | Second most common | Other |")
+    ap("|---|---|---|---|---|")
+    for band in data["bands"]:
+        cell = _context_band_cell(band)
+        if not band["sessions"]:
+            ap(f"| {cell} | - | - | - | - |")
+            continue
+        reason_cells = [
+            f"{row['reason']} {row['sessions']} "
+            f"({row['pct_of_band_sessions']:.1f}%)"
+            for row in band["reasons"]
+        ]
+        while len(reason_cells) < CONTEXT_BAND_TOP_REASONS:
+            reason_cells.append("-")
+        other = band["other"]
+        reason_cells.append(
+            f"{other['sessions']} ({other['pct_of_band_sessions']:.1f}%)"
+        )
+        ap(f"| {cell} | {band['sessions']} | " + " | ".join(reason_cells) + " |")
+    ap("")
+    ap(
+        "Percentages are shares of that band's sessions and sum to 100 % with "
+        "the `other` remainder; ties break alphabetically. A reason is "
+        "categorical, so it is reported as counts and shares only — no "
+        "percentiles. The reason is the session's own attribution "
+        "(`no_remote_fallback` when it never used remote, `unattributed` when "
+        "it has no evidence), exactly as `## Local model usage by session` "
+        "reports it."
+    )
+
+
 def _ap_fallback_attribution(ap, summary: AnalysisResult) -> None:
     """Render the per-session fallback-attribution states (LP-0MVMBMSWR0036RES).
 
@@ -988,18 +1276,24 @@ def _load_metrics_state(
 
 
 def _scorecard_rows(
-    state: dict, actuals: dict[str, float | None]
+    state: dict,
+    actuals: dict[str, float | None],
+    defaults: Mapping | None = None,
 ) -> list[dict]:
-    """Per-metric baseline/target/actual/verdict, in registry order.
+    """Per-metric baseline/target/tolerance/actual/verdict, in registry order.
 
     The **single** derivation behind both scorecard surfaces — the rendered
     summary table and the ``--json`` ``performance_metrics`` block — so the two
-    views can never disagree (LP-0MW1BUAQD001WL8X, parent AC7).
+    views can never disagree (LP-0MW1BUAQD001WL8X, parent AC7). *defaults* is
+    the committed defaults mapping the per-metric ``tolerance_pct`` band is
+    read from; ``None`` loads it, and an absent/invalid value falls back to the
+    10 % default (LP-0MWADHS83006QFQS).
     """
     rows: list[dict] = []
     for metric in performance_metrics.METRIC_REGISTRY:
         measurements = state["metrics"][metric.id]["measurements"]
         actual = actuals.get(metric.id)
+        tolerance_pct = performance_metrics.tolerance_for(metric.id, defaults)
         # The verdict only ever reads Met / Unmet / Insufficient history: a
         # window with no measurable actual has no verdict to give, and the
         # engine's ``n/a`` (its "no actual" answer) would be a fourth label the
@@ -1008,7 +1302,9 @@ def _scorecard_rows(
         verdict = (
             performance_metrics.INSUFFICIENT
             if actual is None
-            else performance_metrics.derive_verdict(actual, measurements, metric.direction)
+            else performance_metrics.derive_verdict(
+                actual, measurements, metric.direction, tolerance_pct=tolerance_pct
+            )
         )
         rows.append(
             {
@@ -1019,11 +1315,22 @@ def _scorecard_rows(
                 "target": performance_metrics.target_from(
                     measurements, metric.direction
                 ),
+                "tolerance_pct": tolerance_pct,
                 "actual": actual,
                 "verdict": verdict,
             }
         )
     return rows
+
+
+def _fmt_metric_tolerance(tolerance_pct: float) -> str:
+    """The tolerance cell: the relative band that decided the verdict.
+
+    ``±10 %`` for the default; a per-metric override renders with its own
+    precision (``±12.5 %``), and ``±0 %`` is rendered rather than hidden
+    because a zero band is a deliberate choice for that metric.
+    """
+    return f"±{float(tolerance_pct):g} %"
 
 
 def _append_performance_metrics_section(
@@ -1051,6 +1358,9 @@ def _append_performance_metrics_section(
     reflects what was just recorded.
     """
     state = _load_metrics_state(metrics_config, metrics_state)
+    defaults = performance_metrics.load_defaults(
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
     actuals = _performance_metric_actuals(summary, config, mode_map)
 
     if update_metrics and metrics_state is not None:
@@ -1076,17 +1386,22 @@ def _append_performance_metrics_section(
     ap(
         "**Baseline** is the best recorded value and the date it was measured; "
         "**Target** is the mean of the three best measurements (direction-aware); "
+        "**Tolerance** is the relative band around the target that the verdict "
+        "was judged against (default ±10 %, overridable per metric); "
         "**Actual** is this window; **Result** compares the actual against the "
-        "target and reads `Met`, `Unmet` or `Insufficient history`."
+        "target and reads `Met` when the actual is within the tolerance band of "
+        "the target (any actual better than the target is also `Met`), `Unmet` "
+        "when it is outside the band, or `Insufficient history`."
     )
     ap("")
-    ap("| Metric | Baseline | Target | Actual | Result |")
-    ap("|---|---|---|---|---|")
-    for row in _scorecard_rows(state, actuals):
+    ap("| Metric | Baseline | Target | Tolerance | Actual | Result |")
+    ap("|---|---|---|---|---|---|")
+    for row in _scorecard_rows(state, actuals, defaults):
         metric = row["metric"]
         ap(
             f"| {metric.label} | {_fmt_metric_baseline(row['baseline'], metric.unit)} | "
             f"{_fmt_metric_value(row['target'], metric.unit)} | "
+            f"{_fmt_metric_tolerance(row['tolerance_pct'])} | "
             f"{_fmt_metric_value(row['actual'], metric.unit)} | {row['verdict']} |"
         )
 
@@ -1224,22 +1539,27 @@ def performance_metrics_json(
 
     Read-only: the single state write happens while the report is built, so a
     ``--json`` consumer can never mutate history. Each entry carries
-    ``baseline`` (``value`` + ``date``), ``target``, ``actual`` and ``verdict``,
-    produced by :func:`_scorecard_rows` — the same derivation the rendered
-    table uses — so the machine-readable block always agrees with the report
-    (parent AC7). A metric without a measurable actual reports ``actual`` as
-    ``null``, never a misleading ``0``.
+    ``baseline`` (``value`` + ``date``), ``target``, ``tolerance_pct`` (the
+    additive relative band the verdict was judged against), ``actual`` and
+    ``verdict``, produced by :func:`_scorecard_rows` — the same derivation the
+    rendered table uses — so the machine-readable block always agrees with the
+    report (parent AC7). A metric without a measurable actual reports ``actual``
+    as ``null``, never a misleading ``0``.
     """
     state = _load_metrics_state(metrics_config, metrics_state)
+    defaults = performance_metrics.load_defaults(
+        performance_metrics.DEFAULTS_PATH if metrics_config is None else metrics_config
+    )
     actuals = _performance_metric_actuals(summary, config, mode_map)
     return {
         row["metric"].id: {
             "baseline": row["baseline"],
             "target": row["target"],
+            "tolerance_pct": row["tolerance_pct"],
             "actual": row["actual"],
             "verdict": row["verdict"],
         }
-        for row in _scorecard_rows(state, actuals)
+        for row in _scorecard_rows(state, actuals, defaults)
     }
 
 
@@ -1395,6 +1715,14 @@ def build_report(
     # many turns it answered, the per-session share and the reason each session
     # moved to remote — read straight from the session aggregates above.
     _append_local_turn_coverage_section(ap, summary)
+
+    # Context size at fallback by percentile band (LP-0MVZ6EAZR001DX5E): the
+    # same cohort banded into disjoint deciles, so "does the dominant fallback
+    # reason change as context grows, and does the uncached work per turn grow
+    # with it?" is answered by the report itself. It reads immediately after
+    # the per-session table it bands and before the whole-window fallback
+    # reasons it splits per band.
+    _append_context_at_fallback_band_section(ap, summary)
 
     if summary.fallback_reason_counts:
         ap("")
@@ -2995,33 +3323,37 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
 
     One row per **absolute wall-clock hour** of the report window
     (window-bounded buckets, partial first/last hours truncated to the
-    window edges, idle hours listed as ``0s``), with busy time / busy-%
-    columns (busy seconds ÷ window-bounded bucket duration, defensively
-    clamped to 100%) and seven per-hour **activity** columns counted by each
+    window edges, idle hours listed), with a **GPU computing (attributable)**
+    column carrying the per-hour `gpu:computing_workload:bool` share (power
+    ≥ 90 W **and** ≥ 1 busy local slot) produced only by
+    `scripts/gpu_utilisation.py` — the same measure as the scorecard's
+    `gpu_busy` row, so the two tables cannot disagree; an hour with no observed
+    instants reads `unknown`, never a fabricated `0 %` (LP-0MWG7KQVZ008DBZM).
+    Seven per-hour **activity** columns are counted by each
     event's own timestamp (LP-0MTYAZFGN003BYQS): ``Requests started`` (all
     ``Stream started`` events), ``Local attempts`` (``Stream started`` with
     ``provider=local``), ``Local served`` (``Stream finished`` with
     ``provider=local``), ``Fallbacks`` (``Fallback triggered`` events), and
-    ``Local-skip`` (``routing_skip_local`` events) — replacing the previous
-    session-first-hour classification columns. ``Local dispatch`` (every
+    ``Local-skip`` (``routing_skip_local`` events). ``Local dispatch`` (every
     ``[local] POST`` attempt to llama-server, LP-0MVKUKG3F0035I85) and
     ``Lease denials`` (``local_dispatch_denied`` refusals) were added so the
     ``State`` column's verdict is auditable from the row itself. A **State**
     column (LP-0MVKUKG3F0035I85) sits next to ``Hour``, carrying the
     availability classification (``serving`` / ``prefill-only-no-decode`` /
     ``lease-blocked`` / ``idle``, ``+``-joined when several apply) so an hour
-    whose gate was wedged no longer reads as ``0s / 0.0%`` idle; the state
+    whose gate was wedged no longer reads as an idle hour; the state
     vocabulary is defined in the footnote printed after the table. Buckets are
     keyed by absolute hour, so a rolling window that straddles an hour emits
     two distinct edge partials rather than two rows sharing one hour-of-day
-    bucket. Always rendered — also when the window has no local traffic (busy
-    columns then read ``0s`` / ``0.0%``); with no events at all the body shows
-    a ``No data`` note. Ends with a Totals row: the window-level state (the
-    classification of the summed window evidence), window busy totals and the
-    sum of each activity column over the window.
+    bucket. Always rendered — also when the window has no local traffic (the
+    attributable column then reads ``unknown`` without GPU telemetry); with no
+    events at all the body shows a ``No data`` note. Ends with a Totals row:
+    the window-level state (the classification of the summed window evidence),
+    the window-level attributable share, and the sum of each activity column
+    over the window.
     """
     sessions = list(summary.sessions.values())
-    hourly = dict(summary.busy.hourly_busy) if summary.busy else {}
+    attributable_by_hour = _hourly_attributable(summary.gpu_busy)
     end = summary.window_end
     has_data = bool(sessions) or bool(summary.hourly_activity)
 
@@ -3030,32 +3362,32 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
     ap("")
     # State column (LP-0MVKUKG3F0035I85): per-hour availability classification
     # derived only from the logs (serving / prefill-only-no-decode /
-    # lease-blocked / idle), so a wedged gate stops reading as ``0s / 0.0%``
-    # idle. Placed next to ``Hour`` so the operator sees the outage before the
-    # busy columns.
-    ap("| Hour | State | Busy | % | " + " | ".join(label for _, label in ACTIVITY_COLUMNS) + " |")
-    ap("|" + "---|" * (4 + len(ACTIVITY_COLUMNS)))
+    # lease-blocked / idle), so a wedged gate stops reading as an idle hour.
+    # Placed next to ``Hour`` so the operator sees the outage before the
+    # activity columns. ``GPU computing (attributable)`` replaces the former
+    # log-derived ``Busy``/``%`` pair (LP-0MWG7KQVZ008DBZM): the hourly "how
+    # much GPU did we use" figure is now the same attributable share the
+    # scorecard reports, not a second, log-only definition.
+    ap(
+        "| Hour | State | GPU computing (attributable) | "
+        + " | ".join(label for _, label in ACTIVITY_COLUMNS)
+        + " |"
+    )
+    ap("|" + "---|" * (3 + len(ACTIVITY_COLUMNS)))
     activity_totals: Counter = Counter()
     window_evidence = Counter()
     if not has_data:
-        ap("| _No session data in window._ |" + " - |" * (3 + len(ACTIVITY_COLUMNS)))
+        ap("| _No session data in window._ |" + " - |" * (2 + len(ACTIVITY_COLUMNS)))
     else:
         # Window-bounded hour buckets keyed by ABSOLUTE hour
         # (LP-0MTYAZFGN003BYQS): each bucket's key is the top of its hour, so
         # the two edge partials of a rolling window never share a key and no
-        # busy duration is double-counted. Busy seconds come from
-        # ``BusyStats.hourly_busy`` (absolute hour -> seconds), already
-        # window-correct because intervals are clipped to the window before
-        # attribution.
+        # duration is double-counted. The attributable share covers the same
+        # absolute-hour buckets, produced by ``scripts/gpu_utilisation.py``.
         cursor = summary.window_start
         while cursor < end:
             bucket_key = cursor.replace(minute=0, second=0, microsecond=0)
             bucket_end = min(bucket_key + timedelta(hours=1), end)
-            duration = (bucket_end - cursor).total_seconds()
-            seconds = hourly.get(bucket_key, 0.0)
-            # Defensive clamp: absolute-hour keys make a >100% row
-            # impossible, but never emit one even if inputs drift.
-            pct = min(100.0, (seconds / duration * 100.0)) if duration else 0.0
             counts = summary.hourly_activity.get(bucket_key, Counter())
             state = aggregation.hour_availability(bucket_key, counts).label
             for key in aggregation.AVAILABILITY_COUNTERS:
@@ -3065,15 +3397,16 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
                 value = counts.get(key, 0)
                 activity_totals[key] += value
                 cells.append(str(value))
+            gpu_cell = _hourly_attributable_cell(
+                attributable_by_hour.get(int(bucket_key.timestamp()))
+            )
             ap(
-                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {state} | {_fmt_duration(seconds)} | {pct:.1f}% | "
+                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {state} | {gpu_cell} | "
                 + " | ".join(cells)
                 + " |"
             )
             cursor = bucket_end
 
-    busy_seconds = summary.busy.busy_seconds if summary.busy else 0.0
-    busy_pct = summary.busy.busy_pct if summary.busy else 0.0
     window_state = aggregation.classify_hour(
         summary.window_start,
         local_dispatch_attempts=window_evidence.get("local_dispatch_attempts", 0),
@@ -3081,15 +3414,67 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
         local_denials=window_evidence.get("local_denials", 0),
         lease_active_fallbacks=window_evidence.get("lease_active_fallbacks", 0),
     ).label
+    window_gpu = summary.gpu_busy
+    window_gpu_cell = (
+        f"{window_gpu.busy_pct:.1f}%" if window_gpu is not None
+        else HOURLY_ATTRIBUTABLE_UNKNOWN
+    )
     ap(
-        f"| Totals | {window_state} | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
+        f"| Totals | {window_state} | {window_gpu_cell} | "
         + " | ".join(str(activity_totals.get(key, 0)) for key, _label in ACTIVITY_COLUMNS)
         + " |"
+    )
+    ap("")
+    ap(
+        "`GPU computing (attributable)` is the share of that hour in which the "
+        "GPU drew ≥ 90 W **and** at least one local llama-server slot was "
+        "busy (`gpu:computing_workload:bool`, on a 15 s grid) — our local "
+        "model's GPU work, produced only by `scripts/gpu_utilisation.py`. It "
+        "is the same measure as the scorecard's `gpu_busy` row, bucketed per "
+        "hour, so the two tables cannot disagree. An hour with no observed "
+        "instants reads `unknown` (never a fabricated `0 %`), and the "
+        "`Totals` cell is the window-level attributable share. The `State` "
+        "column and the activity columns remain log-derived from proxy events; "
+        "the log-derived `local_busy` (`dispatch → finish`) capacity figure is "
+        "reported in the Local model utilization section, not here."
     )
     ap("")
     ap(AVAILABILITY_FOOTNOTE)
     for state_name, note in AVAILABILITY_STATE_NOTES:
         ap(f"- `{state_name}` — {note}")
+
+
+#: The row label carrying the one reported GPU-activity measure. The docs
+#: quote it verbatim (``proxy/tests/test_monitoring_deployment.py``), so it is
+#: defined once here rather than repeated in renderers.
+GPU_ATTRIBUTABLE_ROW_LABEL = (
+    "GPU computing — attributable (power ≥ 90 W and a busy local slot)"
+)
+
+#: Rendered in the hourly table when an hour has no observed GPU instants —
+#: never a fabricated ``0 %`` (coverage honesty).
+HOURLY_ATTRIBUTABLE_UNKNOWN = "unknown"
+
+
+def _hourly_attributable(gpu: object | None) -> dict[int, object]:
+    """Map each absolute hour's unix start to its attributable share.
+
+    The shares come from the single producer via :mod:`gpu_busy`
+    (``GpuBusyResult.hourly_shares``), never re-derived here. Empty when the
+    window had no GPU telemetry, so every hour reads ``unknown``.
+    """
+    shares = getattr(gpu, "hourly_shares", None) or []
+    return {int(share.hour_start): share for share in shares}
+
+
+def _hourly_attributable_cell(share: object | None) -> str:
+    """Render one hour's attributable figure, or ``unknown`` when unobserved."""
+    if share is None:
+        return HOURLY_ATTRIBUTABLE_UNKNOWN
+    pct = getattr(share, "attributable_pct", None)
+    if pct is None:
+        return HOURLY_ATTRIBUTABLE_UNKNOWN
+    return f"{pct:.1f}%"
 
 
 def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSchedule) -> None:
@@ -3140,14 +3525,16 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
     ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
-    # GPU-based busy time from Prometheus power consumption (hardware-side).
+    # Attributable GPU computing (power ≥ 90 W and a busy local slot), the one
+    # reported GPU-activity measure (LP-0MWG7KQVZ008DBZM). Produced only by
+    # ``scripts/gpu_utilisation.py`` and consumed here, never re-derived.
     gpu = summary.gpu_busy
     if gpu is not None:
         gpu_cell = _busy_cell(gpu.busy_seconds, gpu.total_seconds)
         unknown_pct = getattr(gpu, "unknown_pct", 0.0)
         if unknown_pct > 0:
             gpu_cell += f", unknown {unknown_pct:.1f}%"
-        ap(f"| GPU busy — power-based (hardware) | {gpu_cell} | - | - |")
+        ap(f"| {GPU_ATTRIBUTABLE_ROW_LABEL} | {gpu_cell} | - | - |")
     ap("")
     ap(f"_Bounds: lower = {aggregation.BUSY_LOWER_BOUND_LABEL}; upper = "
        f"{aggregation.BUSY_UPPER_BOUND_LABEL}. {b.prefill_extended_streams} of "
@@ -3179,22 +3566,23 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
        "started inside the window or within its 1h busy-pairing margin with no "
        "logged finish (earlier starts are pre-window leftovers); fast/cheap split "
        "follows the slot schedule.")
-    # GPU-based busy-time note (hardware signal, not log-derived).
+    # GPU-based attributable computing note (the single reported measure).
     if gpu is not None:
         ap("")
-        ap("_The **GPU busy** row uses Prometheus power-consumption data "
-           "(`gpu:computing:bool`, evaluated every 15 s): 1 while the GPU "
-           "draws ≥ 90 W (the recording-rule threshold), 0 otherwise. Each "
-           "15 s instant across the window is counted as computing, idle or "
-           "**unknown**, so a monitoring gap cannot inflate the figure; the "
-           "row names the unknown share whenever the window is not fully "
-           "observed. It is **hardware activity, not local model "
-           "utilisation**: `gpu:computing:bool` counts any GPU consumer "
-           "(other workloads, non-local requests) and misses proxy-served "
-           "work during log gaps. The decision figure for local model "
-           "utilisation is the log-derived `local_busy` (`dispatch → "
-           "finish`) above; this row is supplementary hardware telemetry and "
-           "does not depend on the proxy's stream lifecycle logs._")
+        ap("_The **GPU computing — attributable** row is the one reported "
+           "GPU-activity measure: the share of the window in which the GPU "
+           "drew ≥ 90 W **and** at least one local llama-server slot was "
+           "busy (`gpu:computing_workload:bool`, evaluated every 15 s) — that "
+           "is, our local model's work, not any GPU consumer's. It is "
+           "produced only by `scripts/gpu_utilisation.py` and consumed here. "
+           "Each 15 s instant across the window is counted as computing, "
+           "idle or **unknown**, so a monitoring gap cannot inflate the "
+           "figure; the row names the unknown share whenever the window is "
+           "not fully observed. A single short task also fills a whole 15 s "
+           "instance, so this is not sub-15-second precision. It is "
+           "**hardware activity for our workload, not slot occupancy**: the "
+           "log-derived `local_busy` (`dispatch → finish`) above is the "
+           "capacity/contention figure that gates and alerts quote.")
 
 
 def _phase_cell(value: float | None) -> str:
@@ -4440,7 +4828,9 @@ def run_analysis(
         llama_files, window_start, window_end, schedule, mode_map, log_dir=llama_log_dir
     )
 
-    # GPU busy-time from Prometheus power consumption (best-effort).
+    # Attributable GPU-activity share via the single producer
+    # (``scripts/gpu_utilisation.py``), best-effort: an unreachable store or a
+    # window with no observed instants simply yields no row.
     if summary.busy is not None:
         ws = window_start.timestamp()
         we = window_end.timestamp()
@@ -4736,6 +5126,13 @@ def summary_to_json(
         # Local-turn coverage (LP-0MVM93DE6009JGBU): the same derivation the
         # Markdown section renders, so `--json` consumers need not scrape it.
         "local_turn_coverage": local_turn_coverage(summary),
+        # Context size at fallback by percentile band (LP-0MVZ6EAZR001DX5E):
+        # the same derivation the Markdown section renders (cohort counts, the
+        # ten band rows and the per-band top-two reason shares). ADDITIVE —
+        # every key above keeps its value and meaning; an empty window reports
+        # an empty band list and zero cohort counts rather than omitting the
+        # key.
+        CONTEXT_AT_FALLBACK_JSON_KEY: context_at_fallback_by_percentile(summary),
         # Local capacity signals (LP-0MVU8O4EL005IYP9 AC1.5): the same
         # ``slots_stale`` figures and target verdict the Markdown section
         # renders. ADDITIVE — every key above keeps its value and meaning.
@@ -4967,18 +5364,20 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
 
 
 def _gpu_busy_json(gpu: object | None) -> dict | None:
-    """JSON-friendly GPU busy-time from Prometheus power consumption.
+    """JSON-friendly attributable GPU-activity share (the one reported measure).
 
-    Supplementary hardware telemetry, **not** a local-utilisation signal:
-    measures when the GPU drew compute-level power (``gpu:computing:bool`` —
-    any GPU consumer), independent of proxy log events, so it counts GPU work
-    outside the proxy's slot accounting. Coverage is grid-honest: the
-    ``coverage`` block names the expected/observed/computing/idle/unknown
-    sample counts and the ``unknown_*`` fields carry the unobserved share, so
-    a monitoring gap can never read as idle or inflate the busy figure.
-    Decisions use the log-derived ``local_busy`` (``dispatch → finish``); this
-    block is its hardware-side complement. Returns ``None`` when the query
-    fails or the window has no observed instants.
+    The attributable share — ``gpu:computing_workload:bool`` (power ≥ 90 W
+    **and** ≥ 1 busy local slot), produced only by
+    ``scripts/gpu_utilisation.py`` — is the report's sole GPU-usage figure
+    (LP-0MWG7KQVZ008DBZM). Coverage is grid-honest: the ``coverage`` block names
+    the expected/observed/computing/idle/unknown sample counts and the
+    ``unknown_*`` fields carry the unobserved share, so a monitoring gap can
+    never read as idle or inflate the figure. ``hourly`` carries the same
+    measure bucketed per absolute hour (``attributable_pct`` is ``null`` for an
+    hour with no observed instants). The log-derived ``local_busy``
+    (``dispatch → finish``) is a separate ``--json`` key and the capacity figure
+    gates quote. Returns ``None`` when the query fails or the window has no
+    observed instants.
     """
     if gpu is None:
         return None
@@ -5004,7 +5403,12 @@ def _gpu_busy_json(gpu: object | None) -> dict | None:
             "idle": round(gpu.idle_pct, 1),
             "unknown": round(gpu.unknown_pct, 1),
         },
-        # Smoothed power trace (1-min samples, derived from 15-s raw).
+        # Per-hour attributable share (the same measure, bucketed by absolute
+        # hour): the machine-readable twin of the ``## Summary by hour`` column.
+        "hourly": [
+            share.to_dict() for share in getattr(gpu, "hourly_shares", None) or []
+        ],
+        # Smoothed power trace (1-min means of the producer's 15-s series).
         "smoothed_power": [
             {"timestamp": int(ts), "power_watts": round(w, 2)}
             for ts, w in gpu.smoothed_power_values

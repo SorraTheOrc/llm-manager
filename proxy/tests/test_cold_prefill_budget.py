@@ -59,9 +59,17 @@ def _cfg(**server_overrides) -> dict:
 def _seed_cache_cold_dispatches(
     service_ms: float, tokens: int = 40_000, count: int = 6, model: str = "Qwen3"
 ) -> None:
-    """Seed an identical-sample window so the bucket is calibrated."""
+    """Seed an identical-sample window so the bucket is calibrated.
+
+    Q410 AC2 re-basis: the profile is genuinely-cold, so it also feeds the
+    cold window (processed = tokens) — a cold large prompt is priced from the
+    cold window only.
+    """
     for _ in range(count):
         prefill_eta.record_dispatch_sample(model, tokens, 0.0, service_ms)
+        prefill_eta.record_cold_measured_sample(
+            model, tokens, 0.0, tokens, service_ms
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +160,16 @@ def test_25k_in_the_fast_band_is_admitted():
     cannot mask the deadline-relative bound this criterion is about: with the
     shipped 60 s budget a 25k prompt is already refused by the wait bound, and
     AC4 is specifically the safety-fraction band decision.
+
+    Q410 AC2 re-basis: the pinned profile's 20-30k samples fall below the cold
+    window's >= 32k-processed predicate, so the same band rate is seeded as a
+    genuinely-cold 40k sample (bucket 1) — a cold 25k prompt prices from the
+    cold window.
     """
-    harness.seed_pinned_profile()
+    for _ in range(6):
+        prefill_eta.record_cold_measured_sample(
+            harness.MODEL, 40_000, 0.0, 40_000, 40_000 / 270.0 * 1000.0
+        )
 
     decision = prefill_eta.evaluate_admission(
         _cfg(contention_queue_max_wait_seconds=300),
@@ -175,8 +191,10 @@ def test_band_slow_25k_is_refused_by_the_safety_fraction():
     when the measured band is slow — that is what the deadline-relative term
     exists for (parent AC3).
     """
-    # ~190 t/s band: 25k / 190 = 132 s.
-    _seed_cache_cold_dispatches(service_ms=25_000 / 190.0 * 1000.0, tokens=25_000)
+    # ~190 t/s band: 25k / 190 = 132 s. Seeded in the same bucket via the
+    # genuinely-cold 40k window (Q410 AC2 re-basis: a cold large prompt is
+    # priced from the cold window, whose predicate needs >= 32k processed).
+    _seed_cache_cold_dispatches(service_ms=40_000 / 190.0 * 1000.0, tokens=40_000)
 
     decision = prefill_eta.evaluate_admission(
         _cfg(contention_queue_max_wait_seconds=300),
@@ -192,7 +210,7 @@ def test_band_slow_25k_is_refused_by_the_safety_fraction():
 
 
 def test_safety_fraction_zero_disables_the_deadline_relative_bound():
-    _seed_cache_cold_dispatches(service_ms=25_000 / 190.0 * 1000.0, tokens=25_000)
+    _seed_cache_cold_dispatches(service_ms=40_000 / 190.0 * 1000.0, tokens=40_000)
 
     decision = prefill_eta.evaluate_admission(
         _cfg(local_admission_guard_budget_safety_fraction=0.0),
@@ -214,6 +232,11 @@ def test_percentile_pricing_engages_from_the_configured_floor():
     """
     for service_ms in (80_000.0, 84_000.0, 88_000.0, 132_000.0, 140_000.0):
         prefill_eta.record_dispatch_sample("Qwen3", 25_000, 0.0, service_ms)
+        # Q410 AC2 re-basis: the same varied, genuinely-cold profile feeds the
+        # cold window at 40k (same per-token rate, same bucket 1).
+        prefill_eta.record_cold_measured_sample(
+            "Qwen3", 40_000, 0.0, 40_000, service_ms * (40_000 / 25_000)
+        )
 
     new_floor, _ = prefill_eta.estimate_prefill_seconds(
         "Qwen3", 25_000, 0.0, _cfg()
@@ -513,6 +536,13 @@ def test_replay_refuses_every_measured_over_budget_prompt():
     """
     meta, records = harness.load_fixture()
     harness.seed_pinned_profile()
+    # Q410 AC2 re-basis: the pinned 20-30k samples are below the cold window's
+    # >= 32k-processed predicate, so the same band rate is seeded cold (40k,
+    # bucket 1) or the over-budget prompts would be inert-admitted.
+    for _ in range(6):
+        prefill_eta.record_cold_measured_sample(
+            harness.MODEL, 40_000, 0.0, 40_000, 40_000 / 270.0 * 1000.0
+        )
 
     result = harness.replay(records, config=_cfg())
     over_budget = [a for a in result.attempts if a.new_tokens > BUDGET]

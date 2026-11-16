@@ -21,6 +21,16 @@ if proxy_dir not in sys.path:
 _proxy_tests_dir = str(Path(proxy_dir) / "tests")
 if _proxy_tests_dir not in sys.path:
     sys.path.insert(0, _proxy_tests_dir)
+# ``proxy/tests/fixtures`` — shared fixture modules importable by test files.
+# Import them here so pytest discovers the @pytest.fixture objects.
+_proxy_fixtures_dir = str(Path(proxy_dir) / "tests" / "fixtures")
+if _proxy_fixtures_dir not in sys.path:
+    sys.path.insert(0, _proxy_fixtures_dir)
+# Import fixture module so its @pytest.fixture objects are registered.
+try:
+    import test_prefill_scenarios  # noqa: F401
+except ImportError:
+    pass
 
 
 @pytest.fixture(autouse=True)
@@ -32,12 +42,18 @@ def _reset_slot_counts_cache():
     Without a reset, an earlier test that populated the cache would make a
     later test observing a stubbed (0,0) /slots failure see degraded counts
     instead of 0/0.
+
+    The same fixture clears the reachability-probe evidence recorded for the
+    pre-dispatch routing gate (LP-0MWCOMI160011F6C): an earlier test's passing
+    probe must not make a later test's stale-snapshot case look corroborated.
     """
     import proxy.observability as obs
 
     obs._last_slot_counts_cache = None
+    obs.reset_local_backend_reachability()
     yield
     obs._last_slot_counts_cache = None
+    obs.reset_local_backend_reachability()
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +86,24 @@ def _reset_slot_details_cache():
     obs._last_slot_details_cache = []
     yield
     obs._last_slot_details_cache = []
+
+
+@pytest.fixture(autouse=True)
+def _reset_slot_progress_cache():
+    """Reset the log-derived per-slot progress cache before every test.
+
+    ``_slot_progress_cache`` is parsed from ``llama-server.log`` and is now
+    read by the dispatch lease-extension progress probe
+    (:func:`proxy.observability.get_slot_prefill_progress`,
+    LP-0MW8VO2HT007Y1VQ). A leftover entry from another test would make a
+    stubbed ``/slots``/aggregate failure look like measured log progress, so
+    the cache must not leak between tests.
+    """
+    import proxy.observability as obs
+
+    obs._slot_progress_cache = {}
+    yield
+    obs._slot_progress_cache = {}
 
 
 @pytest.fixture(autouse=True)

@@ -183,6 +183,7 @@ dependency order):
 | 6 | `LP-0MVV29XDW006VTWK` | Diurnally matched pre-change baseline restatement — 52.6 % working baseline (record: [`prefill-admission-conversion-diurnal-baseline.md`](prefill-admission-conversion-diurnal-baseline.md)) |
 | 7 | `LP-0MVS9Z034006MFZ6` | Docs and rollback (this page) |
 | 8 | `LP-0MVV29YDQ00437N6` | Blocker-hold pricing: price the diagnosed `prefill_in_flight` blocker class (dispatch-lease hold) in the occupancy term — evidence: [`queue-wait-abandonment-diagnosis.md`](queue-wait-abandonment-diagnosis.md) |
+| 9 | `LP-0MVV29YP6006PLNP` | Post-fix 24 h re-measurement (record: [`prefill-admission-conversion-postfix.md`](prefill-admission-conversion-postfix.md)) |
 
 Related origin items: `LP-0MVKUKF65008D5UN` (conservative ETA for large
 prompts), `LP-0MVICD2YW004DJPV` (occupancy-aware symmetric floor),
@@ -211,3 +212,19 @@ retained as the **historical** pre-change reference, not as the working
 baseline: 15.7 of the 23.8-point move from it is diurnal mix, since both
 pre-change windows are served by identical code. The literal **85 %** bar is
 unchanged.
+
+The **post-fix re-measurement** (occupant-hold build `bed25a46c`, re-anchored
+window `2026-11-06 14:16:00` → `2026-11-07 14:16:00` because the nominal
+fix-anchored window was voided by mid-window redeploys and a backend
+crash-loop) is recorded in
+[`prefill-admission-conversion-postfix.md`](prefill-admission-conversion-postfix.md)
+(`LP-0MVV29YP6006PLNP`): the abandoned-queue-wait share is **82.1 %** (23/28)
+— still below the literal 85 % bar, but above both the 52.6 % working
+baseline (+29.5 points) and the 60.7 % pre-fix post-change share (+21.4
+points). The queue volume collapsed (28 waits vs 136/517) and the per-hour
+abandoned rate fell to 0.96 /h (from 13.1 /h pre-fix, 2.96 /h baseline), so
+the residual queue is tiny but its conditional abandonment is high. Two
+configuration confounds bind the comparison and are stated in the record: the
+queue budget was swept 60 s→30 s and depth 8→2 on 2026-10-31
+(`LP-0MVT1146V007WXA4`, deployed before this fix), and the measured window is
+diurnally 14:16→14:16 vs the 00:10→00:10 baseline.

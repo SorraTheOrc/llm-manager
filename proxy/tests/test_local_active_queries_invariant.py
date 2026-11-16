@@ -33,7 +33,7 @@ Acceptance-criterion map
 - **AC1 — mixed-parallelism invariant.** ``TestMixedOutcomeInvariant`` runs
   three concurrent local streams with distinct outcomes (success, measured
   cache-deficit abort/eviction, client cancel) and asserts
-  ``srv.local_active_queries == _count_active_local_dispatch_records(srv)`` at
+  ``srv.local_active_queries == _outstanding_dispatch_credits(srv)`` at
   every observable step: admission, first byte, per chunk, the abort/eviction
   release, the client-cancel release and completion. The observation is taken
   under the production ``local_active_queries_lock`` → ``dispatch_records_lock``
@@ -513,7 +513,13 @@ def _active_record_dump(srv) -> str:
 
 
 async def _snapshot(srv) -> tuple[int, int]:
-    """Read the counter and the active-record count atomically.
+    """Read the counter and the outstanding-credit count atomically.
+
+    LP-0MW0TLPOR002TAFO: the counter counts dispatch **credits**, not records —
+    a record can carry several credits for overlapping dispatches of one
+    session. The scenarios here use one credit per record, so the credit and
+    record counts coincide; comparing against the credit count keeps the
+    invariant correct if a scenario ever overlaps two dispatches of one session.
 
     Acquires the locks in the order ``_try_acquire_local_dispatch`` uses
     (``local_active_queries_lock`` → ``local_dispatch_records_lock``), so the
@@ -523,7 +529,7 @@ async def _snapshot(srv) -> tuple[int, int]:
     async with srv.local_active_queries_lock:
         async with srv.local_dispatch_records_lock:
             counter = int(srv.local_active_queries)
-            active = helpers._count_active_local_dispatch_records(srv)
+            active = helpers._outstanding_dispatch_credits(srv)
     return counter, int(active or 0)
 
 

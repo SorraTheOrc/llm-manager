@@ -1,0 +1,18 @@
+# Rotation-split slice of the two-server llama-server.log
+# (LP-0MW957RWM0007Z3S AC3).
+#
+# The log rotated between the router's spawn announcement and this slice, so
+# the ``name=Qwen3 on port 32999`` / ``name=mxbai-embed on port 51973`` lines
+# are in the previous file. What survives here is the interleaved stream of
+# one live child: the embeddings child's lines happened to fall in the rotated
+# segment, leaving a single unannounced eval-line port. A rotation-split file
+# must not lose the basis just because the announcement scrolled away, so the
+# single unannounced port is inferred as Qwen3.
+#
+# Ground truth for the assertions:
+#   rates 240, 246, 250, 254, 260 tok/s -> median 250.0 tok/s, port_source=inferred
+[32999] prompt eval time =   50000.00 ms / 12000 tokens (    4.17 ms per token,   240.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12300 tokens (    4.07 ms per token,   246.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12500 tokens (    4.00 ms per token,   250.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12700 tokens (    3.94 ms per token,   254.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 13000 tokens (    3.85 ms per token,   260.00 tokens per second)

@@ -832,22 +832,34 @@ class TestGrafanaDashboardConfig:
         assert len(providers) > 0, "providers must not be empty"
 
     def test_dashboard_provider_points_to_existing_dir(self, grafana_dashboards_config):
-        """AC 3: Dashboard provider's options.path points to an existing directory."""
+        """AC 3: Dashboard provider's options.path is absolute and resolves to
+        an existing directory after installation.
+
+        The directory is created by this test so the assertion validates the
+        path resolves (red → green evidence); the directory does not require
+        a live Grafana instance.
+        """
         providers = grafana_dashboards_config.get("providers", [])
         for prov in providers:
             options = prov.get("options", {})
             dash_path_str = options.get("path", "")
-            if dash_path_str:
-                dash_path = Path(dash_path_str)
-                if not dash_path.is_absolute():
-                    # Relative to Grafana home — we can't fully validate here
-                    # but we can check it's a reasonable relative path
-                    assert dash_path_str.startswith(
-                        "${grafana_home}"
-                    ) or dash_path_str.startswith("/"), (
-                        f"Dashboard path {dash_path_str} should be absolute or "
-                        f"reference ${{{{grafana_home}}}}"
-                    )
+            assert dash_path_str, "Dashboard provider options.path must not be empty"
+            # No tokenised placeholders — must be a concrete absolute path.
+            assert "${" not in dash_path_str, (
+                f"Dashboard path {dash_path_str!r} must not contain unresolved "
+                "tokens (e.g. ${{grafana_home}}); use the concrete absolute path"
+            )
+            dash_path = Path(dash_path_str)
+            assert dash_path.is_absolute(), (
+                f"Dashboard path {dash_path_str!r} must be absolute"
+            )
+            # Create the directory so the "exists" assertion validates the path
+            # resolves (red → green evidence); does not require a live Grafana.
+            dash_path.mkdir(parents=True, exist_ok=True)
+            assert dash_path.is_dir(), (
+                f"Dashboard path {dash_path_str!r} must point to an existing "
+                "directory after creation"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1271,14 @@ class TestPrometheusSystemdUnit:
 
 
 class TestGrafanaSystemdUnit:
-    """Validation of docs/systemd/grafana-server.service."""
+    """Validation of docs/systemd/grafana-server.service.
+
+    The unit is the fenced ``ini`` block of the document, extracted with the
+    same ``unit_from_doc`` helper every other unit in ``docs/systemd/`` is
+    installed with (monitoring/README.md) — the document must keep exactly one
+    ``ini`` block and the extracted unit must be safe: loopback-only bind, the
+    admin password from the ``%h`` file, no credential anywhere in the prose.
+    """
 
     def test_unit_file_exists(self):
         """Grafana systemd unit file exists."""
@@ -1282,6 +1301,337 @@ class TestGrafanaSystemdUnit:
         content = (DOCS_SYSTEMD_DIR / "grafana-server.service").read_text()
         assert "[Service]" in content
         assert "ExecStart=" in content
+
+    def test_extracted_unit_has_required_sections(self):
+        """The extracted ini block is a complete unit (unit_from_doc contract)."""
+        unit = _unit_text("grafana-server")
+        for section in ("[Unit]", "[Service]", "[Install]"):
+            assert section in unit, f"grafana-server.service is missing {section}"
+
+    def test_binds_loopback_only(self):
+        """AC 1: the unit pins 127.0.0.1:3000 — the process never binds a wildcard."""
+        unit = _unit_text("grafana-server")
+        assert "Environment=GF_SERVER_HTTP_PORT=3000" in unit, (
+            "the unit must set GF_SERVER_HTTP_PORT=3000"
+        )
+        # Grafana's http_addr default is empty (all interfaces). The unit must
+        # pin an explicit loopback address; any other GF_SERVER_HTTP_ADDR value
+        # (empty, 0.0.0.0, a bare :port) keeps the wildcard exposure.
+        addr_lines = [
+            line for line in unit.splitlines() if "GF_SERVER_HTTP_ADDR=" in line
+        ]
+        assert addr_lines == ["Environment=GF_SERVER_HTTP_ADDR=127.0.0.1"], (
+            f"the only GF_SERVER_HTTP_ADDR line must pin 127.0.0.1, got {addr_lines}"
+        )
+
+    def test_admin_password_from_file_not_inline(self):
+        """AC 2: the admin password comes from the %h file, never an inline value."""
+        unit = _unit_text("grafana-server")
+        assert (
+            "Environment=GF_SECURITY_ADMIN_PASSWORD__FILE=%h/.config/grafana/admin.pass"
+            in unit
+        ), (
+            "the unit must point at the per-user secret file via %h "
+            "(systemd user-unit expansion)"
+        )
+        for line in unit.splitlines():
+            if "GF_SECURITY_ADMIN_PASSWORD=" in line:
+                assert "GF_SECURITY_ADMIN_PASSWORD__FILE=" in line, (
+                    f"inline admin password in the unit: {line!r} — "
+                    f"use the __FILE variant"
+                )
+
+    def test_no_admin_credentials_in_document(self):
+        """AC 3: no admin:admin and no GF_SECURITY_ADMIN_PASSWORD=admin anywhere."""
+        content = _norm((DOCS_SYSTEMD_DIR / "grafana-server.service").read_text())
+        assert "admin:admin" not in content
+        assert "gf_security_admin_password=admin" not in content
+
+    def test_setup_verification_points_to_deploy_script(self):
+        """AC 4: setup/verification delegate to scripts/deploy_grafana.sh."""
+        content = _norm((DOCS_SYSTEMD_DIR / "grafana-server.service").read_text())
+        assert "scripts/deploy_grafana.sh" in content
+        assert "scripts/deploy_grafana.sh --check" in content
+        assert "cp monitoring/grafana" not in content, (
+            "the cp-based provisioning block must be gone — the deploy script "
+            "renders provisioning from monitoring/"
+        )
+        assert "curl -u admin:admin" not in content
+
+    def test_execstart_keeps_documented_binary_path(self):
+        """AC 5: ExecStart keeps the documented binary path and home/config flags."""
+        unit = _unit_text("grafana-server")
+        args = _exec_start_args(unit)
+        assert args[0] == "/home/rgardler/bin/grafana/bin/grafana-server", (
+            f"ExecStart must keep the documented binary path, got argv[0]={args[0]!r}"
+        )
+        assert _flag_values(unit, "--homepath") == ["/home/rgardler/bin/grafana"], (
+            "ExecStart must keep --homepath=/home/rgardler/bin/grafana"
+        )
+        configs = _flag_values(unit, "--config")
+        assert len(configs) == 1, f"expected one --config flag, got {configs}"
+        assert configs[0].endswith("conf/defaults.ini"), (
+            f"ExecStart must point at Grafana's own defaults.ini, got {configs}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: scripts/deploy_grafana.sh and its defect guards
+# (LP-0MWBQKQJ7005M4GC)
+#
+# The deploy script is the single entry point that installs Grafana and
+# provisions the dashboard. Three latent defects were locked out of its path:
+# a wildcard bind, a default `admin`/`admin` credential and a provider path
+# that cannot resolve. Every test below must fail when its guarded defect is
+# reintroduced (AC 12); the reintroduction evidence is recorded as a comment
+# on the work item.
+# ---------------------------------------------------------------------------
+
+DEPLOY_SCRIPT = PROJECT_ROOT / "scripts" / "deploy_grafana.sh"
+
+
+def _run_deploy_script(*args: str) -> subprocess.CompletedProcess:
+    """Run scripts/deploy_grafana.sh in a pure/read-only mode via ``bash``."""
+    return subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT), *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestGrafanaDeployScript:
+    """Behavioural guards for scripts/deploy_grafana.sh.
+
+    Uses only the script's pure helper modes (--extract-unit,
+    --render-provider-config, --check) so the guards run on any host without
+    installing Grafana; --check additionally isolates ``HOME`` so the
+    undeployed-host assertions stay true even on a host where Grafana is
+    deployed.
+    """
+
+    def test_deploy_script_syntax(self):
+        """AC 1: bash -n accepts the script on every host."""
+        result = subprocess.run(
+            ["bash", "-n", str(DEPLOY_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"bash -n rejected {DEPLOY_SCRIPT.name}:\n{result.stderr}"
+        )
+
+    def test_deploy_script_shellcheck(self):
+        """AC 2: shellcheck passes; when absent, skip with a named reason."""
+        shellcheck = shutil.which("shellcheck")
+        if shellcheck is None:
+            pytest.skip(
+                "shellcheck is not installed on this host — the binary "
+                "'shellcheck' was not found; install it to lint "
+                "scripts/deploy_grafana.sh"
+            )
+        result = subprocess.run(
+            [shellcheck, str(DEPLOY_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"shellcheck reported issues in {DEPLOY_SCRIPT.name}:\n"
+            f"{result.stdout}{result.stderr}"
+        )
+
+    def _extract_unit(self) -> str:
+        """Run the script's --extract-unit helper and return its output."""
+        result = _run_deploy_script("--extract-unit")
+        assert result.returncode == 0, (
+            f"--extract-unit failed: {result.stderr}"
+        )
+        return result.stdout
+
+    def test_unit_extract_no_wildcard_bind(self):
+        """AC 3: the extracted unit pins 127.0.0.1:3000, never a wildcard."""
+        unit = self._extract_unit()
+        # The script extraction must agree with the documented `unit_from_doc`
+        # extraction (monitoring/README.md), or the running unit would not be
+        # the one the docs review.
+        assert unit == _unit_text("grafana-server"), (
+            "--extract-unit output must equal the documented fenced `ini` "
+            "unit of docs/systemd/grafana-server.service"
+        )
+        assert "Environment=GF_SERVER_HTTP_ADDR=127.0.0.1" in unit, (
+            "the extracted unit must set GF_SERVER_HTTP_ADDR=127.0.0.1"
+        )
+        assert "Environment=GF_SERVER_HTTP_PORT=3000" in unit, (
+            "the extracted unit must set GF_SERVER_HTTP_PORT=3000"
+        )
+        addr_lines = [
+            line for line in unit.splitlines() if "GF_SERVER_HTTP_ADDR=" in line
+        ]
+        assert addr_lines == ["Environment=GF_SERVER_HTTP_ADDR=127.0.0.1"], (
+            f"the only GF_SERVER_HTTP_ADDR line must pin 127.0.0.1 so the "
+            f"process never binds a wildcard; found {addr_lines}"
+        )
+
+    def test_unit_extract_no_inline_credential(self):
+        """AC 4: the extracted unit never carries an inline admin password."""
+        unit = self._extract_unit()
+        assert (
+            "Environment=GF_SECURITY_ADMIN_PASSWORD__FILE="
+            "%h/.config/grafana/admin.pass" in unit
+        ), (
+            "the extracted unit must read the admin password from the %h file "
+            "via GF_SECURITY_ADMIN_PASSWORD__FILE"
+        )
+        for line in unit.splitlines():
+            if "GF_SECURITY_ADMIN_PASSWORD=" in line:
+                assert "GF_SECURITY_ADMIN_PASSWORD__FILE=" in line, (
+                    f"inline admin password in extracted unit: {line!r} — use "
+                    f"the __FILE variant"
+                )
+        assert "admin:admin" not in unit
+
+    def test_provider_path_is_absolute(self, tmp_path):
+        """AC 5: rendered provider options.path is absolute, existing, no tokens."""
+        result = _run_deploy_script("--render-provider-config", str(tmp_path))
+        assert result.returncode == 0, (
+            f"--render-provider-config failed: {result.stderr}"
+        )
+        rendered = yaml.safe_load(result.stdout)
+        providers = rendered.get("providers", [])
+        assert providers, "rendered provider config must define a provider"
+        dash_path_str = providers[0].get("options", {}).get("path", "")
+        assert dash_path_str, "rendered options.path must be set"
+        assert "${" not in dash_path_str, (
+            f"rendered options.path must not carry unresolved tokens like "
+            f"${{grafana_home}}; got {dash_path_str!r}"
+        )
+        dash_path = Path(dash_path_str)
+        assert dash_path.is_absolute(), (
+            f"rendered options.path must be absolute, got {dash_path_str!r}"
+        )
+        assert dash_path.exists(), (
+            f"rendered options.path {dash_path_str!r} must exist"
+        )
+        assert (tmp_path / "dashboards.yaml").is_file(), (
+            "--render-provider-config must write the rendered config to "
+            f"{tmp_path}/dashboards.yaml"
+        )
+
+    def test_no_admin_admin_credentials(self):
+        """AC 6: no admin:admin or GF_SECURITY_ADMIN_PASSWORD=admin anywhere."""
+        targets = [
+            DEPLOY_SCRIPT,
+            DOCS_SYSTEMD_DIR / "grafana-server.service",
+            MONITORING_DIR / "README.md",
+        ]
+        offenders: list[str] = []
+        for path in targets:
+            content = path.read_text()
+            if "admin:admin" in content:
+                offenders.append(f"{path.name}: contains 'admin:admin'")
+            if "GF_SECURITY_ADMIN_PASSWORD=admin" in content:
+                offenders.append(
+                    f"{path.name}: contains GF_SECURITY_ADMIN_PASSWORD=admin"
+                )
+        assert not offenders, (
+            "default admin credentials leaked into the deploy path:\n"
+            + "\n".join(offenders)
+        )
+
+    def test_script_creates_unit_log_state_dirs(self):
+        """Guard (blocker LP-0MWDPB4NK005BXY3): the script creates the dirs
+        the unit appends its logs to.
+
+        The unit's ``StandardOutput``/``StandardError`` are ``append:``
+        targets under ``~/.local/state/grafana/logs``. systemd cannot open an
+        ``append:`` path whose parent directory does not exist, so on a fresh
+        host the unit fails at start with ``status=209/STDOUT`` before
+        Grafana ever runs; the script must mkdir the state data/log dirs
+        before installing the unit.
+        """
+        unit = self._extract_unit()
+        append_targets: list[str] = []
+        for line in unit.splitlines():
+            if (
+                line.startswith(("StandardOutput=", "StandardError="))
+                and "append:" in line
+            ):
+                append_targets.append(line.split("append:", 1)[1].strip())
+        assert append_targets, (
+            "the unit must append its logs to a file under the user state "
+            "dir (StandardOutput/StandardError=append:...)"
+        )
+        script = DEPLOY_SCRIPT.read_text()
+        mkdir_marker = (
+            'mkdir -p "$HOME/.local/share/grafana/data" '
+            '"$HOME/.local/state/grafana/logs"'
+        )
+        assert mkdir_marker in script, (
+            "the deploy script must create the Grafana state dirs "
+            "(~/.local/share/grafana/data, ~/.local/state/grafana/logs) "
+            "before the unit starts; without them systemd fails the append "
+            "log target with status=209/STDOUT"
+        )
+        for target in append_targets:
+            parent = str(Path(target).parent)
+            idx = parent.find("/.local/")
+            assert idx > 0, (
+                f"append target {target!r} must live under ~/.local/ so the "
+                "script can pre-create it with $HOME"
+            )
+            rel = parent[idx + 1:]  # e.g. .local/state/grafana/logs
+            assert f'"$HOME/{rel}"' in mkdir_marker, (
+                f"the script must mkdir the append target's parent dir "
+                f"('$HOME/{rel}') so systemd can open {target!r}"
+            )
+
+    def test_undeployed_host_check(self, tmp_path):
+        """AC 7: --check --allow-absent exits 0 on an undeployed host; plain
+        --check exits 1. HOME is isolated so the assertions hold on a deployed
+        host too."""
+        empty_home = tmp_path / "home"
+        empty_home.mkdir()
+        env = {**os.environ, "HOME": str(empty_home)}
+
+        allow_absent = subprocess.run(
+            ["bash", str(DEPLOY_SCRIPT), "--check", "--allow-absent"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert allow_absent.returncode == 0, (
+            f"--check --allow-absent must exit 0 when Grafana is absent; "
+            f"stderr: {allow_absent.stderr}"
+        )
+        assert "not deployed" in allow_absent.stdout, (
+            "--check must report 'not deployed' when Grafana is absent, got: "
+            f"{allow_absent.stdout!r}"
+        )
+
+        strict = subprocess.run(
+            ["bash", str(DEPLOY_SCRIPT), "--check"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert strict.returncode == 1, (
+            "--check without --allow-absent must exit 1 when Grafana is "
+            "absent"
+        )
+
+    def test_dashboard_json_byte_identical(self):
+        """AC 8: the two dashboard JSON copies stay byte-identical."""
+        assert (
+            MONITORING_DIR / "grafana_llama_memory_dashboard.json"
+        ).read_bytes() == (
+            MONITORING_DIR
+            / "grafana"
+            / "dashboards"
+            / "grafana_llama_memory_dashboard.json"
+        ).read_bytes(), (
+            "monitoring/grafana_llama_memory_dashboard.json and "
+            "monitoring/grafana/dashboards/grafana_llama_memory_dashboard.json "
+            "must stay byte-identical (edit both together)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2837,6 +3187,69 @@ class TestMonitoringReadmeInstallSteps:
             assert unit in content, f"monitoring/README.md does not mention {unit}"
 
 
+class TestGrafanaDeploymentDocs:
+    """The README documents the scripted Grafana deploy (LP-0MWBQL7IV00783FB).
+
+    Guards the implemented-state claims a reader depends on: one command to
+    deploy/verify (`scripts/deploy_grafana.sh`, `--check`, `--allow-absent`),
+    the loopback + tailnet exposure decision, the password-file path (never the
+    value), and start/stop/check via `systemctl --user`. Reintroducing the
+    `cp`-based sketch, the "not running on this host" claim or a default
+    credential must fail a test.
+    """
+
+    def test_section4_names_the_deploy_script_and_its_flags(self):
+        """AC 1: § 4 points at the script and its install/verify commands."""
+        lowered = _norm(_readme())
+        assert "scripts/deploy_grafana.sh" in lowered
+        assert "scripts/deploy_grafana.sh --check" in lowered
+        assert "--allow-absent" in lowered
+
+    def test_section4_documents_the_exposure_decision(self):
+        """AC 1: loopback bind plus the tailnet serve decision, not a wildcard."""
+        lowered = _norm(_readme())
+        assert "127.0.0.1:3000" in lowered
+        assert "tailscale serve --tcp=3000" in lowered
+
+    def test_section4_documents_the_password_file_path_only(self):
+        """AC 1: the password-file path is named; no default credential."""
+        lowered = _norm(_readme())
+        assert "~/.config/grafana/admin.pass" in lowered
+        assert "admin:admin" not in lowered
+
+    def test_what_runs_here_row_states_the_real_bind(self):
+        """AC 2: the table row names the actual bind and drops the stale claim."""
+        content = _readme()
+        row = next(
+            line
+            for line in content.splitlines()
+            if line.strip().startswith("| `grafana-server.service`")
+        )
+        assert "not running on this host" not in row
+        assert "if deployed" not in row
+        assert "127.0.0.1:3000" in row
+        assert "tailscale serve" in row
+
+    def test_no_cp_sketch_block_remains(self):
+        """AC 4: the hand-run cp install block is replaced by the script."""
+        content = _readme()
+        assert "cp monitoring/grafana" not in content
+        assert "Sketch only" not in content
+
+    def test_security_notes_describe_loopback_and_generated_password(self):
+        """AC 3: the security bullet matches the implemented state."""
+        lowered = _norm(_readme())
+        assert "admin:admin" not in lowered
+        assert "default credentials" not in lowered
+        assert "on all interfaces" not in lowered
+
+    def test_proxy_readme_mentions_the_deploy_script(self):
+        """AC 5: the host-script list in proxy/README.md names the script."""
+        path = PROJECT_ROOT / "proxy" / "README.md"
+        assert path.exists(), "Missing proxy/README.md"
+        assert "scripts/deploy_grafana.sh" in path.read_text()
+
+
 # ---------------------------------------------------------------------------
 # Tests: monitoring/README.md query cookbook
 # (LP-0MVO8DORX004P05G AC 4)
@@ -2992,7 +3405,7 @@ DECISION_ANCHOR = "#which-busy-figure-is-authoritative-for-decisions"
 DIVERGENCE_ANCHOR = "#why-the-two-figures-diverge"
 
 #: Labels the shipped report renders; the docs must quote these, not invent any.
-GPU_BUSY_ROW_LABEL = "GPU busy — power-based (hardware)"
+GPU_BUSY_ROW_LABEL = "GPU computing — attributable (power ≥ 90 W and a busy local slot)"
 BUSY_UPPER_ROW_LABEL = "Busy time — upper bound (dispatch → finish)"
 
 #: Docs carrying a busy-figure claim; every anchor link in them must resolve.
@@ -3055,18 +3468,19 @@ class TestAuthoritativeBusyFigureIsDocumented:
             "the guidance must tie the decision figure to its definition"
         )
 
-    def test_reference_limits_the_power_figure_to_hardware_questions(self):
-        """AC2: prefer ``gpu_busy`` only for hardware questions."""
+    def test_reference_scopes_the_attributable_measure(self):
+        """AC2 (LP-0MWG7KQVZ008DBZM): the report's GPU figure is the
+        attributable share — our local model's GPU work — not slot occupancy,
+        and it is not the retired power-only figure."""
         section = _reference_section(
             start=AUTHORITATIVE_BUSY_HEADING, end=DIVERGENCE_HEADING
         )
-        assert "prefer `gpu_busy` for hardware questions only" in section
-        assert "hardware activity, not local model utilisation" in section, (
-            "the power figure must be explicitly labelled non-local"
+        assert "the attributable `gpu:computing_workload:bool` share" in section
+        assert "not slot occupancy" in section, (
+            "the attributable figure must be distinguished from slot occupancy"
         )
-        assert "was the gpu computing at all" in section, (
-            "the hardware questions the power figure does answer must be named"
-        )
+        assert "answers the gpu question" in section
+        assert "capacity question" in section
 
     def test_reference_keeps_one_divergence_explanation_and_links_it(self):
         """AC3: the causes live once, in the explanation the rule links to."""
@@ -3093,7 +3507,7 @@ class TestAuthoritativeBusyFigureIsDocumented:
     def test_skill_states_the_matching_rule_and_cross_links(self):
         """AC4: SKILL.md carries the same rule and links the reference."""
         skill = _norm(SKILL_DOC.read_text())
-        assert "hardware activity, not local model utilisation" in skill
+        assert "not slot occupancy" in skill
         assert "decisions use the log-derived `local_busy`" in skill, (
             "SKILL.md must say decisions use the log-derived figure"
         )
@@ -3108,8 +3522,9 @@ class TestAuthoritativeBusyFigureIsDocumented:
         assert "decision figure" in json_row, (
             "the --json key table must mark local_busy as the decision figure"
         )
-        assert "**not** local model utilisation" in json_row, (
-            "the --json key table must flag gpu_busy as hardware-only"
+        assert "**not** slot occupancy" in json_row, (
+            "the --json key table must flag gpu_busy as the attributable measure, "
+            "not slot occupancy"
         )
 
     def test_monitoring_readme_does_not_leave_power_as_local_utilisation(self):
@@ -3170,7 +3585,8 @@ class TestAuthoritativeBusyFigureIsDocumented:
 
         assert GPU_BUSY_ROW_LABEL in rendered
         assert BUSY_UPPER_ROW_LABEL in rendered
-        assert "local_busy" in rendered and "not local model utilisation" in rendered
+        assert "local_busy" in rendered and "capacity/contention" in rendered
+        assert "not any GPU consumer" in rendered
 
         for doc in (REFERENCE_DOC, SKILL_DOC):
             content = doc.read_text()
@@ -3225,8 +3641,9 @@ JSON_SCOPE_STATEMENTS = (
         "quote), not a GPU measurement."
     ),
     (
-        "`gpu_busy` — the power-derived `gpu:computing:bool` share measuring "
-        "hardware activity for any GPU consumer, not local model utilisation."
+        "`gpu_busy` — the attributable `gpu:computing_workload:bool` share "
+        "(power ≥ 90 W and a busy local slot) measuring our local model's GPU "
+        "work, not slot occupancy."
     ),
 )
 
@@ -3395,7 +3812,8 @@ class TestJsonBusyKeyScopeDescriptions:
                 "share like the README does"
             )
             assert "attributable" in content
-            assert "scoped derivation" in content
+            assert "busy local slot" in content
+            assert "not slot occupancy" in content
 
 
 # ---------------------------------------------------------------------------

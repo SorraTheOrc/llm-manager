@@ -1205,6 +1205,28 @@ def _get_max_prefill_seconds(srv) -> float:
         return 900.0
 
 
+def _get_prefill_eta_factor(srv) -> float:
+    """Return the runaway-prefill ETA factor (default 2.0).
+
+    A prefill whose elapsed time exceeds ``eta_prefill_s * factor`` is a
+    runaway: the prompt is taking more than the priced prefill duration by a
+    wide margin. Such a record is released early with the distinct reason
+    ``prefill_eta_exceeded`` instead of waiting out the full hard deadline
+    (LP-0MW8VOKB9002W2C1 AC4, parent AC14).
+
+    ``eta_prefill_s`` is the contended prefill estimate captured at admission
+    by ``_dispatch_evidence``. A value <= 0 or a missing estimate disables the
+    ETA bound for that record — the ceiling and no-progress watchdog still
+    bound it. Returns 0 to disable the ETA bound entirely.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_prefill_eta_factor", 2.0)
+        return float(raw) if raw is not None else 2.0
+    except Exception:
+        return 2.0
+
+
 def _get_first_byte_timeout_seconds(srv, request=None) -> float:
     """Return the initial first-byte wait ceiling in seconds (default 840).
 
@@ -2767,7 +2789,13 @@ async def _query_prefill_progress(
     1. Per-slot: ``/slots`` -> per-slot state from ``_query_slots_progress``
        (``n_past`` / ``n_prompt_tokens_processed`` when the build reports
        them, plus the ``is_processing`` liveness flag).
-    2. Aggregate: ``query_llama_status()`` -> ``kv_cache_tokens`` (or
+    2. Per-slot log tail: ``get_slot_prefill_progress()`` -> the
+       ``n_tokens`` parsed from llama-server's ``slot update_slots … prompt
+       processing progress, n_tokens = N`` stderr lines. This is the
+       measured source on llama.cpp b8782, which removed the numeric
+       ``/slots`` fields but still emits the progress line
+       (LP-0MW8VO2HT007Y1VQ, LP-0MW8VPXNZ007T0J2).
+    3. Aggregate: ``query_llama_status()`` -> ``kv_cache_tokens`` (or
        ``n_past`` if present).
 
     Returns ``(progress, alive)``:
@@ -2775,10 +2803,11 @@ async def _query_prefill_progress(
     - *progress* is the latest observed prefill progress (``None`` when no
       numeric progress can be observed).
     - *alive* is True when the slot is observed actively processing
-      (``is_processing``), even when the llama.cpp build exposes no numeric
-      progress fields (b8782 removed ``n_past``/``n_prompt_tokens_processed``
-      from ``/slots``; LP-0MSUO5Z0K007HBSS). This lets the caller extend the
-      lease on liveness rather than progress advance alone.
+      (``is_processing`` or a fresh log progress line), even when the
+      llama.cpp build exposes no numeric progress fields (b8782 removed
+      ``n_past``/``n_prompt_tokens_processed`` from ``/slots``;
+      LP-0MSUO5Z0K007HBSS). This lets the caller extend the lease on
+      liveness rather than progress advance alone.
 
     When progress is unobservable AND the slot is not observed processing,
     a throttled warning is logged so silent query failures are visible in
@@ -2797,7 +2826,7 @@ async def _query_prefill_progress(
             # LP-0MVWBXEAI008YZ7B: a definitively unloaded model has nothing
             # to probe — the resolver's (None, None) skip sentinel means no
             # /slots request and no router traversal; fall through to the
-            # /status aggregation below.
+            # log-derived and /status sources below.
             _slots_endpoint, _slots_port = _resolve_local_slots_target(
                 srv, model=model_name, endpoint=endpoint, router_port=llama_port
             )
@@ -2818,6 +2847,24 @@ async def _query_prefill_progress(
         except Exception:
             pass
 
+        # LP-0MW8VO2HT007Y1VQ / LP-0MW8VPXNZ007T0J2: log-derived per-slot
+        # progress. On llama.cpp b8782 ``/slots`` omits n_past/context_tokens,
+        # so the measured signal is the ``slot update_slots … n_tokens = N``
+        # stderr line. The proxy tails it into ``_slot_progress_cache``;
+        # reading it here is what turns the lease extension from an estimate
+        # into a measurement. Run the (small, 64 KiB) tail read off the event
+        # loop so a slow disk cannot stall the stream loop (AC4).
+        try:
+            from proxy.observability import get_slot_prefill_progress
+
+            entry = await asyncio.to_thread(get_slot_prefill_progress, slot_id)
+            if isinstance(entry, dict):
+                n_tokens = entry.get("n_tokens")
+                if isinstance(n_tokens, (int, float)) and n_tokens >= 0:
+                    return int(n_tokens), True
+        except Exception:
+            pass
+
     try:
         from proxy.observability import query_llama_status
 
@@ -2830,6 +2877,10 @@ async def _query_prefill_progress(
         pass
 
     if not alive:
+        # LP-0MW8VPH2Q007XPHQ AC2/AC3: count every unobservable poll (a
+        # countable rate, not only the throttled log line) and then emit the
+        # throttled WARNING so both logging and observability capture it.
+        _count_prefill_progress_unobservable()
         _warn_prefill_progress_unobservable(srv)
     return None, alive
 
@@ -2844,6 +2895,22 @@ cadence (LP-0MSUO5Z0K007HBSS AC2).
 
 _PREFILL_WARN_INTERVAL = 60.0
 """Seconds between repeated 'prefill progress unobservable' warnings."""
+
+
+def _count_prefill_progress_unobservable() -> None:
+    """Increment ``proxy_prefill_progress_unobservable_total`` (fail-soft).
+
+    LP-0MW8VPH2Q007XPHQ AC2: the metric counts every unobservable lease poll;
+    the WARNING stays throttled. Imported lazily so ``router_helpers`` stays
+    free of a module-level ``proxy.metrics`` dependency and a missing
+    prometheus_client can never break the lease path.
+    """
+    try:
+        from proxy.metrics import record_prefill_progress_unobservable
+
+        record_prefill_progress_unobservable()
+    except Exception:
+        pass
 
 
 def _warn_prefill_progress_unobservable(srv) -> None:
@@ -3028,16 +3095,35 @@ async def _extend_lease_during_prefill(
                     if advancing or alive:
                         record["last_progress_ts"] = time.monotonic()
                     extended = True
+                    # LP-0MW8VOKB9002W2C1 AC1: distinguish a measured-
+                    # progress extension from a liveness-only or in-flight-only
+                    # one so the window can be analysed by reason.
+                    _extend_reason = (
+                        "measured_progress" if advancing
+                        else ("liveness" if alive else "in_flight")
+                    )
                     try:
                         srv.logger.info(
                             "lease_extended_during_prefill session=%s progress=%s "
-                            "alive=%s in_flight=%s buffer=%.0fs",
+                            "alive=%s in_flight=%s reason=%s buffer=%.0fs",
                             session_key if session_key else "unknown",
                             progress,
                             alive,
                             in_flight_own,
+                            _extend_reason,
                             buffer_seconds,
                         )
+                        if advancing:
+                            # Parent AC2: a bounded extension based on measured
+                            # tokens, logged under its own name so the rate is
+                            # directly countable.
+                            srv.logger.info(
+                                "lease_extended_on_measured_progress session=%s "
+                                "progress=%s buffer=%.0fs",
+                                session_key if session_key else "unknown",
+                                progress,
+                                buffer_seconds,
+                            )
                     except Exception:
                         pass
     except Exception:
@@ -3461,6 +3547,7 @@ async def _increment_local_active_queries(
     body_json: dict | None = None,
     model_name: str | None = None,
     admission_evidence: dict | None = None,
+    request: Request | None = None,
 ) -> None:
     """Safely increment the local-only active queries counter.
 
@@ -3478,6 +3565,17 @@ async def _increment_local_active_queries(
     the lease) hold their lease for the full prefill duration. This
     applies the adaptive lease to anonymous/non-explicit sessions, not
     just explicit ones (LP-0MSEHMMBK0062ZPI).
+
+    LP-0MW0TLPOR002TAFO: when a live record already exists for the same
+    ``(endpoint, session_key)`` — an overlapping dispatch of the same
+    non-explicit session — this **appends** a credit to it instead of
+    overwriting it. Overwriting dropped the in-flight sibling's credit from the
+    record set, so the counter (2) no longer matched the record's credits (1)
+    and the next recovery tick treated the still-running dispatch as stale: the
+    measured ``local_active_queries 2→1`` / ``1→0`` and ``active_queries 1→0``
+    / ``local_generating_queries reclaimed 1`` recoveries. The explicit-session
+    path (``_try_acquire_local_dispatch``) already preserved the record and
+    appended its credit; this anonymous path was the missing counterpart.
     """
     try:
         async with srv.local_active_queries_lock:
@@ -3494,49 +3592,87 @@ async def _increment_local_active_queries(
                 async with lock:
                     record_key = _dispatch_lease_key(backend, session_key)
                     dispatch_token = _new_dispatch_token()
+                    now = time.monotonic()
 
-                    srv.local_dispatch_records[record_key] = {
-                        "backend": backend,
-                        "started_at": time.monotonic(),
-                        "active": True,
-                        "expires_at": time.monotonic() + lease_timeout,
-                        "model_name": model_name,
-                        "endpoint": backend,
-                        # LP-0MVYWLHNI000AQ7X AC1: the dispatch identity the
-                        # self-healing clamp reports (it runs outside any
-                        # request context, so the turn cannot be read there).
-                        "session": session_key,
-                        "turn": get_turn_id() or "",
-                        # LP-0MVYZEYZY003IQAH: per-dispatch identity so a
-                        # late teardown/release can be scoped to its own
-                        # dispatch instead of the shared session record.
-                        "dispatch_token": dispatch_token,
-                        # LP-0MVWF78QK0060TZH AC1/AC2: the outstanding counter
-                        # credits this record holds (this anonymous dispatch is
-                        # one), so an overwritten record's leftover credit is
-                        # still releasable by the counter-vs-outstanding rule.
-                        "dispatch_credits": [dispatch_token],
-                        # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
-                        # A record that never makes progress is bounded by
-                        # ``local_dispatch_no_progress_timeout_seconds`` from
-                        # creation (no waiting on an unobservable signal).
-                        "last_progress": 0,
-                        "last_progress_ts": time.monotonic(),
-                        # LP-0MVN4LCED00661MX AC2: the admission evidence the
-                        # post-acceptance eviction ERROR reports.
-                        # LP-0MVODJ3P6000AIUM AC1/AC4: verbatim admission-time
-                        # snapshot when one was threaded; explicit ``None``
-                        # markers (never a recompute) otherwise.
-                        **_dispatch_evidence(
-                            body_json,
-                            model_name,
-                            session_key,
-                            admission_evidence=admission_evidence,
-                        ),
-                    }
+                    existing = srv.local_dispatch_records.get(record_key)
+                    existing_credits = (
+                        _dispatch_credit_tokens(existing)
+                        if isinstance(existing, dict)
+                        and existing.get("active")
+                        else None
+                    )
+                    if existing_credits is not None:
+                        # A sibling dispatch of this session is still in
+                        # flight: keep the record (it is the live-work
+                        # evidence the recovery loops read) and append this
+                        # dispatch's credit. Its attribution moves to this
+                        # dispatch; the live fields (started_at, stream_cm,
+                        # progress baseline, evidence) are preserved.
+                        existing["dispatch_credits"] = [
+                            *existing_credits,
+                            dispatch_token,
+                        ]
+                        existing["dispatch_token"] = dispatch_token
+                        existing["expires_at"] = now + lease_timeout
+                        existing["turn"] = get_turn_id() or ""
+                    else:
+                        # No live sibling, or a legacy record that cannot
+                        # express a second credit: create a fresh record (the
+                        # pre-change behaviour).
+                        srv.local_dispatch_records[record_key] = {
+                            "backend": backend,
+                            "started_at": now,
+                            "active": True,
+                            "expires_at": now + lease_timeout,
+                            "model_name": model_name,
+                            "endpoint": backend,
+                            # LP-0MVYWLHNI000AQ7X AC1: the dispatch identity the
+                            # self-healing clamp reports (it runs outside any
+                            # request context, so the turn cannot be read there).
+                            "session": session_key,
+                            "turn": get_turn_id() or "",
+                            # LP-0MVYZEYZY003IQAH: per-dispatch identity so a
+                            # late teardown/release can be scoped to its own
+                            # dispatch instead of the shared session record.
+                            "dispatch_token": dispatch_token,
+                            # LP-0MVWF78QK0060TZH AC1/AC2: the outstanding counter
+                            # credits this record holds (this anonymous dispatch is
+                            # one), so an overwritten record's leftover credit is
+                            # still releasable by the counter-vs-outstanding rule.
+                            "dispatch_credits": [dispatch_token],
+                            # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                            # A record that never makes progress is bounded by
+                            # ``local_dispatch_no_progress_timeout_seconds`` from
+                            # creation (no waiting on an unobservable signal).
+                            "last_progress": 0,
+                            "last_progress_ts": now,
+                            # LP-0MVN4LCED00661MX AC2: the admission evidence the
+                            # post-acceptance eviction ERROR reports.
+                            # LP-0MVODJ3P6000AIUM AC1/AC4: verbatim admission-time
+                            # snapshot when one was threaded; explicit ``None``
+                            # markers (never a recompute) otherwise.
+                            **_dispatch_evidence(
+                                body_json,
+                                model_name,
+                                session_key,
+                                admission_evidence=admission_evidence,
+                            ),
+                        }
                     _pin_dispatch_slot(
                         srv, record_key, session_key, backend
                     )
+                    # LP-0MW0TLPOR002TAFO: stamp the owning request with this
+                    # dispatch's credit token on the anonymous path too. The
+                    # explicit path already did, so a teardown/cancellation
+                    # release was token-scoped only for explicit sessions; an
+                    # anonymous request released with ``dispatch_token=None``
+                    # could consume a *sibling's* credit and make the recovery
+                    # loop fire. Stamping makes the credit model complete.
+                    if request is not None:
+                        try:
+                            request._local_dispatch_token = dispatch_token
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -5845,6 +5981,77 @@ async def _release_measured_cache_abort_dispatch(
     return removed
 
 
+def _record_abandoned_prefill_cold_sample(
+    srv,
+    model_name: str | None,
+    latest: list[Any] | None,
+    config: Any | None,
+    *,
+    session_id: str | None = None,
+) -> bool:
+    """Record one cold sample from a prefill abandoned at the deadline/ceiling.
+
+    LP-0MWGAEBWJ00334W2 (option 1 of the work item). A dispatch the prefill
+    deadline (or the max-prefill ceiling) cancels never emits a first byte, so
+    the first-byte cold-sample call site in ``router.proxy_to_local`` can never
+    see it — which is why the cold window never calibrates for the buckets that
+    carry large cold prompts. *latest* is the :func:`_prefetch_measured_cache_abort`
+    ``latest_sink``: the last ``prompt_progress`` observation of this dispatch,
+    filled on every event so a peek cancelled at the deadline still carries it.
+
+    The sample is priced by :func:`proxy.prefill_eta.record_abandoned_prefill_sample`
+    (prompt bucket from ``total``, positions actually prefilled, the dispatch's
+    own measured elapsed) and nothing else changes: no admission decision, no
+    release ordering, no client-visible behaviour.
+
+    Fail-open by contract: any problem (no observation, rollback key off,
+    unusable fields, an internal error) simply records nothing and returns
+    ``False``. Returns ``True`` when the sample entered the cold window, and
+    logs one ``cold_sample_abandoned`` line so an operator can watch the new
+    source fill (the evidence AC1 asks for is that count reaching
+    ``local_admission_guard_min_samples``).
+    """
+    try:
+        from proxy.prefill_eta import (
+            eviction_cold_sample_enabled,
+            record_abandoned_prefill_sample,
+        )
+
+        if not latest:
+            return False
+        measured = latest[-1]
+        if measured is None:
+            return False
+        if not eviction_cold_sample_enabled(config):
+            return False
+        recorded = record_abandoned_prefill_sample(
+            model_name,
+            getattr(measured, "total", None),
+            getattr(measured, "cache", None),
+            getattr(measured, "processed", None),
+            getattr(measured, "time_ms", None),
+        )
+        if not recorded:
+            return False
+        try:
+            srv.logger.info(
+                "cold_sample_abandoned session=%s model=%s total=%s cache=%s "
+                "processed=%s time_ms=%s → recorded into the cold calibration "
+                "window from the abandoned prefill",
+                session_id or "unknown",
+                model_name or "unknown",
+                getattr(measured, "total", None),
+                getattr(measured, "cache", None),
+                getattr(measured, "processed", None),
+                getattr(measured, "time_ms", None),
+            )
+        except Exception:
+            pass
+        return True
+    except Exception:  # fail-open: a metric path must not break a dispatch
+        return False
+
+
 @dataclass
 class MeasuredAbortPrefetch:
     """Outcome of :func:`_prefetch_measured_cache_abort` (LP-0MVR7IN0O000DPXN).
@@ -5858,12 +6065,21 @@ class MeasuredAbortPrefetch:
     ``measured_cache_abort`` line (``detail``/``measured_eta_s``/``budget_s``)
     so a tolerated deficit is explainable. ``None`` when no decision was taken
     (no measurement, or the peek ended before one).
+
+    ``latest_measured`` is the **last** ``prompt_progress`` observation the peek
+    saw, which is what the abandonment cold sample prices
+    (LP-0MWGAEBWJ00334W2): ``measured`` stays the *deciding* (first) event
+    because its ``cache`` is the final reused prefix, while ``latest_measured``
+    carries the progress reached at abandonment. It is also delivered through
+    the caller's ``latest_sink`` so a peek cancelled at the deadline — the case
+    this exists for — still leaves the latest observation with the caller.
     """
 
     chunks: list[bytes]
     abort: bool = False
     decision: Any | None = None
     measured: Any | None = None
+    latest_measured: Any | None = None
     complete: bool = False
     error: BaseException | None = None
 
@@ -5877,6 +6093,7 @@ async def _prefetch_measured_cache_abort(
     timeout: float = 5.0,
     max_chunks: int = 1024,
     chunks_sink: list[bytes] | None = None,
+    latest_sink: list[Any] | None = None,
 ) -> MeasuredAbortPrefetch:
     """Peek the local SSE stream for the first ``prompt_progress`` measurement.
 
@@ -5913,6 +6130,14 @@ async def _prefetch_measured_cache_abort(
     replays those bytes through a fresh ``SSEEventReframer``, so a cancelled
     peek never loses or re-orders a byte.
 
+    *latest_sink* (LP-0MWGAEBWJ00334W2) is the same cancellation-safe channel
+    for the **latest** measurement: it is refreshed on every ``prompt_progress``
+    event (single element, so a caller never has to reason about growth), which
+    is what the abandonment cold sample prices when the prefill deadline
+    cancels the peek. A peek that is cancelled therefore still leaves the
+    progress reached at abandonment with the caller; nothing else about the
+    decision changes (only the FIRST event decides).
+
     *aiter* is the dispatch's ``aiter_bytes()`` iterator and *reframer* its
     :class:`proxy.utils.SSEEventReframer`, both owned by the caller: the peek
     must consume the SAME cursor and event buffer the normal stream loop
@@ -5934,6 +6159,20 @@ async def _prefetch_measured_cache_abort(
     capture = PromptProgressCapture()
     decided_measured = None
     decided_decision = None
+    latest_measured = None
+
+    def _observe_latest(measured) -> None:
+        """Refresh the latest-measurement channel (cancellation-safe)."""
+        nonlocal latest_measured
+        latest_measured = measured
+        if latest_sink is None:
+            return
+        try:
+            latest_sink.clear()
+            latest_sink.append(measured)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     deadline_at = time.monotonic() + timeout if timeout > 0 else None
 
     while len(chunks) < max_chunks:
@@ -5963,13 +6202,19 @@ async def _prefetch_measured_cache_abort(
             chunk = read_task.result()
         except StopAsyncIteration:
             return MeasuredAbortPrefetch(
-                chunks=chunks, complete=True, decision=decided_decision
+                chunks=chunks,
+                complete=True,
+                decision=decided_decision,
+                latest_measured=latest_measured,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # read error — fail open, replay + raise later
             return MeasuredAbortPrefetch(
-                chunks=chunks, error=exc, decision=decided_decision
+                chunks=chunks,
+                error=exc,
+                decision=decided_decision,
+                latest_measured=latest_measured,
             )
         chunks.append(chunk)
 
@@ -5983,15 +6228,21 @@ async def _prefetch_measured_cache_abort(
                         chunks=chunks,
                         measured=decided_measured,
                         decision=decided_decision,
+                        latest_measured=latest_measured,
                     )
+                # Every progress event refreshes the latest measurement: what
+                # the prefill reached is the abandonment cold sample's evidence
+                # (LP-0MWGAEBWJ00334W2), and only this peek ever observes it
+                # before the deadline cancels the dispatch.
+                measured = MeasuredPrefill.from_progress(
+                    progress, priced_new_tokens=priced_new_tokens
+                )
+                _observe_latest(measured)
                 if decided_measured is not None:
                     # Only the FIRST progress event decides (its ``cache`` is
                     # the final reused prefix); later ones add no decision
                     # information, so keep peeking for the deadline bound.
                     continue
-                measured = MeasuredPrefill.from_progress(
-                    progress, priced_new_tokens=priced_new_tokens
-                )
                 decided_measured = measured
                 decision = decide_measured_cache_abort(
                     progress, priced_new_tokens, effective
@@ -5999,7 +6250,11 @@ async def _prefetch_measured_cache_abort(
                 decided_decision = decision
                 if decision.abort:
                     return MeasuredAbortPrefetch(
-                        chunks=chunks, abort=True, decision=decision, measured=measured
+                        chunks=chunks,
+                        abort=True,
+                        decision=decision,
+                        measured=measured,
+                        latest_measured=latest_measured,
                     )
                 # No abort: keep peeking so ``local_prefill_deadline_seconds``
                 # keeps bounding the whole pre-first-byte wait. The declined
@@ -6014,10 +6269,14 @@ async def _prefetch_measured_cache_abort(
                 chunks=chunks,
                 measured=decided_measured,
                 decision=decided_decision,
+                latest_measured=latest_measured,
             )
         # No complete event yet (partial/empty read): keep reading.
     return MeasuredAbortPrefetch(
-        chunks=chunks, measured=decided_measured, decision=decided_decision
+        chunks=chunks,
+        measured=decided_measured,
+        decision=decided_decision,
+        latest_measured=latest_measured,
     )
 
 
@@ -6155,6 +6414,17 @@ def _release_client_disconnect_dispatch(
     True)``, which is the single owner of those decrements. Decrementing in
     both places would release another session's capacity
     (``local_active_queries`` is a pool-wide counter).
+
+    LP-0MW0TLPOR002TAFO: a dispatch record is keyed ``(endpoint, session)`` and
+    is **shared** by overlapping dispatches of one session — one credit per
+    in-flight dispatch. When another dispatch still holds a credit, this
+    release must not pop the shared record: doing so destroyed the sibling's
+    credit/lease/attribution and left ``local_active_queries`` above the record
+    set, which the self-healing clamp then "repaired" with a WARNING. In that
+    case the paired ``_cleanup_after_request`` releases this request's
+    token-scoped credit and leaves the sibling intact; the synchronous pop is
+    correct only when this request's credit is the last one (or the caller
+    cannot name it).
     """
     if not session_key:
         return False
@@ -6170,13 +6440,33 @@ def _release_client_disconnect_dispatch(
                 # Belt-and-braces tuple-key form (mirrors
                 # ``_release_prefill_deadline_dispatch``).
                 keys.append((endpoint, session_key))
+            dispatch_token = (
+                getattr(request, "_local_dispatch_token", None)
+                if request is not None
+                else None
+            )
+            shared_with_sibling = False
             for key in keys:
-                record = records.pop(key, None)
-                if isinstance(record, dict):
-                    released_record = record
-                    stream_cm = record.get("stream_cm")
-                    removed = True
+                record = records.get(key)
+                if not isinstance(record, dict):
+                    continue
+                credits = _dispatch_credit_tokens(record)
+                if (
+                    credits
+                    and dispatch_token is not None
+                    and dispatch_token in credits
+                    and len(credits) > 1
+                ):
+                    shared_with_sibling = True
                     break
+            if not shared_with_sibling:
+                for key in keys:
+                    record = records.pop(key, None)
+                    if isinstance(record, dict):
+                        released_record = record
+                        stream_cm = record.get("stream_cm")
+                        removed = True
+                        break
         except Exception:
             removed = False
 
@@ -6515,6 +6805,62 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
         return False
 
 
+def _watchdog_release_reason(srv, record: dict) -> str | None:
+    """Return the distinct reason a watchdog release applies, or ``None``.
+
+    This is the single source of truth for *why* the watchdog would release a
+    record; :func:`_watchdog_no_progress` is a thin boolean wrapper so the
+    decision and the recorded reason can never drift (LP-0MW8VOKB9002W2C1
+    AC2/AC3). Reasons, in earliest-abort priority order:
+
+    - ``prefill_eta_exceeded`` — elapsed since ``started_at`` exceeds the
+      admission ``eta_prefill_s`` bound by ``local_prefill_eta_factor``. A
+      runaway prefill (progressing but far over its priced duration) is cut
+      early rather than at the full wait (parent AC14).
+    - ``prefill_stalled`` — no observed progress for
+      ``local_dispatch_no_progress_timeout_seconds`` (measured progress now
+      refreshes ``last_progress_ts``, so a genuinely progressing prefill never
+      trips this).
+    - ``prefill_max_exceeded`` — total active time exceeds
+      ``local_dispatch_max_prefill_seconds`` (the hard backstop).
+
+    Returns ``None`` for a record without a ``last_progress_ts`` baseline
+    (legacy records) — the pre-existing expiry/orphan path owns those.
+    """
+    no_progress_timeout = _get_no_progress_timeout_seconds(srv)
+    max_prefill = _get_max_prefill_seconds(srv)
+    eta_factor = _get_prefill_eta_factor(srv)
+    now = time.monotonic()
+
+    last_progress_ts = record.get("last_progress_ts")
+    if last_progress_ts is None:
+        return None
+
+    started_at = record.get("started_at")
+
+    # Runaway ETA bound: the earliest evidence of failure when progress is
+    # measured but far slower than priced. Only applies when an ETA exists.
+    if eta_factor > 0:
+        try:
+            eta = float(record.get("eta_prefill_s"))
+        except (TypeError, ValueError):
+            eta = 0.0
+        if math.isfinite(eta) and eta > 0 and started_at is not None:
+            if now - float(started_at) > eta * eta_factor:
+                return "prefill_eta_exceeded"
+
+    # No-progress timeout: no observed progress for longer than the timeout.
+    if no_progress_timeout > 0 and now - last_progress_ts > no_progress_timeout:
+        return "prefill_stalled"
+
+    # Max-prefill ceiling: total active time exceeds the ceiling.
+    if max_prefill > 0:
+        if started_at is not None and now - float(started_at) > max_prefill:
+            return "prefill_max_exceeded"
+
+    return None
+
+
 def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
     """Check whether a dispatch record has exceeded the no-progress timeout.
 
@@ -6528,6 +6874,8 @@ def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
       progress has been observed for that long.
     - Or the record's ``started_at`` exceeds ``local_dispatch_max_prefill_seconds``
       (hard ceiling on any single request's lifetime, even with progress).
+    - Or the record's elapsed time exceeds its admission ``eta_prefill_s``
+      bound by ``local_prefill_eta_factor`` (runaway prefill, parent AC14).
 
     Records without a ``last_progress_ts`` baseline (legacy records created
     before this feature) return ``False`` — they fall through to the
@@ -6535,36 +6883,14 @@ def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
     watchdog. This keeps the change surgical and avoids misclassifying
     records whose age was never tracked on a progress clock.
 
+    The reason is available from :func:`_watchdog_release_reason` for the
+    caller's release log; this wrapper exists so existing boolean call sites
+    and tests are unchanged.
+
     When ``True``, the caller should release the lease so the session can
     fall through to the next backend (LP-0MUCEFB8E003YVFF).
     """
-    no_progress_timeout = _get_no_progress_timeout_seconds(srv)
-    max_prefill = _get_max_prefill_seconds(srv)
-    now = time.monotonic()
-
-    # The watchdog only has an opinion about records whose progress clock it
-    # owns (``last_progress_ts``). This is set at creation and refreshed on
-    # every observed progress advance, every observed prefill liveness signal
-    # (LP-0MUXQ5QL40027VZ4), every in-flight prefill refresh
-    # (LP-0MUXTW4MD003TVIC), and every data chunk. A record that is being
-    # liveness- or in-flight-extended therefore falls through to the
-    # ``max_prefill`` ceiling below, which bounds a wedged slot that keeps
-    # reporting ``is_processing`` or never answers.
-    last_progress_ts = record.get("last_progress_ts")
-    if last_progress_ts is None:
-        return False
-
-    # No-progress timeout: no observed progress for longer than the timeout.
-    if no_progress_timeout > 0 and now - last_progress_ts > no_progress_timeout:
-        return True
-
-    # Max-prefill ceiling: total active time exceeds the ceiling.
-    if max_prefill > 0:
-        started_at = record.get("started_at")
-        if started_at is not None and now - started_at > max_prefill:
-            return True  # exceeded max prefill ceiling
-
-    return False
+    return _watchdog_release_reason(srv, record) is not None
 
 
 async def _cleanup_stale_local_dispatch(srv) -> int:
@@ -6693,6 +7019,28 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 ):
                     session_key = _dispatch_key_session_id(sid)
                     endpoint_from_record = _endpoint_from_record(record)
+                    # LP-0MW8VOKB9002W2C1 AC2/AC3: record the distinct reason
+                    # and elapsed seconds so a pre-deadline abort is
+                    # diagnosable and is never a "blind kill". Computed from
+                    # the still-live ``record`` dict before it is mutated.
+                    _watchdog_reason = (
+                        _watchdog_release_reason(srv, record)
+                        or "no_progress_watchdog"
+                    )
+                    _now_wd = time.monotonic()
+                    try:
+                        _elapsed_s = max(
+                            0.0, _now_wd - float(record.get("started_at") or _now_wd)
+                        )
+                    except (TypeError, ValueError):
+                        _elapsed_s = 0.0
+                    try:
+                        _stalled_s = max(
+                            0.0,
+                            _now_wd - float(record.get("last_progress_ts") or _now_wd),
+                        )
+                    except (TypeError, ValueError):
+                        _stalled_s = 0.0
                     # LP-0MUGQHPJ50046LV8: capture the upstream stream context
                     # manager before deleting the record so we can cancel the
                     # in-flight request after releasing the lock.
@@ -6712,10 +7060,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         pass
                     try:
                         srv.logger.warning(
-                            "lease_released session=%s reason=no_progress_watchdog "
-                            "endpoint=%s",
+                            "lease_released session=%s reason=%s "
+                            "endpoint=%s elapsed_s=%.1f stalled_for_s=%.1f",
                             session_key if session_key else "unknown",
+                            _watchdog_reason,
                             endpoint_from_record or "default",
+                            _elapsed_s,
+                            _stalled_s,
                         )
                     except Exception:
                         pass
@@ -6723,7 +7074,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     _note_local_dispatch_release(
                         srv,
                         session_key,
-                        reason="no_progress_watchdog",
+                        reason=_watchdog_reason,
                         record=released_record,
                         record_key=sid,
                         endpoint=endpoint_from_record,
@@ -7220,14 +7571,27 @@ async def _recover_stuck_local_active_queries(srv) -> None:
     """Detect and repair a stuck ``local_active_queries`` counter.
 
     The counter can only be as large as the number of truly in-flight local
-    requests (LP-0MVKSXR4P001V0CM AC2). A leak that outlives the request —
+    dispatches (LP-0MVKSXR4P001V0CM AC2). A leak that outlives the request —
     e.g. a swallowed exception in ``_decrement_local_active_queries`` — is
-    repaired by clamping the counter to the number of **active** dispatch
-    records at every tick, rather than only resetting to 0 when *no* active
+    repaired by clamping the counter to the number of **outstanding dispatch
+    credits** at every tick, rather than only resetting to 0 when *no* active
     records exist. Without the clamp, a leak that coexists with any in-flight
     request (``has_active`` true) survived indefinitely and made
     ``/llama/local/status`` report busy while the GPU was idle (2026-10-22
     night: 66 consecutive ``freeSlots: 0`` refusals).
+
+    LP-0MW0TLPOR002TAFO: the authoritative quantity is the *credit* count, not
+    the record count. A dispatch record is keyed ``(endpoint, session)`` and
+    now holds one credit per in-flight dispatch (``dispatch_credits``,
+    LP-0MVWF78QK0060TZH), so two overlapping dispatches of one session are
+    legitimately ``counter == 2`` with **one** active record. Clamping to the
+    record count consumed a live credit (the measured ``2→1 (1 active
+    dispatch records)`` recovery) and cascaded into the ``1→0`` and global
+    ``active_queries`` recoveries once the stranded record was reaped.
+    :func:`_outstanding_dispatch_credits` is the record-set counterpart that
+    matches what the counter actually counts (and still equals the record
+    count for one-credit records, so the pre-existing leak shapes are
+    unchanged).
 
     In legacy mode (no ``local_dispatch_records`` attribute), the counter
     is reset whenever it is > 0, since there is no dispatch-record-based
@@ -7241,17 +7605,23 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                     # Read the records snapshot (not holding records_lock).
                     # This is a self-correcting check that runs every 10s,
                     # so a slightly stale snapshot is acceptable.
+                    # LP-0MW0TLPOR002TAFO: clamp to the outstanding credits,
+                    # never the record count (one record can carry several
+                    # credits for overlapping dispatches of one session).
+                    outstanding_credits = _outstanding_dispatch_credits(srv)
                     active_count = _count_active_local_dispatch_records(srv)
                     active_count = active_count if active_count is not None else 0
-                    if srv.local_active_queries > active_count:
+                    if srv.local_active_queries > outstanding_credits:
                         prev = srv.local_active_queries
-                        srv.local_active_queries = active_count
+                        srv.local_active_queries = outstanding_credits
                         # LP-0MVYWLHNI000AQ7X AC1: name the requests this
                         # recovery could not account for, so a recurrence is
                         # diagnosable from this line alone. Read-only and
                         # lock-free: the clamp's own snapshot plus the bounded
-                        # release history (AC2). AC4: only the payload grows —
-                        # ``prev``/``active_count`` are untouched.
+                        # release history (AC2). LP-0MW0TLPOR002TAFO: the
+                        # reset target is now the outstanding-credit count;
+                        # the parenthetical still reports the active *record*
+                        # count (equal to it for one-credit records).
                         identity = _local_dispatch_recovery_identifying_fields(srv)
                         try:
                             srv.logger.warning(
@@ -7260,7 +7630,7 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                                 "records) session=%s turn=%s record=%s "
                                 "release_reason=%s release_age_s=%s",
                                 prev,
-                                active_count,
+                                outstanding_credits,
                                 active_count,
                                 identity["session"],
                                 identity["turn"],

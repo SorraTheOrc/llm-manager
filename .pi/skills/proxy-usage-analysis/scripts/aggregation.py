@@ -14,11 +14,22 @@ work item's decisions:
   the session and the reason; the provider-context skip also names the
   provider and the ceiling that blocked that attempt), or its own
   session-bearing ``Fallback triggered`` line, falling back to the nearest
-  session-less ``Fallback triggered`` line within 60s before the first remote
-  stream (rotated logs predating the session stamp only), then to a local-lease
+  session-less ``Fallback triggered`` line within
+  ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` (60s) before the first remote stream
+  (rotated logs predating the session stamp only), then to a local-lease
   refusal, and finally to the first remote stream time itself. Another
   session's reason is never inherited — the provenance is recorded in
   ``SessionStats.fallback_attribution``;
+- every own-evidence tier above is selected **turn-first** by
+  :func:`_pick_turn_first_evidence`: an exact ``turn=`` match on the session's
+  own line wins over the timestamp, because the proxy emits
+  ``Fallback triggered`` from ``_handle_streaming_success()`` *after* the
+  pre-flight has started and finished the remote stream it describes, so a
+  timestamp-first filter would drop the session's own line. Evidence without a
+  turn id keeps the historical at-or-before-the-first-remote-stream rule, so
+  rotated logs predating ``turn=`` attribute exactly as before. The recorded
+  move time is clamped to the first remote stream, so a late matched line never
+  shifts ``context_at_fallback``;
 - fast/cheap bucket and slot count come from the slot schedule, keyed by
   session start time.
 
@@ -142,6 +153,22 @@ FALLBACK_ATTRIBUTION_ORDER = (
 CONTEXT_AT_FALLBACK_ROUTING_SKIP = "routing_skip"
 CONTEXT_AT_FALLBACK_REMOTE_STREAM = "remote_stream"
 CONTEXT_AT_FALLBACK_SESSION_CONTEXT = "session_context"
+
+# Provenance of a session's "final-turn new tokens" (LP-0MVZ6EAZR001DX5E): the
+# new (uncached) prompt tokens the session's LAST turn cost. It is read from
+# that turn's own admission/routing line, in this order:
+#
+# - ``measured_new_tokens`` — the priced ``new_tokens=`` on that line (the
+#   ``local_admission_guard`` decision, or the ``routing_skip_local`` line that
+#   skipped local for it). A measured count is never re-derived;
+# - ``estimated_uncached`` — ``estimated_tokens= × (1 − cached_ratio=)`` from
+#   the same line, the prompt's uncached remainder on logs that predate
+#   ``new_tokens=``;
+# - ``None`` — the final turn carries no token evidence. The session is
+#   excluded from the banded average and tallied as ``n/a``; an earlier turn's
+#   figure is never borrowed and a zero is never imputed.
+FINAL_TURN_NEW_TOKENS_MEASURED = "measured_new_tokens"
+FINAL_TURN_NEW_TOKENS_ESTIMATED = "estimated_uncached"
 
 # Fallback reasons that describe a PROMPT-SIZE decision (the local or remote
 # entry's context ceiling) rather than an availability/quality problem. They
@@ -629,6 +656,13 @@ class SessionStats:
     # when the logs carry no token evidence — rendered ``n/a``).
     context_at_fallback: int | None = None
     context_at_fallback_source: str | None = None
+    # New (uncached) prompt tokens on the session's FINAL turn, with its
+    # provenance (one of the ``FINAL_TURN_NEW_TOKENS_*`` states, or ``None``
+    # when that turn's admission/routing line carries no token evidence).
+    # Additive (LP-0MVZ6EAZR001DX5E): consumers that do not read it are
+    # unaffected, and a missing figure is ``None`` — never ``0``.
+    final_turn_new_tokens: int | None = None
+    final_turn_new_tokens_source: str | None = None
     # Per-session measured-usage coverage (LP-0MVMBM6N400541EH AC3): terminal
     # ``Stream finished`` lines that carried counted ``tokens=`` vs. those that
     # reported no usage at all — ``tokens=missing`` on new logs, an absent
@@ -1368,6 +1402,47 @@ def _count_local_turns(
     return answered, starts - answered
 
 
+def _final_turn_new_tokens(
+    builder: _SessionBuilder,
+    admission_guards: list[LogEvent] | None = None,
+) -> tuple[int | None, str | None]:
+    """Derive ``(new_tokens, source)`` for the session's FINAL turn.
+
+    The final turn is the session's last admission/routing decision that priced
+    its uncached prompt: a ``routing_skip_local`` line (local skipped for the
+    turn) or a ``local_admission_guard`` line (the guard priced it and either
+    admitted or refused the dispatch). Those lines are emitted per request, so
+    the chronologically last one belongs to the last turn the session tried to
+    serve; neither carries a per-turn record on the returned aggregate, which
+    is why the figure is derived here (LP-0MVZ6EAZR001DX5E).
+
+    Order of preference — this session's own evidence only:
+
+    1. the line's measured ``new_tokens=`` (the priced uncached count);
+    2. ``estimated_tokens= × (1 − cached_ratio=)`` when the same line carries
+       both, i.e. the prompt's uncached remainder on logs predating
+       ``new_tokens=``;
+    3. ``(None, None)`` — the final turn carries no token evidence. An earlier
+       turn's figure is never borrowed and a zero is never imputed; the
+       report tallies the session as ``n/a`` instead.
+    """
+    candidates = list(builder.routing_skips) + list(admission_guards or [])
+    if not candidates:
+        return None, None
+    last = max(candidates, key=lambda e: e.ts)
+    measured = getattr(last, "new_tokens", None)
+    if measured is not None:
+        return int(measured), FINAL_TURN_NEW_TOKENS_MEASURED
+    estimated = getattr(last, "estimated_tokens", None)
+    ratio = getattr(last, "cached_ratio", None)
+    if estimated is not None and ratio is not None and 0.0 <= ratio <= 1.0:
+        return (
+            int(round(estimated * (1.0 - ratio))),
+            FINAL_TURN_NEW_TOKENS_ESTIMATED,
+        )
+    return None, None
+
+
 def _context_at_fallback(
     session_id: str,
     anchor_ts: datetime,
@@ -1417,6 +1492,51 @@ def _context_at_fallback(
     return None, None
 
 
+def _pick_turn_first_evidence(
+    events: list[LogEvent],
+    first_remote_ts: datetime,
+    turn: str | None,
+) -> LogEvent | None:
+    """Pick this session's own evidence line, turn-first.
+
+    Shared by **every** own-evidence tier — ``own_skip`` (``routing_skip_local``),
+    ``own_provider_skip`` (``routing_skip_provider_context``) and
+    ``own_fallback`` (``Fallback triggered``) — so no tier keeps a timestamp
+    filter ahead of an exact ``turn=`` match
+    (LP-0MW8U39FH005GWHY, LP-0MW8U39ZQ007MPQO).
+
+    *events* must already be scoped to one session's own evidence (``e.session
+    == session_id``), so the picker can only choose among lines that already
+    belong to that session and the no-inheritance guarantee
+    (LP-0MVMBMSWR0036RES) is untouched.
+
+    The turn id is an exact join key (LP-0MVMBM467005BT4A), so it decides
+    **before** any timestamp:
+
+    - An exact ``turn=`` match wins regardless of when the line was logged. The
+      proxy emits ``Fallback triggered`` from ``_handle_streaming_success()``,
+      i.e. *after* ``_preflight_streaming_response()`` has consumed the remote
+      stream — the observed order is ``[remote] POST`` -> ``Stream started`` ->
+      ``Stream finished`` -> ``Fallback triggered``, all carrying the same
+      ``turn=``. A timestamp-first filter drops that line.
+    - Evidence without a turn id keeps the historical rule — the latest line
+      at/before ``first_remote_ts`` — so rotated logs predating the ``turn=``
+      field attribute exactly as before.
+
+    A turn id is unique per client request, so an exact match cannot cross
+    turns: the relaxed timestamp only widens the window to the turn's own
+    lifecycle, never to an unrelated later line.
+    """
+    if turn:
+        exact = [e for e in events if e.turn == turn]
+        if exact:
+            return max(exact, key=lambda e: e.ts)
+    at_or_before = [e for e in events if e.ts <= first_remote_ts]
+    if at_or_before:
+        return max(at_or_before, key=lambda e: e.ts)
+    return None
+
+
 def _attribute_fallback(
     session_id: str,
     first_remote_ts: datetime,
@@ -1431,14 +1551,21 @@ def _attribute_fallback(
     Priority — a session's own evidence always wins, and another session's
     reason is never inherited (LP-0MVMBMSWR0036RES):
 
-    1. The session's own ``routing_skip_local`` line at/before the first remote
-       stream (unchanged precedence; it names why local was skipped).
-    2. The session's own ``routing_skip_provider_context`` line at/before the
-       first remote stream (LP-0MVMBM1Y3001TPRT): also session-bearing, and it
-       names the provider + ``limit`` whose context ceiling blocked that
-       attempt, so it outranks the generic fallback line.
+    1. The session's own ``routing_skip_local`` line (it names why local was
+       skipped). Selected turn-first: an exact ``turn=`` match wins regardless
+       of its timestamp, so late-arriving evidence is attributed; turn-less
+       evidence keeps the at/before-the-stream rule (LP-0MW8U39ZQ007MPQO).
+    2. The session's own ``routing_skip_provider_context`` line
+       (LP-0MVMBM1Y3001TPRT): also session-bearing, and it names the provider +
+       ``limit`` whose context ceiling blocked that attempt, so it outranks the
+       generic fallback line. Selected turn-first by the same picker as tier 1
+       (LP-0MW8U39ZQ007MPQO).
     3. The session's own session-bearing ``Fallback triggered`` line at/before
-       the first remote stream (the actual decision line).
+       the first remote stream (the actual decision line). An exact ``turn=``
+       match wins over the timestamp: the proxy logs that line **after** the
+       pre-flight has already started and finished the remote stream it
+       describes (LP-0MW8U39FH005GWHY), so a timestamp-first filter would drop
+       the session's own line and read the session as ``unattributed``.
     4. The nearest **session-less** ``Fallback triggered`` line within
        ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` before the first remote stream —
        only rotated logs predating the session stamp can reach this branch; a
@@ -1461,46 +1588,53 @@ def _attribute_fallback(
     longer be confused (LP-0MVMBM467005BT4A AC3). Without ids the historical
     session/timestamp rules above apply unchanged.
 
+    Every own-evidence tier (1)-(3) is selected by the same picker,
+    :func:`_pick_turn_first_evidence`, so the order never depends on which tier
+    answered. Tier 4 is the **bounded legacy path**: it applies only to
+    session-less lines within ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` (60s)
+    before the first remote stream, which rotated logs predating the session
+    stamp alone can reach. The returned move time is clamped to
+    ``first_remote_ts`` on every own-evidence tier, so a late turn-matched line
+    never moves the ``context_at_fallback`` anchor past the first remote stream
+    it followed.
+
     Returns ``(None, None, attribution)`` when there is no timestamped
     evidence.
     """
 
-    def _same_turn(events: list[LogEvent]) -> list[LogEvent]:
-        return [e for e in events if turn and e.turn == turn]
-
-    skips = [e for e in routing_skips.get(session_id, []) if e.ts <= first_remote_ts]
-    exact = _same_turn(skips)
-    if exact:
-        e = max(exact, key=lambda x: x.ts)
-        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
-    if skips:
-        e = max(skips, key=lambda x: x.ts)
-        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
+    skips = _pick_turn_first_evidence(
+        routing_skips.get(session_id, []), first_remote_ts, turn
+    )
+    if skips is not None:
+        # The move time never lands after the first remote stream, even when the
+        # matched line was logged later (same clamp as tier 3);
+        # ``context_at_fallback`` anchors on the move time.
+        return (
+            min(skips.ts, first_remote_ts),
+            skips.reason,
+            FALLBACK_ATTRIBUTION_OWN_SKIP,
+        )
     if provider_context_skips:
-        ctx_skips = [
-            e
-            for e in provider_context_skips.get(session_id, [])
-            if e.ts <= first_remote_ts
-        ]
-        exact = _same_turn(ctx_skips)
-        if exact:
-            e = max(exact, key=lambda x: x.ts)
-            return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
-        if ctx_skips:
-            e = max(ctx_skips, key=lambda x: x.ts)
-            return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
-    own = [
-        e
-        for e in fallback_events
-        if e.session == session_id and e.ts <= first_remote_ts
-    ]
-    exact = _same_turn(own)
-    if exact:
-        e = max(exact, key=lambda x: x.ts)
-        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
-    if own:
-        e = max(own, key=lambda x: x.ts)
-        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
+        ctx_skip = _pick_turn_first_evidence(
+            provider_context_skips.get(session_id, []), first_remote_ts, turn
+        )
+        if ctx_skip is not None:
+            return (
+                min(ctx_skip.ts, first_remote_ts),
+                ctx_skip.reason,
+                FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP,
+            )
+    own = [e for e in fallback_events if e.session == session_id]
+    picked = _pick_turn_first_evidence(own, first_remote_ts, turn)
+    if picked is not None:
+        # The move time never lands after the first remote stream, even when the
+        # matched line was logged later: ``context_at_fallback`` anchors on the
+        # move time, so a late line must not shift the context anchor.
+        return (
+            min(picked.ts, first_remote_ts),
+            picked.reason,
+            FALLBACK_ATTRIBUTION_OWN_FALLBACK,
+        )
     earliest = first_remote_ts - timedelta(seconds=FALLBACK_ATTRIBUTION_WINDOW_SECONDS)
     candidates = [
         e
@@ -1525,6 +1659,7 @@ def _build_session(
     schedule: bucketing.SlotSchedule,
     mode_map: bucketing.ModeScheduleMap | None = None,
     provider_context_skips: dict[str, list[LogEvent]] | None = None,
+    admission_guards: dict[str, list[LogEvent]] | None = None,
 ) -> SessionStats:
     started = sorted(builder.started, key=lambda e: e.ts)
     finished = sorted(builder.finished, key=lambda e: e.ts)
@@ -1598,6 +1733,14 @@ def _build_session(
     input_tokens = sum(prompt_tokens)
     output_tokens = sum(completion_tokens)
 
+    # Final-turn new (uncached) tokens (LP-0MVZ6EAZR001DX5E): derived from the
+    # session's last admission/routing pricing line — the same per-request
+    # evidence the coverage section's context figure reads, so the two can
+    # never disagree about which turn they describe.
+    final_turn_new_tokens, final_turn_new_tokens_source = _final_turn_new_tokens(
+        builder, (admission_guards or {}).get(builder.session_id)
+    )
+
     # Decode speed fallback: total local completion tokens / local active span
     # (first→last local stream event). Only derivable with local completions
     # and a positive span; conservative (includes inter-request gaps).
@@ -1643,6 +1786,8 @@ def _build_session(
         local_turns_unanswered=local_unanswered,
         context_at_fallback=context_at_fallback,
         context_at_fallback_source=context_source,
+        final_turn_new_tokens=final_turn_new_tokens,
+        final_turn_new_tokens_source=final_turn_new_tokens_source,
         streams_with_usage=builder.streams_with_usage,
         streams_without_usage=builder.streams_without_usage,
     )
@@ -2276,6 +2421,12 @@ def aggregate(
     # Provider context-ceiling skips indexed by session (LP-0MVMBM1Y3001TPRT):
     # per-session attribution input, see ``_attribute_fallback``.
     provider_context_skips: dict[str, list[LogEvent]] = {}
+    # Admission-guard decisions carrying a priced ``new_tokens=``, indexed by
+    # session (LP-0MVZ6EAZR001DX5E): the final-turn uncached-token derivation
+    # prefers this measured figure over an estimate. Kept out of the session
+    # builders so no existing per-session aggregate (duration, busy pairing)
+    # gains an event.
+    admission_guards: dict[str, list[LogEvent]] = {}
     fallback_events: list[LogEvent] = []
     provider_context_skip_events: list[LogEvent] = []
     routing_skip_events: list[LogEvent] = []
@@ -2432,6 +2583,12 @@ def aggregate(
             "slot_save_error",
             "backend_retry",
             "upstream_http_error",
+            # Typed deterministic-400 errors (LP-0MW959HRZ00231FN, parent AC5):
+            # their own taxonomy categories, never folded into
+            # ``provider_exhausted`` (which is not an error event at all — it is
+            # collected separately as client-visible exhaustion).
+            "deterministic_client_error",
+            "session_wedged",
         ):
             error_events.append(ev)
             continue
@@ -2481,6 +2638,8 @@ def aggregate(
             continue
         if ev.kind == "local_admission_guard":
             local_admission_events.append(ev)
+            if ev.session and ev.new_tokens is not None:
+                admission_guards.setdefault(ev.session, []).append(ev)
             continue
         if ev.kind == STATUS_REQUEST:
             status_request_events.append(ev)
@@ -2552,6 +2711,7 @@ def aggregate(
             schedule,
             mode_map,
             provider_context_skips,
+            admission_guards,
         )
 
     busy = compute_busy_stats(
@@ -2789,13 +2949,14 @@ def local_busy_pct(busy: BusyStats | None) -> float | None:
 
 
 def gpu_busy_pct(gpu: object | None) -> float | None:
-    """Coverage-honest power-based GPU computing percentage (any GPU consumer).
+    """Attributable GPU-computing percentage (power ≥ 90 W and a busy local slot).
 
-    Supplementary hardware telemetry (see :mod:`gpu_busy`), **not** a
-    local-utilisation signal. The value divides computing instants by the
-    window's *expected* grid instants, so unobserved time is neither idle nor
-    busy and cannot inflate the figure. ``None`` when the Prometheus query
-    failed or no GPU result was collected.
+    The one reported GPU-activity figure, produced only by
+    ``scripts/gpu_utilisation.py`` (via :mod:`gpu_busy`): the share of the
+    window's expected 15 s instants on which our local model kept the GPU
+    computing. Unobserved time is neither idle nor busy and cannot inflate the
+    figure. ``None`` when the Prometheus query failed or no GPU result was
+    collected.
     """
     value = _float_or_none(getattr(gpu, "busy_pct", None))
     return round(value, 1) if value is not None else None

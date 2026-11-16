@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "purpose": "Re-derive the local-share ceiling from the 2026-11-01 measured basis and pin which denominator each published share uses.",
+  "report_path": "/home/rgardler/proxy-usage-reports/postfix-thrash-gate/report.md",
+  "window": {
+    "start": "2026-11-01 13:12:48",
+    "end": "2026-11-01 14:00:03",
+    "seconds": 2835.0,
+    "hours": 0.7875
+  },
+  "measured": {
+    "report_generated_at": "2026-11-01 14:07:11",
+    "window_start": "2026-11-01 13:12:48",
+    "window_end": "2026-11-01 14:00:03",
+    "window_hours_reported": 0.8,
+    "window_seconds": 2835.0,
+    "sessions": 58,
+    "requests": 1788,
+    "local_requests": 46,
+    "remote_requests": 1742,
+    "offered_prompt_tokens": 125577780,
+    "offered_completion_tokens": 841445,
+    "local_prompt_tokens": 877908,
+    "local_completion_tokens": 5027,
+    "local_total_tokens": 882935,
+    "local_streams": 46,
+    "local_busy_seconds": 1223.0,
+    "fallback_total": 1667,
+    "fallback_counts": {
+      "large_context_bypass": 547,
+      "resident_prefix_insufficient": 411,
+      "local_admission_guard": 302,
+      "context_too_large": 276,
+      "local_concurrency_limit": 67,
+      "local_lease_active": 39,
+      "post_deadline_terminal": 10,
+      "tenant_limit": 9,
+      "ReadTimeout": 4,
+      "empty_response": 2
+    }
+  },
+  "derived": {
+    "offered_prompt_tok_s": 44295.51322751323,
+    "local_rate_tok_s": 717.8315617334423,
+    "local_token_share_pct": 0.6990950150576002,
+    "local_stream_share_pct": 2.5727069351230427,
+    "local_prompt_tokens_per_stream": 19084.956521739132,
+    "remote_prompt_tokens_per_stream": 71584.3122847302,
+    "offered_prompt_tokens_per_stream": 70233.65771812081,
+    "prompt_size_ratio_remote_over_local": 3.750823964581242,
+    "ceiling_tokens": 2035052.4775143089,
+    "ceiling_tokens_published_2820s": 2024285.0040883073,
+    "headroom_factor": 2.31807031888798,
+    "ceiling_token_share_pct": 1.6205514044875686,
+    "ceiling_stream_share_pct": 5.963715585505989,
+    "ceiling_stream_share_pct_published_2820s": 5.932161534789025,
+    "ceiling_stream_share_pct_refusal_mix": 4.377586640669224,
+    "ceiling_stream_share_pct_offered_mix": 1.6205514044875684,
+    "needed_for_10pct_token_share_tokens": 12557778.0,
+    "needed_for_10pct_token_share_factor": 6.17073915230852,
+    "needed_for_10pct_stream_share_tokens": 3412390.226086957,
+    "needed_for_10pct_stream_share_factor": 1.6768069933287328,
+    "refusal_shares_pct": {
+      "large_context_bypass": 32.813437312537495,
+      "resident_prefix_insufficient": 24.65506898620276,
+      "local_admission_guard": 18.11637672465507,
+      "context_too_large": 16.556688662267547,
+      "local_concurrency_limit": 4.019196160767846,
+      "local_lease_active": 2.339532093581284,
+      "post_deadline_terminal": 0.5998800239952009,
+      "tenant_limit": 0.5398920215956808,
+      "ReadTimeout": 0.23995200959808038,
+      "empty_response": 0.11997600479904019
+    }
+  },
+  "cross_checks": [
+    {
+      "claim": "header sessions matches standard_sessions.csv sum",
+      "published": 58,
+      "reproduced": 58,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "header requests matches standard_sessions.csv sum",
+      "published": 1788,
+      "reproduced": 1788,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "header local_requests matches standard_sessions.csv sum",
+      "published": 46,
+      "reproduced": 46,
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "header remote_requests matches standard_sessions.csv sum",
+      "published": 1742,
+      "reproduced": 1742,
+      "ok": true,
+      "verdict": "reproduces"
+    }
+  ],
+  "checks": [
+    {
+      "claim": "offered prompt load \u2248 44 300 tok/s",
+      "published": 44300.0,
+      "reproduced": 44295.51,
+      "tolerance": "0.100% relative",
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "local delivered rate \u2248 718 tok/s",
+      "published": 718.0,
+      "reproduced": 717.83,
+      "tolerance": "0.100% relative",
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "prompt-token share ceiling \u2248 1.6 %",
+      "published": 1.6,
+      "reproduced": 1.621,
+      "tolerance": "0.2 pp",
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "denominator: offered prompt tokens"
+    },
+    {
+      "claim": "stream-share ceiling \u2248 5.8 % (constant local prompt mix)",
+      "published": 5.8,
+      "reproduced": 5.932,
+      "tolerance": "0.2 pp",
+      "ok": true,
+      "verdict": "reproduces",
+      "note": "denominator: offered streams, capacity divided by the current local mean prompt size"
+    },
+    {
+      "claim": "refusal share large_context_bypass = 32.8 %",
+      "published": 32.8,
+      "reproduced": 32.813,
+      "tolerance": "0.05 pp",
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "refusal share resident_prefix_insufficient = 24.7 %",
+      "published": 24.7,
+      "reproduced": 24.655,
+      "tolerance": "0.05 pp",
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "refusal share local_admission_guard = 18.1 %",
+      "published": 18.1,
+      "reproduced": 18.116,
+      "tolerance": "0.05 pp",
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "refusal share context_too_large = 16.6 %",
+      "published": 16.6,
+      "reproduced": 16.557,
+      "tolerance": "0.05 pp",
+      "ok": true,
+      "verdict": "reproduces"
+    },
+    {
+      "claim": "\u226510 % share needs ~4.2 M local prompt tokens (10 % of ~42 M)",
+      "published": 4200000.0,
+      "reproduced": {
+        "token_share_requirement_tokens": 12557778.0,
+        "stream_share_requirement_tokens": 3412390.2,
+        "implied_denominator_tokens": 42000000.0,
+        "implied_token_share_pct_of_offered": 3.345,
+        "offered_prompt_tokens": 125577780.0,
+        "factor_vs_single_gate_capacity": 2.064
+      },
+      "tolerance": "exact denominator match",
+      "ok": false,
+      "verdict": "unverified",
+      "note": "no denominator in the window equals ~42 M: 10 % of the offered 125.58 M is 12.56 M and 10 % of the offered streams at the current local mix is 3.41 M; 4.2 M is 2.06x the single-gate capacity, so the 'more than 2x' claim holds, but it is not 10 % of any denominator this window contains"
+    }
+  ],
+  "published_ceiling_seconds": 2820.0,
+  "verdicts": {
+    "token_definition": {
+      "label": "local share of offered prompt tokens",
+      "ceiling_pct": 1.621,
+      "assumption": "none beyond the measured rate"
+    },
+    "stream_definition": {
+      "label": "local share of streams (current local prompt mix)",
+      "ceiling_pct": 5.964,
+      "assumption": "every offered stream is locally servable and the newly served streams carry the current local mean prompt size (19085 tokens)"
+    },
+    "stream_definition_refusal_mix_pct": 4.378,
+    "stream_definition_offered_mix_pct": 1.621,
+    "published_stream_ceiling_pct": 5.8,
+    "implied_denominator_tokens_for_published_stream_ceiling": 34901465.58772944,
+    "stream_equivalent_denominator_tokens": 34123902.26086957,
+    "headroom_factor": 2.318,
+    "prompt_size_ratio_remote_over_local": 3.751
+  }
+}

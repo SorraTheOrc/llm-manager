@@ -202,10 +202,18 @@ def _within_eta_budget() -> str:
 
 
 def _seed_huge_prompt_window() -> None:
-    """Seed a spread 56 000-token window so conservative pricing engages."""
+    """Seed a spread 56 000-token window so conservative pricing engages.
+
+    Q410 AC2 re-basis: the window is genuinely-cold, so it also feeds the
+    cold window (processed = HUGE_TOTAL) — a cold large prompt is priced from
+    the cold window only.
+    """
     for service_ms in SEED_WINDOW_MS:
         prefill_eta.record_dispatch_sample(
             MODELLED_MODEL, HUGE_TOTAL, 0.0, service_ms
+        )
+        prefill_eta.record_cold_measured_sample(
+            MODELLED_MODEL, HUGE_TOTAL, 0.0, HUGE_TOTAL, service_ms
         )
 
 

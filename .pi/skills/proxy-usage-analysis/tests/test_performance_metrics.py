@@ -34,7 +34,10 @@ Functions::
     retained(measurements, direction, limit=3) -> list[dict]  # best first
     target_from(measurements, direction) -> float | None      # None below 3
     baseline_from(measurements, direction) -> dict | None     # best value+date
-    derive_verdict(actual, measurements, direction) -> str
+    derive_verdict(actual, measurements, direction,
+                   tolerance_pct=DEFAULT_TOLERANCE_PCT) -> str
+    tolerance_for(metric_id, defaults=None) -> float          # band, 10 % default
+    DEFAULT_TOLERANCE_PCT -> float                            # 10.0
     configuration_fingerprint(slot_count, per_slot_context) -> str
     is_cross_era(measurements) -> bool
     parse_archived_report(report_text) -> dict[str, float]    # omit unparseable
@@ -47,7 +50,8 @@ Functions::
 ``target_from`` returns ``None`` below three measurements; the summary renderer
 prints that as ``n/a`` (pinned by the report integration item
 LP-0MW1BU93N0022IYJ). ``derive_verdict`` returns the literals ``"Met"``,
-``"Unmet"``, ``"Insufficient history"`` and ``n/a``.
+``"Unmet"``, ``"Insufficient history"`` and ``n/a``, and judges the actual
+against the target inside the metric's tolerance band (LP-0MWADHS83006QFQS).
 
 Fail-first window
 -----------------
@@ -74,6 +78,8 @@ sys.path.insert(0, str(SCRIPTS))
 from tests.fixtures import (  # noqa: E402
     ARCHIVED_REPORT_ERA_A,
     ARCHIVED_REPORT_ERA_B,
+    ARCHIVED_REPORT_ERA_PREFILL,
+    ARCHIVED_REPORT_ERA_SECONDS,
 )
 
 ENGINE_PATH = SCRIPTS / "performance_metrics.py"
@@ -192,16 +198,19 @@ def test_registry_direction_matches_the_parent_definition(metric_id, direction):
     assert registry_entry(metric_id).direction == direction
 
 
-def test_gpu_busy_names_its_hardware_scope_and_keeps_a_comparable_history():
-    """AC4 (LP-0MW5K8YE9001QO39): the scorecard label names the hardware
-    scope (power-based, any GPU consumer) rather than reading as local model
-    utilisation, while the unit and direction stay unchanged so the recorded
-    history remains comparable."""
+def test_gpu_busy_names_its_attributable_scope():
+    """LP-0MWG7KQVZ008DBZM: the scorecard label names the attributable scope
+    (power ≥ 90 W **and** a busy local slot, our local model's work) rather
+    than the retired power-only ``gpu:computing:bool`` figure. Unit and
+    direction are unchanged so the reset history stays comparable within one
+    definition."""
     metric = registry_entry("gpu_busy")
 
-    assert "power-based" in metric.label
-    assert "any consumer" in metric.label
-    assert "any GPU consumer" in metric.source
+    assert "attributable" in metric.label
+    assert "power" in metric.label and "busy local slot" in metric.label
+    assert "gpu:computing_workload:bool" in metric.source
+    assert "scripts/gpu_utilisation.py" in metric.source
+    assert "any consumer" not in metric.label
     assert metric.unit == "%"
     assert metric.direction == HIGHER
 
@@ -271,7 +280,7 @@ def test_baseline_is_the_single_best_value_with_its_date(measurements, direction
         (30.0, "Unmet"),
     ],
 )
-def test_higher_is_better_is_met_when_actual_reaches_the_target(actual, expected):
+def test_higher_is_better_is_met_within_the_tolerance_band(actual, expected):
     assert pm.derive_verdict(actual, HIGHER_MEASUREMENTS, HIGHER) == expected
 
 
@@ -279,10 +288,10 @@ def test_higher_is_better_is_met_when_actual_reaches_the_target(actual, expected
     ("actual", "expected"),
     [
         (400.0, "Met"),
-        (480.0, "Unmet"),
+        (600.0, "Unmet"),
     ],
 )
-def test_lower_is_better_is_met_when_actual_stays_under_the_target(actual, expected):
+def test_lower_is_better_is_met_within_the_tolerance_band(actual, expected):
     assert pm.derive_verdict(actual, LOWER_MEASUREMENTS, LOWER) == expected
 
 
@@ -295,12 +304,147 @@ def test_equality_with_the_target_counts_as_met(measurements, direction):
     # three in a test constant would make the verdict a float-associativity
     # problem rather than an equality-semantics one.
     target = pm.target_from(measurements, direction)
-    worse = target - 0.1 if direction == HIGHER else target + 0.1
     better = target + 0.1 if direction == HIGHER else target - 0.1
 
     assert pm.derive_verdict(target, measurements, direction) == "Met"
     assert pm.derive_verdict(better, measurements, direction) == "Met"
-    assert pm.derive_verdict(worse, measurements, direction) == "Unmet"
+
+
+# --- Tolerance band (LP-0MWADHS83006QFQS) -----------------------------------
+#
+# A target is met when the actual is inside a relative band of it (default
+# ±10 %), not only when it beats it exactly. The band is direction-aware and
+# both edges count as met, so run-to-run measurement noise is not reported as a
+# regression.
+
+
+def test_the_default_tolerance_is_ten_percent():
+    assert pm.DEFAULT_TOLERANCE_PCT == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    ("measurements", "direction"),
+    [(HIGHER_MEASUREMENTS, HIGHER), (LOWER_MEASUREMENTS, LOWER)],
+)
+def test_an_actual_just_inside_the_band_is_met(measurements, direction):
+    target = pm.target_from(measurements, direction)
+    band = pm.DEFAULT_TOLERANCE_PCT / 100.0
+    inside = target * (1 - band) if direction == HIGHER else target * (1 + band)
+
+    assert pm.derive_verdict(inside, measurements, direction) == "Met"
+
+
+@pytest.mark.parametrize(
+    ("measurements", "direction"),
+    [(HIGHER_MEASUREMENTS, HIGHER), (LOWER_MEASUREMENTS, LOWER)],
+)
+def test_the_band_edge_counts_as_met(measurements, direction):
+    target = pm.target_from(measurements, direction)
+    band = pm.DEFAULT_TOLERANCE_PCT / 100.0
+    # Derived from the engine's own target so the assertion is about band
+    # semantics, not float associativity.
+    edge = target * (1 - band) if direction == HIGHER else target * (1 + band)
+
+    assert pm.derive_verdict(edge, measurements, direction) == "Met"
+
+
+@pytest.mark.parametrize(
+    ("measurements", "direction"),
+    [(HIGHER_MEASUREMENTS, HIGHER), (LOWER_MEASUREMENTS, LOWER)],
+)
+def test_an_actual_just_outside_the_band_is_unmet(measurements, direction):
+    target = pm.target_from(measurements, direction)
+    band = pm.DEFAULT_TOLERANCE_PCT / 100.0
+    outside = (
+        target * (1 - band) - 1e-6
+        if direction == HIGHER
+        else target * (1 + band) + 1e-6
+    )
+
+    assert pm.derive_verdict(outside, measurements, direction) == "Unmet"
+
+
+@pytest.mark.parametrize(
+    ("measurements", "direction"),
+    [(HIGHER_MEASUREMENTS, HIGHER), (LOWER_MEASUREMENTS, LOWER)],
+)
+def test_an_actual_better_than_the_target_is_met(measurements, direction):
+    target = pm.target_from(measurements, direction)
+    better = target * 2 if direction == HIGHER else target / 2
+
+    assert pm.derive_verdict(better, measurements, direction) == "Met"
+
+
+def test_a_zero_target_has_a_zero_width_band():
+    # A lower-is-better metric whose target is 0: 10 % of 0 is 0, so only an
+    # actual of 0 is inside the band. Documented, never replaced by an invented
+    # absolute epsilon.
+    measurements = [
+        measurement(0.0, "2026-07-01"),
+        measurement(0.0, "2026-07-02"),
+        measurement(0.0, "2026-07-03"),
+    ]
+
+    assert pm.target_from(measurements, LOWER) == pytest.approx(0.0)
+    assert pm.derive_verdict(0.0, measurements, LOWER) == "Met"
+    assert pm.derive_verdict(0.1, measurements, LOWER) == "Unmet"
+
+
+# --- Per-metric tolerance override -----------------------------------------
+
+
+def test_tolerance_defaults_to_ten_percent_when_the_key_is_absent():
+    defaults = {"metrics": {"decode_speed": {"measurements": []}}}
+
+    assert pm.tolerance_for("decode_speed", defaults) == pytest.approx(
+        pm.DEFAULT_TOLERANCE_PCT
+    )
+
+
+def test_tolerance_reads_the_per_metric_override():
+    defaults = {"metrics": {"decode_speed": {"tolerance_pct": 25}}}
+
+    assert pm.tolerance_for("decode_speed", defaults) == pytest.approx(25.0)
+
+
+@pytest.mark.parametrize("value", ["wide", None, -5, -0.1, True, float("nan")])
+def test_an_invalid_tolerance_falls_back_to_the_default(value):
+    defaults = {"metrics": {"decode_speed": {"tolerance_pct": value}}}
+
+    assert pm.tolerance_for("decode_speed", defaults) == pytest.approx(
+        pm.DEFAULT_TOLERANCE_PCT
+    )
+
+
+def test_the_committed_defaults_carry_a_ten_percent_tolerance_per_metric():
+    defaults = pm.load_defaults()
+
+    for metric in pm.METRIC_REGISTRY:
+        assert pm.tolerance_for(metric.id, defaults) == pytest.approx(10.0), metric.id
+
+
+def test_an_explicit_tolerance_widens_the_band_the_verdict_uses():
+    target = pm.target_from(LOWER_MEASUREMENTS, LOWER)
+    actual = target * 1.15
+
+    assert pm.derive_verdict(actual, LOWER_MEASUREMENTS, LOWER) == "Unmet"
+    assert (
+        pm.derive_verdict(actual, LOWER_MEASUREMENTS, LOWER, tolerance_pct=20) == "Met"
+    )
+    # A metric that demands exactness can override to a zero band, in which
+    # case only a value at least as good as the target qualifies.
+    assert (
+        pm.derive_verdict(
+            target, LOWER_MEASUREMENTS, LOWER, tolerance_pct=0
+        )
+        == "Met"
+    )
+    assert (
+        pm.derive_verdict(
+            target * 1.01, LOWER_MEASUREMENTS, LOWER, tolerance_pct=0
+        )
+        == "Unmet"
+    )
 
 
 @pytest.mark.parametrize("direction", [HIGHER, LOWER])
@@ -315,6 +459,8 @@ def test_fewer_than_three_measurements_never_yields_a_verdict(direction, count):
 
 def test_a_missing_actual_renders_not_available():
     assert pm.derive_verdict(None, HIGHER_MEASUREMENTS, HIGHER) == "n/a"
+    # A missing actual stays n/a whatever tolerance is applied.
+    assert pm.derive_verdict(None, HIGHER_MEASUREMENTS, HIGHER, tolerance_pct=25) == "n/a"
 
 
 # --- State ------------------------------------------------------------------
@@ -430,15 +576,196 @@ def test_backfill_parser_reads_the_era_b_standard_low_report():
     assert parsed["fallback_rate"] == pytest.approx(48.1)
     assert parsed["decode_speed"] == pytest.approx(37.8)
     assert parsed["prompt_eval_speed"] == pytest.approx(193.3)
-    assert parsed["time_to_first_token"] == pytest.approx(670.0)
     assert parsed["contention_denials_per_hour"] == pytest.approx(12.8)
+
+
+# --- Scorecard parser: the attributable GPU row (LP-0MWG7KQVZ008DBZM) -------
+
+_ATTRIBUTABLE_REPORT = """
+## Local model utilization
+
+| Metric | Total | Standard | Low |
+|---|---|---|---|
+| GPU computing — attributable (power ≥ 90 W and a busy local slot) | 6h 45m (28.1%) | - | - |
+"""
+
+_POWER_ONLY_REPORT = """
+## Local model utilization
+
+| Metric | Total | Standard | Low |
+|---|---|---|---|
+| GPU busy — power-based (hardware) | 6h 45m (28.1%) | - | - |
+"""
+
+
+def test_scorecard_parser_reads_the_attributable_row():
+    """The scorer parses the attributable figure the report now renders."""
+    assert pm._parse_gpu_busy(_ATTRIBUTABLE_REPORT) == pytest.approx(28.1)
+
+
+def test_scorecard_parser_ignores_the_retired_power_only_row():
+    """A pre-reset archived report carries the power-only figure; it must seed
+    **nothing**, so history is never compared across two definitions."""
+    assert pm._parse_gpu_busy(_POWER_ONLY_REPORT) is None
+    assert "gpu_busy" not in pm.parse_archived_report(_POWER_ONLY_REPORT)
+
+
+# --- History reset (definition change) --------------------------------------
+
+
+def test_reset_metric_history_clears_measurements_and_records_the_reason():
+    """A definition change resets the metric's history, documenting the reset."""
+    state = pm.new_state()
+    pm.record_measurement(state, "gpu_busy", window="2026-11-03", value=23.1)
+    pm.record_measurement(state, "gpu_busy", window="2026-11-04", value=52.3)
+
+    removed = pm.reset_metric_history(
+        state,
+        "gpu_busy",
+        note="definition changed to the attributable gpu:computing_workload:bool share",
+        reset_at="2026-11-15",
+    )
+
+    assert removed == 2
+    assert state["metrics"]["gpu_busy"]["measurements"] == []
+    assert pm.metric_notes(state, "gpu_busy") == [
+        {
+            "event": "definition_change",
+            "note": "definition changed to the attributable gpu:computing_workload:bool share",
+            "at": "2026-11-15",
+        }
+    ]
+    # Baseline/target are derived only from the post-reset history.
+    assert pm.baseline_from(state["metrics"]["gpu_busy"]["measurements"], HIGHER) is None
+
+
+def test_reset_metric_history_round_trips_through_the_state_file(tmp_path):
+    """The reset note survives save/load, so it is not a silent discontinuity."""
+    path = tmp_path / "state.yaml"
+    state = pm.new_state()
+    pm.record_measurement(state, "gpu_busy", window="2026-11-03", value=23.1)
+    pm.reset_metric_history(
+        state,
+        "gpu_busy",
+        note="definition changed to the attributable share",
+        reset_at="2026-11-15",
+    )
+    pm.save_state(state, path)
+
+    loaded = pm.load_state(path)
+    assert loaded["metrics"]["gpu_busy"]["measurements"] == []
+    assert pm.metric_notes(loaded, "gpu_busy")[0]["event"] == "definition_change"
+
+
+def test_reset_metric_history_rejects_an_unknown_metric():
+    with pytest.raises(ValueError):
+        pm.reset_metric_history(pm.new_state(), "nope", note="x")
+
+
+# --- Time-to-first-token population (LP-0MWBLZ8HP005F6KO) -------------------
+#
+# The archive carries two first-token p90s over different populations. The
+# ``## Time to first token`` ``| Total |`` row is the **combined local +
+# remote** p90 (remote ``ttft_seconds=`` samples dominate its sample count and
+# drag it to single-digit seconds), whereas the scorecard metric is the
+# **local-only** p90 (``aggregation.ttft_p90_ms(..., include_remote=False)``).
+# Only the ``## Prefill vs decode`` ``Prefill (dispatch → first byte)``
+# ``p90 (s)`` column is local-only, so the backfill derives the seed from it
+# and never falls back to the combined row (which seeded an unreachable
+# 558-646 ms best-3 target for a metric whose actual is 30-60 s).
+
+#: The ``## Prefill vs decode`` prefill row of the recent-era fixture.
+_PREFILL_P90_ROW = (
+    "| Prefill (dispatch → first byte) | 11h 07m | 60.4% | 0.6 | 3.9 | 33.5 | 198.0 | 3081 |"
+)
+
+
+def _report_with_prefill_p90(cell: str) -> str:
+    assert _PREFILL_P90_ROW in ARCHIVED_REPORT_ERA_PREFILL
+    rows = ARCHIVED_REPORT_ERA_PREFILL.replace(
+        _PREFILL_P90_ROW, _PREFILL_P90_ROW.replace("| 33.5 |", f"| {cell} |")
+    )
+    assert cell in rows
+    return rows
+
+
+def test_backfill_parser_seeds_the_local_only_ttft_p90_not_the_combined_one():
+    """The fixture renders both figures: a combined 9.0 s p90 and a local-only
+    33.5 s p90. Only the local-only one is comparable with the metric."""
+    parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_PREFILL)
+
+    assert parsed["time_to_first_token"] == pytest.approx(33_500.0)
+    assert parsed["time_to_first_token"] != pytest.approx(9_000.0)
+
+
+def test_backfill_parser_never_seeds_the_combined_local_plus_remote_ttft():
+    """Era B renders only the combined ``## Time to first token`` p90
+    (``670ms``): seeding it as the metric's value would install a target the
+    local-only actual can never meet."""
+    parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_B)
+
+    assert "time_to_first_token" not in parsed
+    assert parsed["decode_speed"] == pytest.approx(37.8), "other metrics still parse"
+
+
+def test_backfill_parser_ignores_the_seconds_era_combined_ttft_row():
+    """The middle-era report renders its combined p90 as ``43.7s``. The unit
+    suffix no longer rescues the value: it is the wrong population."""
+    parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_SECONDS)
+
+    assert "time_to_first_token" not in parsed
+    assert parsed["decode_speed"] == pytest.approx(29.4), "other metrics still parse"
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected_ms"),
+    [
+        ("33.5", 33_500.0),  # the column is declared in seconds
+        ("33.5s", 33_500.0),
+        ("12.5 sec", 12_500.0),
+        ("33500ms", 33_500.0),
+        ("33500 ms", 33_500.0),
+    ],
+)
+def test_backfill_parser_converts_the_prefill_p90_to_milliseconds(cell, expected_ms):
+    """The local-only column is in seconds while the registry unit is ms, so a
+    unit-blind read would seed 33.5 ms — a sub-second value that would win the
+    lower-is-better best-3 forever."""
+    parsed = pm.parse_archived_report(_report_with_prefill_p90(cell))
+
+    assert parsed["time_to_first_token"] == pytest.approx(expected_ms)
+
+
+@pytest.mark.parametrize("cell", ["33.5x", "33.5 s/req", "~33.5", "fast"])
+def test_backfill_parser_refuses_an_unrecognised_prefill_unit(cell):
+    """An unrecognised suffix is skipped, never guessed: a wrong unit must not
+    seed history at all rather than seed a mis-scaled value."""
+    parsed = pm.parse_archived_report(_report_with_prefill_p90(cell))
+
+    assert "time_to_first_token" not in parsed
+    assert parsed["decode_speed"] == pytest.approx(33.9), "other metrics still parse"
+
+
+def test_backfill_parser_omits_ttft_when_the_prefill_row_has_no_samples():
+    """A window with no local prefill samples renders ``-`` in every phase
+    cell. That is not a value, so the metric is skipped rather than seeded as
+    0 — and the combined row is still not consulted."""
+    report = ARCHIVED_REPORT_ERA_PREFILL.replace(
+        _PREFILL_P90_ROW,
+        "| Prefill (dispatch → first byte) | - | - | - | - | - | - | 0 |",
+    )
+
+    parsed = pm.parse_archived_report(report)
+
+    assert "time_to_first_token" not in parsed
+    assert parsed["decode_speed"] == pytest.approx(33.9)
 
 
 def test_backfill_parser_returns_no_measurement_for_metrics_it_cannot_parse():
     parsed = pm.parse_archived_report(ARCHIVED_REPORT_ERA_A)
 
-    # Era A renders neither a time-to-first-token nor a contention section, so
-    # those metrics are skipped rather than guessed.
+    # Era A renders neither a time-to-first-token nor a local-only prefill
+    # section, so those metrics are skipped rather than guessed.
     assert "time_to_first_token" not in parsed
     assert "contention_denials_per_hour" not in parsed
     assert set(parsed) <= set(TEN_METRICS)
@@ -488,6 +815,30 @@ def test_backfill_reports_the_metrics_it_could_not_parse():
     assert "contention_denials_per_hour" in skipped
     assert _measurement_count(state, "time_to_first_token") == 0
     assert _measurement_count(state, "decode_speed") == 1
+
+
+def test_backfill_skips_ttft_when_only_the_combined_row_is_rendered():
+    """A report with no local-only figure contributes nothing for the metric,
+    so it is reported as skipped rather than seeded from the combined row."""
+    state = pm.new_state()
+
+    result = pm.seed_history(state, [("2026-10-31", ARCHIVED_REPORT_ERA_B)])
+
+    assert "time_to_first_token" in result["skipped_metrics"]
+    assert _measurement_count(state, "time_to_first_token") == 0
+
+
+def test_backfill_seeds_a_ttft_in_the_scorecard_actual_range():
+    """The seeded value is comparable with the metric's own windows (the
+    live 2026-11-08/09 actuals are 33.5 s and 34.0 s), not with the combined
+    p90 (single-digit seconds) of the same report."""
+    state = pm.new_state()
+
+    pm.seed_history(state, [("2026-11-09", ARCHIVED_REPORT_ERA_PREFILL)])
+
+    stored = state["metrics"]["time_to_first_token"]["measurements"][0]
+    assert stored["window"] == "2026-11-09"
+    assert 25_000.0 <= stored["value"] <= 60_000.0
 
 
 def test_archived_window_id_uses_the_generated_date():

@@ -46,16 +46,44 @@ def _depth() -> float:
     return float(proxy_contention_queue_depth._store.get((), 0))
 
 
+def _histogram_sample(histogram, sample_name: str, accessor: str) -> float:
+    """Read one published histogram sample (``count`` / ``sum``) by name.
+
+    ``prometheus_client`` 0.25 removed the private ``_count`` accessor while
+    keeping ``_sum``, so reading the internals directly broke every wait
+    assertion (LP-0MWCP958V007UB0B). The exposition surface (``collect()``) is
+    the stable, public way to read a histogram: prefer it, and fall back to
+    the repo-root stub's ``.get()``-able ``_count``/``_sum`` accessors (the
+    stub has no ``collect()``).
+    """
+    collect = getattr(histogram, "collect", None)
+    if callable(collect):
+        for metric in collect():
+            for sample in metric.samples:
+                if sample.name == sample_name:
+                    return float(sample.value)
+        return 0.0
+    return float(getattr(histogram, f"_{accessor}").get())
+
+
 def _wait_count() -> float:
     from proxy.metrics import proxy_contention_queue_wait_seconds
 
-    return float(proxy_contention_queue_wait_seconds._count.get())
+    return _histogram_sample(
+        proxy_contention_queue_wait_seconds,
+        "proxy_contention_queue_wait_seconds_count",
+        "count",
+    )
 
 
 def _wait_sum() -> float:
     from proxy.metrics import proxy_contention_queue_wait_seconds
 
-    return float(proxy_contention_queue_wait_seconds._sum.get())
+    return _histogram_sample(
+        proxy_contention_queue_wait_seconds,
+        "proxy_contention_queue_wait_seconds_sum",
+        "sum",
+    )
 
 
 def _loss(reason: str) -> float:

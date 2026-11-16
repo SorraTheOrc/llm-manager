@@ -101,6 +101,60 @@ stale ceiling. Follow `slots_stale_reason`:
 Every value is a member of `observability.SLOTS_STALE_REASONS`. Treat an
 unrecognised value as **stale** (fail closed), never as fresh.
 
+## Staleness never starves the local route
+
+A stale surface is an observation about the *poll*, not proof the backend is
+down, so the pre-dispatch routing gate
+(`observability._local_backend_unreachable_remaining_seconds`) only treats it as
+unreachability when a **reachability probe measured unreachable within the
+probe window**.
+
+Background (LP-0MWCOMI160011F6C, 2026-11-11): a llama-server respawn moved the
+child port at 20:55 and the `/slots` probe then failed for 93 minutes. The
+counts cache froze, and once it passed `local_slots_max_snapshot_age_seconds`
+the gate skipped local on every request (60 s at a time) — with no probe on the
+skip path, so the skip was self-sustaining and kept a healthy, idle backend
+starved while `/health` reported `backend_reachable: true` the whole time.
+
+| Setting | Meaning |
+|---|---|
+| `server.local_reachability_probe_max_age_seconds` | freshness window of a measured reachability verdict (default **60 s**) |
+| `server.local_backend_skip_seconds` | TTL of a skip decided from that verdict (default **60 s**) |
+
+The gate's decision order:
+
+1. **Armed skip deadline** (`local_backend_unreachable_until`) — set by a
+   deterministic connection-refused dispatch or a failed reachability probe;
+   unchanged behaviour, so a refused connect still fail-fasts immediately.
+2. **Stale snapshot + recent `unreachable` probe verdict** — skip, bounded by
+   `local_backend_skip_seconds`.
+3. **Anything else** — dispatch local (fail open). A stale snapshot alone, an
+   expired (or absent) probe verdict, or a passing probe never skips, so a
+   recovered backend is re-admitted on the next probe cycle instead of waiting
+   for a lucky `/slots` success.
+
+Reachability evidence is published by `lifecycle._probe_backend_reachable`
+(the `/health` and `/models` probe that already runs on every `/health` poll)
+and by the fail-fast arm path, and is bounded by
+`local_reachability_probe_max_age_seconds` so a verdict can never decide a skip
+forever.
+
+### `/slots` failure classification
+
+`llama_slots_query_failures_total{reason=...}` labels every failed `/slots`
+read. `observability.classify_slots_transport_failure` maps an exception onto
+that vocabulary once for all three `/slots` callers (counts, detail, occupancy
+sampler):
+
+| Exception | Label |
+|---|---|
+| `httpx.TimeoutException` (`ConnectTimeout`, `ReadTimeout`, `WriteTimeout`, `PoolTimeout`), builtin `TimeoutError` | `timeout` |
+| `httpx.NetworkError` (`ConnectError`, `ReadError`, `WriteError`, `CloseError`), builtin `ConnectionError`/`OSError` | `connection_error` |
+| anything else | `unknown` |
+
+Before this mapping every httpx transport error landed in `unknown`, which is
+why the 93-minute outage could not be diagnosed from the metric.
+
 ## Verification script
 
 `scripts/verify_slots_observability.py` produces the reproducible PASS/FAIL

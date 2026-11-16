@@ -85,11 +85,11 @@ def _live_record(session_id: str, endpoint: str, active: bool = True) -> tuple:
 
 def test_record_dispatch_sample_separates_windows_by_co_residency():
     """Each sample lands in the window matching its contended flag."""
-    _seed(tokens=100_000, ms_per_token=3.9, count=6, contended=False)
-    _seed(tokens=100_000, ms_per_token=8.3, count=6, contended=True)
+    _seed(tokens=6_659, ms_per_token=3.9, count=6, contended=False)
+    _seed(tokens=6_659, ms_per_token=8.3, count=6, contended=True)
 
-    solitary = prefill_eta.coefficients("Qwen3", 100_000, _cfg(), contended=False)
-    contended = prefill_eta.coefficients("Qwen3", 100_000, _cfg(), contended=True)
+    solitary = prefill_eta.coefficients("Qwen3", 6_659, _cfg(), contended=False)
+    contended = prefill_eta.coefficients("Qwen3", 6_659, _cfg(), contended=True)
 
     assert solitary.samples == 6
     assert contended.samples == 6
@@ -104,10 +104,10 @@ def test_record_dispatch_sample_separates_windows_by_co_residency():
 
 def test_record_dispatch_sample_does_not_mix_a_short_contended_window():
     """Below ``min_samples`` the contended window is reported but never fit."""
-    _seed(tokens=100_000, ms_per_token=3.9, count=6, contended=False)
-    _seed(tokens=100_000, ms_per_token=8.3, count=4, contended=True)
+    _seed(tokens=6_659, ms_per_token=3.9, count=6, contended=False)
+    _seed(tokens=6_659, ms_per_token=8.3, count=4, contended=True)
 
-    contended = prefill_eta.coefficients("Qwen3", 100_000, _cfg(), contended=True)
+    contended = prefill_eta.coefficients("Qwen3", 6_659, _cfg(), contended=True)
 
     # 4 contended samples < min_samples (5): the contended window is
     # reported for diagnosis but the solitary window priced the estimate.
@@ -195,12 +195,12 @@ def test_dispatch_sample_contended_or_admission_time_snapshot_and_live_check():
 
 def test_contended_admission_prices_from_contended_window_when_calibrated():
     """busy_slots >= 1 prices the own-prefill term from the contended window."""
-    _seed(tokens=100_000, ms_per_token=3.9, count=6, contended=False)
-    _seed(tokens=100_000, ms_per_token=8.3, count=6, contended=True)
+    _seed(tokens=6_659, ms_per_token=3.9, count=6, contended=False)
+    _seed(tokens=6_659, ms_per_token=8.3, count=6, contended=True)
     cfg = _cfg()
 
     decision = prefill_eta.evaluate_admission(
-        cfg, "Qwen3", 100_000, 0.0, "low", busy_slots=1
+        cfg, "Qwen3", 6_659, 0.0, "low", busy_slots=1
     )
 
     assert decision.active is True
@@ -208,39 +208,39 @@ def test_contended_admission_prices_from_contended_window_when_calibrated():
     assert decision.contended_samples == 6
     # The contended rate (8.3 ms * 1.2 conservatism) must be priced, not the
     # fast solitary rate — the whole point of the change.
-    expected_eta = 100_000 * 8.3 * prefill_eta.CONSERVATISM_FACTOR / 1000.0
+    expected_eta = 6_659 * 8.3 * prefill_eta.CONSERVATISM_FACTOR / 1000.0
     assert decision.eta_prefill_seconds == pytest.approx(expected_eta, rel=1e-3)
 
 
 def test_contended_admission_falls_back_to_solitary_when_uncalibrated():
     """No contended samples yet: price from the solitary window, say so."""
-    _seed(tokens=100_000, ms_per_token=3.9, count=6, contended=False)
+    _seed(tokens=6_659, ms_per_token=3.9, count=6, contended=False)
     cfg = _cfg()
 
     decision = prefill_eta.evaluate_admission(
-        cfg, "Qwen3", 100_000, 0.0, "low", busy_slots=1
+        cfg, "Qwen3", 6_659, 0.0, "low", busy_slots=1
     )
 
     assert decision.rate_bucket == "solitary_fallback"
     assert decision.contended_samples == 0
     assert decision.eta_prefill_seconds == pytest.approx(
-        100_000 * 3.9 * prefill_eta.CONSERVATISM_FACTOR / 1000.0, rel=1e-3
+        6_659 * 3.9 * prefill_eta.CONSERVATISM_FACTOR / 1000.0, rel=1e-3
     )
 
 
 def test_solitary_admission_prices_from_solitary_window():
-    _seed(tokens=100_000, ms_per_token=3.9, count=6, contended=False)
-    _seed(tokens=100_000, ms_per_token=8.3, count=6, contended=True)
+    _seed(tokens=6_659, ms_per_token=3.9, count=6, contended=False)
+    _seed(tokens=6_659, ms_per_token=8.3, count=6, contended=True)
     cfg = _cfg()
 
     decision = prefill_eta.evaluate_admission(
-        cfg, "Qwen3", 100_000, 0.0, "low", busy_slots=0
+        cfg, "Qwen3", 6_659, 0.0, "low", busy_slots=0
     )
 
     assert decision.rate_bucket == "solitary"
     assert decision.rate_bucket != "contended"
     assert decision.eta_prefill_seconds == pytest.approx(
-        100_000 * 3.9 * prefill_eta.CONSERVATISM_FACTOR / 1000.0, rel=1e-3
+        6_659 * 3.9 * prefill_eta.CONSERVATISM_FACTOR / 1000.0, rel=1e-3
     )
 
 
@@ -296,23 +296,23 @@ def test_contended_window_at_measured_median_prices_6659_tokens_above_55s():
 def test_warm_prompt_prices_identically_to_before_the_change():
     """cached_ratio >= 0.9 keeps the pre-change (solitary) computation even
     behind an occupied gate."""
-    _seed(tokens=100_000, ms_per_token=8.3, count=6, contended=True)
-    _seed(tokens=100_000, ms_per_token=3.9, count=6, contended=False)
+    _seed(tokens=6_659, ms_per_token=8.3, count=6, contended=True)
+    _seed(tokens=6_659, ms_per_token=3.9, count=6, contended=False)
     cfg = _cfg()
 
     pre_change_eta = prefill_eta.estimate_prefill_seconds(
-        "Qwen3", 100_000, 0.9, cfg, contended=False
+        "Qwen3", 6_659, 0.9, cfg, contended=False
     )[0]
 
     decision = prefill_eta.evaluate_admission(
-        cfg, "Qwen3", 100_000, 0.9, "low", busy_slots=1
+        cfg, "Qwen3", 6_659, 0.9, "low", busy_slots=1
     )
     assert decision.active is True
     assert decision.rate_bucket == "solitary"
     assert decision.eta_prefill_seconds == pytest.approx(pre_change_eta, rel=1e-9)
     # A cache-miss prompt behind the same gate IS contended-priced (control).
     cold = prefill_eta.evaluate_admission(
-        cfg, "Qwen3", 100_000, 0.0, "low", busy_slots=1
+        cfg, "Qwen3", 6_659, 0.0, "low", busy_slots=1
     )
     assert cold.rate_bucket == "contended"
     assert cold.eta_prefill_seconds > decision.eta_prefill_seconds
@@ -333,9 +333,9 @@ def _decision_log_line(caplog, **kwargs) -> str:
 
 def test_log_carries_rate_bucket_for_contended_decision(caplog):
     caplog.set_level(logging.INFO, logger="llama-proxy")
-    _seed(tokens=100_000, ms_per_token=8.3, count=6, contended=True)
+    _seed(tokens=6_659, ms_per_token=8.3, count=6, contended=True)
     decision = prefill_eta.evaluate_admission(
-        _cfg(), "Qwen3", 100_000, 0.0, "low", busy_slots=1
+        _cfg(), "Qwen3", 6_659, 0.0, "low", busy_slots=1
     )
     assert decision.active is True
 
@@ -348,9 +348,9 @@ def test_log_carries_rate_bucket_for_contended_decision(caplog):
 
 def test_log_carries_rate_bucket_for_solitary_decision(caplog):
     caplog.set_level(logging.INFO, logger="llama-proxy")
-    _seed(tokens=100_000, ms_per_token=3.9, count=6, contended=False)
+    _seed(tokens=6_659, ms_per_token=3.9, count=6, contended=False)
     decision = prefill_eta.evaluate_admission(
-        _cfg(), "Qwen3", 100_000, 0.0, "low", busy_slots=0
+        _cfg(), "Qwen3", 6_659, 0.0, "low", busy_slots=0
     )
     assert decision.active is True
 
@@ -362,9 +362,9 @@ def test_log_carries_rate_bucket_for_solitary_decision(caplog):
 
 def test_log_carries_rate_bucket_for_uncalibrated_contended_fallback(caplog):
     caplog.set_level(logging.INFO, logger="llama-proxy")
-    _seed(tokens=100_000, ms_per_token=3.9, count=6, contended=False)
+    _seed(tokens=6_659, ms_per_token=3.9, count=6, contended=False)
     decision = prefill_eta.evaluate_admission(
-        _cfg(), "Qwen3", 100_000, 0.0, "low", busy_slots=1
+        _cfg(), "Qwen3", 6_659, 0.0, "low", busy_slots=1
     )
     assert decision.active is True
     assert decision.rate_bucket == "solitary_fallback"

@@ -159,6 +159,45 @@ def test_incident_snapshot_is_critical_with_both_reasons():
     assert "GPU GTT" in joined
 
 
+def test_pressure_reason_strings_are_exact():
+    """The modernization refactor must not alter the operator-facing reasons."""
+    snapshot = hp.MemorySnapshot(
+        mem_total_bytes=INCIDENT_MEM_TOTAL,
+        mem_available_bytes=INCIDENT_MEM_AVAILABLE,
+        gtt_used_bytes=INCIDENT_GTT_USED,
+        gtt_total_bytes=INCIDENT_GTT_TOTAL,
+    )
+
+    assert hp.evaluate_pressure(snapshot).reasons == (
+        "MemAvailable 0.2% of MemTotal (critical threshold 6%)",
+        "GPU GTT 53.7% of physical RAM (warning threshold 50%)",
+    )
+
+    warning_only = hp.MemorySnapshot(mem_total_bytes=100, mem_available_bytes=10)
+    assert hp.evaluate_pressure(warning_only).reasons == (
+        "MemAvailable 10.0% of MemTotal (warning threshold 12%)",
+    )
+
+
+def test_describe_snapshot_string_is_exact():
+    """``describe_snapshot`` renders GiB with one decimal and ``unknown`` for gaps."""
+    gib = 1024**3
+    snapshot = hp.MemorySnapshot(
+        mem_total_bytes=4 * gib,
+        mem_available_bytes=gib,
+        gtt_used_bytes=gib,
+        gtt_total_bytes=2 * gib,
+    )
+    assert (
+        hp.describe_snapshot(snapshot)
+        == "MemAvailable 1.0 GiB of 4.0 GiB, GPU GTT 1.0 GiB of 2.0 GiB"
+    )
+    assert (
+        hp.describe_snapshot(hp.MemorySnapshot())
+        == "MemAvailable unknown of unknown, GPU GTT unknown of unknown"
+    )
+
+
 def test_unknown_when_nothing_is_measurable():
     verdict = hp.evaluate_pressure(hp.MemorySnapshot())
     assert verdict.level == "unknown"
@@ -203,6 +242,34 @@ def test_log_pressure_swallows_a_broken_logger():
 
     verdict = hp.log_pressure(_Broken(), hp.MemorySnapshot(mem_total_bytes=1, mem_available_bytes=1))
     assert verdict.level == "ok"
+
+
+def test_log_pressure_message_prefix_is_exact():
+    """The logged summary keeps its ``Host memory pressure [context]: level — series`` shape."""
+    logger = logging.getLogger("test-host-pressure-exact")
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture()
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        snapshot = hp.MemorySnapshot(
+            mem_total_bytes=INCIDENT_MEM_TOTAL,
+            mem_available_bytes=INCIDENT_MEM_AVAILABLE,
+        )
+        hp.log_pressure(logger, snapshot, context="exact")
+    finally:
+        logger.removeHandler(handler)
+
+    assert records
+    assert records[0].getMessage().startswith(
+        "Host memory pressure [exact]: critical — "
+        "MemAvailable 0.2 GiB of 124.4 GiB, GPU GTT unknown of unknown"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +384,7 @@ def test_apply_oom_score_adj_reports_a_dead_pid():
     proc.wait(timeout=10)
     applied, error = hp.apply_oom_score_adj(proc.pid, 100)
     assert error is not None
+    assert error.startswith("FileNotFoundError: ")
     assert applied is None
 
 
@@ -437,6 +505,10 @@ def test_log_startup_gap_is_info_for_a_quick_restart(tmp_path, caplog):
         hp.log_startup_gap(logger, tmp_path, now=1005.0)
 
     assert [r.levelno for r in caplog.records] == [logging.INFO]
+    assert caplog.records[0].getMessage() == (
+        "Recovery: previous proxy log write 1970-01-01T00:16:40+00:00 "
+        "(proxy.log.2026-11-02_120245), 5s before this start"
+    )
 
 
 # ---------------------------------------------------------------------------

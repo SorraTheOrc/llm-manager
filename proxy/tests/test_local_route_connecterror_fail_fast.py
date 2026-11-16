@@ -282,6 +282,21 @@ async def test_successful_dispatch_clears_routing_skip(monkeypatch):
     assert server.local_backend_unreachable_until == 0.0
 
 
+def test_refused_connect_arms_skip_and_publishes_unreachable_evidence():
+    """AC4: a refused local connect still fail-fasts, arms the skip
+    immediately, and leaves the unreachable evidence the staleness
+    corroboration consumes (LP-0MWCOMI160011F6C)."""
+    exc = _refused_connect_error()
+
+    with pytest.raises(httpx.ConnectError):
+        observability._record_connection_refused_fail_fast(
+            "v1/chat/completions", False, 1, 8, exc
+        )
+
+    assert server.local_backend_unreachable_until > time.monotonic()
+    assert observability.last_local_backend_reachability(_base_config()) is False
+
+
 # ======================================================================
 # AC2 — the routing gate (remaining seconds / staleness read)
 # ======================================================================
@@ -299,12 +314,43 @@ def test_routing_gate_reads_armed_skip_and_expiry():
     assert observability._local_backend_unreachable_remaining_seconds(_base_config()) == 0.0
 
 
-def test_routing_gate_skips_on_stale_slots_snapshot(monkeypatch):
-    """AC2: a slots snapshot older than the configured staleness bound is
-    treated as a known-unreachable backend."""
+def test_routing_gate_skips_on_stale_snapshot_plus_unreachable_probe():
+    """AC2: a stale snapshot *corroborated* by a recent failed reachability
+    probe skips local, and the skip stays bounded by the TTL."""
     observability._last_slot_counts_cache = (1, 2, time.monotonic() - 10_000)
+    observability.record_local_backend_reachability(False)
     cfg = _base_config(local_slots_max_snapshot_age_seconds=60)
-    assert observability._local_backend_unreachable_remaining_seconds(cfg) > 0
+    remaining = observability._local_backend_unreachable_remaining_seconds(cfg)
+    assert remaining > 0
+    assert remaining <= 60
+
+
+def test_routing_gate_fails_open_on_stale_snapshot_alone(monkeypatch):
+    """AC1: a stale slot snapshot on its own is never ``backend_unreachable``.
+
+    Reproduces the 2026-11-11 starvation: the counts cache is frozen far past
+    ``local_slots_max_snapshot_age_seconds`` while the backend is healthy and
+    the ``/health`` probe passes. The gate must return 0 (dispatch local)
+    instead of skipping, and must not consult ``/slots`` to decide.
+    """
+    observability._last_slot_counts_cache = (1, 2, time.monotonic() - 5566)
+    observability.record_local_backend_reachability(True)
+    cfg = _base_config(local_slots_max_snapshot_age_seconds=300)
+    assert observability._local_backend_unreachable_remaining_seconds(cfg) == 0.0
+
+
+def test_routing_gate_fails_open_when_probe_evidence_is_stale():
+    """AC2: the staleness skip is bounded by the probe interval — evidence
+    older than ``local_reachability_probe_max_age_seconds`` is no evidence at
+    all, so the gate fails open and a recovered backend is re-admitted
+    without waiting for a lucky ``/slots`` success."""
+    observability._last_slot_counts_cache = (1, 2, time.monotonic() - 10_000)
+    observability._local_reachability_probe = (False, time.monotonic() - 120)
+    cfg = _base_config(
+        local_slots_max_snapshot_age_seconds=60,
+        local_reachability_probe_max_age_seconds=60,
+    )
+    assert observability._local_backend_unreachable_remaining_seconds(cfg) == 0.0
 
 
 def test_routing_gate_does_not_skip_on_fresh_slots_snapshot():
@@ -438,16 +484,51 @@ async def test_routing_skips_local_predispatch_when_backend_unreachable(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_routing_skips_local_on_stale_slots_snapshot(monkeypatch, caplog):
-    """AC2: a slots snapshot older than the configured staleness bound skips
-    local pre-dispatch (the 6.5 h-stale snapshot of the incident)."""
+async def test_routing_dispatches_local_on_stale_snapshot_when_probe_passes(monkeypatch, caplog):
+    """AC1: a stale snapshot plus a passing reachability probe dispatches
+    local — the healthy-but-idle backend is no longer starved."""
+    import logging
+
+    observability._last_slot_counts_cache = (2, 2, time.monotonic() - 4_477)
+    observability.record_local_backend_reachability(True)
+    local_calls = {"n": 0}
+
+    async def _healthy_local(_req, _path, _endpoint=None):
+        local_calls["n"] += 1
+        return _success_response()
+
+    async def _remote_must_not_run(_req, _path, _provider_cfg):
+        raise AssertionError("local must be dispatched on a stale-but-reachable backend")
+
+    monkeypatch.setattr(provider, "_get_proxy_to_local", lambda: _healthy_local)
+    monkeypatch.setattr(provider, "_get_proxy_to_remote", lambda: _remote_must_not_run)
+
+    cfg = _base_config(local_slots_max_snapshot_age_seconds=300)
+    with caplog.at_level(logging.INFO, logger="llama-proxy.provider"):
+        result = await provider.proxy_with_fallback(
+            _StubRequest(), "v1/chat/completions", _mixed_chain(), cfg
+        )
+
+    assert result.status_code == 200
+    assert local_calls["n"] == 1
+    assert not any(
+        "routing_skip_local" in r.message and "reason=backend_unreachable" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_routing_skips_local_on_stale_snapshot_with_unreachable_probe(monkeypatch, caplog):
+    """AC2: a stale snapshot corroborated by a recent failed probe still skips
+    local pre-dispatch (the dead-backend case the branch exists for)."""
     import logging
 
     observability._last_slot_counts_cache = (1, 2, time.monotonic() - 10_000)
+    observability.record_local_backend_reachability(False)
     remote_calls = {"n": 0}
 
     async def _local_must_not_run(_req, _path, _endpoint=None):
-        raise AssertionError("local must not be dispatched on a stale snapshot")
+        raise AssertionError("local must not be dispatched without a reachable probe")
 
     async def _healthy_remote(_req, _path, _provider_cfg):
         remote_calls["n"] += 1
@@ -468,6 +549,36 @@ async def test_routing_skips_local_on_stale_slots_snapshot(monkeypatch, caplog):
         "routing_skip_local" in r.message and "reason=backend_unreachable" in r.message
         for r in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_reachability_probe_publishes_evidence(monkeypatch):
+    """AC2: every reachability probe publishes its result, so the gate's
+    staleness corroboration is fed by ``/health`` polling rather than by a
+    ``/slots`` success."""
+    import proxy.lifecycle as lifecycle
+    import proxy.server as srv_mod
+
+    class _Resp:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+    class _Client:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+        async def get(self, _url, timeout=None):
+            return _Resp(self.status_code)
+
+    obs = observability
+    obs.reset_local_backend_reachability()
+    monkeypatch.setattr(srv_mod, "_http_client", _Client(200))
+    assert await lifecycle._probe_backend_reachable(8080) is True
+    assert obs.last_local_backend_reachability(_base_config()) is True
+
+    monkeypatch.setattr(srv_mod, "_http_client", _Client(503))
+    assert await lifecycle._probe_backend_reachable(8080) is False
+    assert obs.last_local_backend_reachability(_base_config()) is False
 
 
 # ======================================================================

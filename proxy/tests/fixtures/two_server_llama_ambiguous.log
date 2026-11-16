@@ -1,0 +1,22 @@
+# Genuinely ambiguous two-server slice of llama-server.log
+# (LP-0MW957RWM0007Z3S AC3).
+#
+# Same rotation as ``two_server_llama_rotated.log``, but both children kept
+# emitting into the post-rotation file. With the router spawn lines gone there
+# are two unannounced eval-line ports and no evidence which one is Qwen3, so no
+# basis may be published: ``seconds_basis_tok_s`` is None, never a median that
+# mixes the embeddings child's ~100 tok/s lines into the Qwen3 rate.
+#
+# Ground truth for the assertions:
+#   ports 32999 and 51973 both unannounced, no spawn line -> reason is
+#   "ambiguous", tok_s=None, contributing_eval_lines=0, eval_lines_total=10.
+[32999] prompt eval time =   50000.00 ms / 12000 tokens (    4.17 ms per token,   240.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10000 tokens (   10.00 ms per token,   100.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12300 tokens (    4.07 ms per token,   246.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10100 tokens (    9.90 ms per token,   101.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12500 tokens (    4.00 ms per token,   250.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10200 tokens (    9.80 ms per token,   102.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 12700 tokens (    3.94 ms per token,   254.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10300 tokens (    9.71 ms per token,   103.00 tokens per second)
+[32999] prompt eval time =   50000.00 ms / 13000 tokens (    3.85 ms per token,   260.00 tokens per second)
+[51973] prompt eval time =  100000.00 ms / 10400 tokens (    9.62 ms per token,   104.00 tokens per second)

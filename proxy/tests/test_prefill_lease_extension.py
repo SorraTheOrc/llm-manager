@@ -1407,9 +1407,13 @@ async def test_accepted_but_never_progressed_released_by_no_progress_watchdog(mo
     assert srv.local_active_queries == 0
     assert "sess-1" not in srv.local_prefill_in_flight
     warn_lines = [str(call) for call in srv.logger.warning.call_args_list]
-    assert any("reason=no_progress_watchdog" in line for line in warn_lines), (
-        f"expected a no_progress_watchdog release, got: {warn_lines}"
-    )
+    # LP-0MW8VOKB9002W2C1 AC2: the no-progress release now records the distinct
+    # reason ``prefill_stalled`` (was the generic ``no_progress_watchdog``)
+    # together with the elapsed seconds.
+    assert any(
+        "prefill_stalled" in call.args
+        for call in srv.logger.warning.call_args_list
+    ), f"expected a prefill_stalled release, got: {warn_lines}"
 
 
 @pytest.mark.asyncio

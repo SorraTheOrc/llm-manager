@@ -112,6 +112,21 @@ Outputs written to:
   A `% local turns` of 100 means the session never used remote; a null
   `context_at_fallback` means the logs carried no token evidence (the report
   renders `n/a`, never an estimate).
+- `--json` summary field `context_at_fallback_by_percentile` — the banded
+  context-at-fallback view behind the report's
+  `## Context size at fallback by percentile band` section
+  (LP-0MVZ6EAZR001DX5E): `{"sessions_in_window": N,
+  "sessions_with_local": M, "sessions_included": N,
+  "sessions_excluded_no_context": N, "sessions_without_final_turn_tokens": N,
+  "bands": [{"label": "P0–P10", "lower_decile": 0, "upper_decile": 10,
+  "lower_bound": i|null, "upper_bound": i|null, "sessions": N,
+  "avg_context_at_fallback": i|null, "avg_final_turn_new_tokens": i|null,
+  "final_turn_new_tokens_samples": N, "final_turn_new_tokens_missing": N,
+  "reasons": [{"reason": r, "sessions": N,
+  "pct_of_band_sessions": f}, …at most two…],
+  "other": {"sessions": N, "pct_of_band_sessions": f}}, …ten bands…]}`.
+  A null average is an empty band (never a fabricated 0); an empty window keeps
+  the key with `"bands": []` and zero cohort counts.
 - `--json` summary field `engine_cross_check` — the engine cross-check
   (LP-0MVNWULLI006ZYXX): proxy-inferred phase slot-time vs llama-server's own
   summed per-task eval durations. `{"unit": "slot-seconds",
@@ -356,15 +371,20 @@ Outputs written to:
   before the Session summary and always — regardless of local traffic): one
   row per
   **absolute wall-clock hour** of the report window (partial first/last hours
-  truncated to the window edges, idle hours included as `0s`) with busy time
-  / busy-% columns — busy seconds ÷ window-bounded bucket duration,
-  defensively clamped to 100% — plus five per-hour **activity** columns
+  truncated to the window edges, idle hours included) with a **GPU computing
+  (attributable)** column — the per-hour `gpu:computing_workload:bool` share
+  (power ≥ 90 W **and** ≥ 1 busy local slot), produced only by
+  `scripts/gpu_utilisation.py` and identical to the scorecard's `gpu_busy`
+  measure, so the two tables can never disagree; an hour with no observed
+  instants reads `unknown`, never a fabricated `0 %` (LP-0MWG7KQVZ008DBZM) —
+  plus seven per-hour **activity** columns
   counted by each event's own timestamp within the bucket: `Requests started`
   (all `Stream started` events), `Local attempts` (`Stream started` with
   `provider=local`), `Local served` (`Stream finished` with
   `provider=local`), `Fallbacks` (`Fallback triggered` events), and
   `Local-skip` (`routing_skip_local` events); a **Totals** row gives the
-  window busy totals plus the sum of each activity column over the window.
+  window-level attributable share plus the sum of each activity column over
+  the window.
   **Chain-hold de-duplication (LP-0MUIEO6IP0030CT3):** the `Local-skip`
   columns count only genuine demand — a held request re-emitted across
   chain-hold cycles (`chain_hold_cycle>0`, LP-0MU5AIAAY003KVM0) is counted
@@ -378,11 +398,12 @@ Outputs written to:
   request counted N+1 times); the intended count drop is therefore an
   accuracy fix, not lost data.
   Absolute-hour buckets keep the two edge partials of a rolling window
-  distinct, so no busy duration is double-counted and no row exceeds 100%
+  distinct, so no duration is double-counted and no row exceeds 100%
   (the previous hour-of-day keying could collide them and emit impossible
   >100% rows, LP-0MTYAZFGN003BYQS); the `--json` summary exposes the same
   per-hour activity as `hourly_activity`, plus `hourly_busy` and
-  `hourly_session_classification`, all keyed by absolute hour. Each
+  `hourly_session_classification`, all keyed by absolute hour, and the
+  per-hour attributable share as `gpu_busy.hourly`. Each
   `hourly_activity` entry (LP-0MVKUKG3F0035I85) carries `state` (the
   `+`-joined availability label), `states` (the ordered tuple), and the raw
   evidence counters `local_dispatch_attempts`, `local_denials`,
@@ -390,9 +411,10 @@ Outputs written to:
   can audit the availability verdict instead of trusting it, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
-  fast/cheap split, plus the hardware-side **GPU busy — power-based** row when
-  Prometheus is reachable — see [GPU busy time from power](#gpu-busy-time-from-power-prometheus)
-  — when the window has local traffic) followed by
+  fast/cheap split, plus the attributable **GPU computing — attributable**
+  row when GPU telemetry is reachable — see
+  [GPU computing from power](#gpu-computing-from-power-prometheus) — when the
+  window has local traffic) followed by
   **Local contention prediction vs reality** (LP-0MVGR2OXT0096OGK, when the
   window has a denial or status poll): M1 per-hour denial attribution by
   derived pool state plus the guard-reason and `capacity_hint` splits; M2 the
@@ -525,6 +547,72 @@ line `No session in the window used the local model.` instead of empty tables.
 The same derivation is exposed as the `local_turn_coverage` `--json` key, so
 Markdown and machine-readable views cannot disagree.
 
+### Context size at fallback by percentile band
+
+Since LP-0MVZ6EAZR001DX5E the report bands the same cohort so one read answers
+*does the dominant reason for falling back change as context grows, and does
+the uncached work per turn grow with it?*. The section sits **immediately
+after** `## Local model usage by session` and **before** `## Fallback reasons`:
+
+```text
+## Context size at fallback by percentile band
+
+| Band | Sessions | Avg total context size | Avg final-turn new tokens |
+| P0–P10 (1,024–3,347) | … |
+
+### Top two fallback reasons per band
+| Band | Sessions | Most common reason | Second most common | Other |
+```
+
+Operational definitions:
+
+- **Cohort** — the `## Local model usage by session` cohort (a session with
+  ≥1 local turn) **restricted to sessions with token evidence at their
+  fallback** (the same derivation that section's `Context size at fallback`
+  column prints: `routing_skip_local estimated_tokens`, else the first remote
+  `Stream finished` prompt tokens, else the session's own measured context).
+  Because both sections call `local_turn_rows()` and
+  `_fallback_reason_label()`, they cannot disagree about a session's
+  context-at-fallback figure or its fallback reason. The section states the
+  cohort size, how many sessions are included in the banded figures and how
+  many are **excluded** for missing token evidence — an excluded session is
+  counted, never rendered as 0.
+- **Bands** — ten **disjoint** deciles `P0–P10` … `P90–P100` cut at the P10,
+  P20 … P90 **percentiles** of the included sessions, computed with the
+  report's usual `linear interpolation` convention (`_percentile`), so the
+  bands and the sibling section's P10/P50/P90 row agree. Membership rule: a
+  session whose context size is **exactly on a cut belongs to the higher
+  band**, while the cohort minimum always anchors `P0–P10` (the one exception,
+  so a cohort clustered at its minimum still reads as the smallest contexts)
+  and the maximum belongs to `P90–P100`. Each band row carries its session count, the arithmetic mean of
+  its members' context size at fallback, and the arithmetic mean of their
+  final-turn new tokens.
+- **Final-turn new tokens** — the new (uncached) prompt tokens of the
+  session's **final turn**, derived once in `aggregation.py`
+  (`SessionStats.final_turn_new_tokens` + `final_turn_new_tokens_source`) from
+  that turn's own admission/routing line: its measured `new_tokens=`
+  (`measured_new_tokens`, on `local_admission_guard` / `routing_skip_local`),
+  else `estimated_tokens= × (1 − cached_ratio=)` (`estimated_uncached`) when
+  the line carries both. A session whose final turn carries no such evidence is
+  **excluded from that column's mean and tallied as `n/a`** — never imputed
+  as 0, and an earlier turn's figure is never borrowed.
+- **Top-two fallback reasons per band** — the two most common reasons among
+  that band's sessions (deterministic tie-break: higher count, then
+  alphabetical), each as a count and a percentage **of that band's sessions**,
+  plus an explicit `other` remainder so every row reads as shares of 100 %.
+  Reasons are categorical: counts and shares only, no percentiles.
+- **Empty and sparse windows** — an empty band renders `-` (no fabricated
+  mean, no 0). When the cohort is empty (no local turns at all) the whole
+  section is **omitted**, so the unattended 05:00 cron exits 0 on an empty
+  window; `--json` then still carries the
+  `context_at_fallback_by_percentile` key with `"bands": []` and zero cohort
+  counts. Purely additive: no LLM call, no network call, no interactive
+  prompt, and no existing section, column, JSON key or CSV column changes.
+
+The machine-readable projection is the `context_at_fallback_by_percentile`
+`--json` key (shape documented in the outputs list above), so the Markdown
+table and `jq` cannot drift.
+
 ### Archival
 
 Before writing fresh outputs, the script moves any existing artifacts
@@ -621,11 +709,11 @@ the renderer.
 ```text
 ## Performance metrics summary
 
-| Metric | Baseline | Target | Actual | Result |
-|---|---|---|---|---|
-| GPU activity — power-based, any consumer | 18.4 % (2026-11-03) | n/a | 18.4 % | Insufficient history |
-| Fallback rate | 87.9 % of requests (2026-11-03) | n/a | 87.9 % of requests | Insufficient history |
-| Decode speed | 32.1 tok/s (2026-11-03) | n/a | 32.1 tok/s | Insufficient history |
+| Metric | Baseline | Target | Tolerance | Actual | Result |
+|---|---|---|---|---|---|
+| GPU computing — attributable (power ≥ 90 W and a busy local slot) | 18.4 % (2026-11-03) | n/a | ±10 % | 18.4 % | Insufficient history |
+| Fallback rate | 87.9 % of requests (2026-11-03) | n/a | ±10 % | 87.9 % of requests | Insufficient history |
+| Decode speed | 32.1 tok/s (2026-11-03) | n/a | ±10 % | 32.1 tok/s | Insufficient history |
 …one row per registered metric, in registry order…
 ```
 
@@ -640,14 +728,23 @@ exists.)
   (best per the metric's direction). `n/a` when nothing is recorded yet.
 - **Target** — the mean of the **three best** recorded measurements. `n/a`
   below three, because there is no evidence base to average.
+- **Tolerance** — the relative band around the target the verdict was judged
+  against, rendered as `±10 %` for the default. It is a *relative* band
+  (`tolerance × target`) because the ten metrics carry different units, and a
+  relative band is the only unit-free reading of "within 10 % of the target".
+  A metric may override it with `tolerance_pct` in the committed defaults
+  file; an absent, non-numeric or negative value falls back to the 10 %
+  default (see [Verdict rule](#verdict-rule-tolerance-band)).
 - **Actual** — this window's measurement. `n/a` (never `0`) when the window
   cannot be measured: no GPU sample, no llama-server eval lines, no matched
   ETA pairs, and so on. A genuine measured zero renders as `0.0 <unit>`.
 - **Result** — `Met` / `Unmet` / `Insufficient history`. The comparison is
-  direction-aware and *equality with the target counts as met*. Fewer than
-  three recorded measurements always reports `Insufficient history`, never a
-  false Met/Unmet; a metric with no measurable actual also reports
-  `Insufficient history` (its actual is `n/a`).
+  direction-aware and **inside the tolerance band**: `Met` means the actual is
+  within the tolerance band of the target (any actual better than the target
+  is also `Met`), not that the target was beaten exactly. Fewer than three
+  recorded measurements always reports `Insufficient history`, never a false
+  Met/Unmet; a metric with no measurable actual also reports `Insufficient
+  history` (its actual is `n/a`).
 - **Retention rules.** All measurements are stored (they are the evidence
   behind the target); the best three are *derived* per direction, at most one
   per window, so a re-run of the same window replaces that window's value
@@ -668,6 +765,33 @@ exists.)
   order — the integration tests assert both, so a metric cannot be added to
   one surface and forgotten in the other.
 
+### Verdict rule (tolerance band)
+
+`Met` means the actual is **within the tolerance band of the target**, not
+that it beat the target exactly, so a normal run-to-run wobble (a decode
+median 0.3 tok/s under target, a p90 first token a few milliseconds over) is
+not reported as a regression. The band is relative and direction-aware
+(`target × tolerance_pct / 100`):
+
+| Direction | `Met` when |
+|---|---|
+| Higher is better | `actual >= target × (1 − tolerance_pct / 100)` |
+| Lower is better | `actual <= target × (1 + tolerance_pct / 100)` |
+
+- **Both band edges count as met**, and any actual better than the target is
+  met.
+- **Default ±10 %** for every metric. The committed defaults file sets
+  `tolerance_pct` per metric; an absent, non-numeric or negative value falls
+  back to 10 and never fails the run. A value other than 10 carries a one-line
+  rationale comment beside it, because widening or tightening a metric's band
+  weakens or strengthens its verdict.
+- **A zero target has a zero-width band.** 10 % of zero is zero, so a
+  lower-is-better metric whose target is 0 is `Met` only at an actual of 0.
+  This is stated rather than replaced by an invented absolute epsilon.
+- **No other rule changes.** Retention (best three, one per window), the target
+  maths (mean of the retained three) and history recording are unchanged —
+  only the comparison band moved.
+
 ### Metric definitions
 
 All ten metrics, in the order the report renders them. `id` is the registry
@@ -675,7 +799,7 @@ key, the `--json` key and the detail-subsection prefix.
 
 | id | Label | Unit | Direction | Data source |
 |---|---|---|---|---|
-| `gpu_busy` | GPU activity — power-based, any consumer | % | higher is better | GPU telemetry sampler power samples (gpu:computing:bool, any GPU consumer) |
+| `gpu_busy` | GPU computing — attributable (power ≥ 90 W and a busy local slot) | % | higher is better | GPU telemetry power and busy-slot samples (gpu:computing_workload:bool, via scripts/gpu_utilisation.py) |
 | `fallback_rate` | Fallback rate | % of requests | lower is better | `Fallback triggered` log events |
 | `decode_speed` | Decode speed | tok/s | higher is better | `Stream finished` token counts |
 | `prompt_eval_speed` | Prompt eval speed | tok/s | higher is better | llama-server prompt eval timing |
@@ -689,16 +813,19 @@ key, the `--json` key and the detail-subsection prefix.
 How each value is calculated (`aggregation.performance_metric_inputs` is the
 single roll-up that produces exactly these keys):
 
-- **`gpu_busy`** — coverage-honest power-based computing share from the GPU
-  telemetry sampler. Every expected 15-second instant across the window is
-  classified `computing`, `idle` or `unknown` from the `gpu:computing:bool`
-  recording rule, with the unobserved share reported as `unknown` (never
+- **`gpu_busy`** — the attributable GPU-activity share from the single
+  producer (`scripts/gpu_utilisation.py`): every expected 15-second instant
+  across the window is classified `computing`, `idle` or `unknown` from the
+  `gpu:computing_workload:bool` recording rule (power ≥ 90 W **and** ≥ 1 busy
+  local slot), with the unobserved share reported as `unknown` (never
   renormalised away, never counted as `idle`, and never added to the
   numerator); corroborated by log-derived local busy time for the same window.
-  This is the **hardware** figure the **Local model utilization** section
-  renders, and it counts **any GPU consumer** — **not** a local-utilisation
-  signal: decisions still use the log-derived `local_busy` (see [Which busy
-figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
+  This is the **one reported GPU-activity measure** the **Local model
+  utilization** row and the **Summary by hour** column both render, bucketed
+  per hour, so they cannot disagree. It measures *our local model's* GPU work,
+  not any arbitrary consumer, and it is **not** slot occupancy: the log-derived
+  `local_busy` remains the capacity/contention figure gates quote (see [Which
+  busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
   `n/a` when Prometheus was unreachable or the window had no observed
   instants.
 - **`fallback_rate`** — share of the window's requests that produced
@@ -749,6 +876,7 @@ future default history could seed:
 metrics:
   decode_speed:
     measurements: []          # optional seeded history, one entry per window
+    tolerance_pct: 10         # optional relative verdict band (default 10)
     why: "…why the metric matters…"
     calculation: "…how it is calculated and from which data…"
     levers: "…what an operator can change…"
@@ -758,7 +886,9 @@ metrics:
 
 Every field except `measurements` is optional: a field a custom defaults file
 omits is reported as `not documented in the committed metrics defaults.`
-rather than invented. `data_section_anchor` is the `##` heading of the data
+rather than invented. `tolerance_pct` is the metric's verdict band (default
+10, see [Verdict rule](#verdict-rule-tolerance-band)); it is a number, not
+prose. `data_section_anchor` is the `##` heading of the data
 section reporting the metric's figures; the renderer links to it instead of
 restating its tables. Loading either file never writes it, and
 `config_loader`'s guarded-import YAML pattern keeps PyYAML optional — no new
@@ -812,11 +942,11 @@ python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 `DIR` (default `~/proxy-usage-reports`) holds one subdirectory per archived
 run, each with its `report.md`; every such file is parsed and the seed exits
 **without** analysing logs. Only the live state file is written — the
-committed defaults are read, never modified. Example run over the 258
+committed defaults are read, never modified. Example run over the 269
 archived windows in this deployment:
 
 ```text
-Seeded 333 measurement(s) from 258 archived report window(s); 643 measurement(s) were already present and left untouched.
+Seeded 333 measurement(s) from 269 archived report window(s); 653 measurement(s) were already present and left untouched.
 Metrics with no parseable value in the archive (history accrues from the next run):
   stream_error_rate: not rendered in the archived report
   context_pressure: not rendered in the archived report
@@ -838,16 +968,32 @@ The rules behind those numbers:
   `contention_denials_per_hour`). A metric with no rendered figure — or whose
   section did not exist in that report era — is reported as skipped and
   accrues history from the first post-ship run.
+- **`time_to_first_token` seeds the local-only p90, never the combined one.**
+  An archived report renders two first-token p90s over different populations:
+  the `## Time to first token` `| Total |` row is the **combined local +
+  remote** p90 (remote `ttft_seconds=` samples dominate its sample count and
+  drag it down to single-digit seconds), while the scorecard metric measures
+  the **local-only** p90 (`aggregation.ttft_p90_ms(...,
+  include_remote=False)`). The seed therefore derives the value from the
+  `## Prefill vs decode` `Prefill (dispatch → first byte)` `p90 (s)` column —
+  one sample per local stream, the same population as the metric — and never
+  falls back to the combined row (LP-0MWBLZ8HP005F6KO). Reports of an era that
+  renders no such section (174 of the 269 archived reports) contribute no
+  TTFT value and are reported as skipped, never seeded from the combined row.
+  Verified over the archive: the 19 windows that render it seed 21,500-55,700
+  ms (the metric's own recent actuals are 33,515-52,418 ms), where the
+  combined row's best three would have been 558-646 ms.
 - **Unknown era.** A backfilled measurement carries an empty configuration
   fingerprint, because an archived report does not record its slot geometry.
   Cross-era flags therefore ignore backfilled entries.
-- **Units are taken as rendered.** A backfilled value keeps the scale the
-  archived report used. Where an older era rendered a figure in different
-  units from the current registry (the middle-era `## Time to first token`
-  table renders seconds, later tables milliseconds), the stored value keeps
-  the older scale; that extraction gap is tracked in LP-0MW20RKLE006TG4M, so
-  re-seed from a clean state after it lands rather than trusting a
-  seconds-era TTFT measurement.
+- **Units are normalised to the registry.** A rendered figure whose cell
+  carries its own unit is converted to the registry's unit, and a bare number
+  is read in the unit its **column header** declares: the `## Prefill vs
+  decode` percentile columns are in seconds (`33.5` is 33.5 s, converted to
+  milliseconds), while the `## Time to first token` table is in milliseconds
+  (`670`, `670ms`) and the middle-era reports suffix their cells (`43.7s`). An
+  unrecognised unit is skipped rather than guessed, so a mis-scaled value
+  never enters the best-3 history (LP-0MW20RKLE006TG4M).
 - The seed writes to `--metrics-state` when given, otherwise to
   `<output-dir>/performance_metrics_state.yaml`; point `--output-dir` at the
   report directory the daily cron writes to so the next run inherits the
@@ -864,6 +1010,7 @@ parses Markdown:
     "actual": 33.1,
     "baseline": {"date": "2026-11-03", "value": 32.1},
     "target": null,
+    "tolerance_pct": 10.0,
     "verdict": "Insufficient history"
   }
 },
@@ -872,10 +1019,11 @@ parses Markdown:
 
 The block is keyed by metric id (all ten, in registry order) and each entry
 carries `baseline` (`value` + `date`, `null` when nothing is recorded),
-`target` (`null` below three measurements), `actual` (`null`, never `0`, when
-unmeasurable) and `verdict`. It is produced by the same derivation as the
-rendered table, so the two views can never disagree, and it is **read-only**:
-the single state write happens while the report is built.
+`target` (`null` below three measurements), `tolerance_pct` (the additive
+relative band the verdict was judged against, `10.0` by default), `actual`
+(`null`, never `0`, when unmeasurable) and `verdict`. It is produced by the same
+derivation as the rendered table, so the two views can never disagree, and it
+is **read-only**: the single state write happens while the report is built.
 
 ## Wasted GPU compute (LP-0MW2SQNHJ0044PV6)
 
@@ -1064,12 +1212,13 @@ entry is a local runtime edit, not a committed artifact.
      depend on ordering: `pair_ttft_to_streams()` pairs a
      `dispatch_first_byte_ms=`/`ttft_seconds=` line with the `Stream started`
      line of the same turn, `pair_stream_events()` pairs `Stream started` with
-     its own `Stream finished` (busy time, decode/prefill slot-seconds), and
-     `_attribute_fallback()` prefers the fallback/skip/denial evidence carrying
-     the first remote stream's turn. Lines **without** ids (rotated logs
-     predating the field) keep the historical per-session FIFO and
-     nearest-line-within-60s heuristics, so historical windows still analyse
-     unchanged.
+     its own `Stream finished` (busy time, decode/prefill slot-seconds), and the
+     shared picker `_pick_turn_first_evidence()` lets `_attribute_fallback()`
+     take the fallback/skip evidence carrying the first remote stream's turn
+     even when that line was logged after it. Lines **without** ids (rotated
+     logs predating the field) keep the historical per-session FIFO and
+     at-or-before-the-stream / nearest-session-less-line-within-60s heuristics,
+     so historical windows still analyse unchanged.
    Local `dispatch_first_byte_ms=` lines (LP-0MTSSM5SO003PKU0) parse into
    `ttft` events carrying the prefill breakdown: `ttft_ms` (dispatch → first
    byte total), `dispatch_to_first_byte_ms` (total minus queued wait),
@@ -1316,8 +1465,10 @@ entry is a local runtime edit, not a committed artifact.
    advice and the documentation.
 8. **Error taxonomy** — error events (`Stream finished: reason=error`,
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
-   error`) are parsed in the same streaming pass, collected per window, and
-   rendered into the report's **Error analysis** section (taxonomy table
+   error`, and the typed deterministic-400 lines `Deterministic client
+   error:` / `Session wedged:`) are parsed in the same streaming pass,
+   collected per window, and rendered into the report's **Error analysis**
+   section (taxonomy table
    **with a Status column** for upstream HTTP errors, plus a
    **Root-cause breakdown** table for stream errors, an
    **Upstream HTTP error breakdown by status** table, and a
@@ -1330,8 +1481,13 @@ entry is a local runtime edit, not a committed artifact.
    `opencode-go`, `opencode.ai/zen` → `opencode`, `api.deepseek.com` →
    `deepseek`, `models.inference.ai.azure.com` → `github`; unknown endpoints
    fall back to the bare hostname) and the model is unknown; `backend_retry`
-   carries neither. Undetermined values render as `-` in the report and
-   `(unknown)` in JSON. Upstream HTTP errors are **broken out by HTTP status
+   carries neither. The typed deterministic-400 lines carry
+   `provider=`/`model=`/`session=` directly and are counted as their own
+   categories: a `Deterministic client error:` or `Session wedged:` line
+   never increments the provider-exhaustion count, and an `All providers
+   exhausted` line never appears in either category
+   (LP-0MW959HRZ00231FN AC3). Undetermined values render as `-` in the
+   report and `(unknown)` in JSON. Upstream HTTP errors are **broken out by HTTP status
    code** (one taxonomy row per status, one recommendation per status) so
    429 rate-limit events and 402 balance events are never conflated. The
    `errors.json` artifact includes `upstream_by_status` and
@@ -1453,20 +1609,22 @@ Measured usage makes the first limit honest: a turn whose measurement is
 missing is priced as fully cold (`cached_ratio = 0.0`), which is what pushed
 large-context sessions permanently onto remote providers.
 
-### GPU busy time from power (Prometheus)
+### GPU computing from power (Prometheus)
 
-The **Local model utilization** table's primary busy figures are derived from
-proxy logs (the dispatch → finish slot union). Alongside them, when Prometheus
-is reachable, the report adds a **GPU busy — power-based (hardware)** row and
-exposes the same data under `--json`'s `gpu_busy` key. It is a **scoped
-derivation** of the one-measure doctrine in
+The **Local model utilization** table's busy figures are derived from proxy logs
+(the dispatch → finish slot union) — that is `local_busy`, the capacity and
+contention figure. Alongside them, when GPU telemetry is reachable, the report
+adds the **GPU computing — attributable (power ≥ 90 W and a busy local slot)**
+row and exposes the same data under `--json`'s `gpu_busy` key. This row is the
+**one reported GPU-activity measure** of the doctrine in
 [monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure):
-the single reported GPU-activity figure is the attributable
-`gpu:computing_workload:bool` share produced **only** by
-`scripts/gpu_utilisation.py`, while this row is the power-only
-`gpu:computing:bool` share (any GPU consumer). It does **not** depend on the
-proxy's stream-lifecycle logging — but it is **not** the local model
-utilisation figure: decisions use the log-derived `local_busy` (see
+the attributable `gpu:computing_workload:bool` share produced **only** by
+`scripts/gpu_utilisation.py` and consumed here, never re-derived. It measures
+*our local model's* GPU work — power ≥ 90 W **and** ≥ 1 busy local slot — not
+any arbitrary consumer's, and it does **not** depend on the proxy's
+stream-lifecycle logging for its numerator. It is not slot occupancy either:
+the log-derived `local_busy` remains the capacity/contention figure gates quote
+(see
 [Which busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
 
 Why power rather than `gpu_busy_percent`: on this Strix Halo APU that counter
@@ -1484,38 +1642,48 @@ is not a utilisation signal. AMD's own tooling is not an alternative either:
 `rocm-smi` or `amdtop`?*, which carries the measurement, the pre/post-reboot
 comparison and the PromQL recipe that recomputes every band). Power draw
 discriminates
-cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing:bool`
-recording rule (`gpu:power_watts:amdgpu >= bool 90`) is evaluated by Prometheus
-every **15 s** from the node_exporter hwmon series. Over the window the report
-classifies **every expected instant on a 15 s grid** as `computing`, `idle` or
-`unknown`: an instant is observed only when a sentinel proves the sampling
-pipeline was alive there (`up{job="llama-proxy"}`, `up{job="node-exporter"}`
-or a fresh `llama_slots_sample_timestamp_seconds` heartbeat) **and** the rule
-has a sample; the remainder is `unknown`. Absence is never folded into `idle`
-and never into the numerator, so a monitoring gap cannot inflate the figure
-(a rolling average over only the present samples would). The three shares
+cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing_workload:bool`
+recording rule (power ≥ 90 W **and** `llama_slots_busy ≥ 1`) is evaluated by
+Prometheus every **15 s** from the node_exporter hwmon and proxy slot series.
+Over the window, `scripts/gpu_utilisation.py` classifies **every expected
+instant on a 15 s grid** as `computing`, `idle` or `unknown`: an instant is
+observed only when a sentinel proves the sampling pipeline was alive there
+(`up{job="llama-proxy"}`, `up{job="node-exporter"}` or a fresh
+`llama_slots_sample_timestamp_seconds` heartbeat) **and** the rule has a
+sample; the remainder is `unknown`. Absence is never folded into `idle` and
+never into the numerator, so a monitoring gap cannot inflate the figure (a
+rolling average over only the present samples would). The three shares
 therefore cover the window exactly — `computing_seconds + idle_seconds +
 unknown_seconds == window_seconds` and the percentages sum to 100 %.
 
-- The figure measures **hardware activity for any GPU consumer**
-  (`gpu:computing:bool`), not only the local model's work; that scope is named
-  in the scorecard label and the row's note.
+- The figure measures **our local model's GPU work** (power ≥ 90 W **and** a
+  busy local slot), not any GPU consumer's; the scope is named in the scorecard
+  label and the row's note. The retired power-only `gpu:computing:bool` share is
+  no longer reported as a GPU-usage figure anywhere.
+- **Per hour as well as per window.** The same computation is bucketed by
+  absolute hour in Python (no second PromQL aggregation) and rendered in the
+  **Summary by hour** `GPU computing (attributable)` column, so the scorecard
+  and the hourly table can never disagree; an hour with no observed instants
+  reads `unknown`, never a fabricated `0 %`.
 - The 15 s cadence is comfortably finer than the workload timescales (median
 decode 2.4 s, worst prefill 108 s), so sub-15-second sampling would add no
-accuracy.
+accuracy; a short task inside one sample fills the whole instant, so no
+surface claims sub-15-second precision.
 - The row is **best-effort**: if Prometheus is unreachable the query returns
-  `None`, the row is omitted from the report, and `--json`'s `gpu_busy` is
-  `null`. A report run never fails because monitoring is down. A window with
-  **no observed instants at all** keeps that same "no row" behaviour rather
-  than reporting a fabricated `0 %`; a partially observed window keeps the row
-  and names its `unknown` share.
+  `None`, the row is omitted from the report (and every hourly cell reads
+  `unknown`), and `--json`'s `gpu_busy` is `null`. A report run never fails
+  because monitoring is down. A window with **no observed instants at all**
+  keeps that same "no row" behaviour rather than reporting a fabricated
+  `0 %`; a partially observed window keeps the row and names its `unknown`
+  share.
 - The `gpu_busy` block carries `computing_fraction` (0–1), `busy_pct`,
   `busy_seconds`, `idle_pct`, `idle_seconds`, `unknown_pct`, `unknown_seconds`,
   `total_seconds`, a `coverage` block (`expected_samples`, `observed_samples`,
   `computing_samples`, `idle_samples`, `unknown_samples`), the three
-  `shares_pct` values, and `smoothed_power` — the `gpu:power_watts:avg5m` trace
-  at 1-minute resolution, derived from the 15 s raw series by a 5-minute
-  rolling average, for warm-up/cooldown context.
+  `shares_pct` values, `hourly` (one entry per absolute hour: `attributable_pct`
+  is `null` for an unobserved hour, with its own `coverage` block) and
+  `smoothed_power` — 1-minute means of the producer's 15 s power series, for
+  warm-up/cooldown context.
 
 #### Which busy figure is authoritative for decisions
 
@@ -1532,19 +1700,18 @@ The one reported GPU-activity measure is the attributable
 `gpu:computing_workload:bool` share produced **only** by
 `scripts/gpu_utilisation.py` (the doctrine in
 [monitoring/README.md](../../../monitoring/README.md#one-reported-gpu-activity-measure));
-the report's `gpu_busy` row is a **scoped derivation** of it — the power-only
-`gpu:computing:bool` share (any GPU consumer) — and `llama_slots_busy` is the
-rule's input. The two `--json` keys state their scope in one sentence each:
+the report's `gpu_busy` row **is** that measure — not a derivation of it — and
+`llama_slots_busy` is the rule's input. The two `--json` keys state their scope
+in one sentence each:
 
 - `local_busy` — the log-derived `dispatch → finish` slot-union share measuring local capacity/contention (the figure gates and alerts quote), not a GPU measurement.
-- `gpu_busy` — the power-derived `gpu:computing:bool` share measuring hardware activity for any GPU consumer, not local model utilisation.
+- `gpu_busy` — the attributable `gpu:computing_workload:bool` share (power ≥ 90 W and a busy local slot) measuring our local model's GPU work, not slot occupancy.
 
-**Prefer `gpu_busy` for hardware questions only** — was the GPU computing at
-all, is another workload using it, is it power/thermally limited. The row is
-**hardware activity, not local model utilisation**: it counts any GPU draw
-≥ 90 W (other workloads, requests the proxy never served) and misses
-proxy-served work during log gaps, so it must never be presented as the local
-utilisation figure, and no gate or alert may quote it as the busy %.
+**The attributable share answers the GPU question; `local_busy` answers the
+capacity question.** "How much of the window did our slots keep the GPU
+computing?" is `gpu_busy`; "was local capacity contended?" is `local_busy`.
+Neither is a substitute for the other, and no gate or alert may quote the
+attributable share as the busy %.
 
 The two figures legitimately diverge by design — see [Why the two figures
 diverge](#why-the-two-figures-diverge) for the causes (single source; not
@@ -1553,12 +1720,13 @@ repeated here).
 #### Why the two figures diverge
 
 The log union measures *slot occupancy* (including queued time and excluding
-any work the proxy did not log); the power figure measures when the
-*hardware* actually computed. A persistent gap between them usually means log
-gaps, unfinished streams, or GPU work outside the proxy's slot accounting, so
-the same window can legitimately report `local_busy` 12.6 % next to a
-power-based 39.3 % — and only the former answers whether local capacity was
-contended.
+any work the proxy did not log); the attributable share measures when the
+*hardware* actually computed on **our** slots. A persistent gap between them
+usually means log
+gaps, unfinished streams, or gpu work outside the proxy's slot accounting, so
+the same window can legitimately report `local_busy` 12.6 % next to an
+attributable share on a different scale — and only the former answers whether
+local capacity was contended.
 
 ## Contention-queue Prometheus series (LP-0MVWPJW2700966ZU)
 
@@ -1734,7 +1902,7 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   decode, LP-0MVJN9H2I00116FP); the retained decode-only figure is its
   labelled lower bound, and a stream with no first-byte line never inflates
   it. This is the **decision figure** — gates and alerts quote it, not the
-  power-based `gpu_busy` row (see [Which busy figure is authoritative for
+  attributable GPU `gpu_busy` row (see [Which busy figure is authoritative for
   decisions](#which-busy-figure-is-authoritative-for-decisions)). The **Prefill vs decode** section then splits the *phase* slot time
   into prefill (dispatch → first byte) and decode (first byte → finish) as
   slot-seconds and as a share of combined phase slot time (always 100%
@@ -1863,6 +2031,18 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   - `upstream error` (HTTP 5xx) — server-side upstream error; monitor for
     clustering (provider outage). Other 4xx codes carry the specific error
     message in the `errors.csv` evidence column.
+  - `Deterministic client error:` — the typed 400 the proxy returns when a
+    byte-identical resend of a history the local provider has already
+    rejected arrives again (LP-0MW95BDJQ002DSVI). It is its own taxonomy
+    category, **never** provider exhaustion: this history is rejected every
+    time, so the fix is client-side compaction, not a provider
+    investigation. The evidence column carries the advertised
+    `retry_after=<n>s` and the `provider=`/`session=` attribution.
+  - `Session wedged:` — the terminal 400 that ends a session which kept
+    resending that same rejected history after every backoff window
+    (LP-0MW95BE7X00574OL). Also its own category: its presence means a
+    client ignored the typed error, and compaction (the error's `hint`) is
+    the only way forward.
 
   <a id="root-cause-taxonomy"></a>
   **Root-cause taxonomy for stream errors (LP-0MUQO82LJ008F1FS / LP-0MUQO862C004UT7T):**
@@ -1947,7 +2127,7 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   engine total that covers more than the window (engine ≫ proxy, a windowing
   artefact rather than unattributed traffic). Deriving wall-clock GPU busy time
   from these logs is impossible by construction and is out of scope (the
-  power-based `gpu_busy` telemetry covers hardware utilisation).
+  attributable `gpu_busy` telemetry covers GPU computing).
 - **Hold-cycle re-emissions are excluded from local-skip demand counters
   (LP-0MUIEO6IP0030CT3).** A held request re-emitted across chain-hold
   cycles (`chain_hold_cycle>0`) counts once (its cycle-0 occurrence) in the
@@ -1960,15 +2140,24 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
 - **Per-session fallback attribution (LP-0MVMBMSWR0036RES).** Since
   `Fallback triggered` carries `session=`, a session's fallback reason is taken
   from its **own** evidence and never inherited from a neighbouring line. The
-  precedence is (1) the session's own `routing_skip_local` line at/before its
-  first remote stream, (2) the session's own `routing_skip_provider_context`
-  line at/before its first remote stream (LP-0MVMBM1Y3001TPRT — it names the
-  provider and the `limit` that blocked that chain step, so it outranks the
-  generic fallback line), (3) the session's own `Fallback triggered` line
-  at/before its first remote stream, (4) the nearest **session-less** fallback
-  line within 60s before the first remote stream — reachable only for rotated
-  logs predating the session stamp — and (5) no own evidence at all. The
-  provenance is exposed as the `fallback_attribution` column (`own_skip`,
+  precedence is (1) the session's own `routing_skip_local` line, (2) the
+  session's own `routing_skip_provider_context` line (LP-0MVMBM1Y3001TPRT — it
+  names the provider and the `limit` that blocked that chain step, so it
+  outranks the generic fallback line), (3) the session's own
+  `Fallback triggered` line, (4) the nearest **session-less** fallback line
+  within 60s before the first remote stream — reachable only for rotated logs
+  predating the session stamp — and (5) no own evidence at all. Tiers (1)–(3)
+  select turn-first (LP-0MW8U39ZQ007MPQO): an exact `turn=` match wins **over**
+  the timestamp, so the session's own line is attributed even when it was
+  logged after its first remote stream (the proxy emits `Fallback triggered`
+  after the pre-flight consumed that stream, LP-0MW8U39FH005GWHY); evidence
+  without a turn id keeps the historical at/before-the-stream rule. The
+  reported move time is never later than the first remote stream. A session is
+  therefore `unattributed` only when it has **no own evidence** of any kind:
+  the state never means its own line merely arrived after the stream — a late
+  line carrying the first remote stream's `turn=` is still attributed
+  (LP-0MW8U39FH005GWHY). The provenance is exposed as the
+  `fallback_attribution` column (`own_skip`,
   `own_provider_skip`, `own_fallback`, `legacy_nearest`, `lease_denied`,
   `unattributed`) plus the `no_remote_fallback` state for sessions that never
   used a remote provider; the report's `Session fallback attribution` line and
