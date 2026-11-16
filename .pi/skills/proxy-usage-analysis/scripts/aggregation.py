@@ -490,6 +490,12 @@ def admission_breakdown(summary: AnalysisResult) -> dict:
     ``decision`` is neither ``admit`` nor ``reject`` are skipped so the splits
     always sum to the pre-existing ``local_admission_admit`` /
     ``local_admission_reject`` counters.
+
+    An **inert admit** (``reason_inert`` set, LP-0MVZF4SU10032OZH) is skipped
+    as well: the guard admitted without pricing the prompt, so it neither
+    belongs in a pricing-bucket split nor in the priced-admit counter those
+    splits sum to (it is reported separately as
+    ``local_admission_inert_admit``).
     """
     rate_buckets: dict[str, dict[str, int]] = {}
     bands: dict[str, AdmissionBandStats] = {}
@@ -498,6 +504,10 @@ def admission_breakdown(summary: AnalysisResult) -> dict:
     for event in getattr(summary, "local_admission_events", []) or []:
         decision = getattr(event, "decision", None)
         if decision not in ("admit", "reject"):
+            continue
+        if getattr(event, "reason_inert", None):
+            # Inert admit: nothing was priced, so it cannot inform a pricing
+            # bucket or a conversion rate for a priced admission.
             continue
         bucket = getattr(event, "rate_bucket", None) or UNKNOWN_RATE_BUCKET_LABEL
         verdicts = rate_buckets.setdefault(bucket, {"admit": 0, "reject": 0})

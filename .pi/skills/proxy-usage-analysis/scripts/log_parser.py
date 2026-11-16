@@ -192,6 +192,13 @@ RE_LOCAL_ADMISSION_ENFORCED = re.compile(r"\benforced=(true|false)\b")
 RE_LOCAL_ADMISSION_ETA = re.compile(r"\beta_prefill_s=([\d.]+)")
 RE_LOCAL_ADMISSION_BUDGET = re.compile(r"\bbudget_s=([\d.]+)")
 RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
+#: The underlying inert reason on an inert admit (LP-0MVZF4SU10032OZH): the
+#: line is ``decision=admit reason=inert_admit reason_inert=<reason>``, so the
+#: report can tell a priced admit from an inert (non-adjudicating) one instead
+#: of inflating the priced-admit counter with every uncalibrated dispatch.
+RE_GUARD_REASON_INERT = re.compile(r"\breason_inert=([A-Za-z_]+)")
+#: The verdict token an inert admit carries (the guard abstained).
+INERT_ADMIT_REASON = "inert_admit"
 # Measured pool state on the guard record (LP-0MVGR2OXT0096OGK M1): the
 # busy/decode slot count, in-flight prefill count and free-slot flag at
 # decision time — the fields the denial-attribution verdict is derived from
@@ -764,6 +771,10 @@ class LogEvent:
     enforced: str | None = None
     eta_prefill_s: str | None = None
     budget_s: str | None = None
+    #: The underlying inert reason on an inert admit (LP-0MVZF4SU10032OZH):
+    #: ``no_budget`` / ``insufficient_samples`` / ``policy_off``. ``None`` on
+    #: a priced decision and on lines that predate the field.
+    reason_inert: str | None = None
     # Contended-pricing metadata on the same record (LP-0MVS8T6F4006DGG3): the
     # rate-calibration bucket the ETA was priced from and that bucket's sample
     # count, plus the occupancy term of the projection. ``new_tokens`` (a
@@ -1331,6 +1342,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             model=_first(RE_MODEL, msg),
             session=_session_from(msg),
             reason=_normalize_reason(_first(RE_LOCAL_ADMISSION_REASON, msg)),
+            reason_inert=_first(RE_GUARD_REASON_INERT, msg),
             decision=m2.group(1),
             enforced=_first(RE_LOCAL_ADMISSION_ENFORCED, msg),
             eta_prefill_s=_first(RE_LOCAL_ADMISSION_ETA, msg),

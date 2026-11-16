@@ -2296,10 +2296,15 @@ def record_guard_decision(
 ) -> None:
     """Emit the ``local_admission_guard`` log line for *decision*.
 
-    Only active decisions are logged (an inert guard made no decision, and
-    logging every inert request would flood the log). The line is parsed by
-    the proxy-usage-analysis skill, which counts admits and refusals
-    (AC2).
+    Active decisions are logged with their verdict (``decision=admit|reject``)
+    and enforced flag. An **inert** decision (LP-0MVZF4SU10032OZH AC1) is
+    logged as an admit: it never refuses, so the verdict and the enforced
+    flag are unchanged, but the line carries ``reason=inert_admit
+    reason_inert=<original reason>`` so a later ``prefill_deadline`` eviction
+    of that dispatch is attributable from the log alone (measured 47 of 126
+    in 24 h were invisible before this). The line is parsed by the
+    proxy-usage-analysis skill, which counts admits and refusals (AC2) and
+    splits ``inert_unlogged`` by ``reason_inert`` when it can (AC3).
 
     The occupancy evidence is part of the line (LP-0MVICD2YW004DJPV AC6): own
     ETA, occupancy term, projected wait, budget, busy slots and in-flight
@@ -2321,8 +2326,9 @@ def record_guard_decision(
     # (AC7, LP-0MVN4LBZ500281Z7), not a priced estimate. The deadline token
     # capacity (LP-0MW957RB3000ER79) is likewise a token-count refusal that
     # carries no priced ETA, so it must be logged too.
-    if not decision.active or (
-        decision.eta_prefill_seconds is None
+    if (
+        decision.active
+        and decision.eta_prefill_seconds is None
         and decision.reason
         not in ("prefill_budget_exceeded", REASON_DEADLINE_CAPACITY)
     ):
@@ -2330,16 +2336,28 @@ def record_guard_decision(
     # The logged ``decision`` is the guard's *verdict* (admit/reject); the
     # ``enforced`` flag distinguishes an enforced refusal from an ``observe``
     # rollout, so the usage report can count would-be refusals during a
-    # validation window.
-    verdict = (
-        "reject"
-        if str(decision.reason).startswith("eta_exceeds_budget")
-        or str(decision.reason).startswith("prefill_eta_exceeds_deadline")
-        or str(decision.reason).startswith("prefill_eta_exceeds_safety_budget")
-        or str(decision.reason).startswith("prefill_budget_exceeded")
-        or str(decision.reason).startswith(REASON_DEADLINE_CAPACITY)
-        else "admit"
-    )
+    # validation window. An INERT decision (LP-0MVZF4SU10032OZH AC1) is never
+    # a rejection — the guard admitted without adjudicating (``no_budget`` /
+    # ``insufficient_samples`` — an uncalibrated bucket — or ``policy_off``)
+    # — so its verdict stays ``admit`` and the line additionally carries
+    # ``reason=inert_admit reason_inert=<original reason>``. That is what the
+    # prefill-deadline attribution CLI splits ``inert_unlogged`` by (AC2);
+    # the verdict and enforced flag are untouched, so the line can never be
+    # misread as a refusal.
+    if decision.active:
+        verdict = (
+            "reject"
+            if str(decision.reason).startswith("eta_exceeds_budget")
+            or str(decision.reason).startswith("prefill_eta_exceeds_deadline")
+            or str(decision.reason).startswith("prefill_eta_exceeds_safety_budget")
+            or str(decision.reason).startswith("prefill_budget_exceeded")
+            or str(decision.reason).startswith(REASON_DEADLINE_CAPACITY)
+            else "admit"
+        )
+        reason_suffix = ""
+    else:
+        verdict = "admit"
+        reason_suffix = f" reason_inert={decision.reason}"
     projected = (
         decision.projected_wait_seconds
         if decision.projected_wait_seconds is not None
@@ -2359,8 +2377,12 @@ def record_guard_decision(
          "prefill_budget_exceeded", REASON_DEADLINE_CAPACITY)
     ):
         effective_label = decision.reason
+    reason_logged = (
+        "inert_admit" if not decision.active else (effective_label or decision.reason)
+    )
+    enforced = "false" if decision.admit else "true"
     logger.info(
-        "local_admission_guard decision=%s reason=%s enforced=%s "
+        "local_admission_guard decision=%s reason=%s%s enforced=%s "
         "eta_prefill_s=%.1f eta_occupancy_s=%.1f occupant_hold_s=%.1f "
         "projected_wait_s=%.1f "
         "budget_s=%.1f bound_s=%.1f deadline_s=%.1f deadline_budget_s=%.1f "
@@ -2372,8 +2394,9 @@ def record_guard_decision(
         "free_slot=%s priority=%s policy=%s model=%s samples=%d provider=%s "
         "session=%s",
         verdict,
-        effective_label or decision.reason,
-        "false" if decision.admit else "true",
+        reason_logged,
+        reason_suffix,
+        enforced,
         float(decision.eta_prefill_seconds or 0.0),
         float(decision.eta_occupancy_seconds or 0.0),
         # Measured blocker evidence (LP-0MVV29YDQ00437N6): 0.0 on the fail-open

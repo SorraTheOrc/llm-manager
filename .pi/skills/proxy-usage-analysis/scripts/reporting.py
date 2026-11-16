@@ -1587,12 +1587,26 @@ def build_report(
 
     fallback_rate = (len(summary.fallback_events) / total) if total else 0.0
     # Prefill-ETA admission-guard tallies (LP-0MVGDUV5E005UWBQ AC2).
+    # An INERT admit is a ``decision=admit reason=inert_admit`` record
+    # (LP-0MVZF4SU10032OZH): the guard admitted without adjudicating, so it
+    # must not inflate the *priced*-admit figure — the split keeps the
+    # pre-change meaning of both rows byte-for-byte on a window with no inert
+    # admits.
     guard_events = getattr(summary, "local_admission_events", []) or []
     local_admission_rejects = sum(
         1 for e in guard_events if getattr(e, "decision", None) == "reject"
     )
+    local_admission_inert_admits = sum(
+        1
+        for e in guard_events
+        if getattr(e, "decision", None) == "admit"
+        and getattr(e, "reason_inert", None)
+    )
     local_admission_admits = sum(
-        1 for e in guard_events if getattr(e, "decision", None) == "admit"
+        1
+        for e in guard_events
+        if getattr(e, "decision", None) == "admit"
+        and not getattr(e, "reason_inert", None)
     )
     schedule = bucketing.schedule_from_config(
         config, (config or {}).get("session_slot_pool_size")
@@ -1690,6 +1704,12 @@ def build_report(
        f"- | {local_admission_rejects} |")
     ap(f"| Local admission admitted (prefill ETA) | {local_admission_admits} | "
        f"- | {local_admission_admits} |")
+    # Inert admits (LP-0MVZF4SU10032OZH): the guard was consulted but admitted
+    # without adjudicating (an uncalibrated bucket, every time bound disabled,
+    # or the policy off), so nothing was priced. Split out of the row above
+    # because a non-adjudicated admit is not a priced admission.
+    ap(f"| Local admission admitted — guard inert (not adjudicated) | "
+       f"{local_admission_inert_admits} | - | {local_admission_inert_admits} |")
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): economic cold-cache
     # bypasses overridden because the GPU had been idle for at least the
     # configured threshold. Local-only by construction (it *is* a local serve),
@@ -5184,6 +5204,16 @@ def summary_to_json(
             1
             for e in getattr(summary, "local_admission_events", []) or []
             if getattr(e, "decision", None) == "admit"
+            and not getattr(e, "reason_inert", None)
+        ),
+        # Inert admits (LP-0MVZF4SU10032OZH): ``decision=admit`` records the
+        # guard did not adjudicate. Additive, so a consumer reading the
+        # priced-admit counter above keeps its pre-change meaning.
+        "local_admission_inert_admit": sum(
+            1
+            for e in getattr(summary, "local_admission_events", []) or []
+            if getattr(e, "decision", None) == "admit"
+            and getattr(e, "reason_inert", None)
         ),
         # Contended-pricing split (LP-0MVS9YKHL007UBBZ AC2): the admit/reject
         # verdicts above, split by the pricing ``rate_bucket`` the ETA was

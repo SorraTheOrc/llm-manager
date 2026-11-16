@@ -90,11 +90,11 @@ def _guard(
 
 
 def _inert_no_budget(ts: datetime, session: str, *, priority: str = "high") -> str:
-    """A logged inert ``no_budget`` decision (every time bound disabled).
+    """A logged legacy inert ``no_budget`` decision (every time bound disabled).
 
-    Inert decisions log nothing by default, so this line is only produced when
-    an inert decision was explicitly logged; it is what separates a genuine
-    ``high_priority_inert`` from an unlogged eviction (LP-0MVZQUT3A0039MLY).
+    This is the historical line shape (LP-0MVZQUT3A0039MLY); inert admits are
+    now logged as ``reason=inert_admit reason_inert=no_budget``
+    (LP-0MVZF4SU10032OZH), see :func:`_inert_admit`.
     """
     return (
         f"{_ts(ts)} - INFO - local_admission_guard decision=admit "
@@ -106,6 +106,35 @@ def _inert_no_budget(ts: datetime, session: str, *, priority: str = "high") -> s
         f"priority={priority} policy=reject model=Qwen3 samples=5 "
         f"provider=local-qwen3 session={session}"
     )
+
+
+def _inert_admit(
+    ts: datetime,
+    session: str,
+    *,
+    reason_inert: str = "insufficient_samples",
+    priority: str = "medium",
+    samples: int = 2,
+    eta_prefill_s: float = 87.0,
+) -> str:
+    """A logged inert admit (LP-0MVZF4SU10032OZH AC1).
+
+    The guard admitted without adjudicating; the verdict stays ``admit`` and
+    the underlying inert reason rides in ``reason_inert=``. ``samples`` below
+    the calibration floor (5) is the uncalibrated-bucket signature.
+    """
+    return (
+        f"{_ts(ts)} - INFO - local_admission_guard decision=admit "
+        f"reason=inert_admit reason_inert={reason_inert} enforced=false "
+        f"eta_prefill_s={eta_prefill_s:.1f} eta_occupancy_s=0.0 "
+        f"projected_wait_s={eta_prefill_s:.1f} budget_s=30.0 bound_s=30.0 "
+        f"deadline_s=180.0 deadline_budget_s=171.0 new_tokens=12000 "
+        f"budget_tokens=25000 rate_bucket=solitary contended_samples=0 "
+        f"busy_slots=0 in_flight_prefills=0 gate_occupancy=0 free_slot=true "
+        f"priority={priority} policy=reject model=Qwen3 samples={samples} "
+        f"provider=local-qwen3 session={session}"
+    )
+
 
 
 def _priority(ts: datetime, session: str, priority: str) -> str:
@@ -300,7 +329,7 @@ def test_unlogged_high_priority_eviction_is_inert_unlogged(tmp_path: Path) -> No
 def test_high_priority_with_no_budget_guard_is_high_priority_inert(
     tmp_path: Path,
 ) -> None:
-    """Only a logged inert ``no_budget`` line keeps ``high_priority_inert``."""
+    """Only a logged legacy bare ``no_budget`` line keeps ``high_priority_inert``."""
     moment = datetime(2026, 11, 1, 22, 0, 0)
     session = "sess-high-no-budget"
     _write_log(
@@ -316,6 +345,153 @@ def test_high_priority_with_no_budget_guard_is_high_priority_inert(
     summary = _attribute(tmp_path)
     assert summary["by_admission"] == {attribution.HIGH_PRIORITY_INERT: 1}
     assert summary["rows"][0]["admission"] == attribution.HIGH_PRIORITY_INERT
+
+
+# ---------------------------------------------------------------------------
+# Inert admits are now logged (LP-0MVZF4SU10032OZH AC1/AC2)
+# ---------------------------------------------------------------------------
+
+def test_logged_inert_admit_insufficient_samples_is_attributed_by_reason(
+    tmp_path: Path,
+) -> None:
+    """An uncalibrated-bucket admit (``reason_inert=insufficient_samples``)
+    is attributable from the log instead of vanishing into ``inert_unlogged``.
+
+    AC1/AC2: the inert path admitting the dispatch is established from the
+    logged ``reason=inert_admit`` line, and the CLI splits it by inert reason.
+    Never misclassified as a priced admit — the line carries no certified ETA.
+    """
+    moment = datetime(2026, 11, 1, 22, 0, 0)
+    session = "sess-inert-uncalibrated"
+    _write_log(
+        tmp_path, "proxy.log",
+        [
+            _priority(moment, session, "medium"),
+            _inert_admit(moment, session, reason_inert="insufficient_samples",
+                         samples=2, eta_prefill_s=30.8),
+            _eviction(moment + timedelta(seconds=120), session, new_tokens=14041),
+        ],
+    )
+
+    summary = _attribute(tmp_path)
+    assert summary["by_admission"] == {
+        attribution.INERT_INSUFFICIENT_SAMPLES: 1,
+    }
+    row = summary["rows"][0]
+    assert row["admission"] == attribution.INERT_INSUFFICIENT_SAMPLES
+    assert row["inert_reason"] == "insufficient_samples"
+    assert row["guard_eta_s"] == pytest.approx(30.8)
+
+
+def test_logged_inert_admit_no_budget_is_attributed_by_reason(
+    tmp_path: Path,
+) -> None:
+    """A nothing-priced inert admit (``reason_inert=no_budget``) gets its own
+    class rather than the legacy ``high_priority_inert`` treatment."""
+    moment = datetime(2026, 11, 1, 22, 0, 0)
+    session = "sess-inert-no-budget"
+    _write_log(
+        tmp_path, "proxy.log",
+        [
+            _priority(moment, session, "high"),
+            _inert_admit(moment, session, reason_inert="no_budget",
+                         priority="high", samples=0, eta_prefill_s=0.0),
+            _eviction(moment + timedelta(seconds=121), session, new_tokens=20723,
+                      eta_prefill_s="278.8", elapsed_s=121.0),
+        ],
+    )
+
+    summary = _attribute(tmp_path)
+    assert summary["by_admission"] == {attribution.INERT_NO_BUDGET: 1}
+    row = summary["rows"][0]
+    assert row["admission"] == attribution.INERT_NO_BUDGET
+    assert row["inert_reason"] == "no_budget"
+
+
+def test_inert_admit_with_unreadable_reason_stays_inert_unlogged(
+    tmp_path: Path,
+) -> None:
+    """A logged inert admit whose ``reason_inert=`` is missing/unreadable stays
+    ``inert_unlogged`` — the split is only as good as the evidence (AC2)."""
+    moment = datetime(2026, 11, 1, 22, 0, 0)
+    session = "sess-inert-unknown"
+    _write_log(
+        tmp_path, "proxy.log",
+        [
+            _priority(moment, session, "medium"),
+            _inert_admit(moment, session, reason_inert="some_future_reason"),
+            _eviction(moment + timedelta(seconds=120), session, new_tokens=14041),
+        ],
+    )
+
+    summary = _attribute(tmp_path)
+    assert summary["by_admission"] == {attribution.INERT_UNLOGGED: 1}
+
+
+def test_inert_admit_line_is_joined_inside_the_guard_window(
+    tmp_path: Path,
+) -> None:
+    """A stale inert-admit line from an earlier attempt must not be borrowed."""
+    moment = datetime(2026, 11, 1, 23, 0, 0)
+    session = "sess-inert-stale"
+    _write_log(
+        tmp_path, "proxy.log.2026-11-01_21",
+        [
+            _priority(moment, session, "medium"),
+            _inert_admit(moment - timedelta(seconds=540), session),
+            _eviction(moment + timedelta(seconds=120), session),
+        ],
+    )
+
+    row = next(
+        r for r in _attribute(tmp_path)["rows"] if r["session"] == session
+    )
+    assert row["admission"] == attribution.INERT_UNLOGGED
+
+
+def test_override_still_wins_over_an_inert_abstention(tmp_path: Path) -> None:
+    """A routing override outranks an inert guard abstention.
+
+    The idle-override dispatch still runs through the direct guard, which now
+    logs ``reason=inert_admit`` when the bucket is uncalibrated. The override
+    is the path that ADMITTED the dispatch, so ``idle_override`` keeps its
+    exact pre-change attribution (LP-0MVZF4SU10032OZH must not reclassify it).
+    """
+    moment = datetime(2026, 11, 1, 22, 0, 0)
+    session = "sess-idle-inert"
+    _write_log(
+        tmp_path, "proxy.log",
+        [
+            _priority(moment, session, "medium"),
+            _idle_admit(moment, session, new_tokens=14041),
+            _inert_admit(moment, session, reason_inert="insufficient_samples"),
+            _eviction(moment + timedelta(seconds=120), session, new_tokens=14041),
+        ],
+    )
+
+    summary = _attribute(tmp_path)
+    assert summary["by_admission"] == {"idle_override": 1}
+
+
+def test_inert_admit_takes_precedence_over_the_legacy_high_priority_class(
+    tmp_path: Path,
+) -> None:
+    """A new-shape ``no_budget`` inert admit classes by reason, not legacy-high."""
+    moment = datetime(2026, 11, 1, 22, 0, 0)
+    session = "sess-high-new-shape"
+    _write_log(
+        tmp_path, "proxy.log",
+        [
+            _priority(moment, session, "high"),
+            _inert_admit(moment, session, reason_inert="no_budget",
+                         priority="high", samples=0, eta_prefill_s=0.0),
+            _eviction(moment + timedelta(seconds=121), session, new_tokens=20723,
+                      eta_prefill_s="278.8", elapsed_s=121.0),
+        ],
+    )
+
+    summary = _attribute(tmp_path)
+    assert summary["by_admission"] == {attribution.INERT_NO_BUDGET: 1}
 
 
 def test_summary_reports_budget_and_over_deadline_evidence(log_dir: Path) -> None:

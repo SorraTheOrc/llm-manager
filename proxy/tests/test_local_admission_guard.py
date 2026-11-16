@@ -384,7 +384,13 @@ async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, capl
 async def test_missing_calibration_keeps_queueing_unchanged(
     mixed_model_config, caplog
 ):
-    """AC3: with no calibration the guard is inert and today's queue applies."""
+    """AC3: with no calibration the guard is inert and today's queue applies.
+
+    LP-0MVZF4SU10032OZH AC1: the inert admit is now LOGGED
+    (``reason=inert_admit reason_inert=insufficient_samples``) so a later
+    ``prefill_deadline`` eviction is attributable from the log, but the
+    verdict and the queueing behaviour are unchanged.
+    """
     caplog.set_level(logging.INFO, logger="llama-proxy")
     concurrency = _MutableConcurrency(1, 1)
     calls: list[str] = []
@@ -427,7 +433,10 @@ async def test_missing_calibration_keeps_queueing_unchanged(
     assert result.status_code == 200
     assert calls == ["local"]
     messages = " ".join(r.getMessage() for r in caplog.records)
-    assert "local_admission_guard" not in messages
+    assert "decision=admit" in messages
+    assert "reason=inert_admit" in messages
+    assert "reason_inert=insufficient_samples" in messages
+    assert "decision=reject" not in messages, "an inert guard must never refuse"
 
 
 @pytest.mark.asyncio

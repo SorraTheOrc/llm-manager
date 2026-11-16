@@ -291,6 +291,140 @@ def test_record_guard_decision_logs_deadline_refusal(caplog):
 
 
 # ---------------------------------------------------------------------------
+# record_guard_decision: inert admits are logged (LP-0MVZF4SU10032OZH AC1)
+# ---------------------------------------------------------------------------
+
+def test_record_guard_decision_logs_inert_admit_insufficient_samples(caplog):
+    """An inert (uncalibrated-bucket) admit is logged, verdict unchanged.
+
+    AC1 AC1: the inert path admitting a dispatch must be established from the
+    log. The line carries ``reason=inert_admit reason_inert=insufficient_samples``
+    while the verdict stays ``admit`` and ``enforced=false`` — an inert guard
+    never refuses, so today's behaviour is unchanged.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_cold(count=2)  # below min_samples -> the guard is inert
+    cfg = _cfg()
+    decision = prefill_eta.evaluate_admission(cfg, "Qwen3", 100_000, 0.0, "low")
+
+    assert decision.admit is True
+    assert decision.active is False
+    assert decision.reason == "insufficient_samples"
+
+    prefill_eta.record_guard_decision(decision, session_id="s-inert")
+
+    line = next(
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("local_admission_guard")
+    )
+    assert "decision=admit" in line
+    assert "reason=inert_admit" in line
+    assert "reason_inert=insufficient_samples" in line
+    assert "enforced=false" in line
+    assert "samples=2" in line
+
+
+def test_record_guard_decision_logs_inert_admit_no_budget(caplog):
+    """A nothing-priced ``no_budget`` inert admit is logged too.
+
+    ``high`` priority with every time bound disabled returns ``no_budget``
+    (nothing priced); the line must carry the underlying reason so the
+    prefill-deadline attribution CLI can class the eviction, and it must not
+    leak the caller's direct-dispatch ``reason_label``.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_cold(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)  # calibrated
+    cfg = _cfg(local_prefill_deadline_seconds=0)
+    decision = prefill_eta.evaluate_admission(cfg, "Qwen3", 100_000, 0.0, "high")
+
+    assert decision.admit is True
+    assert decision.active is False
+    assert decision.reason == "no_budget"
+
+    prefill_eta.record_guard_decision(
+        decision, session_id="s-nb", reason_label="eta_exceeds_budget_direct"
+    )
+
+    line = next(
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("local_admission_guard")
+    )
+    assert "decision=admit" in line
+    assert "reason=inert_admit" in line
+    assert "reason_inert=no_budget" in line
+    assert "enforced=false" in line
+    assert "eta_exceeds_budget_direct" not in line
+
+
+def test_record_guard_decision_logs_inert_admit_policy_off(caplog):
+    """An inert ``policy_off`` admit is logged when it reaches the recorder.
+
+    The production provider short-circuits ``policy: off`` before the guard is
+    consulted, so this path is exercised directly; the line stays an admit.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    cfg = _cfg(local_admission_guard_policy="off")
+    decision = prefill_eta.evaluate_admission(cfg, "Qwen3", 100_000, 0.0, "low")
+
+    assert decision.admit is True
+    assert decision.active is False
+    assert decision.reason == "policy_off"
+
+    prefill_eta.record_guard_decision(decision, session_id="s-policy-off")
+
+    line = next(
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("local_admission_guard")
+    )
+    assert "decision=admit" in line
+    assert "reason=inert_admit" in line
+    assert "reason_inert=policy_off" in line
+
+
+@pytest.mark.asyncio
+async def test_direct_path_logs_inert_admit(caplog):
+    """The production guard logs the inert admit and still returns ``None``.
+
+    AC1 via the real call path: an uncalibrated bucket emits
+    ``reason=inert_admit reason_inert=insufficient_samples`` while the guard
+    stays inert (``None``) so today's queueing behaviour is unchanged.
+    """
+    from unittest.mock import patch
+
+    import proxy.provider as provider
+
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    # No calibration: the bucket is uncalibrated (insufficient_samples).
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _FreeConcurrency()),
+        patch("proxy.provider._local_occupant_prefill_seconds", lambda *a, **k: 0.0),
+        _guard_patches(tokens=100_000),
+    ):
+        decision = await provider._prefill_admission_guard(
+            _cfg(),
+            {"name": "local-llama", "llama_model": "Qwen3"},
+            100_000,
+            "session-direct",
+            priority="low",
+            max_local=1,
+            reason_label=_DIRECT_REASON_LABEL,
+            free_slot=True,
+        )
+
+    assert decision is None, "an uncalibrated guard stays inert (None)"
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("local_admission_guard decision=")
+    ]
+    assert len(lines) == 1
+    assert "decision=admit" in lines[0]
+    assert "reason=inert_admit" in lines[0]
+    assert "reason_inert=insufficient_samples" in lines[0]
+    assert "free_slot=true" in lines[0]
+
+
+# ---------------------------------------------------------------------------
 # Direct dispatch path: the production guard owns the label mapping
 # ---------------------------------------------------------------------------
 

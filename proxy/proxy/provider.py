@@ -10459,6 +10459,26 @@ async def _prefill_admission_guard(
             residency_measured=_residency_is_measured(model_name, session_id),
         )
         if not decision.active:
+            # An inert decision admits without adjudicating (an uncalibrated
+            # bucket, every time bound disabled, or policy off). Log it with
+            # ``reason=inert_admit reason_inert=<reason>`` so a later
+            # ``prefill_deadline`` eviction of this dispatch is attributable
+            # from the log alone (LP-0MVZF4SU10032OZH AC1); the return stays
+            # ``None`` so today's queueing behaviour is byte-for-byte
+            # unchanged.
+            prefill_eta.record_guard_decision(
+                decision,
+                provider=(
+                    provider_cfg.get("name")
+                    if isinstance(provider_cfg, dict)
+                    else None
+                ),
+                session_id=session_id,
+                model=model_name,
+                priority=priority,
+                reason_label=reason_label,
+                free_slot=free_slot,
+            )
             return None
         # For the deadline refusal keep the decision's own reason so the
         # log reason is ``prefill_eta_exceeds_deadline`` on both paths

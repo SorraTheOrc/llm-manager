@@ -2255,6 +2255,13 @@ each eviction to its admission evidence at the measured dispatch start
 | `priced_within_queue_budget` — admitted inside the 30 s queue budget (5.3–28.0 s) yet stalled the full deadline behind another session's prefill (occupancy priced 0) | 8 | 12,954 |
 | `idle_override` — admitted by the idle-capacity override, guard not consulted | 2 | 7,214 |
 
+This window predates the inert-admit logging (LP-0MVZF4SU10032OZH): inert
+decisions are now logged
+``decision=admit reason=inert_admit reason_inert=<reason>``, so a post-fix
+window splits the `inert_unlogged` class by inert reason (`inert_no_budget` /
+`inert_insufficient_samples` / `inert_policy_off`) instead of treating it as
+one observability defect.
+
 **Conclusions.** (1) The rung's own accepted trade is **26 / 24 h** — not
 126 / 24 h: the other 100 events came from admission paths the rung does not
 govern and are tracked separately (LP-0MVZF3JZ9009LTN2 high priority,

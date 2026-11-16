@@ -437,3 +437,78 @@ def test_report_omits_the_section_without_guard_events():
     report = reporting.build_report(_analyse([]), {})
 
     assert "## Admission verdicts by rate bucket and prompt band" not in report
+
+
+# ---------------------------------------------------------------------------
+# Inert admits are logged and must not inflate the priced-admit counters
+# (LP-0MVZF4SU10032OZH AC1/AC2)
+# ---------------------------------------------------------------------------
+
+INERT_GUARD = (
+    "2026-10-28 10:00:00,123 - INFO - local_admission_guard decision=admit "
+    "reason=inert_admit reason_inert=insufficient_samples enforced=false "
+    "eta_prefill_s=30.8 eta_occupancy_s=0.0 occupant_hold_s=0.0 "
+    "projected_wait_s=30.8 budget_s=30.0 bound_s=30.0 deadline_s=180.0 "
+    "deadline_budget_s=171.0 new_tokens=12000 budget_tokens=25000 "
+    "rate_bucket=solitary contended_samples=0 busy_slots=0 in_flight_prefills=0 "
+    "gate_occupancy=0 free_slot=false priority=medium policy=reject model=Qwen3 "
+    f"samples=2 provider=local-qwen3 session={SESSION_D}"
+)
+
+
+def test_inert_admit_line_is_parsed_with_its_inert_reason():
+    """LP-0MVZF4SU10032OZH AC1: the inert reason rides on the parsed event.
+
+    The verdict stays ``admit`` (an inert guard never refuses) and the line is
+    distinguishable from a priced admit by ``reason_inert``.
+    """
+    event = log_parser.parse_log_line(INERT_GUARD)
+
+    assert event is not None
+    assert event.kind == "local_admission_guard"
+    assert event.decision == "admit"
+    assert event.reason == "inert_admit"
+    assert event.reason_inert == "insufficient_samples"
+    assert event.enforced == "false"
+
+
+def test_priced_guard_line_has_no_inert_reason():
+    """A priced decision leaves ``reason_inert`` ``None`` (never fabricated)."""
+    event = log_parser.parse_log_line(_guard_line())
+
+    assert event is not None
+    assert event.reason_inert is None
+
+
+def test_inert_admits_are_split_out_of_the_priced_admit_counters():
+    """LP-0MVZF4SU10032OZH: an inert admit is not a priced admission.
+
+    Both the human row and the JSON counter keep their pre-change meaning, and
+    the inert admits are visible in their own additive figure — otherwise every
+    uncalibrated dispatch would inflate the priced-admit row several-fold.
+    """
+    summary = _analyse(
+        [
+            _guard_line(decision="admit", reason="within_budget"),
+            _guard_line(decision="reject", reason="eta_exceeds_budget"),
+            INERT_GUARD,
+            INERT_GUARD.replace("insufficient_samples", "no_budget"),
+        ]
+    )
+
+    payload = reporting.summary_to_json(summary)
+    assert payload["local_admission_admit"] == 1
+    assert payload["local_admission_reject"] == 1
+    assert payload["local_admission_inert_admit"] == 2
+    # The pricing-bucket / band split keeps summing to the *priced* verdicts:
+    # an inert admit prices nothing, so it never lands in a bucket row.
+    assert payload["local_admission_by_rate_bucket"] == {
+        "solitary": {"admit": 1, "reject": 1},
+    }
+
+    report = reporting.build_report(summary, {})
+    assert "| Local admission admitted (prefill ETA) | 1 | - | 1 |" in report
+    assert (
+        "| Local admission admitted — guard inert (not adjudicated) | 2 | - | 2 |"
+        in report
+    )
