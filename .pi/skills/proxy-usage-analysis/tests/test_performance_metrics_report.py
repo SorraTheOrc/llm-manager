@@ -784,6 +784,83 @@ class TestStrictFallbackRateSurfaces:
 
 
 # ---------------------------------------------------------------------------
+# Prefill-ETA raw error actual (LP-0MWJOUV5P007R799)
+# ---------------------------------------------------------------------------
+#
+# Parent LP-0MWEOGIUK006B1DD Q3 answer (a): `prefill_eta_accuracy` reports the
+# median absolute relative **error** directly and is registered
+# lower-is-better. The aggregation helper already returns that error (p50
+# ≈ 1041 % on recent windows); `reporting._performance_metric_actuals` converts
+# it to `max(0, 100 − error)` for a higher-is-better entry, so every recorded
+# window reads 0.0 % (≈8 % at ≈92 % error).
+#
+# Red-first: the raw-value assertions fail against the current conversion and
+# are marked ``xfail(strict=True)`` naming the implementation child
+# (LP-0MWJOUZG9008Q4RG); the tree stays green for the dev-push gate, and the
+# strict marker turns red once the conversion is gone so it cannot be left
+# behind. The `n/a` assertion passes under both definitions and runs unmarked:
+# it pins the behaviour the redefinition must not change.
+
+PENDING_RAW_PREFILL_ETA_ERROR = (
+    "pending LP-0MWJOUZG9008Q4RG (report the raw median absolute relative "
+    "error for prefill_eta_accuracy, registered lower-is-better)"
+)
+
+
+def _prefill_actuals(monkeypatch, error: float) -> dict:
+    """The scorecard actuals with the aggregation reporting *error* only."""
+    monkeypatch.setattr(
+        aggregation,
+        "performance_metric_inputs",
+        lambda summary, config, mode_map: {"prefill_eta_accuracy": error},
+    )
+    return reporting._performance_metric_actuals(_probe_summary(), None, None)
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
+@pytest.mark.parametrize(
+    ("error", "former_accuracy"),
+    [
+        (1041.0, 0.0),  # the current window: clamped to "no accuracy at all"
+        (92.3, 7.7),  # the documented ≈8 % window
+    ],
+)
+def test_the_scorecard_actual_is_the_raw_error_with_no_accuracy_conversion(
+    monkeypatch, error, former_accuracy
+):
+    actuals = _prefill_actuals(monkeypatch, error)
+
+    assert actuals["prefill_eta_accuracy"] == pytest.approx(error)
+    assert actuals["prefill_eta_accuracy"] != pytest.approx(former_accuracy)
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
+def test_the_json_actual_is_the_same_raw_error_as_the_scorecard(monkeypatch):
+    """Both surfaces read ``_performance_metric_actuals``, so a conversion left
+    in one of them would make them disagree."""
+    actuals = _prefill_actuals(monkeypatch, 1041.0)
+    entry = reporting.performance_metrics_json(_probe_summary(), None, None)[
+        "prefill_eta_accuracy"
+    ]
+
+    assert entry["actual"] == pytest.approx(1041.0)
+    assert entry["actual"] == pytest.approx(actuals["prefill_eta_accuracy"])
+
+
+def test_no_matched_pairs_still_reports_not_available():
+    """The fixture window pairs no dispatch with a guard record: the metric is
+    `n/a` on both surfaces and is never recorded as a fabricated 0."""
+    summary = _probe_summary()
+    actuals = reporting._performance_metric_actuals(summary, None, None)
+    entry = reporting.performance_metrics_json(summary, None, None)["prefill_eta_accuracy"]
+
+    assert aggregation.prefill_eta_accuracy(summary) is None
+    assert actuals["prefill_eta_accuracy"] is None
+    assert entry["actual"] is None
+    assert entry["verdict"] == "Insufficient history"
+
+
+# ---------------------------------------------------------------------------
 # --json contract
 # ---------------------------------------------------------------------------
 
