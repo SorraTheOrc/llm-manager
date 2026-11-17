@@ -94,8 +94,8 @@ metrics:
   context_pressure:
     tolerance_pct: 10
     measurements: []
-    why: "Context pressure shows how much local demand is pushed away by prompt size. The per-slot context is fixed by the model and the hardware available, so this metric measures pressure against a ceiling no setting can raise."
-    calculation: "Share of local requests whose estimated prompt size is at or above the per-slot context threshold, from routing_skip_local estimated_tokens lines against the configured slot geometry."
+    why: "Context pressure shows how often sessions reach their effective per-slot context limit, the point at which local serving degrades and oversized prompts must be routed away. The per-slot context is fixed by the model and the hardware available, so this metric measures pressure against a ceiling no setting can raise."
+    calculation: "Share of sessions at or above 80% on per-session peak context (max_context_size) versus the effective per-slot context (local_model_ctx_size / active slots); sessions without a resolvable per-slot limit are excluded and a window with no measurable session reports n/a."
     levers: "Prompt compaction in clients, slot-count versus per-slot-context rebalancing within the fixed model context, and the cache-cold and cache-warm routing thresholds."
     trade_offs: "Rebalancing toward fewer, larger slots relieves per-slot pressure but lowers concurrency and raises queueing; more slots shrink per-slot context and raise bypass volume. The total context is capped by the model and the hardware, so it cannot be raised to buy headroom."
     data_section_anchor: "## Context sizes approaching per-slot limits"

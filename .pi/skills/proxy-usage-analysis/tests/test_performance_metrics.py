@@ -584,18 +584,16 @@ def test_a_larger_error_than_the_target_reads_unmet():
 # pressure is the share of sessions at or above **80 % of the effective
 # per-slot context**, the ratio the report's own "Context sizes approaching
 # per-slot limits" recommendation already uses
-# (``recommendations.CONTEXT_PRESSURE_RATIO = 0.80``). The current
-# implementation samples only *served local requests* against **100 %** of the
+# (``recommendations.CONTEXT_PRESSURE_RATIO = 0.80``). The previous
+# implementation sampled only *served local requests* against **100 %** of the
 # per-slot limit, and the large-context bypass routes oversized requests away,
-# so the row is structurally 0.0 % every window.
+# so the row was structurally 0.0 % every window.
 #
-# Red-first: the non-zero assertions fail against that implementation and are
-# marked ``xfail(strict=True)`` naming the implementation child
-# (LP-0MWJOUYUL0005H95) that lowers ``CONTEXT_PRESSURE_THRESHOLD_RATIO`` to
-# 0.80 and samples each session's peak context; the tree stays green for the
-# dev-push gate. The no-pressure and n/a assertions hold under both
-# definitions and run unmarked — they pin the sides that must not move either
-# way (the fix must never fabricate pressure, nor a fabricated 0).
+# Implemented by LP-0MWJOUYUL0005H95, which lowers
+# ``CONTEXT_PRESSURE_THRESHOLD_RATIO`` to 0.80 and samples each session's peak
+# context. The no-pressure and n/a assertions hold under both definitions and
+# pin the sides that must not move either way (the fix must never fabricate
+# pressure, nor a fabricated 0).
 #
 # The fixture windows (``tests.fixtures.context_pressure_window``) describe a
 # 1 000-token profile across 2 slots, so the per-slot context is 500 tokens
@@ -603,14 +601,7 @@ def test_a_larger_error_than_the_target_reads_unmet():
 # half each session's peak — every one below 400 — so a 0.0 % reading can only
 # come from measuring the wrong population (the served requests).
 
-PENDING_CONTEXT_PRESSURE_80_PCT = (
-    "pending LP-0MWJOUYUL0005H95 (context-pressure share at 80 % of per-slot "
-    "context: CONTEXT_PRESSURE_THRESHOLD_RATIO 1.0 -> 0.80 over the "
-    "per-session peak context)"
-)
 
-
-@pytest.mark.xfail(strict=True, reason=PENDING_CONTEXT_PRESSURE_80_PCT)
 def test_context_pressure_counts_sessions_at_80_percent_of_per_slot_context():
     """Two of four sessions peak at or above the 400-token threshold: one at
     480 (96 %) and one at exactly 400 (80 %, which is "at or above"), while
@@ -657,7 +648,6 @@ def test_context_pressure_reports_zero_when_no_session_reaches_80_percent():
     assert stats.share_pct == 0.0
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_CONTEXT_PRESSURE_80_PCT)
 def test_context_pressure_uses_each_sessions_own_per_slot_context():
     """The threshold follows each session's own profile rather than one
     analysis-time context: session ``fast`` (1 000 tokens over 2 slots, 500 per

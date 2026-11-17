@@ -815,7 +815,7 @@ key, the `--json` key and the detail-subsection prefix.
 | `prompt_eval_speed` | Prompt eval speed | tok/s | higher is better | llama-server prompt eval timing |
 | `time_to_first_token` | Time to first token | ms | lower is better | `dispatch_first_byte_ms` and `ttft_seconds` log lines |
 | `stream_error_rate` | Stream error rate | % | lower is better | `Stream error` and `Stream finished reason=error` lines |
-| `context_pressure` | Context-size pressure | % | lower is better | `routing_skip_local estimated_tokens` lines |
+| `context_pressure` | Context-size pressure | % | lower is better | Per-session peak context (`max_context_size`) versus the effective per-slot context (`local_model_ctx_size` / active slots) |
 | `prompt_cache_hit_ratio` | Prompt cache hit ratio | ratio | higher is better | `cached_ratio` and `cache_state` log fields |
 | `contention_denials_per_hour` | Contention denials per hour | denials/h | lower is better | `local_dispatch_denied` log events |
 | `prefill_eta_accuracy` | Prefill ETA error | % | lower is better | median absolute relative error between the admission guard's priced prefill ETA and the dispatch's observed first byte (local_admission_guard and dispatch first-byte pairs) |
@@ -853,11 +853,12 @@ single roll-up that produces exactly these keys):
 - **`stream_error_rate`** — share of streams ending in error, from `Stream
   error` and `Stream finished reason=error` lines divided by all streams (the
   **Error analysis** section).
-- **`context_pressure`** — share of local requests whose estimated prompt size
-  is at or above the per-slot context threshold, from
-  `routing_skip_local estimated_tokens` lines against the configured slot
-  geometry (the **Context sizes approaching per-slot limits**
-  recommendation).
+- **`context_pressure`** — share of sessions whose peak context
+  (`max_context_size`) is at or above 80 % of their effective per-slot context
+  (`local_model_ctx_size` / active slots), the same measure the **Context
+  sizes approaching per-slot limits** recommendation applies. Sessions whose
+  per-slot limit cannot be resolved are excluded, and a window with no
+  measurable session renders `n/a`, never `0`.
 - **`prompt_cache_hit_ratio`** — median `cached_ratio` across local dispatches
   (a 0–1 ratio, rendered to three decimals); the warm/cold share comes from
   the `cache_state` field. The underlying data section is **Time to first

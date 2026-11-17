@@ -196,7 +196,10 @@ METRIC_REGISTRY: tuple[Metric, ...] = (
         label="Context-size pressure",
         unit="%",
         direction=LOWER,
-        source="routing_skip_local estimated_tokens lines",
+        source=(
+            "Per-session peak context (max_context_size) versus the "
+            "effective per-slot context (local_model_ctx_size / active slots)"
+        ),
     ),
     Metric(
         id="prompt_cache_hit_ratio",

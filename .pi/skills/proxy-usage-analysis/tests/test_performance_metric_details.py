@@ -21,8 +21,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import pytest
-
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -235,18 +233,10 @@ class TestCrossEraFlag:
 # describes a population that is structurally unpressed (oversized requests
 # are routed away by the large-context bypass).
 #
-# Red-first: both copies currently name the wrong input, so the assertions are
-# marked ``xfail(strict=True)`` naming the implementation child
-# (LP-0MWJOUYUL0005H95) that rewrites them; the tree stays green for the
-# dev-push gate. The behavioural half of the same rule is pinned in
+# Implemented by LP-0MWJOUYUL0005H95: both copies now name the sampled input.
+# The behavioural half of the same rule is pinned in
 # ``test_performance_metrics.py`` (non-zero share from session peaks, 0.0 %
 # without pressure, n/a without a resolvable limit).
-
-PENDING_CONTEXT_PRESSURE_80_PCT = (
-    "pending LP-0MWJOUYUL0005H95 (context-pressure share at 80 % of per-slot "
-    "context: CONTEXT_PRESSURE_THRESHOLD_RATIO 1.0 -> 0.80 over the "
-    "per-session peak context)"
-)
 
 #: Words a copy may use for "the largest context each session reached".
 _PEAK_CONTEXT_WORDS = ("peak", "max", "largest", "highest")
@@ -265,7 +255,6 @@ def _names_the_session_peak_population(copy: str) -> bool:
     )
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_CONTEXT_PRESSURE_80_PCT)
 def test_context_pressure_registry_source_names_the_session_peak_population():
     """The registry's `source` names the per-session peak context, not the
     `routing_skip_local estimated_tokens` lines the metric never samples."""
@@ -277,7 +266,6 @@ def test_context_pressure_registry_source_names_the_session_peak_population():
     assert "routing_skip_local" not in _copy_text(entry.source), entry.source
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_CONTEXT_PRESSURE_80_PCT)
 def test_context_pressure_calculation_names_the_session_peak_population():
     """The defaults' `calculation` describes the share of sessions at or above
     the per-slot threshold, not a share of individual requests whose prompt

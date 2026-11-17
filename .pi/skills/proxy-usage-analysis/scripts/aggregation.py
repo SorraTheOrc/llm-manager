@@ -2860,10 +2860,17 @@ CACHE_STATE_COLD = "cold"
 #: or persistence failures, not a stream outcome.
 STREAM_ERROR_KINDS = ("stream_error", "stream_finish_error")
 
-#: Share of the effective per-slot context that counts as "pressure"
-#: (LP-0MW1BU9R5006C23N AC1): a request at or above the per-slot context
-#: cannot fit a slot at all.
-CONTEXT_PRESSURE_THRESHOLD_RATIO = 1.0
+#: Share of the effective per-slot context that counts as "pressure".
+#:
+#: Aligned with the context-size recommendation's
+#: ``recommendations.CONTEXT_PRESSURE_RATIO`` (LP-0MWJOUYUL0005H95): a session
+#: reaching 80 % of its own per-slot context is exactly the pressure the
+#: report's "Context sizes approaching per-slot limits" recommendation flags.
+#: The previous ``1.0`` threshold was structurally unreachable for *served*
+#: local requests, because the large-context bypass routes oversized requests
+#: away before they are served, so the scorecard row read ``0.0 %`` every
+#: window.
+CONTEXT_PRESSURE_THRESHOLD_RATIO = 0.80
 
 PROMPT_CACHE_METRIC_ID = "prompt_cache_hit_ratio"
 CONTEXT_PRESSURE_METRIC_ID = "context_pressure"
@@ -3215,13 +3222,14 @@ def per_slot_context_limit(
 
 @dataclass(frozen=True)
 class ContextPressureStats:
-    """Share of local requests at or above the effective per-slot context.
+    """Share of sessions at or above the effective per-slot context threshold.
 
     ``thresholds`` lists the distinct per-slot limits (rounded tokens) the
-    measured requests were compared against, so a mixed-mode window makes the
-    different eras visible. ``unknown_threshold_samples`` counts local requests
-    whose session (and therefore profile) could not be resolved: they are
-    excluded from the share rather than measured against a guessed limit.
+    measured sessions were compared against, so a mixed-mode window makes the
+    different eras visible. ``unknown_threshold_samples`` counts sessions whose
+    peak context is known but whose per-slot limit (and therefore profile)
+    could not be resolved: they are excluded from the share rather than
+    measured against a guessed limit.
     """
 
     metric_id: ClassVar[str] = CONTEXT_PRESSURE_METRIC_ID
@@ -3240,37 +3248,38 @@ def context_pressure(
     *,
     threshold_ratio: float = CONTEXT_PRESSURE_THRESHOLD_RATIO,
 ) -> ContextPressureStats | None:
-    """Share of local requests at or above the effective per-slot context.
+    """Share of sessions at or above the effective per-slot context threshold.
 
-    Each per-request prompt size retained in
-    ``AnalysisResult.local_prompt_samples`` is compared with **its own
-    session's** :func:`per_slot_context_limit` (scaled by *threshold_ratio*),
-    because the fast and cheap profiles pin different slot geometries. Returns
-    ``None`` when the window has no local request with a resolvable limit.
+    Each session's peak context (``SessionStats.max_context_size``) is compared
+    with **its own** :func:`per_slot_context_limit` (scaled by
+    *threshold_ratio*), because the fast and cheap profiles pin different slot
+    geometries. This is the population the report's "Context sizes approaching
+    per-slot limits" recommendation already measures
+    (``recommendations.CONTEXT_PRESSURE_RATIO``). The served requests' own
+    prompt sizes cannot show it: the large-context bypass routes oversized
+    requests away, so a served local request never reaches the per-slot ceiling.
 
-    Source note: ``performance_metrics.METRIC_REGISTRY`` describes this
-    metric's source as the ``routing_skip_local estimated_tokens=`` lines,
-    i.e. the routing decisions that were *skipped*. The measured input here is
-    the dispatched local requests' own prompt sizes, which is what "share of
-    local requests" means and is available for every serving window (a window
-    with no routing skips would otherwise report n/a). The skip-line evidence
-    remains the per-session ``context_at_fallback`` figure the report already
-    renders.
+    ``performance_metrics.METRIC_REGISTRY`` names this sampled input as the
+    per-session peak context against each session's effective per-slot
+    context (``local_model_ctx_size / active slots``), so the metric and its
+    copy describe the same population. Returns ``None`` when no session has a
+    resolvable limit ("n/a", never a fabricated ``0``).
     """
-    samples = getattr(summary, "local_prompt_samples", []) or []
     at_or_above = 0
     measured = 0
     unknown = 0
     thresholds: set[int] = set()
-    for session_id, tokens in samples:
-        session = summary.sessions.get(session_id) if session_id else None
+    for session in summary.sessions.values():
+        peak = _float_or_none(getattr(session, "max_context_size", None))
+        if peak is None:
+            continue
         limit = per_slot_context_limit(session, config, mode_map)
         if limit is None:
             unknown += 1
             continue
         measured += 1
         thresholds.add(round(limit))
-        if tokens >= limit * threshold_ratio:
+        if peak >= limit * threshold_ratio:
             at_or_above += 1
     if not measured:
         return None
