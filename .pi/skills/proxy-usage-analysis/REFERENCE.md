@@ -841,6 +841,10 @@ single roll-up that produces exactly these keys):
 - **`fallback_rate`** — share of the window's requests that produced
   `Fallback triggered` events, as a percentage; the dominant fallback reason
   is rendered in the **Fallback reasons** section rather than in the table.
+  The verdict is **strict**: the committed defaults give it
+  `tolerance_pct: 0` (LP-0MWJOUY4E002FNHP), so an over-target window reads
+  `Unmet` with no +tolerance band above the target — see [Verdict
+  rule](#verdict-rule-tolerance-band).
 - **`decode_speed`** — median decode throughput (tok/s) from `Stream finished`
   token counts for local streams in the window (the same figure the **Decode
   speed** section renders).
@@ -922,12 +926,17 @@ metrics:
       fingerprint: slots=2,ctx=131072   # configuration era ('' when unknown)
       value: 9.12                 # measured value, in the registry unit
       window: '2026-11-03'        # window id; one measurement per window
-  context_pressure:
+  decode_speed:
     measurements:
     - date: '2026-11-03'
       fingerprint: slots=2,ctx=131072
-      value: 0.0
+      value: 32.1
       window: '2026-11-03'
+notes:
+  gpu_busy:
+  - at: '2026-11-15'                    # reset date (YYYY-MM-DD)
+    event: definition_change            # the only event kind today
+    note: "why the metric was redefined and its history reset"
 ```
 
 - Every registered metric appears, with its `measurements` list (empty until
@@ -939,6 +948,49 @@ metrics:
   override it **per metric**, so the live file always wins where it has
   something to say; a missing file simply leaves that metric empty.
 - A metric with no measurable actual is not recorded at all — never as `0`.
+- The optional `notes` block records deliberate discontinuities per metric
+  id (`at`, `event`, `note`); it is preserved verbatim across the nightly
+  load → merge → save cycle, so a recorded reset is never lost or duplicated.
+
+### Definition-change history resets
+
+A baseline and a target are only meaningful over **one** metric definition, so
+when a metric's semantics change its recorded history is reset rather than
+continued: the measurements of the two definitions are never compared, and the
+scorecard reads **Insufficient history** until three post-change windows are
+recorded (a reset therefore never fabricates a target). The reset is a
+documented discontinuity, not data loss — `performance_metrics.reset_metric_history()`
+clears the metric's `measurements` and appends a `definition_change` event in
+the state file's `notes` block:
+
+```python
+import sys
+sys.path.insert(0, ".pi/skills/proxy-usage-analysis/scripts")
+import performance_metrics as pm
+
+state_path = "/home/user/proxy-usage-reports/performance_metrics_state.yaml"
+state = pm.load_state(state_path)
+pm.reset_metric_history(
+    state,
+    "prefill_eta_accuracy",
+    note="why the definition changed and what the new semantics are",
+    reset_at="2026-11-17",
+)
+pm.save_state(state, state_path)   # the only writer of the state file
+```
+
+Only the named metric is touched: every other metric keeps its measurements
+and its existing notes. Recorded resets in this deployment:
+
+| Metric | Reset | New definition |
+|---|---|---|
+| `gpu_busy` | 2026-11-15 | attributable `gpu:computing_workload:bool` share (power ≥ 90 W **and** a busy local slot), no longer the power-only `gpu:computing:bool` share (LP-0MWG7KQVZ008DBZM) |
+| `context_pressure` | 2026-11-17 | share of sessions whose peak context is at or above **80 % of the effective per-slot context** (the retired measure sampled served per-request prompts against 100 %, which read a structural `0.0 %`; LP-0MWJOV2S7001CVS5) |
+| `prefill_eta_accuracy` | 2026-11-17 | the **raw median absolute relative error** (`median(|predicted − observed| / observed × 100)`), registered lower-is-better (the retired `100 − error` accuracy conversion clamped the row to ~0–8 %; LP-0MWJOUZG9008Q4RG, LP-0MWJOV2S7001CVS5) |
+
+`fallback_rate` history is **retained**: only its verdict band changed
+(strict, `tolerance_pct: 0`), so its measurements still mean the same thing
+and remain comparable across the change (LP-0MWJOUY4E002FNHP).
 
 ### Backfilling the history (`--seed-metrics-history`)
 

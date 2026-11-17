@@ -138,6 +138,83 @@ def test_docs_describe_the_strict_zero_band_as_deliberate():
     assert "fallback_rate" in reference
 
 
+def test_docs_describe_the_three_redefined_metric_semantics():
+    """LP-0MWJOV2S7001CVS5: the three redefined scorecard rows are documented
+    as they are now calculated — a strict Fallback-rate verdict, the 80 %
+    context-pressure measure and the raw prefill-ETA error."""
+    skill = _read(SKILL_DOC)
+    reference = _read(REFERENCE_DOC)
+
+    for name, doc in (("SKILL.md", skill), ("REFERENCE.md", reference)):
+        assert "context_pressure" in doc, f"{name} omits context_pressure"
+        assert "80 %" in doc, f"{name} omits the 80 % context-pressure threshold"
+        assert "prefill_eta_accuracy" in doc, f"{name} omits prefill_eta_accuracy"
+        assert "median absolute relative error" in doc, (
+            f"{name} omits the raw prefill-ETA error measure"
+        )
+        assert "lower" in doc.lower()
+        # The strict Fallback-rate verdict: a zero, one-sided band.
+        assert "tolerance_pct: 0" in doc, f"{name} omits the strict fallback band"
+        # The retired accuracy conversion must not be the documented
+        # calculation: the docs state the raw error, unclamped, so an error
+        # above 100 % reads above 100 %.
+        assert "above 100 %" in doc, f"{name} omits the unbounded-error guarantee"
+
+
+def _section(text: str, heading: str) -> str:
+    """Body of the ``heading`` section (up to the next heading of any level)."""
+    lines = text.splitlines()
+    start = next(
+        (index for index, line in enumerate(lines) if line.strip() == heading),
+        None,
+    )
+    assert start is not None, f"heading {heading!r} is missing"
+    body = []
+    for line in lines[start + 1 :]:
+        if line.startswith("#"):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def test_reference_documents_the_definition_change_history_reset():
+    """A metric whose definition changed has its history reset with a recorded
+    reason, so baseline/target are never computed across two definitions."""
+    reference = _read(REFERENCE_DOC)
+
+    assert "reset_metric_history" in reference
+    section = _section(reference, "### Definition-change history resets")
+    assert "definition_change" in section
+    assert "notes" in section
+    # Both redefined metrics are named as reset, with their new semantics.
+    assert "context_pressure" in section
+    assert "80 %" in section
+    assert "prefill_eta_accuracy" in section
+    assert "median absolute relative error" in section
+    assert "lower" in section.lower()
+    # fallback_rate history is deliberately retained (only its band moved).
+    assert "fallback_rate" in section
+    assert "retain" in section.lower()
+    # A reset reads as Insufficient history, never as a fabricated target.
+    assert "Insufficient history" in section
+
+
+def test_live_state_schema_documents_the_notes_block():
+    """The state-file `notes` block is part of the documented schema."""
+    reference = _read(REFERENCE_DOC)
+
+    assert "notes:" in reference
+    assert "event: definition_change" in reference
+
+
+def test_readme_describes_the_redefined_metric_semantics():
+    """The skill README names the same three semantics as the other surfaces."""
+    readme = _read(README_DOC)
+
+    assert "context_pressure" in readme or "80 %" in readme
+    assert "median absolute relative error" in readme
+
+
 def test_skill_states_the_0500_cron_invocation_is_unchanged():
     """The documented cron line still carries no performance-metric flag."""
     skill = _read(SKILL_DOC)

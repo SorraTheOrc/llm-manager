@@ -14,7 +14,7 @@ proxy.log + llama-server.log
         │  streaming parse (log_parser.py / llama_log_parser.py, window-filtered)
         ▼
    aggregation.py      sessions, fallbacks, busy time, TTFT, cache, denials, ETA
-        │              accuracy — the ten scorecard inputs
+        │              error — the ten scorecard inputs
         ▼
   performance_metrics.py   metric registry, best-3 history, targets, verdicts
         │
@@ -37,11 +37,19 @@ proxy.log + llama-server.log
   evidence-based target (the mean of the three best measurements) and this
   window's `Met` / `Unmet` / `Insufficient history` result — followed by a
   `## Performance metric details` block with one subsection per metric
-  (importance, calculation, levers, trade-offs).
+  (importance, calculation, levers, trade-offs). Three rows are read against
+  explicit semantics: Fallback rate is judged **strictly** (`Met` only at or
+  below target), `context_pressure` is the share of sessions at or above
+  **80 % of the effective per-slot context**, and `prefill_eta_accuracy` is the
+  raw **median absolute relative error** of the admission guard's ETA
+  (lower-is-better, above 100 % where the error is).
 - **State file.** The committed `metrics/performance_metrics.yaml` holds the
   metric definitions and detail copy and is **never** written at runtime; the
   mutable history lives in `<output-dir>/performance_metrics_state.yaml`, so
-  the nightly run never dirties the repository.
+  the nightly run never dirties the repository. A metric whose definition
+  changes has its history reset with the change recorded in the state file's
+  `notes` block, so a baseline or target is never computed across two
+  definitions.
 - **Backfill.** A one-off `--seed-metrics-history [DIR]` seeds the best-3
   history from the archived `report.md` files (idempotent per window), so the
   scorecard is useful on its first run instead of reporting `Insufficient

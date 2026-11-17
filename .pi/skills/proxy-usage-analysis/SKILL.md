@@ -205,6 +205,14 @@ The rules behind those numbers:
   best three span more than one era the section prints a **cross-era note**
   naming the metric and the eras, because such a target averages unlike
   configurations.
+- **Definition-change resets.** A metric whose *definition* changed has its
+  recorded history **reset**, with the change recorded in the state file's
+  `notes` block (`event: definition_change`), so a baseline or target is never
+  computed across two definitions; the row reads **Insufficient history**
+  until three post-change windows exist. `fallback_rate` history is retained
+  (only its verdict band moved). How to perform a reset, and the resets
+  already recorded: [REFERENCE.md § Definition-change history
+  resets](REFERENCE.md#definition-change-history-resets).
 
 `## Performance metric details` follows the table immediately: one `###`
 subsection per metric, headed by the metric id and label (for example
@@ -214,6 +222,21 @@ trade-offs of trying to improve it. The prose comes from the committed
 defaults file rather than the renderer, so a wording change is a defaults-file
 change; each subsection links to the data section reporting its figures
 instead of repeating those tables.
+
+### Metric semantics to read carefully (LP-0MWJOV2S7001CVS5)
+
+Three rows were redefined because their old values could not be read as
+signals. Each is now stated the way it is calculated:
+
+| Metric | Semantics |
+|---|---|
+| `fallback_rate` | **Strict verdict.** `Met` only when the window's fallback rate is **at or below** the target (`tolerance_pct: 0`, rendered `±0 %`); an over-target window is `Unmet`. No +tolerance band above the target (LP-0MWJOUY4E002FNHP). |
+| `context_pressure` | **At or above 80 % of the effective per-slot context** — share of sessions whose peak context (`max_context_size`) is ≥ 80 % of `local_model_ctx_size` / active slots, aligned with the **Context sizes approaching per-slot limits** recommendation. The retired measure sampled served per-request prompts against 100 %, which read a structural `0.0 %`. Sessions with no resolvable per-slot limit are excluded; `n/a` when nothing is measurable (LP-0MWJOUYUL0005H95). |
+| `prefill_eta_accuracy` | **Raw median absolute relative error**, as-is: `median(|predicted − observed| / observed × 100)` over matched guard-ETA → first-byte pairs, registered **lower-is-better** so the best three windows are the smallest errors. Errors above 100 % are reported above 100 % — there is no `100 − error` accuracy conversion and no clamp (LP-0MWJOUZG9008Q4RG). |
+
+Their recorded history in `performance_metrics_state.yaml` was reset for the
+two redefined measures, so the first post-change windows read `Insufficient
+history` rather than comparing against a pre-change baseline (LP-0MWJOV2S7001CVS5).
 
 Where the numbers live:
 
