@@ -819,3 +819,69 @@ history above is the baseline it is read against, with the widened
 `_ABANDON_REASONS` set noted as a discontinuity.
 
 
+## Read-path cost attribution and the child-port probe (LP-0MVVXGI490089OX5)
+
+Two tools together separate "the handler ran out of budget" from "the backend was slow". They are
+deliberately different measurements, because the handler's per-phase timings are **clamped by the
+handler's own budgets** and therefore cannot show how slow a `/slots` fetch actually was:
+
+- `scripts/capacity_signal_verification.py` reports `per_phase_read_path` — p50/p90/p99 for
+  `status_query_ms`, `slots_counts_ms` and `slots_detail_ms`, split stale vs fresh, with the
+  per-poll upstream fan-out (`slots_upstream_calls`) and the served `slots_snapshot_source`.
+- `scripts/probe_child_slots.py` times `GET /slots?model=…` **directly against the resolved
+  llama-server child port** (never through the proxy), pairs every sample with the child's
+  `is_processing` flags so "the GPU was busy" is recorded per sample, and reads the proxy's last
+  `status_request` line before and after so the two costs are compared at the same moment.
+
+```bash
+# closed-window profile
+python3 scripts/capacity_signal_verification.py \
+  --since '2026-11-16 15:20:47' --until '2026-11-17 15:20:47' --window-closed \
+  --label post-f1-24h --json --write-artifacts ~/proxy-usage-reports/post-f1-24h
+
+# ≥ 10 timed child-port /slots calls while a slot is processing
+python3 scripts/probe_child_slots.py --model Qwen3 --samples 12 --interval 0.15 --timeout 35 \
+  --write-artifact ~/proxy-usage-reports/post-f1-24h/ac2-child-port-probe --json
+```
+
+### Measured — restart-free closed window, 2026-11-16 15:20:47 → 2026-11-17 15:20:47
+
+29,053 status polls (coverage complete, no gaps); `slots_stale` 5,239 (**18.03 %** — the target is
+< 5 %), all of them served from the last known snapshot (`slots_snapshot_source=snapshot`).
+
+| phase | stale p50 / p90 / p99 (ms) | fresh p50 / p90 / p99 (ms) |
+|---|---|---|
+| `status_query_ms` | 4 / 6 / 21 | 4 / 6 / 29 |
+| `slots_counts_ms` | **1647 / 4002 / 5388** | 0 / 1 / 2963 |
+| `slots_detail_ms` | **1015 / 2029 / 3043** | 0 / 0 / 0 |
+
+Per-poll fan-out: stale `0:992 · 1:2780 · **2:1467** (28 %)`; fresh `0:23067 · 1:747`.
+Snapshot age of the served payload: p50 0.55 s, p90 14.5 s, p99 61.8 s, max 235.9 s; **17.80 %**
+of polls were served a snapshot older than 2 s (4.44 % older than 30 s, 1.09 % older than 60 s,
+0 % older than 300 s).
+
+### Measured — live child-port probe, 2026-11-17 18:35:30 (12 samples, all while a slot processed)
+
+`p50 17.8 ms`, **`p95 32 096 ms`**, min 13.4 ms, max 32 096 ms; **3 of 12 samples exceeded the
+1 s `STATUS_QUERY_TIMEOUT`** (per-sample: 32 096 · 4 614 · 12 556 · 18.4 · 17.8 · 18.3 · 18.5 ·
+17.3 · 14.4 · 14.4 · 13.4 · 14.4 ms). The proxy's own phases at that moment were
+`status_query_ms=4`, `slots_counts_ms=1148`, `slots_detail_ms=1016`, `slots_upstream_calls=1` — the
+handler clamped at its budgets while the single upstream fetch it was waiting on took tens of
+seconds.
+
+### Conclusion
+
+The dominant contributor to > 2 s refreshes is the **child `/slots` handler blocking behind
+llama-server's generation loop**: while a prompt is being prefilled the endpoint returns in seconds
+to tens of seconds (idle/decode cost is 1–18 ms). Proxy-side serialisation is an **amplifier, not
+the cause**: the handler issues counts and detail as two sequential bounded queries, so 28 % of
+stale polls pay that blocking cost twice, and the 2 s + 1 s budgets guarantee the poll is reported
+stale long before the backend answers.
+
+Consequences recorded for the follow-up items (LP-0MVVXGLTM008ROJ9, LP-0MVVXGM54009TOXD): serving
+one shared snapshot removes the double fetch and keeps poll latency inside budget, but it cannot
+make the data fresher than the last **completed** fetch — so a `slots_stale` defined by snapshot
+age inherits the backend's blocking time. Against the delivered ≈300 s ceiling an age-derived
+`slots_stale` would read **0 %** on this window (max age 235.9 s); against a 2 s budget it reads
+17.8 %. The freshness budget, not the derivation, decides the verdict; that trade-off belongs to
+the producer (parent AC2 second branch).
