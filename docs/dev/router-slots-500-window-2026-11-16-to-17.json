@@ -1,0 +1,405 @@
+{
+ "work_item": "LP-0MVP7HX2S008IU57",
+ "fix_under_test": "LP-0MVP7525P008RXMF",
+ "measurement_run_utc": "2026-11-17T18:20:11Z",
+ "title_anchor": "earliest run 2026-11-17T15:20:47Z (window 2026-11-16T15:20:47Z -> 2026-11-17T15:20:47Z)",
+ "window": {
+  "start_utc": "2026-11-16T15:20:47Z",
+  "end_utc": "2026-11-17T15:20:47Z",
+  "duration_hours": 24,
+  "anchored_to": "group-2 proxy restart 2026-11-16T15:20:47Z (reported in comment LP-C0MWJFS4EX0030JHL); earliest-run rule = restart + 24 h",
+  "measured_at_utc": "2026-11-17T18:20:11Z (window had been closed for 2 h 59 m)",
+  "verdict": "RED",
+  "verdict_axis": "AC4 chat-model fallback delta == 0 is UNMET (delta 1, boot transient at window start +4.4 s); AC1 router-responder /slots 500 == 0 is MET"
+ },
+ "restart_integrity_ac6": {
+  "window_proxy_pid": 3720326,
+  "window_proxy_lstart_utc": "2026-11-16T15:20:47Z",
+  "etime_at_measurement": "1-02:58:55",
+  "restart_inside_window": false,
+  "in_window_startup_markers": 1,
+  "in_window_startup_marker_timestamps_utc": [
+   "2026-11-16T15:20:49.786Z"
+  ],
+  "startup_marker_note": "the single `Starting LLama Proxy Server` line is the window-anchor process's own boot, 2.8 s after its lstart \u2014 not a restart; no further startup markers in any window file (1 in proxy.log.2026-11-16_15, 0 in the other four)",
+  "child_generations": {
+   "child_pid_in_log": 44409,
+   "note": "every /slots access line in both window files carries container-namespace pid 44409 \u2014 the persistent host-first llama-server (host pid 3122336, started 2026-11-15T01:06:52Z, i.e. BEFORE the window). The pid therefore proves a single model-child generation across the superset, but it does NOT pin the file set to the window start; the file set is the daily copytruncate copy plus the live file."
+  },
+  "counter_delta_available": true,
+  "counter_delta_available_reason": "the serving proxy process started exactly at the window start and was still running at measurement time, so its monotonic counters are the window counters (plus the 2 h 56 m post-window overhang, which contains no fallback: the counter incremented once, at boot)"
+ },
+ "baseline_ac5": {
+  "counter_baseline_at_window_start": 0.0,
+  "baseline_available": true,
+  "baseline_reason": "the proxy process that defines the window start is the same process that serves the measurement, so its counters were 0 at t0 by construction (process lifetime == window)",
+  "log_line_count_baseline": null,
+  "log_line_count_note": "no pre-window llama-server.log line count was captured; the file-set argument is instead the over-count direction - the union of the daily copytruncate copy and the live file is a 42 h 20 m superset (15 h 20 m before the window, 2 h 56 m after it), so zero router 500s across the superset proves zero inside the window"
+ },
+ "fallback_counter_ac4": {
+  "metric": "llama_slots_child_port_fallbacks_total{reason=\"no_child_port_router_mode\"}",
+  "window_delta": 1.0,
+  "raw_metric_output_verbatim": [
+   "# HELP llama_slots_child_port_fallbacks_total Proxy /slots queries falling back to the router port because no model child port could be discovered, by reason",
+   "# TYPE llama_slots_child_port_fallbacks_total counter",
+   "llama_slots_child_port_fallbacks_total{reason=\"no_child_port_router_mode\"} 1.0"
+  ],
+  "in_window_warning_lines": 1,
+  "in_window_warning_models": [
+   "Qwen3"
+  ],
+  "chat_model_fallbacks": 1,
+  "chat_model_fallbacks_steady_state": 0,
+  "steady_state_window_utc": "2026-11-16T15:20:52Z..2026-11-17T15:20:47Z (23 h 59 m 56 s)",
+  "embed_model_fallbacks": 0,
+  "warn_throttle_seconds": 300,
+  "related_query_failures_total": {
+   "reason": "timeout",
+   "value": 12210.0,
+   "note": "current-process lifetime value (process start == window start) plus the 2 h 56 m post-window overhang"
+  },
+  "ac4_verdict": "UNMET"
+ },
+ "llama_server_file_set": [
+  {
+   "file": "llama-server.log-2026-11-17",
+   "mtime_utc": "2026-11-17T00:00:04Z",
+   "content_range_utc": "2026-11-16T00:00:00Z..2026-11-17T00:00:00Z",
+   "in_window_coverage": "2026-11-16T15:20:47Z..2026-11-17T00:00:00Z (whole in-window share) plus a 15 h 20 m pre-window overhang",
+   "intersects_window": true,
+   "responder_status": {
+    "44409:200": 60893,
+    "router:200": 1,
+    "router:400": 1070
+   },
+   "slots_total": 61964,
+   "router": {
+    "200": 1,
+    "400": 1070,
+    "500": 0
+   },
+   "child": {
+    "200": 60893,
+    "400": 0,
+    "500": 0,
+    "other": 0
+   }
+  },
+  {
+   "file": "llama-server.log",
+   "mtime_utc": "2026-11-17T18:20:10Z",
+   "content_range_utc": "2026-11-17T00:00:00Z..2026-11-17T18:20:11Z (live at measurement)",
+   "in_window_coverage": "2026-11-17T00:00:00Z..2026-11-17T15:20:47Z (whole in-window share) plus a 2 h 56 m post-window overhang to measurement time",
+   "intersects_window": true,
+   "responder_status": {
+    "44409:200": 47056,
+    "router:400": 310
+   },
+   "slots_total": 47366,
+   "router": {
+    "200": 0,
+    "400": 310,
+    "500": 0
+   },
+   "child": {
+    "200": 47056,
+    "400": 0,
+    "500": 0,
+    "other": 0
+   }
+  }
+ ],
+ "excluded_files": [
+  {
+   "file": "llama-server.1.log",
+   "mtime_utc": "2026-11-15T01:06:49Z",
+   "reason": "in-process rotation written at the 2026-11-15T01:06Z restart; last write is before the window and it contains no line for the persistent child pid 44409"
+  },
+  {
+   "file": "llama-server.2.log .. llama-server.15.log",
+   "mtime_utc": "2026-11-05..2026-11-11",
+   "reason": "older numeric rotations; last write before the window and no line for child pid 44409"
+  },
+  {
+   "file": "llama-server.log-2026-11-16.gz",
+   "mtime_utc": "2026-11-16T00:00:09Z",
+   "reason": "daily copytruncate copy taken at 2026-11-16T00:00Z, so its content is the 2026-11-15 day and ends where the window begins (one day before the window's content range)"
+  },
+  {
+   "file": "llama-server.log-2026-11-03.gz .. llama-server.log-2026-11-15.gz",
+   "mtime_utc": "2026-11-03..2026-11-15",
+   "reason": "pre-window daily copies"
+  }
+ ],
+ "superset": {
+  "content_range_utc": "2026-11-16T00:00:00Z..2026-11-17T18:20:11Z",
+  "content_range_note": "42 h 20 m superset: the daily copytruncate copy (content = the 2026-11-16 UTC day) plus the live file (2026-11-17T00:00Z..measurement). It overhangs the window by 15 h 20 m before and 2 h 56 m after, so zero router-responder 500s across it proves zero inside the window (over-count direction).",
+  "router": {
+   "200": 1,
+   "400": 1380,
+   "500": 0
+  },
+  "child": {
+   "200": 107949,
+   "400": 0,
+   "500": 0,
+   "other": 0
+  },
+  "router_500_total": 0,
+  "router_400_total": 1380,
+  "router_200_total": 1,
+  "child_total": 107949,
+  "slots_total": 109330,
+  "router_500_zero_proof": "the superset contains the whole window (plus 15 h 20 m of pre-window and 2 h 56 m of post-window traffic) and reports 0 router-responder 500s; a non-negative count inside the window cannot exceed the superset count, so in-window router-responder 500s are 0",
+  "router_share_of_slots": 0.01263
+ },
+ "daily_router_500_trend": {
+  "_labels": "content day (the copytruncate copy named by its rotation date holds the PREVIOUS UTC day)",
+  "2026-11-07": {
+   "router_500": 0,
+   "router_400": 193
+  },
+  "2026-11-08": {
+   "router_500": 0,
+   "router_400": 496
+  },
+  "2026-11-09": {
+   "router_500": 0,
+   "router_400": 343
+  },
+  "2026-11-10": {
+   "router_500": 0,
+   "router_400": 611
+  },
+  "2026-11-11": {
+   "router_500": 0,
+   "router_400": 31,
+   "coverage": "partial day (2,434 child /slots 200s only)"
+  },
+  "2026-11-12": {
+   "router_500": 0,
+   "router_400": 439
+  },
+  "2026-11-13": {
+   "router_500": 1,
+   "router_400": 515
+  },
+  "2026-11-14": {
+   "router_500": 0,
+   "router_400": 93
+  },
+  "2026-11-15": {
+   "router_500": 0,
+   "router_400": 264
+  },
+  "2026-11-16": {
+   "router_500": 0,
+   "router_400": 1070
+  },
+  "2026-11-17 (partial 00:00 -> 18:20)": {
+   "router_500": 0,
+   "router_400": 310
+  },
+  "_source": "one copytruncate copy per UTC day (suffix = rotation date, content = the previous 24 h) plus the live file, same triage CLI",
+  "_comparison": {
+   "2026-10-25": 20134,
+   "2026-10-26": 2753,
+   "2026-10-27": 128,
+   "2026-10-28": 1043,
+   "2026-10-29": 604,
+   "2026-10-30_partial": 140,
+   "2026-10-31..2026-11-02_window_superset": 752
+  },
+  "_reading": "the residual router-500 floor measured in the 2026-11-01 -> 11-02 window (752 in a 31.9 h superset, ~16/day in-window) has not recurred: every measured day from 2026-11-07 shows 0 router 500s except a single line on 2026-11-13, consistent with the remediation closed as LP-0MVYZ8Z16004QIRG on 2026-11-04"
+ },
+ "proxy_log_window": {
+  "dedupe_rule": "each proxy.log* candidate's own first/last line timestamp derived; the five kept files tile the window with no overlap; the live proxy.log was excluded because its first line (15:21:01 on 2026-11-17) is after the window end, and proxy.log.2026-11-16_152045 was excluded because it ends at 2026-11-16T15:20:45Z, before the window start",
+  "files": [
+   {
+    "file": "proxy.log.2026-11-16_15",
+    "first_line_utc": "2026-11-16T15:20:48.866000Z",
+    "last_line_utc": "2026-11-16T21:20:47.400000Z",
+    "in_window_lines": 155471,
+    "status_request_polls": 13695,
+    "slots_stale_true": 2532,
+    "slots_stale_false": 11163,
+    "active_prefill_polls": 8306,
+    "active_prefill_slots_stale_true": 2426,
+    "fallback_warnings": 1,
+    "starting_markers": 1,
+    "clip": "whole file"
+   },
+   {
+    "file": "proxy.log-2026-11-17_00",
+    "first_line_utc": "2026-11-16T21:20:48.857000Z",
+    "last_line_utc": "2026-11-17T00:00:03.557000Z",
+    "in_window_lines": 62202,
+    "status_request_polls": 7507,
+    "slots_stale_true": 941,
+    "slots_stale_false": 6566,
+    "active_prefill_polls": 3069,
+    "active_prefill_slots_stale_true": 912,
+    "fallback_warnings": 0,
+    "starting_markers": 0,
+    "clip": "whole file"
+   },
+   {
+    "file": "proxy.log.2026-11-16_21",
+    "first_line_utc": "2026-11-17T00:00:05.674000Z",
+    "last_line_utc": "2026-11-17T03:20:46.648000Z",
+    "in_window_lines": 28776,
+    "status_request_polls": 1771,
+    "slots_stale_true": 489,
+    "slots_stale_false": 1282,
+    "active_prefill_polls": 1188,
+    "active_prefill_slots_stale_true": 483,
+    "fallback_warnings": 0,
+    "starting_markers": 0,
+    "clip": "whole file"
+   },
+   {
+    "file": "proxy.log.2026-11-17_03",
+    "first_line_utc": "2026-11-17T03:20:48.056000Z",
+    "last_line_utc": "2026-11-17T09:20:46.252000Z",
+    "in_window_lines": 45875,
+    "status_request_polls": 2529,
+    "slots_stale_true": 506,
+    "slots_stale_false": 2023,
+    "active_prefill_polls": 1738,
+    "active_prefill_slots_stale_true": 474,
+    "fallback_warnings": 0,
+    "starting_markers": 0,
+    "clip": "whole file"
+   },
+   {
+    "file": "proxy.log.2026-11-17_09",
+    "first_line_utc": "2026-11-17T09:20:52.805000Z",
+    "last_line_utc": "2026-11-17T15:20:51.185000Z",
+    "in_window_lines": 71009,
+    "status_request_polls": 3551,
+    "slots_stale_true": 771,
+    "slots_stale_false": 2780,
+    "active_prefill_polls": 1896,
+    "active_prefill_slots_stale_true": 723,
+    "fallback_warnings": 0,
+    "starting_markers": 0,
+    "clip": "tail clipped at window end"
+   }
+  ],
+  "totals": {
+   "in_window_lines": 363333,
+   "status_request_polls": 29053,
+   "slots_stale_true": 5239,
+   "slots_stale_false": 23814,
+   "slots_stale_share_all_polls": 0.1803,
+   "active_prefill_polls": 16197,
+   "active_prefill_share_of_polls": 0.5575,
+   "active_prefill_slots_stale_true": 5018,
+   "active_prefill_slots_stale_share": 0.3098,
+   "starting_llama_proxy_server_markers": 1
+  },
+  "pre_fix_baseline": {
+   "slots_stale_true": 579,
+   "polls": 899,
+   "share": 0.644,
+   "source": "2026-10-26 file, all status_request polls (parent intake)"
+  },
+  "prior_post_fix_windows": {
+   "2026-10-27_to_28": {
+    "polls": 15953,
+    "slots_stale_share_all_polls": 0.3137,
+    "router_500_superset": 1171
+   },
+   "2026-11-01_to_02": {
+    "polls": 20926,
+    "slots_stale_share_all_polls": 0.4267,
+    "router_500_superset": 752
+   }
+  },
+  "fallback_warnings": [
+   {
+    "ts_utc": "2026-11-16T15:20:51.411000Z",
+    "model": "Qwen3",
+    "file": "proxy.log.2026-11-16_15",
+    "source": "log_signal"
+   }
+  ],
+  "fallback_warning_count": 1,
+  "model_attribution": {
+   "status_request_current_model": {
+    "Qwen3": 29052,
+    "unknown/absent": 1
+   },
+   "gpt120_requests_in_window": 4,
+   "gpt120_fallback_warnings_in_window": 0,
+   "mxbai_embed_lines_in_window": 1,
+   "mxbai_embed_note": "the single mxbai-embed line is `Router model already loaded: mxbai-embed` at 2026-11-16T15:20:51.670Z (boot adoption), not a fallback warning; embed-model fallbacks in-window = 0"
+  }
+ },
+ "acceptance_criteria_verdicts": {
+  "AC1_chat_model_router_500_zero": {
+   "verdict": "met",
+   "evidence": "router:500 = 0 across the 109,330-slot superset that covers every in-window access"
+  },
+  "AC2_raw_router_and_child_counts": {
+   "verdict": "met",
+   "evidence": "per-file 200/400/500 responder split recorded for both files; triage CLI classification blocks pasted verbatim in docs/dev/slots-500-triage.md"
+  },
+  "AC3_slots_stale_share": {
+   "verdict": "met",
+   "evidence": "5,239 / 29,053 = 18.03 % (all status_request polls); active-prefill subset 5,018 / 16,197 = 30.98 %"
+  },
+  "AC4_fallback_evidence": {
+   "verdict": "unmet",
+   "evidence": "chat-model fallback delta 1 (warning + counter), boot transient at window start +4.4 s; embed 0"
+  },
+  "AC5_reproducibility": {
+   "verdict": "met",
+   "evidence": "window timestamps, pid/lstart, raw /metrics output, triage CLI invocations and proxy.log file set with observed first/last timestamps recorded in the work-item comment and this artifact; baseline = counter 0 at t0 by construction"
+  },
+  "AC6_restart_integrity": {
+   "verdict": "met",
+   "evidence": "single pid 3720326 for the whole window, one startup marker (the anchor's own boot), single child generation pid 44409"
+  },
+  "AC7_documentation": {
+   "verdict": "met",
+   "evidence": "docs/dev/slots-500-triage.md section 'Post-fix 24 h window verification (LP-0MVP7HX2S008IU57, 2026-11-16 -> 2026-11-17)' plus this artifact"
+  },
+  "AC8_full_suite": {
+   "verdict": "met",
+   "evidence": "docs/JSON-only change; changed-scope gate green at finish, full suite enforced by the dev-push gate"
+  }
+ },
+ "linked_bugs": [
+  {
+   "id": "LP-0MWL0R0UT004G9XE",
+   "priority": "medium",
+   "title": "Boot-time chat-model child-port fallback: the first slot poll after a proxy restart falls back to the router (Qwen3, slots_child_port_unavailable)",
+   "attribution": "discovered-from:LP-0MVP7525P008RXMF"
+  },
+  {
+   "id": "LP-0MVP7525P008RXMF",
+   "priority": "high",
+   "title": "the fix under test (rotation-proof child-port discovery)",
+   "attribution": "completed / in_review - never reopened"
+  }
+ ],
+ "related_items": [
+  {
+   "id": "LP-0MVVLKPBM007F6U6",
+   "note": "sibling router:500 == 0 verification re-anchored to the same window; shares this evidence"
+  },
+  {
+   "id": "LP-0MVU8003X0018WT8",
+   "note": "sibling router:400 == 0 verification for the same window; this artifact records router 400 = 1,380 in the superset for it"
+  }
+ ],
+ "limitations": [
+  "llama-server access lines carry no timestamps: the window is scoped by file (daily copytruncate copy + live file), not by line timestamps; the verdict relies on the over-count direction (a 42 h 20 m superset with 0 router 500s)",
+  "the superset overhangs the window by 15 h 20 m before and 2 h 56 m after it; both overhangs contain 0 router 500s",
+  "the fallback counter delta includes the window's first 4.4 s (the anchor restart's boot transient), because process lifetime == window",
+  "the persistent host-first llama-server (container pid 44409 / host pid 3122336) predates the window, so its log lines cannot be time-bounded by pid as in the 2026-10-27 window; the file-scoped superset is the bound instead",
+  "proxy.log window end is clipped at 15:20:47 inside proxy.log.2026-11-17_09 (whose last line is 15:20:51)",
+  "`llama_slots_query_failures_total{reason=\"timeout\"}` = 12,210 is a process-lifetime value (window + overhang), reported as an observation only"
+ ]
+}
