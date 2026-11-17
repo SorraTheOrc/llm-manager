@@ -234,8 +234,16 @@ class _FakeLock:
 class TestHandlerGracefulDegradation:
     """GET /llama/local/status serves last-known counts on /slots failure."""
 
-    async def _get(self, slots_counts, cache_value=None, stale_after=None):
+    async def _get(
+        self, slots_counts, cache_value=None, stale_after=None, counts_failed=False
+    ):
         """Issue /llama/local/status with controllable counts + last-known cache.
+
+        ``counts_failed`` marks the fresh counts read as a transport failure
+        (HTTP 500), which is what the graceful-degradation fixtures model. Its
+        outcome matters to the age-derived ``slots_stale``: a failed read that
+        served nothing is a *missing snapshot* and reports stale
+        (LP-0MVVXGM54009TOXD), while a successful empty read is a live answer.
 
         Returns the parsed JSON body.
         """
@@ -247,7 +255,33 @@ class TestHandlerGracefulDegradation:
         async def fake_query():
             return {"llama_server_running": True}
 
-        counts_mock = AsyncMock(return_value=slots_counts)
+        def _stamp_provenance(kwargs):
+            """Publish the fetch stamp the real helpers always record."""
+            prov = kwargs.get("provenance_out")
+            if isinstance(prov, dict):
+                prov.setdefault("source", "upstream")
+                prov.setdefault("fetched_at", time.monotonic())
+                prov.setdefault("upstream_calls", 1)
+
+        async def _counts(*_args, **kwargs):
+            _stamp_provenance(kwargs)
+            if counts_failed:
+                out = kwargs.get("status_out")
+                if isinstance(out, dict):
+                    out.update({"status": 500, "reason": "http_500"})
+                # The real helper records the failure reason for the payload.
+                from proxy import observability
+
+                observability._record_slots_query_failure("http_500")
+            return slots_counts
+
+        async def _detail(*_args, **kwargs):
+            _stamp_provenance(kwargs)
+            return []
+
+        counts_mock = AsyncMock(side_effect=_counts)
+        counts_mock.return_value = slots_counts
+        detail_mock = AsyncMock(side_effect=_detail)
         transport = httpx.ASGITransport(app=app)
         with patch("proxy.server.query_llama_status", side_effect=fake_query):
             with patch.object(server, "current_model", "test-model"):
@@ -265,7 +299,7 @@ class TestHandlerGracefulDegradation:
                                     ):
                                         with patch(
                                             "proxy.observability._query_slots_detail",
-                                            AsyncMock(return_value=[]),
+                                            detail_mock,
                                         ):
                                             with patch(
                                                 "proxy.observability._query_slots",
@@ -300,24 +334,41 @@ class TestHandlerGracefulDegradation:
 
     @pytest.mark.asyncio
     async def test_slots_failure_serves_last_known_counts(self):
-        """Fresh /slots failure (0,0) with a fresh last-known cache → cached
-        total + slots_stale. Since LP-0MW1VDZIX0011D8M a stale list asserts no
+        """A last-known counts cache is served on a /slots failure.
+
+        The cached snapshot is seconds old, so under the age-derived
+        ``slots_stale`` (LP-0MVVXGM54009TOXD) the poll is *not* stale even
+        though the counts phase fell back — ``slot_counts_stale`` discloses
+        that. Since LP-0MW1VDZIX0011D8M a cache-served counts pair asserts no
         availability: ``available_slots`` is 0 with ``availability_unknown``
-        true, while the cached pool size is still published as ``total_slots``."""
-        cache = (2, 3, time.monotonic())
-        j = await self._get(slots_counts=(0, 0), cache_value=cache)
+        true, while the cached pool size is still published as ``total_slots``.
+        """
+        cache = (2, 3, time.monotonic() - 2.0)  # inside the 300 s ceiling
+        j = await self._get(
+            slots_counts=(0, 0), cache_value=cache, counts_failed=True
+        )
         assert j["total_slots"] == 3
         assert j["available_slots"] == 0
         assert j["availability_unknown"] is True
-        assert j["slots_stale"] is True
+        assert j["slot_counts_stale"] is True
+        assert j["slots_stale"] is False
 
     @pytest.mark.asyncio
     async def test_slots_failure_with_no_last_known_stays_closed(self):
-        """Fresh /slots failure with no last-known cache → 0/0, slots_stale=false."""
-        j = await self._get(slots_counts=(0, 0), cache_value=None)
+        """A failed /slots read with no cache → 0/0 capacity and stale.
+
+        Nothing was served and nothing dated can be read from the backend, so
+        the surface is a *missing snapshot* under the age-derived definition
+        (LP-0MVVXGM54009TOXD): ``slots_stale`` is true (no live evidence) while
+        the counts stay fail-closed at 0/0.
+        """
+        j = await self._get(
+            slots_counts=(0, 0), cache_value=None, counts_failed=True
+        )
         assert j["total_slots"] == 0
         assert j["available_slots"] == 0
-        assert j["slots_stale"] is False
+        assert j["slots_stale"] is True
+        assert j["slots_stale_reason"] == "query_error"
 
     @pytest.mark.asyncio
     async def test_fresh_counts_not_stale(self):

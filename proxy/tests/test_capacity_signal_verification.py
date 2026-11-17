@@ -219,6 +219,113 @@ def test_status_poll_slots_stale_rate_and_hint_histogram(csv, tmp_path):
     }
 
 
+def _age_pair(age, ceiling):
+    """The age/ceiling fields a post-F1 status line publishes."""
+    return {
+        "slots_snapshot_age_seconds": age,
+        "slots_max_snapshot_age_seconds": ceiling,
+    }
+
+
+def test_slots_stale_is_age_derived_when_the_poll_publishes_the_age(csv, tmp_path):
+    """F4 AC5: the reported rate follows the age-derived definition.
+
+    A line that publishes the age/ceiling pair is judged by it, not by the
+    ``slots_stale`` flag its build emitted: a fresh snapshot is fresh even
+    though it was served from cache (the old flag said stale), and an over-age
+    or undatable snapshot is stale even though the old flag said fresh. The
+    same window reports which definition produced each verdict and how far the
+    old flag is from the new one.
+    """
+    log_dir = tmp_path / "logs"
+    budget = 300.0
+    write_log(
+        log_dir / "proxy.log",
+        # Inside the budget: fresh (a cache-served snapshot is not a defect).
+        status_line(
+            "2026-10-23 00:00:01", stale="true", per_phase=_age_pair(1.0, budget)
+        )
+        # Exactly at the budget: still fresh (last acceptable age).
+        + status_line(
+            "2026-10-23 00:00:02",
+            stale="false",
+            per_phase=_age_pair(budget, budget),
+        )
+        # Over the budget: stale, whatever the old flag said.
+        + status_line(
+            "2026-10-23 00:00:03",
+            stale="false",
+            per_phase=_age_pair(301.0, budget),
+        )
+        # An undatable snapshot is a missing snapshot: stale.
+        + status_line(
+            "2026-10-23 00:00:04", stale="false", per_phase=_age_pair(None, budget)
+        )
+        # A pre-F1 line carries no age field: counted by its own flag.
+        + status_line("2026-10-23 00:00:05", stale="true"),
+    )
+
+    metrics = csv.analyse_status_stream(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 24, 0, 0),
+    )
+
+    assert metrics["status_polls"] == 5
+    assert metrics["slots_stale"] == {"count": 3, "denominator": 5, "rate": 0.6}
+    assert metrics["slots_stale_derivation"] == {
+        "derived_from_snapshot_age": 4,
+        "from_published_flag": 1,
+        "disagreements_with_published_flag": 3,
+    }
+
+
+def test_slots_stale_pre_change_window_is_counted_as_before(csv, tmp_path):
+    """F4 AC5: a window with no age field keeps its published flag.
+
+    Historical windows must stay readable without re-deriving anything, and
+    the schema-1 exclusion from the denominator is unchanged.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        status_line("2026-10-23 00:00:01", stale="true", schema=2)
+        + status_line("2026-10-23 00:00:02", stale="false", schema=2)
+        + "2026-10-23 00:00:03,000 - INFO - status_request capacity_hint=idle "
+        "status_schema_version=1 total_slots=2\n",
+    )
+
+    metrics = csv.analyse_status_stream(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 24, 0, 0),
+    )
+
+    assert metrics["slots_stale"] == {"count": 1, "denominator": 2, "rate": 0.5}
+    assert metrics["slots_stale_derivation"] == {
+        "derived_from_snapshot_age": 0,
+        "from_published_flag": 2,
+        "disagreements_with_published_flag": 0,
+    }
+
+
+def test_slots_stale_from_age_needs_both_fields(csv):
+    """The derivation abstains (``None``) rather than inventing a verdict."""
+    assert csv.slots_stale_from_age(_age_pair(10.0, 300.0)) is False
+    assert csv.slots_stale_from_age(_age_pair(300.0, 300.0)) is False
+    assert csv.slots_stale_from_age(_age_pair(300.1, 300.0)) is True
+    assert csv.slots_stale_from_age(_age_pair(None, 300.0)) is True
+    # No ceiling (an F1-era line on a build without the ceiling) or no age
+    # field at all (pre-F1): the caller must fall back to the published flag.
+    assert csv.slots_stale_from_age(
+        {"slots_snapshot_age_seconds": 10.0}
+    ) is None
+    assert csv.slots_stale_from_age({}) is None
+    assert csv.slots_stale_from_age(
+        _age_pair("bogus", "also-bogus")
+    ) is None
+
+
 def test_saturated_without_live_work_uses_inflight_then_flag_fallback(
     csv, tmp_path
 ):

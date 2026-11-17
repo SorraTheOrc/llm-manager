@@ -158,11 +158,13 @@ FOSSIL = [
 ]
 
 
-async def _get_status(client, server_config=None, fossil=None, age_seconds=None):
+async def _get_status(client, server_config=None, fossil=None, age_seconds=None,
+                      stamp=None):
     """Poll ``/llama/local/status`` against a scripted router-mode server.
 
     ``age_seconds`` back-dates the seeded fossil cache's stamp so the served
     snapshot has a known, deterministic age without patching ``time``.
+    ``stamp`` seeds the stamp directly (a frozen backend served repeatedly).
     """
     from proxy.server import app
 
@@ -177,7 +179,9 @@ async def _get_status(client, server_config=None, fossil=None, age_seconds=None)
     }
 
     obs._last_slot_details_cache[:] = list(fossil or [])
-    if fossil:
+    if stamp is not None:
+        obs._last_slot_details_at = stamp
+    elif fossil:
         obs._last_slot_details_at = time.monotonic() - float(age_seconds or 0.0)
     else:
         obs._last_slot_details_at = 0.0
@@ -309,6 +313,56 @@ class TestClockAdvancePastCeiling:
         assert payload["slots"] == []
 
 
+class TestSnapshotAgeIsMonotonic:
+    """AC3 (LP-0MVVXGM54009TOXD): the age comes from the fetch stamp.
+
+    A frozen backend is polled repeatedly: every poll is served the same
+    last-known snapshot, so the age must grow monotonically from that one
+    stamp — never be reset to "fresh" by serving the cache again, and never
+    go negative. Only the handler's clock is frozen; the cache TTL machinery
+    keeps the real clock.
+    """
+
+    _now = 0.0
+
+    class _Clock:
+        """Proxy the real ``time`` module, freezing only ``monotonic``."""
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        @staticmethod
+        def monotonic():
+            return TestSnapshotAgeIsMonotonic._now
+
+    @pytest.mark.asyncio
+    async def test_age_grows_from_the_fetch_stamp_across_cache_reads(self):
+        base = 500_000.0
+        client = _ScriptedClient(ok=False)  # frozen backend: every fetch fails
+        config = {"local_slots_max_snapshot_age_seconds": 300}
+        type(self)._now = base
+
+        def poll():
+            return _get_status(client, server_config=config, fossil=FOSSIL, stamp=base)
+
+        with patch("proxy.handlers.time", self._Clock()):
+            first, _ = await poll()
+            type(self)._now = base + 10.0
+            second, _ = await poll()
+            type(self)._now = base + 301.0
+            third, _ = await poll()
+
+        assert first["slots_snapshot_age_seconds"] == pytest.approx(0.0, abs=0.01)
+        assert second["slots_snapshot_age_seconds"] == pytest.approx(10.0, abs=0.01)
+        assert third["slots_snapshot_age_seconds"] == pytest.approx(301.0, abs=0.01)
+        # Growing past the ceiling flips the observable — the cache read itself
+        # never made the snapshot look fresh again.
+        assert first["slots_stale"] is False
+        assert second["slots_stale"] is False
+        assert third["slots_stale"] is True
+        assert third["slots_stale_reason"] == "snapshot_too_old"
+
+
 class TestBelowTheCeiling:
     """Existing graceful degradation is unchanged below the ceiling."""
 
@@ -325,7 +379,14 @@ class TestBelowTheCeiling:
         assert record is not None, "no status_request line was logged"
         assert record.slots_snapshot_source == "snapshot"
         assert payload["slots_detail_stale"] is True
-        assert payload["slots_stale_reason"] in ("query_error", "query_timeout")
+        # Age-derived ``slots_stale`` (LP-0MVVXGM54009TOXD): the served
+        # snapshot is inside the ceiling, so the surface is fresh and publishes
+        # no reason — a just-failed fetch served from cache is not staleness.
+        assert payload["slots_stale"] is False
+        assert payload["slots_stale_reason"] is None
+        assert payload["slots_snapshot_age_seconds"] <= payload[
+            "slots_max_snapshot_age_seconds"
+        ]
 
     @pytest.mark.asyncio
     async def test_ceiling_midpoint_is_inclusive(self):

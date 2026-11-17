@@ -803,7 +803,9 @@ class TestPerSlotDetails:
         # v6 (LP-0MW1VVIPG008896N): additive ``slots_stale_reason``.
         # v7 (LP-0MW1VDZIX0011D8M): ``available_slots`` derived from
         # ``slots[]`` + ``availability_unknown``.
-        assert j["status_schema_version"] == 7  # AC1: additive + versioned
+        # v8 (LP-0MVVXGM54009TOXD): ``slots_stale`` derived from the served
+        # snapshot's age against the ceiling (additive: no field renamed).
+        assert j["status_schema_version"] == 8  # AC1: additive + versioned
 
 
 # ======================================================================
@@ -1079,6 +1081,7 @@ class _CapacityStatusHarness:
         ``llama_running`` selects the engine-health state the fake status query
         reports (``False`` exercises the payload's absent-safe paths).
         """
+        import time
         from unittest.mock import AsyncMock
 
         from proxy.server import app
@@ -1088,14 +1091,38 @@ class _CapacityStatusHarness:
         async def fake_query():
             return {"llama_server_running": llama_running}
 
+        def _stamp_provenance(kwargs):
+            """Fill ``provenance_out`` the way the real helpers do.
+
+            The real ``_query_slots`` / ``_query_slots_detail`` always publish
+            the fetch stamp of the payload they return (or attempt), which is
+            what the age-derived ``slots_stale`` reads
+            (LP-0MVVXGM54009TOXD AC1/AC3). A mock that leaves it empty would
+            make every healthy poll look undatable — and therefore stale.
+            """
+            prov = kwargs.get("provenance_out")
+            if isinstance(prov, dict):
+                prov.setdefault("source", "upstream")
+                prov.setdefault("fetched_at", time.monotonic())
+                prov.setdefault("upstream_calls", 1)
+
         if detail_side_effect is not None:
             detail_mock = AsyncMock(side_effect=detail_side_effect)
         else:
-            detail_mock = AsyncMock(return_value=slots_detail or [])
+            async def _detail(*_args, **kwargs):
+                _stamp_provenance(kwargs)
+                return slots_detail or []
+
+            detail_mock = AsyncMock(side_effect=_detail)
         if counts_outcome is None:
-            counts_mock = AsyncMock(return_value=counts or (0, 0))
+            async def _counts_ok(*_args, **kwargs):
+                _stamp_provenance(kwargs)
+                return counts or (0, 0)
+
+            counts_mock = AsyncMock(side_effect=_counts_ok)
         else:
             async def _counts(*_args, **kwargs):
+                _stamp_provenance(kwargs)
                 out = kwargs.get("status_out")
                 if isinstance(out, dict):
                     out.update(counts_outcome)
@@ -1190,7 +1217,8 @@ async def test_new_capacity_fields_are_additive_and_versioned():
     # v6 (LP-0MW1VVIPG008896N): additive ``slots_stale_reason``.
     # v7 (LP-0MW1VDZIX0011D8M): ``available_slots`` derived from ``slots[]``,
     # ``availability_unknown`` and the additive ``unknown`` capacity hint.
-    assert j["status_schema_version"] == 7
+    # v8 (LP-0MVVXGM54009TOXD): age-derived ``slots_stale``.
+    assert j["status_schema_version"] == 8
     assert j["capacity_hint"] in (
         "idle",
         "prefill_bound",
@@ -1779,7 +1807,14 @@ async def test_stale_summary_never_asserts_availability(
     counts_outcome, use_detail_cache, stale_counts, expect_slots_stale
 ):
     """AC3: for any staleness/staleness-reason combination, a stale payload
-    asserts no availability and never contradicts the detail it serves."""
+    asserts no availability and never contradicts the detail it serves.
+
+    Under the age-derived definition (LP-0MVVXGM54009TOXD) "served from
+    cache" is not itself staleness: a cache entry is stale when its snapshot
+    is older than the freshness ceiling. The cache-served rows therefore seed
+    a snapshot age past the default 300 s ceiling, and the payload must still
+    withhold availability.
+    """
     import time as _time
     from unittest.mock import patch as _patch
 
@@ -1790,12 +1825,19 @@ async def test_stale_summary_never_asserts_availability(
     }
     if use_detail_cache:
         kwargs["stale_cache"] = cached
+    stale_stamp = _time.monotonic() - 400.0  # past the derived 300 s ceiling
     if stale_counts:
-        # A fresh last-known counts cache makes the failed counts query
-        # degrade to cached counts (counts_stale=true) instead of 0/0.
+        # An over-age last-known counts cache makes the failed counts query
+        # degrade to cached counts (counts_stale=true) instead of 0/0, and the
+        # served snapshot is genuinely stale.
         with _patch(
             "proxy.observability._last_slot_counts_cache",
-            (2, 2, _time.monotonic()),
+            (2, 2, stale_stamp),
+        ):
+            j = await _CapacityStatusHarness().get(**kwargs)
+    elif use_detail_cache:
+        with _patch(
+            "proxy.observability._last_slot_details_at", stale_stamp
         ):
             j = await _CapacityStatusHarness().get(**kwargs)
     else:
@@ -1844,7 +1886,16 @@ async def test_counts_stale_with_fresh_detail_never_serves_cached_availability()
     # Cache paths are disclosed independently and keep their meaning.
     assert j["slot_counts_stale"] is True
     assert j["slots_detail_stale"] is False
-    assert j["slots_stale"] is True
+    # The age-derived definition (LP-0MVVXGM54009TOXD): the counts cache entry
+    # was fetched moments ago, so the served snapshot is inside the ceiling and
+    # the surface is NOT stale — even though a phase was served from cache.
+    # That is exactly the semantic the change introduces; the staleness
+    # observable is the published ``slots_snapshot_age_seconds``.
+    assert j["slots_stale"] is False
+    assert j["slots_snapshot_age_seconds"] is not None
+    assert (
+        j["slots_snapshot_age_seconds"] <= j["slots_max_snapshot_age_seconds"]
+    )
 
     # The cached ``available_slots=1`` is not served: a cache-served counts
     # pair cannot assert free capacity, so availability is withheld.
@@ -2043,7 +2094,7 @@ async def test_endpoint_wide_entry_annotates_the_draining_slot(
         slots_detail=[_slot(1, is_processing=True, n_decoded=7)],
     )
 
-    assert j["status_schema_version"] == 7
+    assert j["status_schema_version"] == 8
     assert j["capacity_hint"] == "abandoned_busy"
     assert j["capacity_hint"] != "saturated"
     assert j["capacity_hint"] != "idle"
@@ -2220,7 +2271,7 @@ class TestLocalRouteAvailability:
             config=_route_config(), current_model="Qwen3"
         )
 
-        assert j["status_schema_version"] == 7
+        assert j["status_schema_version"] == 8
         assert j["local_route_available"] is True
         assert j["local_route_reason"] is None
         # ``None`` — a fabricated ``0`` would read as "armed and expiring now".
@@ -2352,7 +2403,7 @@ class TestLocalRouteAvailability:
         """AC10b: a config with no resolvable local entry stays well-formed."""
         j = await _CapacityStatusHarness().get(config=_route_config(with_models=False))
 
-        assert j["status_schema_version"] == 7
+        assert j["status_schema_version"] == 8
         assert j["local_route_available"] is True
         assert j["local_route_reason"] is None
         assert j["local_route_cooldown_remaining_s"] is None
@@ -2648,14 +2699,17 @@ async def test_status_handler_within_budget_when_slots_never_answers():
 #
 # Once the poll path serves a warm shared snapshot by design, "served from
 # cache" is true for almost every poll and ``slots_stale`` must stop meaning
-# that. The contract: ``slots_stale`` = served-snapshot-age >
-# ``SLOTS_SNAPSHOT_MAX_AGE_SECONDS`` (missing snapshot ⇒ stale), with the age
-# published on the payload. The pre-fix path derives the flag from cache use,
-# so the ``< budget`` / ``== budget`` / missing-snapshot rows are red against
-# dev. The shared-snapshot stamp (``observability._last_slot_details_at``, the
-# F4-reused stamp) is seeded and the clock frozen so the served age is exact;
-# the fresh /slots query is made to fail so the poll is served from the seeded
-# snapshot (F4's serve-on-refresh-failure path).
+# that. The contract (LP-0MVVXGM54009TOXD, producer decision 2026-11-05 option A):
+# ``slots_stale`` = served-snapshot-age > the delivered ceiling
+# (``local_slots_max_snapshot_age_seconds`` / published
+# ``slots_max_snapshot_age_seconds``), missing snapshot ⇒ stale, with the age
+# published on the payload. The shared-snapshot stamp
+# (``observability._last_slot_details_at``, the F4-reused stamp) is seeded and
+# the clock frozen so the served age is exact; the fresh /slots query is made
+# to fail so the poll is served from the seeded snapshot (F4's
+# serve-on-refresh-failure path). The ceiling is configured to the table's
+# budget: the delivered default is ~300 s, and this item must not re-tune it
+# (the value question belongs to the parent's F6 decision).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SNAPSHOT_AGE_BUDGET = 2.0
@@ -2667,50 +2721,10 @@ _AGE_SNAPSHOT_SLOTS = [
 @pytest.mark.parametrize(
     "seeded_age,has_snapshot,expected_stale",
     [
-        pytest.param(
-            1.0,
-            True,
-            False,
-            id="age_lt_budget",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "LP-0MVVXGHHB0073W1B red-first (AC1): pre-fix slots_stale is a "
-                    "cache-use flag (True whenever the detail cache is served), so an "
-                    "age-fresh snapshot still reports stale; F4 derives it from the "
-                    "snapshot age — remove the xfail when it lands."
-                ),
-            ),
-        ),
-        pytest.param(
-            2.0,
-            True,
-            False,
-            id="age_eq_budget",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "LP-0MVVXGHHB0073W1B red-first (AC1): see age_lt_budget; "
-                    "age == budget must not be stale (F4 AC1) — remove the xfail "
-                    "when it lands."
-                ),
-            ),
-        ),
+        pytest.param(1.0, True, False, id="age_lt_budget"),
+        pytest.param(2.0, True, False, id="age_eq_budget"),
         pytest.param(3.0, True, True, id="age_gt_budget"),
-        pytest.param(
-            None,
-            False,
-            True,
-            id="missing_snapshot",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "LP-0MVVXGHHB0073W1B red-first (AC1): pre-fix an absent snapshot "
-                    "reports slots_stale=false (fail-open on the pool); F4 defines "
-                    "missing ⇒ stale — remove the xfail when it lands."
-                ),
-            ),
-        ),
+        pytest.param(None, False, True, id="missing_snapshot"),
     ],
 )
 @pytest.mark.asyncio
@@ -2732,6 +2746,14 @@ async def test_slots_stale_follows_snapshot_age(
                     stale_cache=_AGE_SNAPSHOT_SLOTS if has_snapshot else None,
                     counts=(0, 0),
                     counts_outcome={"status": 500, "reason": "http_500"},
+                    config={
+                        "server": {
+                            "llama_server_port": 8080,
+                            "local_slots_max_snapshot_age_seconds": (
+                                _SNAPSHOT_AGE_BUDGET
+                            ),
+                        }
+                    },
                 )
 
     assert j["slots_stale"] is expected_stale, (
@@ -2739,13 +2761,23 @@ async def test_slots_stale_follows_snapshot_age(
         f"{_SNAPSHOT_AGE_BUDGET}s: slots_stale must be {expected_stale!r}, got "
         f"{j['slots_stale']!r}"
     )
+    if expected_stale:
+        # The reason vocabulary is unchanged and must never contradict the
+        # flag; a fresh snapshot inside the ceiling publishes ``null``.
+        assert j["slots_stale_reason"] is not None or not has_snapshot
+    else:
+        assert j["slots_stale_reason"] is None
     # The published age (F4 AC1) must match the snapshot that was served.
-    published = j.get("slot_snapshot_age_seconds")
-    if published is not None and seeded_age is not None:
-        assert abs(published - seeded_age) <= 0.05, (
-            f"published slot_snapshot_age_seconds {published} must match the "
+    published = j.get("slots_snapshot_age_seconds")
+    if seeded_age is None:
+        assert published is None
+    else:
+        assert published is not None and abs(published - seeded_age) <= 0.05, (
+            f"published slots_snapshot_age_seconds {published} must match the "
             f"seeded snapshot age {seeded_age}"
         )
+    # The ceiling the flag was judged against is published beside the age.
+    assert j["slots_max_snapshot_age_seconds"] == _SNAPSHOT_AGE_BUDGET
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

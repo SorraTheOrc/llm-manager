@@ -5,8 +5,11 @@ LP-0MUFSVXID0039ZAQ: when the fresh per-slot detail query fails
 back to ``_last_slot_details_cache`` so consumers (herdr) retain per-slot
 identity instead of receiving ``slots: []``.
 
-``slots_stale`` is set to true when served slot data came from cache,
-mirroring the count-based ``slots_stale`` behaviour (LP-0MSVP7XJ6008QPKX).
+``slots_stale`` is **age-derived** (LP-0MVVXGM54009TOXD): serving a cache
+entry inside the freshness ceiling is not staleness. These tests therefore
+assert the per-phase cache flags (``slot_counts_stale`` /
+``slots_detail_stale``) for the fallback, and ``slots_stale=false`` while the
+served snapshot is within the ceiling.
 """
 
 import os
@@ -21,6 +24,15 @@ import pytest
 # ======================================================================
 
 _LEGACY_SLOT_KEYS = ("slot_id", "is_processing", "n_decoded")
+
+#: Age seeded on the last-known detail cache. It is *inside* the derived 300 s
+#: ``local_slots_max_snapshot_age_seconds`` default, which is the honest shape
+#: for a transient phase failure: the snapshot is seconds old, so the
+#: age-derived ``slots_stale`` (LP-0MVVXGM54009TOXD) is false even though a
+#: phase was served from cache. ``slot_counts_stale`` / ``slots_detail_stale``
+#: keep disclosing the cache use; the over-age → stale case is pinned in
+#: ``test_slots_snapshot_ceiling.py``.
+_CACHE_SNAPSHOT_AGE_SECONDS = 2.0
 
 
 def _legacy_slots(slots):
@@ -74,12 +86,39 @@ class TestSlotsDetailCacheFallback:
         async def fake_query():
             return {"llama_server_running": True}
 
-        counts_mock = AsyncMock(return_value=slots_counts)
-        detail_mock = AsyncMock(
-            return_value=slots_detail, side_effect=slots_detail_side_effect
-        )
+        def _stamp_provenance(kwargs):
+            """Publish the fetch stamp the real helpers always record.
+
+            The age-derived ``slots_stale`` (LP-0MVVXGM54009TOXD) reads it; a
+            mock that leaves ``provenance_out`` empty makes every healthy poll
+            look undatable — and therefore stale.
+            """
+            prov = kwargs.get("provenance_out")
+            if isinstance(prov, dict):
+                prov.setdefault("source", "upstream")
+                prov.setdefault("fetched_at", time.monotonic())
+                prov.setdefault("upstream_calls", 1)
+
+        async def _counts(*_args, **kwargs):
+            _stamp_provenance(kwargs)
+            return slots_counts
+
+        async def _detail(*_args, **kwargs):
+            _stamp_provenance(kwargs)
+            if slots_detail_side_effect is not None:
+                raise slots_detail_side_effect
+            return slots_detail
+
+        counts_mock = AsyncMock(side_effect=_counts)
+        # Keep the declared tuple inspectable by tests that assert what the
+        # counts phase returned.
+        counts_mock.return_value = slots_counts
+        detail_mock = AsyncMock(side_effect=_detail)
         transport = httpx.ASGITransport(app=app)
-        with patch("proxy.server.query_llama_status", side_effect=fake_query):
+        cache_stamp = time.monotonic() - _CACHE_SNAPSHOT_AGE_SECONDS
+        with patch(
+            "proxy.server.query_llama_status", side_effect=fake_query
+        ), patch("proxy.observability._last_slot_details_at", cache_stamp):
             with patch.object(server, "current_model", current_model):
                 with patch.object(server, "model_switch_refcount", 0):
                     with patch.object(server, "model_switch_lock", _FakeLock()):
@@ -152,7 +191,9 @@ class TestSlotsDetailCacheFallback:
             cache_value=self._FAKE_SLOTS,
         )
         assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
-        assert j["slots_stale"] is True
+        assert j["slots_detail_stale"] is True
+        # Age-derived ``slots_stale``: the served snapshot is 2 s old.
+        assert j["slots_stale"] is False
 
     @pytest.mark.asyncio
     async def test_slots_detail_failure_serves_cached_with_fresh_counts(self):
@@ -163,7 +204,8 @@ class TestSlotsDetailCacheFallback:
             cache_value=self._FAKE_SLOTS,
         )
         assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
-        assert j["slots_stale"] is True
+        assert j["slots_detail_stale"] is True
+        assert j["slots_stale"] is False
 
     @pytest.mark.asyncio
     async def test_slots_detail_failure_empty_cache_returns_empty(self):
@@ -196,7 +238,8 @@ class TestSlotsDetailCacheFallback:
             cache_value=self._FAKE_SLOTS,
         )
         assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
-        assert j["slots_stale"] is True
+        assert j["slots_detail_stale"] is True
+        assert j["slots_stale"] is False
 
     @pytest.mark.asyncio
     async def test_slots_detail_exception_serves_cached(self):
@@ -207,7 +250,8 @@ class TestSlotsDetailCacheFallback:
             cache_value=self._FAKE_SLOTS,
         )
         assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
-        assert j["slots_stale"] is True
+        assert j["slots_detail_stale"] is True
+        assert j["slots_stale"] is False
 
     @pytest.mark.asyncio
     async def test_slots_detail_preserves_cache_content(self):
@@ -228,29 +272,37 @@ class TestSlotsDetailCacheFallback:
         assert "phase" in j["slots"][0]
 
     @pytest.mark.asyncio
-    async def test_slots_stale_true_when_both_counts_and_detail_from_cache(self):
-        """When both counts AND detail come from cache, slots_stale is True."""
+    async def test_cache_served_detail_is_disclosed_without_staleness(self):
+        """A cache-served detail phase is disclosed, but is not staleness.
+
+        The served snapshot is 2 s old, inside the freshness ceiling, so the
+        age-derived ``slots_stale`` is false while ``slots_detail_stale``
+        still tells a consumer the phase came from the last-known cache
+        (LP-0MVVXGM54009TOXD).
+        """
         j, detail_mock, counts_mock = await self._get(
             slots_counts=(0, 0),
             slots_detail=[],
             cache_value=self._FAKE_SLOTS,
         )
-        assert j["slots_stale"] is True
+        assert j["slots_detail_stale"] is True
+        assert j["slots_stale"] is False
         assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
-        # Counts were from cache too (total_slots=0 from fresh query)
+        # Counts were from the fresh query (which returned 0/0)
         assert counts_mock.return_value == (0, 0)
 
     @pytest.mark.asyncio
     async def test_slots_detail_cached_when_counts_fresh(self):
-        """When counts are fresh but detail fails, slots_stale is True."""
+        """When counts are fresh but detail falls back, the fallback is disclosed."""
         j, detail_mock, counts_mock = await self._get(
             slots_counts=(2, 3),
             slots_detail=[],
             cache_value=self._FAKE_SLOTS,
         )
         assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
-        assert j["slots_stale"] is True
-        # Counts were fresh — the stale flag is driven by detail cache hit
+        assert j["slots_detail_stale"] is True
+        assert j["slots_stale"] is False
+        # Counts were fresh — the fallback is driven by the detail cache hit
         assert counts_mock.return_value == (2, 3)
 
 
@@ -274,11 +326,33 @@ class TestSlotsDetailResponseBudget:
         async def fake_query():
             return {"llama_server_running": True}
 
-        detail_mock = AsyncMock(side_effect=detail_side_effect)
-        counts_mock = AsyncMock(return_value=(0, 0))
+        def _stamp_provenance(kwargs):
+            prov = kwargs.get("provenance_out")
+            if isinstance(prov, dict):
+                prov.setdefault("source", "upstream")
+                prov.setdefault("fetched_at", time.monotonic())
+                prov.setdefault("upstream_calls", 1)
+
+        async def _counts(*_args, **kwargs):
+            _stamp_provenance(kwargs)
+            return (0, 0)
+
+        async def _detail(*_args, **kwargs):
+            _stamp_provenance(kwargs)
+            if detail_side_effect is not None:
+                raise detail_side_effect
+            return []
+
+        detail_mock = AsyncMock(side_effect=_detail)
+        counts_mock = AsyncMock(side_effect=_counts)
         transport = httpx.ASGITransport(app=app)
         with patch.dict(os.environ, {"STATUS_QUERY_TIMEOUT": timeout_env}):
-            with patch("proxy.server.query_llama_status", side_effect=fake_query):
+            with patch(
+                "proxy.server.query_llama_status", side_effect=fake_query
+            ), patch(
+                "proxy.observability._last_slot_details_at",
+                time.monotonic() - _CACHE_SNAPSHOT_AGE_SECONDS,
+            ):
                 with patch.object(server, "current_model", "test-model"):
                     with patch.object(server, "model_switch_refcount", 0):
                         with patch.object(server, "model_switch_lock", _FakeLock()):
@@ -337,7 +411,7 @@ class TestSlotsDetailResponseBudget:
             cache_value=self._CACHED_SLOTS,
         )
         assert resp.status_code == 200
-        assert resp.json()["slots_stale"] is True
+        assert resp.json()["slots_detail_stale"] is True
         # No new I/O on the fallback path; allow generous CI headroom.
         assert elapsed < 1.0
 
@@ -390,7 +464,9 @@ class TestStaleVariantsNeverSaturatedWithoutLiveWork(TestSlotsDetailCacheFallbac
             slots_detail_side_effect=detail_side_effect,
             cache_value=cache,
         )
-        assert j["slots_stale"] is True, f"variant {variant_id} must serve a stale flag"
+        assert j["slots_detail_stale"] is True, (
+            f"variant {variant_id} must disclose the cache-served detail phase"
+        )
         assert j["local_in_flight_requests"] == 0, (
             f"variant {variant_id} must run with no live local work"
         )

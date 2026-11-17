@@ -72,13 +72,26 @@ its name-encoded hour, ``scripts/lib/proxy_logs.py``).
           | grep 'status_request' | grep -c 'capacity_hint='
 
 ``slots_stale.count`` / ``slots_stale.rate``
-    Number of status polls whose line carries ``slots_stale=true``, and that
-    count divided by ``slots_stale.denominator`` = the number of polls that
-    carry the ``slots_stale`` field at all (``status_schema_version >= 2``;
-    schema 1 polls have no such field and are excluded from the rate rather
-    than counted as fresh). ``slots_stale`` keeps its documented meaning: the
-    counts *or* the per-slot detail were served from cache
-    (``proxy/docs/per-slot-status-verification.md``).
+    Number of status polls whose served snapshot was stale, and that count
+    divided by ``slots_stale.denominator`` = the number of eligible polls. A
+    poll is **stale** when the snapshot it was served from is older than the
+    delivered ceiling (``slots_snapshot_age_seconds`` >
+    ``slots_max_snapshot_age_seconds``) or when it could not date a snapshot at
+    all — the age-derived definition of LP-0MVVXGM54009TOXD, which replaced
+    "counts or detail came from cache" once the shared snapshot was served by
+    design. A pre-F1 line carries no age field: it is judged by the
+    ``slots_stale`` flag its own build published, so historical windows stay
+    readable and their denominators are unchanged. Schema 1 polls have no
+    ``slots_stale`` field and no age pair, and are excluded from the rate
+    rather than counted as fresh.
+
+``slots_stale_derivation``
+    Which definition produced the verdict above: ``derived_from_snapshot_age``
+    (polls judged from the age/ceiling pair), ``from_published_flag`` (pre-F1
+    polls judged by their own flag) and
+    ``disagreements_with_published_flag`` (polls that carry both and disagree —
+    the measured distance between the old cache-use flag and the delivered
+    definition on the same window).
 
 ``capacity_hint.histogram``
     Value of ``capacity_hint=<token>`` per status poll (``idle``,
@@ -325,6 +338,8 @@ from lib.capacity_signals import (  # noqa: E402
     per_phase_distribution,
     per_phase_fields,
     share,
+    slots_age_fields,
+    slots_stale_from_age,
     stale_flag,
     stale_rate,
     stale_rate_check,
@@ -544,6 +559,16 @@ def analyse_status_stream(
     # denominator rule lives in ``capacity_signals.tally_stale`` so the nightly
     # analyzer applies exactly the same one (LP-0MVU8O4EL005IYP9 AC1.1).
     stale_flags: list[bool | None] = []
+    # Which definition produced each poll's stale verdict (F4 AC5): the
+    # age-derived one wherever the line publishes the age/ceiling pair, the
+    # poll's own flag on a pre-F1 line. ``disagreements`` counts polls that
+    # carry both and disagree — the measure of how far the pre-change flag is
+    # from the delivered definition on the same window.
+    stale_derivation = {
+        "derived_from_snapshot_age": 0,
+        "from_published_flag": 0,
+        "disagreements_with_published_flag": 0,
+    }
     stale_by_source = {"detail_cache": 0, "counts_cache": 0, "unknown": 0}
     stale_by_latency_band: dict[str, int] = {band: 0 for band in LATENCY_BANDS}
     # Per-phase /slots read-path attribution (LP-0MVVXGHT1001I5YX, parent AC1
@@ -593,7 +618,24 @@ def analyse_status_stream(
                     hint = fields.get("capacity_hint")
                     live_work = has_live_local_work(fields)
                     hint_samples.append((hint, live_work))
-                    stale = stale_flag(fields)
+                    published = stale_flag(fields)
+                    # Report ``slots_stale`` from the delivered age-derived
+                    # definition (F4 of LP-0MVVCO1N7004TNGY, AC5): a poll that
+                    # publishes the age/ceiling pair is judged by it; a pre-F1
+                    # poll (no age field) keeps its own flag, so old-schema
+                    # windows are counted exactly as before.
+                    age_derived = slots_stale_from_age(slots_age_fields(line))
+                    stale = (
+                        age_derived if age_derived is not None else published
+                    )
+                    if age_derived is not None:
+                        stale_derivation["derived_from_snapshot_age"] += 1
+                        if published is not None and published != age_derived:
+                            stale_derivation[
+                                "disagreements_with_published_flag"
+                            ] += 1
+                    elif published is not None:
+                        stale_derivation["from_published_flag"] += 1
                     stale_flags.append(stale)
                     # Per-phase read-path attribution (additive, F2 of
                     # LP-0MVVCO1N7004TNGY): only polls that carry the
@@ -718,6 +760,10 @@ def analyse_status_stream(
             "denominator": slots_stale_denominator,
             "rate": stale_rate(slots_stale, slots_stale_denominator),
         },
+        # Which definition produced the verdict above (F4 AC5).
+        # ``slots_stale`` itself keeps its shape and meaning, so pre-change
+        # consumers of this JSON are unaffected.
+        "slots_stale_derivation": dict(stale_derivation),
         "slots_stale_attribution": {
             "by_source": dict(stale_by_source),
             "by_latency_band": dict(stale_by_latency_band),
@@ -1713,6 +1759,15 @@ def render(report: dict) -> str:
         f"{metrics['slots_stale']['denominator']} "
         f"({metrics['slots_stale']['rate']:.2%})",
     ]
+    derivation = metrics.get("slots_stale_derivation") or {}
+    if derivation:
+        out.append(
+            "  stale definition              : "
+            f"age-derived={derivation.get('derived_from_snapshot_age', 0)} "
+            f"published-flag={derivation.get('from_published_flag', 0)} "
+            "disagreements="
+            f"{derivation.get('disagreements_with_published_flag', 0)}"
+        )
     histogram = metrics["capacity_hint"]["histogram"]
     if histogram:
         rendered = ", ".join(

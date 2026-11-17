@@ -324,10 +324,18 @@ class TestBusyEngineBaseline:
             "a timed-out detail phase with a cached detail list must report "
             "slots_detail_stale=true"
         )
-        assert payload["slots_stale"] is True, (
-            "slots_stale is the union of both fallbacks; a degraded poll must "
-            "never read fresh"
+        # The per-phase flags above are the degradation evidence. ``slots_stale``
+        # is age-derived (LP-0MVVXGM54009TOXD): the served snapshot is 2 s old,
+        # inside the freshness ceiling, so serving a cache entry is NOT
+        # staleness — that conflation is exactly what the derivation change
+        # removes.
+        assert payload["slots_stale"] is False, (
+            "a cache-served snapshot inside the freshness ceiling is not stale"
         )
+        assert payload["slots_snapshot_age_seconds"] is not None
+        assert payload["slots_snapshot_age_seconds"] <= payload[
+            "slots_max_snapshot_age_seconds"
+        ]
         # LP-0MVVXGLTM008ROJ9: exactly ONE bounded upstream fetch serves both
         # phases (the detail phase reuses the counts phase's shared snapshot),
         # so the busy-engine degradation costs one attempt at the
@@ -411,7 +419,13 @@ class TestBusyEngineHttp500:
         stub = BusySlotsStub(delay=0.0, status=500)
         payload, _ = await call_local_status(stub=stub)
 
-        assert payload["slots_stale"] is True
+        # Age-derived ``slots_stale`` (LP-0MVVXGM54009TOXD): the seeded snapshot
+        # is inside the ceiling, so the surface is fresh even though both
+        # phases were served from cache. The degradation is still disclosed by
+        # ``slot_counts_stale`` / ``slots_detail_stale``.
+        assert payload["slots_stale"] is False
+        assert payload["slot_counts_stale"] is True
+        assert payload["slots_detail_stale"] is True
         # Last-known pool size survives the failure; availability is withheld
         # because a stale list cannot prove capacity.
         assert payload["total_slots"] == _DEFAULT_SEED_COUNTS[1]
@@ -474,7 +488,7 @@ class TestDetailPhaseFailureReason:
         assert after > before, "a detail-phase HTTP 500 must increment http_500"
         # AC1: the graceful-degradation contract is unchanged.
         assert payload["slots_detail_stale"] is True
-        assert payload["slots_stale"] is True
+        assert payload["slots_stale"] is False  # age-derived: cache ≠ stale
         assert len(payload["slots"]) == len(_DEFAULT_SEED_SLOTS)
         # AC3: provenance names the served snapshot and its age.
         assert payload["slots_snapshot_source"] == "snapshot"
@@ -497,7 +511,7 @@ class TestDetailPhaseFailureReason:
         assert after_500 == before_500, "a timeout must NOT be labelled http_500"
         # Same graceful-degradation payload shape as the 500 case.
         assert payload["slots_detail_stale"] is True
-        assert payload["slots_stale"] is True
+        assert payload["slots_stale"] is False  # age-derived: cache ≠ stale
         assert payload["slots_snapshot_source"] == "snapshot"
 
     @pytest.mark.asyncio

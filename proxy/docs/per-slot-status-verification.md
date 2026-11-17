@@ -51,14 +51,19 @@ Now:
   instead of 0/0, bounded by `SLOT_COUNTS_STALE_AFTER_SECONDS` (default
   3600s; env-configurable) so a genuinely-unavailable llama-server
   eventually fail-closes rather than serving stale capacity forever.
-- The payload and `status_request` log gain a `slots_stale` boolean that is
-  `true` whenever the served slot data (counts or per-slot detail) came from
-  the cache (vs a fresh query), so a future silent failure is observable.
+- The payload and `status_request` log gain a `slots_stale` boolean. Since
+  LP-0MVVXGM54009TOXD it reports the **freshness of the snapshot the poll was
+  served from** (see ["`slots_stale` measures snapshot age"](#slots_stale-measures-snapshot-age-lp-0mvvxgm54009toxd)),
+  not cache use: a cache-served snapshot inside the freshness ceiling is
+  fresh, and the per-source `slot_counts_stale` / `slots_detail_stale` flags
+  disclose the cache path.
 - Per-slot detail degrades the same way (LP-0MUFSVXID0039ZAQ): when the
   fresh `_query_slots_detail()` call fails or returns an empty list, the
   handler serves `_last_slot_details_cache` instead of `slots: []`, preserving
   herdr per-slot identity; an empty cache still yields a well-formed empty
-  array. A cached-detail response sets `slots_stale: true`.
+  array. A cached-detail response sets `slots_detail_stale: true` (and
+  `slots_stale: true` only once the served snapshot is past the freshness
+  ceiling).
 - Every failed query increments `llama_slots_query_failures_total{reason=...}`
   (Prometheus counter), alerting via `monitoring/slots_query_alerts.yaml`
   when the failure rate is sustained.
@@ -95,7 +100,7 @@ Now:
   copy** for enrichment, so log-derived fields can never poison the fallback
   cache. Both the periodic broadcast loop and the SSE `status_events()` path
   use it.
-- A status response served from the cache (`slots_stale: true`) therefore
+- A status response served from the cache (`slots_detail_stale: true`) therefore
   reports only genuine `/slots` values — never a log-derived `n_decoded`
   greater than the live value (AC5).
 - With a fresh log the override still works exactly as before (AC4), so the
@@ -159,11 +164,15 @@ discriminator and can annotate a draining slot from an **endpoint-wide**
 registry entry when the release could not resolve a slot identity
 (LP-0MVUVHB1V006HA5I / LP-0MVUVHAQP001IRKK). That is an additive widening of
 *which* abandonments are annotatable — no field is removed or reinterpreted, so
-the abandonment change kept `status_schema_version` at `4`. The payload version
-is now `5` (`LP-0MVWFKIKJ005XHAY` added the read-only `local_route_available` /
-`local_route_reason` / `local_route_cooldown_remaining_s` fields, see
-[routing.md](routing.md#the-published-route-fields-status_schema_version-5));
-every field described below is unchanged by that bump.
+the abandonment change kept `status_schema_version` at `4`. v5
+(`LP-0MVWFKIKJ005XHAY`) added the read-only `local_route_available` /
+`local_route_reason` / `local_route_cooldown_remaining_s` fields (see
+[routing.md](routing.md#the-published-route-fields-status_schema_version-5)),
+v6 added the enumerated `slots_stale_reason`, v7 derived `available_slots` from
+`slots[]` plus `availability_unknown`, and v8
+([`slots_stale` measures snapshot age](#slots_stale-measures-snapshot-age-lp-0mvvxgm54009toxd))
+redefined `slots_stale` as age-derived. No field described below is removed or
+renamed by those bumps.
 
 ## Payload (new fields)
 
@@ -435,11 +444,61 @@ busy snapshot served for hours while the GPU was idle, and the leaked
 `local_active_queries` counter kept `local_active_query` true. Both are now
 truthful.
 
+## `slots_stale` measures snapshot age (LP-0MVVXGM54009TOXD)
+
+`slots_stale` **changed meaning** in `status_schema_version: 8`. It used to be
+the union "counts **or** per-slot detail came from the last-known cache". Once
+the status path serves a warm shared `/slots` snapshot by design
+(LP-0MVVXGLTM008ROJ9) that condition is true for almost every poll, so it
+measured the read path rather than freshness. The published definition is now:
+
+> `slots_stale` is `true` **iff** the age of the snapshot the poll was served
+> from (`slots_snapshot_age_seconds`) exceeds the delivered ceiling
+> `slots_max_snapshot_age_seconds` (`local_slots_max_snapshot_age_seconds` /
+> `LOCAL_SLOTS_MAX_SNAPSHOT_AGE_SECONDS`), and `true` whenever the poll cannot
+> date a snapshot at all (nothing served, or a failed read that served no
+> cache). `age == ceiling` is still fresh; the age is stamped from the fetch
+> that produced the served payload on a monotonic clock and is never reset by
+> serving the cache again.
+
+Consequences a consumer must know:
+
+- **No new knob, no renamed field.** The ceiling is the one delivered by
+  LP-0MW1VVKPF001ZAV5; `slots_snapshot_age_seconds`, `slots_snapshot_source`,
+  `slot_counts_stale` and `slots_detail_stale` keep their names and meanings.
+- **`slots_stale_reason` never contradicts the flag.** The enumerated reason
+  (LP-0MW1VVIPG008896N) is `null` whenever `slots_stale` is `false` — a fresh
+  snapshot inside the ceiling publishes `slots_stale: false` **and**
+  `slots_stale_reason: null` even when a phase served a cache entry. The
+  vocabulary and precedence are unchanged (`snapshot_too_old` dominates), and
+  the forced `true` for `router_model_missing` is retained: the proxy holds no
+  live evidence at all in that state.
+- **A cache-served phase is not staleness.** Use `slot_counts_stale` /
+  `slots_detail_stale` to see *which* phase fell back to the last-known cache.
+  `capacity_hint` reconciliation still keys on `slots_detail_stale` only
+  (LP-0MVKSXR4P001V0CM), so the hint can never claim `saturated` from stale
+  detail while `local_in_flight_requests == 0`.
+- **A definitive "model not loaded" answer is fresh.** llama-server's HTTP
+  400/404 (or a resolver skip) is a live answer, not a missing snapshot: the
+  payload reports the configured pool and does not set `slots_stale`.
+- **Rates before and after the change are not comparable.** The field name is
+  unchanged but its meaning tightened, so judge any `slots_stale` target on
+  post-change windows only. `scripts/capacity_signal_verification.py`
+  re-derives the flag from the published age/ceiling pair when a line carries
+  them and falls back to the line's own flag for pre-F1 windows, so historical
+  windows stay readable; its `slots_stale_derivation` block reports which
+  definition produced each verdict and how many polls disagree.
+
+Pinned by `test_slots_stale_follows_snapshot_age` (the `<`/`==`/`>`/missing
+table), `TestSnapshotAgeIsMonotonic` (a frozen backend's age grows and crosses
+the ceiling) and the `/health` mirror (`slots_surface_status` reports `unknown`,
+never `stale`, when the backend is unreachable).
+
 ## Freshness honesty (AC7)
 
-`slots_stale` semantics are unchanged (counts **or** per-slot detail came from
-the last-known cache); the per-source flags `slot_counts_stale` and
-`slots_detail_stale` tell the two apart. When the served slot detail is stale,
+The per-source flags `slot_counts_stale` and `slots_detail_stale` disclose
+which phase was served from the last-known cache; `slots_stale` is the
+age-derived observable above. When the served slot detail is stale,
 **both per-slot and top-level ETA fields are `null`** — a dispatcher never acts
 on a stale wait estimate. `prefill_budget_seconds` is a configuration constant
 (not poll-derived) and stays truthful.

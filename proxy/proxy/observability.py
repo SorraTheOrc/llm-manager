@@ -754,6 +754,49 @@ def slots_snapshot_too_old(
     return age > ceiling
 
 
+def slots_snapshot_stale(
+    age_seconds: float | None, ceiling_seconds: float | None
+) -> bool:
+    """The published ``slots_stale`` observable (LP-0MVVXGM54009TOXD).
+
+    Once the status path serves a warm shared ``/slots`` snapshot by design,
+    "served from cache" is true for almost every poll and no longer measures
+    staleness. ``slots_stale`` therefore answers a different question: **can
+    this poll prove the snapshot it served is inside the freshness ceiling?**
+
+    * A datable snapshot at or below *ceiling_seconds* → ``False``. The
+      ceiling is the last acceptable age, so ``age == ceiling`` is fresh
+      (the same boundary as :func:`slots_snapshot_too_old`).
+    * An age above the ceiling → ``True``.
+    * No datable age (``None``/NaN: no snapshot at all, or one whose fetch
+      stamp was never recorded) → ``True``. This is deliberately stricter
+      than :func:`slots_snapshot_too_old`, which only *withholds* a served
+      list: absence of evidence is not evidence of freshness for the metric,
+      so a poll that cannot date its snapshot is reported stale.
+    * An unusable ceiling with a known age → ``False`` (fail-open). A
+      misconfigured bound must not fabricate staleness on every poll; the
+      ceiling resolver already falls back to a default for this reason.
+
+    ``slot_counts_stale`` / ``slots_detail_stale`` keep their own meaning (a
+    phase was served from the last-known cache) and are untouched by this
+    derivation, so ``capacity_hint`` reconciliation still keys on
+    ``slots_detail_stale``.
+    """
+    try:
+        age = None if age_seconds is None else float(age_seconds)
+    except (TypeError, ValueError):
+        age = None
+    if age is None or age != age:  # absent or NaN: no datable snapshot
+        return True
+    try:
+        ceiling = None if ceiling_seconds is None else float(ceiling_seconds)
+    except (TypeError, ValueError):
+        ceiling = None
+    if ceiling is None or ceiling != ceiling:  # unprovable bound: fail open
+        return False
+    return age > ceiling
+
+
 SLOTS_SURFACE_OK = "ok"
 SLOTS_SURFACE_STALE = "stale"
 SLOTS_SURFACE_UNKNOWN = "unknown"
@@ -1619,6 +1662,18 @@ async def _read_slots_snapshot(
     cached = _slots_poll_cache.get(url)
     if cached is not None and cached[1] == status and cached[2] is payload:
         fetched_at = cached[0]
+    # Publish the landing fetch's stamp (LP-0MW1VVGHT1001I5YX): the pre-await
+    # note above records ``fetched_at=None`` because nothing had landed yet.
+    # Without this, the poll that *performs* the fetch reports an undatable
+    # snapshot, which the age-derived ``slots_stale``
+    # (LP-0MVVXGM54009TOXD) would have to call stale even though the data is
+    # seconds old.
+    _note_slots_provenance(
+        provenance_out,
+        source="upstream",
+        fetched_at=fetched_at,
+        upstream_calls=calls,
+    )
     return _snapshot_from_payload(
         status,
         payload,

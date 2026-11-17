@@ -26,6 +26,7 @@ from proxy.observability import (
     SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED,
     SLOTS_STALE_REASON_ROUTER_MODEL_MISSING,
     slots_read_scope,
+    slots_snapshot_stale,
 )
 from proxy.provider import clear_usage_limit_quarantine, get_model_type
 
@@ -533,17 +534,23 @@ async def get_llama_local_status(request: Request):
     query fails (e.g. HTTP 500 while the model reloads after a cheap-mode
     restart), the last known slot counts are served instead of 0/0
     (graceful degradation, LP-0MSVP7XJ6008QPKX), bounded by
-    ``SLOT_COUNTS_STALE_AFTER_SECONDS`` (default 1h). ``slots_stale`` is
-    ``true`` whenever the served slot data came from that cache rather than
-    a fresh query — counts or per-slot detail — so a future silent failure
-    (worker alive but zero dispatches across an idle window) is observable.
-    The two sources are also published separately:
-    ``slot_counts_stale`` and ``slots_detail_stale``. Only the detail matters
-    for the capacity *hint*: a cached ``is_processing``/``phase`` is a fossil
-    of a past request, so a hint derived from it is reconciled with live proxy
-    state (see ``capacity_hint`` below, LP-0MVKSXR4P001V0CM AC3). The counts
-    pair feeds ``available_slots`` only when both reads are fresh; a
-    cache-served counts pair is withheld (see above).
+    ``SLOT_COUNTS_STALE_AFTER_SECONDS`` (default 1h). ``slots_stale`` reports
+    the **freshness of the snapshot the poll was served from**
+    (LP-0MVVXGM54009TOXD, ``status_schema_version: 8``): it is ``true`` iff the
+    published ``slots_snapshot_age_seconds`` exceeds the delivered ceiling
+    ``slots_max_snapshot_age_seconds`` (``local_slots_max_snapshot_age_seconds``
+    / ``LOCAL_SLOTS_MAX_SNAPSHOT_AGE_SECONDS``), and ``true`` whenever the
+    poll cannot date a snapshot at all (nothing served, or no fetch stamp).
+    It is no longer "served from cache": once the shared snapshot is served
+    by design that condition held for almost every poll and said nothing
+    about freshness. The two cache paths are still published separately:
+    ``slot_counts_stale`` and ``slots_detail_stale`` (a phase was served from
+    the last-known cache). Only the detail matters for the capacity *hint*: a
+    cached ``is_processing``/``phase`` is a fossil of a past request, so a
+    hint derived from it is reconciled with live proxy state (see
+    ``capacity_hint`` below, LP-0MVKSXR4P001V0CM AC3). The counts pair feeds
+    ``available_slots`` only when both reads are fresh; a cache-served counts
+    pair is withheld (see above).
 
     ``slots`` carries the per-slot details (``slot_id``, ``is_processing``,
     ``n_decoded``) from llama-server's ``/slots`` endpoint so consumers such
@@ -742,6 +749,11 @@ async def get_llama_local_status(request: Request):
     # must be reconciled with live proxy state (LP-0MVKSXR4P001V0CM AC3).
     counts_stale = False
     detail_stale = False
+    # A definitive "the model is not loaded" answer from llama-server's router
+    # (HTTP 400/404, or a resolver skip). That is fresh, live evidence — not a
+    # missing snapshot — so it must never be reported stale
+    # (LP-0MVVXGM54009TOXD AC1).
+    model_absent = False
     # Per-phase read-path instrumentation (LP-0MVVXGHT1001I5YX): each phase's
     # elapsed time and provenance are published additively on the status_request
     # line so a stale (> budget) poll can be attributed to a phase instead of
@@ -755,6 +767,11 @@ async def get_llama_local_status(request: Request):
     slots_snapshot_age_seconds: float | None = None
     counts_provenance: dict = {}
     detail_provenance: dict = {}
+    # Fresh-read outcomes (``{"status", "reason"}``), initialised here so the
+    # snapshot-age derivation below can tell a read that produced a payload
+    # (even an empty one) from one that produced nothing.
+    counts_outcome: dict = {}
+    detail_outcome: dict = {}
     # Enumerated reason contributed by the shared /slots target resolver
     # (LP-0MW1VVIPG008896N): ``child_port_undiscovered`` when router mode had
     # to fall back to the router port, ``router_model_missing`` when model-id
@@ -1041,6 +1058,33 @@ async def get_llama_local_status(request: Request):
                 )
                 break
 
+    # AC3 (LP-0MVVXGM54009TOXD): the published age describes the payload this
+    # poll was served from, so it must come from a fetch that produced one (or
+    # from the cache stamp of a snapshot that was actually served). A read that
+    # failed and served nothing — no fresh payload, no cache, no definitive
+    # model-absent answer — produced no snapshot at all: publishing its attempt
+    # stamp as an age would make an empty surface look datable, and the
+    # age-derived ``slots_stale`` would then call a poll with no evidence
+    # fresh. Leaving the age ``None`` reports it as a missing snapshot instead.
+    _counts_out = counts_outcome if isinstance(counts_outcome, dict) else {}
+    _detail_out = detail_outcome if isinstance(detail_outcome, dict) else {}
+    _counts_prov = counts_provenance if isinstance(counts_provenance, dict) else {}
+    _detail_prov = detail_provenance if isinstance(detail_provenance, dict) else {}
+    _read_failed = bool(_counts_out.get("reason") or _detail_out.get("reason"))
+    _served_a_payload = (
+        bool(slots)
+        or counts_stale
+        or detail_stale
+        or model_absent
+        # A cache hit serves a dated payload even when that payload is a
+        # failure (``failure_backoff``) or an unexpired older result
+        # (``ttl_cache``): the age is real, so it is not a missing snapshot.
+        or _counts_prov.get("source") in ("ttl_cache", "failure_backoff")
+        or _detail_prov.get("source") in ("ttl_cache", "failure_backoff")
+    )
+    if _read_failed and not _served_a_payload:
+        slots_snapshot_age_seconds = None
+
     # -- snapshot age ceiling (LP-0MW1VVKPF001ZAV5) --------------------------
     # The 2026-11-04 defect: ``slots_snapshot_age_seconds`` was published
     # (29825.67) but never enforced, so an 8 h 17 m-old snapshot was served
@@ -1053,6 +1097,7 @@ async def get_llama_local_status(request: Request):
     # restart.
     slots_max_snapshot_age_seconds = None
     slots_snapshot_too_old = False
+    slots_snapshot_age_exceeded = False
     try:
         from proxy.observability import (
             local_slots_max_snapshot_age_seconds,
@@ -1064,10 +1109,16 @@ async def get_llama_local_status(request: Request):
         slots_max_snapshot_age_seconds = local_slots_max_snapshot_age_seconds(
             srv.config if isinstance(getattr(srv, "config", None), dict) else {}
         )
+        # ``slots_snapshot_age_exceeded`` is the age-only judgement, used for
+        # the published ``slots_stale`` derivation and its reason. Withholding
+        # the list stays gated on the cache-served path
+        # (``slots_snapshot_too_old``, unchanged), so the availability
+        # safeguards of LP-0MW1VVKPF001ZAV5 keep their exact scope.
+        slots_snapshot_age_exceeded = _snapshot_too_old(
+            slots_snapshot_age_seconds, slots_max_snapshot_age_seconds
+        )
         if slots_snapshot_source == "snapshot":
-            slots_snapshot_too_old = _snapshot_too_old(
-                slots_snapshot_age_seconds, slots_max_snapshot_age_seconds
-            )
+            slots_snapshot_too_old = slots_snapshot_age_exceeded
     except Exception:
         # Fail-open: a ceiling-resolution fault must not break the endpoint,
         # and must not withhold a snapshot on a guess.
@@ -1384,14 +1435,33 @@ async def get_llama_local_status(request: Request):
 
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
-    # ``slots_stale`` keeps its documented meaning (counts OR detail served
-    # from cache) for existing consumers; the per-source flags are published
-    # alongside it so an operator can tell a count fallback from a capacity
-    # view built on cached slot detail.
-    slots_stale = counts_stale or detail_stale
+    # ``slots_stale`` measures staleness, not cache use (LP-0MVVXGM54009TOXD,
+    # producer decision 2026-11-05 option A). Once the status path serves a
+    # warm shared snapshot by design, "served from cache" holds for almost
+    # every poll and says nothing about freshness; the observable is instead
+    # the age of the snapshot this poll was served from against the delivered
+    # ceiling (``local_slots_max_snapshot_age_seconds``:
+    # ``slots_max_snapshot_age_seconds`` here). A poll that cannot date its
+    # snapshot (no snapshot at all, or a fetch stamp that was never recorded)
+    # cannot prove freshness and is stale — never the reverse.
+    # ``slot_counts_stale`` / ``slots_detail_stale`` keep their meaning and
+    # are still published beside it (the latter alone drives the
+    # ``capacity_hint`` reconciliation).
+    slots_stale = slots_snapshot_stale(
+        slots_snapshot_age_seconds, slots_max_snapshot_age_seconds
+    )
+    if model_absent and not counts_stale and not detail_stale:
+        # llama-server definitively answered "this model is not loaded" (or
+        # the resolver skipped it): the poll reports the configured pool from
+        # a live answer, not from a snapshot, so there is nothing stale to
+        # serve. Treating it as a missing snapshot would mark every ordinary
+        # idle/unloaded window stale.
+        slots_stale = False
     if slots_resolver_reason == SLOTS_STALE_REASON_ROUTER_MODEL_MISSING:
         # The proxy could not name the model it is observing, so it holds no
         # live evidence about the slot surface at all (2026-11-04 shape).
+        # Retained under the age-derived definition: no live evidence can be
+        # inside a freshness ceiling.
         slots_stale = True
     # Enumerated staleness reason (LP-0MW1VVIPG008896N): a bare boolean forced
     # an operator to decode /metrics counter labels to learn *why* the surface
@@ -1402,29 +1472,35 @@ async def get_llama_local_status(request: Request):
     # is the failure the shared /slots target resolver observed this poll
     # (``child_port_undiscovered`` / ``router_model_missing``); the transport
     # reasons arrive through the recorder inside the fetch helpers.
+    #
+    # The reason is gated on ``slots_stale``: a fresh snapshot inside the
+    # ceiling yields ``slots_stale=false`` AND ``slots_stale_reason=null`` even
+    # when a phase served a cache entry (the behaviour this change fixes), so
+    # the two fields can never contradict each other.
     slots_stale_reason = None
-    try:
-        from proxy.observability import (
-            last_slots_stale_reason,
-            select_slots_stale_reason,
-        )
+    if slots_stale:
+        try:
+            from proxy.observability import (
+                last_slots_stale_reason,
+                select_slots_stale_reason,
+            )
 
-        slots_stale_reason = select_slots_stale_reason(
-            detail_reason=last_slots_stale_reason(),
-            counts_reason=None,
-            # An over-age snapshot dominates every transport reason: it is the
-            # condition a consumer must act on regardless of why the last
-            # fetch failed (LP-0MW1VVKPF001ZAV5).
-            snapshot_too_old=slots_snapshot_too_old,
-        )
-    except Exception:
-        # Fail-open: a recorder/evaluator fault publishes ``None`` rather than
-        # breaking the status endpoint.
-        slots_stale_reason = None
-    if slots_resolver_reason is not None:
-        # The resolver's own failure (child port undiscovered, model id
-        # unusable) is more specific than a generic transport error.
-        slots_stale_reason = slots_resolver_reason
+            slots_stale_reason = select_slots_stale_reason(
+                detail_reason=last_slots_stale_reason(),
+                counts_reason=None,
+                # An over-age snapshot dominates every transport reason: it is
+                # the condition a consumer must act on regardless of why the
+                # last fetch failed (LP-0MW1VVKPF001ZAV5).
+                snapshot_too_old=slots_snapshot_age_exceeded,
+            )
+        except Exception:
+            # Fail-open: a recorder/evaluator fault publishes ``None`` rather
+            # than breaking the status endpoint.
+            slots_stale_reason = None
+        if slots_resolver_reason is not None:
+            # The resolver's own failure (child port undiscovered, model id
+            # unusable) is more specific than a generic transport error.
+            slots_stale_reason = slots_resolver_reason
     # Publish the resolved reason into the shared recorder so ``/health``
     # reports exactly what this endpoint reports (LP-0MW1VVMI1005XU0J AC3:
     # one evaluation, one answer). A healthy poll clears it.
@@ -1521,7 +1597,7 @@ async def get_llama_local_status(request: Request):
         "local_route_failure_count": local_route.get(
             "local_route_failure_count", 0
         ),
-        "status_schema_version": 7,
+        "status_schema_version": 8,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -1539,21 +1615,28 @@ async def get_llama_local_status(request: Request):
         "available_slots": available_slots,
         "availability_unknown": bool(availability_unknown),
         "total_slots": total_slots,
-        # True when the served slot data (counts or per-slot detail) came from
-        # the last-known cache because the fresh /slots query failed
-        # (LP-0MSVP7XJ6008QPKX, LP-0MUFSVXID0039ZAQ). Additive field;
-        # consumers that ignore unknown fields are unaffected.
+        # Freshness of the snapshot this poll was served from
+        # (LP-0MVVXGM54009TOXD): true iff ``slots_snapshot_age_seconds`` exceeds
+        # ``slots_max_snapshot_age_seconds``, or no snapshot could be dated at
+        # all. No longer "served from cache" — that condition holds for almost
+        # every poll once the shared snapshot is served by design and says
+        # nothing about freshness. Consumers that ignore unknown fields are
+        # unaffected; consumers that compared pre-change rates must not (the
+        # meaning tightened, the name did not change).
         "slots_stale": bool(slots_stale),
-        # Per-source freshness (LP-0MVKSXR4P001V0CM AC3): ``slots_stale`` is
-        # the union below; ``slots_detail_stale`` is the one that matters for
+        # Per-source cache freshness (LP-0MVKSXR4P001V0CM AC3) — a *different*
+        # question from ``slots_stale``: the phase was served from the
+        # last-known cache. ``slots_detail_stale`` is the one that matters for
         # ``capacity_hint`` (cached ``is_processing``/``phase`` are not live
         # evidence) and ``slot_counts_stale`` only affects the counts.
         "slots_detail_stale": bool(detail_stale),
         "slot_counts_stale": bool(counts_stale),
         # Enumerated, machine-readable cause of ``slots_stale``
         # (LP-0MW1VVIPG008896N): one of ``SLOTS_STALE_REASONS``, or ``None``
-        # when the surface is fresh. Additive field; consumers that ignore it
-        # behave exactly as before. Treat an unrecognised value as stale.
+        # when the surface is fresh — and now always ``None`` when
+        # ``slots_stale`` is ``false``, so the pair cannot contradict itself.
+        # Additive field; consumers that ignore it behave exactly as before.
+        # Treat an unrecognised value as stale.
         "slots_stale_reason": slots_stale_reason,
         # The applied snapshot-age ceiling (LP-0MW1VVKPF001ZAV5): published so
         # a consumer can judge ``slots_snapshot_age_seconds`` against it
@@ -1665,7 +1748,13 @@ async def get_llama_local_status(request: Request):
         # ``capacity_hint`` gains the additive ``unknown`` value in that case,
         # and ``local_idle_seconds`` is held at ``0`` while any slot reports
         # ``is_processing: true``.
-        "status_schema_version": 7,
+        # v8 (LP-0MVVXGM54009TOXD): ``slots_stale`` is DERIVED from the served
+        # snapshot's age against ``slots_max_snapshot_age_seconds`` (missing
+        # snapshot ⇒ stale) instead of "counts or detail came from cache", and
+        # ``slots_stale_reason`` is ``null`` whenever ``slots_stale`` is
+        # ``false``. No field is renamed or removed: the age, source, ceiling
+        # and per-source flags keep their names and meanings.
+        "status_schema_version": 8,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local
