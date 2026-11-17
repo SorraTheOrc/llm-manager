@@ -150,18 +150,52 @@ its name-encoded hour, ``scripts/lib/proxy_logs.py``).
     before/after comparison is not like-for-like.
 
 ``attribution``
-    Each violating ``saturated`` poll attributed to the **nearest preceding**
-    abandonment/restart event within ``--attribution-lookback-seconds``
-    (default 600 s), as ``rows`` (``timestamp``, ``cause``,
-    ``evidence_timestamp``, ``seconds_since_evidence``, ...), ``by_cause``,
-    ``attributed_polls``, ``unattributed_polls`` and
-    ``unattributed_timestamps``. A poll with no preceding event inside the
-    lookback is reported unattributed — never guessed. The event scan reads up
-    to one lookback *before* ``--since`` so a window's first polls can still be
-    explained, while the reported ``abandonment_events`` tally stays scoped to
-    the window. Attribution **explains** a residual; it never turns a missed
-    target into a pass (the check still fails and the cause is stated beside
-    it).
+    Every violating ``saturated`` poll explained by one of three evidence
+    tiers, so a residual is never a bare number and never a silently dropped
+    poll (LP-0MVVXGMGB004DUGR AC1/AC2).
+
+    * **primary** — the nearest **preceding** abandonment/restart event within
+      ``--attribution-lookback-seconds`` (default 600 s). Unchanged: the 600 s
+      behaviour that attributed 65 of the 70 residual polls in the 2026-10-29
+      window is preserved exactly, so windows measured before and after this
+      change stay comparable (AC4).
+    * **corroborated** — the poll falls inside, or within
+      ``--live-work-window-seconds`` (default 10 s) of, a **local dispatch
+      record's lifetime** (``Stream started: provider=local`` → the next
+      ``Stream finished`` for the same session). This closes the structural
+      blind spot the abandonment rule cannot see: a poll that races *live*
+      work. The 2026-11-16 17:32:11 residual is the shape — the dispatch
+      closed 575 ms before the poll while llama-server still reported the slot
+      processing and ``local_in_flight_requests`` had already dropped to 0.
+      ``lease_renewed`` is deliberately *not* accepted on its own: it is a
+      retention heartbeat that fires for idle retained leases too, and an idle
+      lease is not work.
+    * **extended** — a preceding abandonment/restart inside
+      ``--attribution-extended-lookback-seconds`` (default 3600 s) but outside
+      the primary lookback, recorded in ``extended_cause`` /
+      ``extended_evidence_timestamp`` / ``extended_seconds_since_evidence``.
+      It **never** moves ``attributed_polls`` or ``by_cause`` (that is the
+      600 s verdict); it only stops the evidence from being discarded.
+
+    Each per-poll row carries ``reason`` and ``confidence`` for every tier, so
+    a poll with no evidence at all is reported ``unexplained`` — with its
+    timestamp in ``unexplained_timestamps`` and a stated note in the verdict —
+    rather than vanishing behind an empty ``cause`` (AC2). The event scans
+    read up to one extended lookback *before* ``--since`` so a window's first
+    polls can still be explained, while the reported ``abandonment_events``
+    tally stays scoped to the window. Attribution **explains** a residual; it
+    never turns a missed target into a pass (the check still fails and the
+    cause is stated beside it).
+
+``stale_saturated_without_live_work``
+    The log-level guarantee behind the stale-capacity reconciliation
+    (LP-0MVVXGMGB004DUGR AC3): a poll served from a snapshot older than its own
+    published freshness budget (``slots_snapshot_age_seconds`` >
+    ``slots_max_snapshot_age_seconds``) must never report
+    ``capacity_hint=saturated`` while ``local_in_flight_requests == 0``. Only
+    polls that publish the budget are judgeable; a poll that publishes a
+    budget but no age is reported separately as ``undatable`` and counted as a
+    violation (an undatable snapshot is stale under the delivered definition).
 
 ``--write-artifacts DIR``
     Persist the raw evidence (LP-0MVOG7IP80003MLV AC5): ``measurement.json``
@@ -472,6 +506,37 @@ _PROXY_RESTART_RE = re.compile(
     r"Rotated previous proxy log aside|application startup|Started server process|"
     r"Uvicorn running"
 )
+
+#: A local dispatch record opens (``proxy/proxy/router.py`` streaming path).
+#: Its lifetime is the strongest live-work evidence available in the log: the
+#: proxy is demonstrably tracking a local request at that moment.
+_LOCAL_STREAM_START_RE = re.compile(r"\bStream started:\s+provider=local\b")
+#: A local dispatch record's lifetime boundary; ``/slots`` teardown may still
+#: leave the slot processing after this, which is exactly the residual class.
+#: ``lease_released`` also closes a lifetime (the record is gone).
+_LIFETIME_END_RE = re.compile(
+    r"\b(?:Stream finished:|lease_released\b).*?\bsession=(?P<session>\S+)"
+)
+
+#: Cause token for a poll corroborated by a live (or just-ended) local
+#: dispatch record's lifetime rather than by an abandonment (AC1).
+LIVE_WORK_ATTRIBUTION_LAG_CAUSE = "live_work_attribution_lag"
+#: How far either side of a violating poll a local dispatch record's lifetime
+#: may sit and still corroborate it (``--live-work-window-seconds``). Tight on
+#: purpose: this tier explains a **race**, not an unrelated later dispatch, and
+#: the recorded shape (2026-11-06) is a sub-second one.
+DEFAULT_LIVE_WORK_WINDOW_SECONDS = 10.0
+#: Second-tier abandonment/restart lookback
+#: (``--attribution-extended-lookback-seconds``): evidence recorded, never
+#: allowed to move the 600 s ``attributed_polls`` / ``by_cause`` verdict (AC4).
+DEFAULT_ATTRIBUTION_EXTENDED_LOOKBACK_SECONDS = 3600.0
+#: Confidence tiers a per-poll row can carry (AC2).
+CONFIDENCE_PRIMARY = "primary"
+CONFIDENCE_CORROBORATED = "corroborated"
+CONFIDENCE_EXTENDED = "extended"
+CONFIDENCE_UNEXPLAINED = "unexplained"
+#: Reason token for a poll no tier can explain (AC2: never silently dropped).
+UNEXPLAINED_REASON = CONFIDENCE_UNEXPLAINED
 #: A completed local dispatch (emitted only on the local streaming path).
 _LOCAL_DISPATCH_RE = re.compile(
     r"\bdispatch_first_byte_ms=(?P<first_byte>[0-9.]+)\b"
@@ -533,6 +598,23 @@ def parse_bound(text: str) -> dt.datetime:
     raise argparse.ArgumentTypeError(
         f"invalid timestamp {text!r} (expected 'YYYY-MM-DD [HH:MM[:SS]]')"
     )
+
+
+def _parse_seconds(value: str | None) -> float | None:
+    """A published seconds field, or ``None`` when absent/unparseable.
+
+    ``None`` is the honest answer for a missing budget/age — never ``0.0``,
+    which would read as a fresh snapshot.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +680,20 @@ def analyse_status_stream(
     dispatches_by_cache_state: dict[str, int] = {}
     dispatch_sessions: set[str] = set()
     herdr_dispatch_sessions: set[str] = set()
+    # AC3 (LP-0MVVXGMGB004DUGR): a poll served from a snapshot older than its
+    # own published freshness budget must never report ``saturated`` while the
+    # proxy has no live local work. Judged from the same age/ceiling pair the
+    # stale-rate derivation uses, so the tool and the payload cannot disagree.
+    stale_saturated: dict = {
+        "judgeable_polls": 0,
+        "over_age_polls": 0,
+        "undatable_polls": 0,
+        "violations": 0,
+        "violations_over_age": 0,
+        "violations_undatable": 0,
+        "violation_timestamps": [],
+        "rows": [],
+    }
     first_ts: dt.datetime | None = None
     last_ts: dt.datetime | None = None
 
@@ -624,7 +720,8 @@ def analyse_status_stream(
                     # publishes the age/ceiling pair is judged by it; a pre-F1
                     # poll (no age field) keeps its own flag, so old-schema
                     # windows are counted exactly as before.
-                    age_derived = slots_stale_from_age(slots_age_fields(line))
+                    age_fields = slots_age_fields(line)
+                    age_derived = slots_stale_from_age(age_fields)
                     stale = (
                         age_derived if age_derived is not None else published
                     )
@@ -667,6 +764,54 @@ def analyse_status_stream(
                                     per_phase_source[bucket][value] = (
                                         per_phase_source[bucket].get(value, 0) + 1
                                     )
+                    # AC3 (LP-0MVVXGMGB004DUGR): judge the poll against its
+                    # own published freshness budget. ``judgeable`` requires the
+                    # budget field; a poll carrying a budget but no datable
+                    # snapshot is ``undatable`` (stale under the delivered
+                    # definition) and is reported separately. Only a
+                    # ``saturated`` hint with no live local work can violate.
+                    budget = _parse_seconds(
+                        age_fields.get("slots_max_snapshot_age_seconds")
+                    )
+                    if budget is not None:
+                        stale_saturated["judgeable_polls"] += 1
+                        age = _parse_seconds(
+                            age_fields.get("slots_snapshot_age_seconds")
+                        )
+                        if age is None:
+                            stale_saturated["undatable_polls"] += 1
+                            over_budget = "undatable"
+                        elif age > budget:
+                            stale_saturated["over_age_polls"] += 1
+                            over_budget = "over_age"
+                        else:
+                            over_budget = None
+                        if over_budget and hint == "saturated" and not live_work:
+                            timestamp = ts.strftime("%Y-%m-%d %H:%M:%S")
+                            stale_saturated["violations"] += 1
+                            stale_saturated[
+                                f"violations_{over_budget}"
+                            ] += 1
+                            stale_saturated["violation_timestamps"].append(
+                                timestamp
+                            )
+                            stale_saturated["rows"].append(
+                                {
+                                    "timestamp": timestamp,
+                                    "snapshot_age_seconds": age,
+                                    "max_snapshot_age_seconds": budget,
+                                    "over_budget": over_budget,
+                                    "available_slots": parse_int(
+                                        fields.get("available_slots")
+                                    ),
+                                    "latency_ms": parse_latency_ms(
+                                        fields.get("latency_ms")
+                                    ),
+                                    "local_in_flight_requests": parse_int(
+                                        fields.get("local_in_flight_requests")
+                                    ),
+                                }
+                            )
                     if stale:
                         # Attribute the poll to the cache that served it
                         # (counts vs per-slot detail) and to the response
@@ -822,6 +967,9 @@ def analyse_status_stream(
             "count": saturated_without_available_slots,
             "rate_of_polls": share(saturated_without_available_slots, polls),
         },
+        # AC3 (LP-0MVVXGMGB004DUGR): the age-vs-budget invariant behind the
+        # stale-capacity reconciliation, measured rather than assumed.
+        "stale_saturated_without_live_work": dict(stale_saturated),
         "local_dispatches": {
             "count": local_dispatches,
             "by_cache_state": dict(sorted(dispatches_by_cache_state.items())),
@@ -1126,25 +1274,176 @@ def analyse_abandonment_events(
     return sorted(events, key=lambda event: event["timestamp"])
 
 
+def analyse_dispatch_lifetimes(
+    log_dir: Path,
+    *,
+    since: dt.datetime | None = None,
+    until: dt.datetime | None = None,
+) -> list[dict]:
+    """Local dispatch records' lifetimes inside the window.
+
+    The corroboration evidence for the polls the abandonment rule cannot
+    explain (LP-0MVVXGMGB004DUGR AC1). A lifetime opens on
+    ``Stream started: provider=local`` (``proxy/proxy/router.py``) and closes on
+    the next ``Stream finished`` / ``lease_released`` **for the same session**;
+    an unclosed lifetime stays open to the end of the window.
+
+    ``lease_renewed`` is deliberately not a boundary and not evidence on its
+    own: it is a retention heartbeat that fires for an idle retained lease too
+    (``observability`` rule 2 — a retained lease is not work), so accepting it
+    would manufacture corroboration out of an idle slot.
+    """
+    log_dir = Path(log_dir)
+    open_lifetimes: dict[str, dict] = {}
+    lifetimes: list[dict] = []
+    for path in discover_proxy_log_files(log_dir):
+        with open_proxy_log_text(path) as handle:
+            for line in handle:
+                ts = parse_line_timestamp(line)
+                if not in_window(ts, since, until):
+                    continue
+                stamp = ts.strftime("%Y-%m-%d %H:%M:%S")
+                if _LOCAL_STREAM_START_RE.search(line):
+                    session_match = _SESSION_RE.search(line)
+                    session = (
+                        session_match.group("session") if session_match else ""
+                    )
+                    # One session runs one local dispatch at a time; a new
+                    # start without an end closes the previous lifetime at the
+                    # new start rather than silently dropping it.
+                    previous = open_lifetimes.get(session)
+                    if previous is not None:
+                        previous["end"] = stamp
+                        previous["end_kind"] = "next_dispatch_started"
+                        lifetimes.append(previous)
+                    open_lifetimes[session] = {
+                        "session": session,
+                        "start": stamp,
+                        "end": None,
+                        "end_kind": None,
+                    }
+                    continue
+                end = _LIFETIME_END_RE.search(line)
+                if end is None:
+                    continue
+                session = end.group("session")
+                lifetime = open_lifetimes.pop(session, None)
+                if lifetime is None:
+                    continue
+                lifetime["end"] = stamp
+                lifetime["end_kind"] = (
+                    "stream_finished"
+                    if "Stream finished:" in line
+                    else "lease_released"
+                )
+                lifetimes.append(lifetime)
+    # A lifetime still open when the scan ends is evidence up to the window
+    # edge; ``end=None`` is reported as such (never a fabricated end).
+    lifetimes.extend(open_lifetimes.values())
+    return sorted(lifetimes, key=lambda item: (item["start"], item["session"]))
+
+
+def _seconds_between(later: str, earlier: str) -> float:
+    """Signed ``later - earlier`` seconds between two log timestamps."""
+    return (
+        dt.datetime.strptime(later, "%Y-%m-%d %H:%M:%S")
+        - dt.datetime.strptime(earlier, "%Y-%m-%d %H:%M:%S")
+    ).total_seconds()
+
+
+def _nearest_lifetime_evidence(
+    timestamp: str,
+    lifetimes: list[dict],
+    *,
+    window_seconds: float,
+    session: str | None = None,
+) -> tuple[float, str, str, str] | None:
+    """Nearest local dispatch lifetime within *window_seconds* of a poll.
+
+    Returns ``(distance, evidence_timestamp, evidence_kind, session)``. The
+    distance is absolute, so a poll that races the start of a dispatch is
+    corroborated exactly like one that sits in the teardown tail after it:
+    both are moments where ``local_in_flight_requests`` can truthfully read 0
+    while llama-server reports the slot processing.
+    """
+    best: tuple[float, str, str, str] | None = None
+    for lifetime in lifetimes:
+        if session is not None and lifetime["session"] != session:
+            continue
+        start = lifetime["start"]
+        end = lifetime["end"] or lifetime["start"]
+        if timestamp < start:
+            distance = _seconds_between(start, timestamp)
+            evidence_ts, kind = start, "dispatch_lifetime_head"
+        elif timestamp > end:
+            distance = _seconds_between(timestamp, end)
+            evidence_ts, kind = end, "dispatch_lifetime_tail"
+        else:
+            # Inside the record's lifetime: the record itself is the evidence.
+            to_start = _seconds_between(timestamp, start)
+            to_end = _seconds_between(end, timestamp)
+            if to_start <= to_end:
+                distance, evidence_ts = to_start, start
+            else:
+                distance, evidence_ts = to_end, end
+            kind = "dispatch_lifetime"
+        if distance <= window_seconds and (best is None or distance < best[0]):
+            best = (distance, evidence_ts, kind, lifetime["session"])
+    return best
+
+
 def attribute_violations(
     violations: list[dict],
     events: list[dict],
     *,
     lookback_seconds: float = 600.0,
+    live_work_lifetimes: list[dict] | None = None,
+    live_work_window_seconds: float = DEFAULT_LIVE_WORK_WINDOW_SECONDS,
+    extended_lookback_seconds: float = (
+        DEFAULT_ATTRIBUTION_EXTENDED_LOOKBACK_SECONDS
+    ),
 ) -> dict:
-    """Attribute every violating ``saturated`` poll to a preceding event.
+    """Attribute every violating ``saturated`` poll, never guessing.
 
-    Each poll takes the **nearest preceding** abandonment/restart event inside
-    ``lookback_seconds`` (``None`` — never guessed — when there is none, or when
-    the only nearby event is *later* than the poll). Returns the full per-poll
-    rows (``rows``), the cause histogram (``by_cause``) and the unattributed
-    timestamps, so a reader can either accept the mechanism or go to the log.
+    Three evidence tiers, in precedence order (LP-0MVVXGMGB004DUGR):
+
+    1. **primary** — the nearest *preceding* abandonment/restart inside
+       ``lookback_seconds``. This is the recorded behaviour and its counters
+       (``attributed_polls`` / ``unattributed_polls`` / ``by_cause``) keep
+       their exact pre-change meaning (AC4).
+    2. **corroborated** — a local dispatch record's lifetime inside, or within
+       ``live_work_window_seconds`` of, the poll. Explains the blind spot the
+       first tier cannot: a poll that raced *live* work, so nothing was
+       abandoned. Emitted as the ``live_work_attribution_lag`` cause and
+       counted as attributed.
+    3. **extended** — a preceding abandonment/restart inside
+       ``extended_lookback_seconds`` but outside the primary lookback.
+       Recorded in ``extended_*`` fields only: it never moves the primary
+       counters, so a window measured before and after this change stays
+       comparable.
+
+    Every row carries ``reason`` and ``confidence``; a poll no tier explains
+    is ``unexplained`` and listed in ``unexplained_timestamps`` (AC2 — no
+    violating poll is silently dropped).
     """
     events = sorted(events, key=lambda event: event["timestamp"])
     event_times = [event["timestamp"] for event in events]
+    lifetimes = sorted(
+        live_work_lifetimes or [], key=lambda item: item["start"]
+    )
     causes: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    confidence_counts: dict[str, int] = {}
     rows: list[dict] = []
     unattributed: list[str] = []
+    corroborated: list[str] = []
+    extended: list[str] = []
+    unexplained: list[str] = []
+
+    def _tally(reason: str, confidence: str) -> None:
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        confidence_counts[confidence] = confidence_counts.get(confidence, 0) + 1
+
     for poll in violations:
         row = {
             "timestamp": poll["timestamp"],
@@ -1161,33 +1460,111 @@ def attribute_violations(
             "local_owner_session_id": poll.get("local_owner_session_id"),
             "slots_stale": poll.get("slots_stale"),
             "slot_counts_stale": poll.get("slot_counts_stale"),
+            # LP-0MVVXGMGB004DUGR: the tier this poll was explained by and the
+            # evidence behind it, so no row is a bare empty cause.
+            "reason": UNEXPLAINED_REASON,
+            "confidence": CONFIDENCE_UNEXPLAINED,
+            "evidence_kind": None,
+            "evidence_session": None,
+            "extended_cause": None,
+            "extended_evidence_timestamp": None,
+            "extended_seconds_since_evidence": None,
         }
         index = bisect.bisect_right(event_times, row["timestamp"]) - 1
         if index >= 0:
             event = events[index]
-            seconds = (
-                dt.datetime.strptime(
-                    row["timestamp"], "%Y-%m-%d %H:%M:%S"
-                )
-                - dt.datetime.strptime(
-                    event["timestamp"], "%Y-%m-%d %H:%M:%S"
-                )
-            ).total_seconds()
+            seconds = _seconds_between(row["timestamp"], event["timestamp"])
             if seconds <= lookback_seconds:
                 cause = event["reason"] or event["kind"]
                 row["cause"] = cause
+                row["reason"] = cause
+                row["confidence"] = CONFIDENCE_PRIMARY
                 row["evidence_timestamp"] = event["timestamp"]
                 row["seconds_since_evidence"] = int(seconds)
+                row["evidence_kind"] = event["kind"]
+                row["evidence_session"] = event.get("session")
                 causes[cause] = causes.get(cause, 0) + 1
+                _tally(cause, CONFIDENCE_PRIMARY)
+        if row["cause"] is None and lifetimes:
+            # Prefer the poll's own recorded owner session, then any session:
+            # a dispatch record for the owner is stronger evidence, but a
+            # violating poll routinely carries no owner at all.
+            owner = poll.get("local_owner_session_id") or None
+            evidence = (
+                _nearest_lifetime_evidence(
+                    row["timestamp"],
+                    lifetimes,
+                    window_seconds=live_work_window_seconds,
+                    session=owner,
+                )
+                if owner
+                else None
+            ) or _nearest_lifetime_evidence(
+                row["timestamp"],
+                lifetimes,
+                window_seconds=live_work_window_seconds,
+            )
+            if evidence is not None:
+                _, evidence_ts, kind, session = evidence
+                row["cause"] = LIVE_WORK_ATTRIBUTION_LAG_CAUSE
+                row["reason"] = LIVE_WORK_ATTRIBUTION_LAG_CAUSE
+                row["confidence"] = CONFIDENCE_CORROBORATED
+                row["evidence_timestamp"] = evidence_ts
+                # Signed: evidence *after* the poll reads negative, never
+                # silently rounded to 0.
+                row["seconds_since_evidence"] = int(
+                    _seconds_between(row["timestamp"], evidence_ts)
+                )
+                row["evidence_kind"] = kind
+                row["evidence_session"] = session
+                causes[LIVE_WORK_ATTRIBUTION_LAG_CAUSE] = (
+                    causes.get(LIVE_WORK_ATTRIBUTION_LAG_CAUSE, 0) + 1
+                )
+                corroborated.append(row["timestamp"])
+                _tally(LIVE_WORK_ATTRIBUTION_LAG_CAUSE, CONFIDENCE_CORROBORATED)
         if row["cause"] is None:
             unattributed.append(row["timestamp"])
+            if index >= 0:
+                event = events[index]
+                seconds = _seconds_between(
+                    row["timestamp"], event["timestamp"]
+                )
+                if seconds <= extended_lookback_seconds:
+                    cause = event["reason"] or event["kind"]
+                    row["extended_cause"] = cause
+                    row["extended_evidence_timestamp"] = event["timestamp"]
+                    row["extended_seconds_since_evidence"] = int(seconds)
+                    row["reason"] = (
+                        "proxy_restart_beyond_lookback"
+                        if event["kind"] == "proxy_restart"
+                        else "abandonment_beyond_lookback"
+                    )
+                    row["confidence"] = CONFIDENCE_EXTENDED
+                    extended.append(row["timestamp"])
+                    _tally(row["reason"], CONFIDENCE_EXTENDED)
+            if row["confidence"] == CONFIDENCE_UNEXPLAINED:
+                unexplained.append(row["timestamp"])
+                _tally(UNEXPLAINED_REASON, CONFIDENCE_UNEXPLAINED)
         rows.append(row)
     return {
         "lookback_seconds": lookback_seconds,
+        "live_work_window_seconds": live_work_window_seconds,
+        "extended_lookback_seconds": extended_lookback_seconds,
         "attributed_polls": len(violations) - len(unattributed),
         "unattributed_polls": len(unattributed),
         "unattributed_timestamps": unattributed,
+        "corroborated_polls": len(corroborated),
+        "extended_polls": len(extended),
+        "unexplained_polls": len(unexplained),
+        "unexplained_timestamps": unexplained,
+        "explained_polls": len(violations) - len(unexplained),
         "by_cause": dict(sorted(causes.items())),
+        "by_reason": dict(sorted(reason_counts.items())),
+        "by_confidence": dict(sorted(confidence_counts.items())),
+        "dispatch_lifetime_evidence": {
+            "lifetimes": len(lifetimes),
+            "sessions": len({item["session"] for item in lifetimes}),
+        },
         "rows": rows,
     }
 
@@ -1490,6 +1867,31 @@ def evaluate(
             "pass": violations == 0,
         }
     )
+    # AC3 (LP-0MVVXGMGB004DUGR): the age-vs-budget invariant, checked on every
+    # window rather than trusted. A window whose polls predate the ceiling
+    # field has nothing judgeable, which is reported (``observed`` carries the
+    # judgeable count) instead of passing silently.
+    stale_saturated = metrics.get("stale_saturated_without_live_work") or {}
+    stale_violations = stale_saturated.get("violations", 0)
+    checks.append(
+        {
+            "target": (
+                "no poll served from a stale snapshot reports saturated "
+                "without live local work"
+            ),
+            "observed": stale_violations,
+            "pass": stale_violations == 0,
+        }
+    )
+    if stale_violations:
+        notes.append(
+            f"{stale_violations} poll(s) were served from a snapshot older "
+            "than the published freshness budget and still reported "
+            "capacity_hint=saturated with no live local work "
+            f"(``stale_saturated_without_live_work``: "
+            f"{stale_saturated.get('violations_over_age', 0)} over-age, "
+            f"{stale_saturated.get('violations_undatable', 0)} undatable)"
+        )
     if dispatches["covered"]:
         checks.append(
             {
@@ -1521,15 +1923,30 @@ def evaluate(
         ) or "none"
         notes.append(
             f"{attribution['attributed_polls']} of {violations} violating polls "
-            f"attributed to a preceding abandoned local dispatch or proxy "
-            f"restart within {attribution['lookback_seconds']:.0f}s "
-            f"(by cause: {by_cause})"
+            f"attributed within {attribution['lookback_seconds']:.0f}s "
+            f"(by cause: {by_cause}; live-work corroboration window "
+            f"{attribution['live_work_window_seconds']:.0f}s)"
         )
         if attribution["unattributed_polls"]:
             notes.append(
                 f"{attribution['unattributed_polls']} violating polls are "
                 "unattributable from the proxy log (no preceding abandonment "
-                "or restart inside the lookback); see the attribution rows"
+                "or restart inside the lookback and no local dispatch "
+                "lifetime beside the poll); see the attribution rows"
+            )
+        if attribution.get("extended_polls"):
+            notes.append(
+                f"{attribution['extended_polls']} violating polls carry "
+                "extended evidence outside the primary lookback (recorded in "
+                "``extended_cause``; it does not move the attribution counts)"
+            )
+        if attribution.get("unexplained_polls"):
+            notes.append(
+                f"{attribution['unexplained_polls']} violating polls could not "
+                "be attributed by any evidence tier and are reported as "
+                "``unexplained`` (explicit residual, not a silent drop): "
+                + ", ".join(attribution["unexplained_timestamps"][:5])
+                + ("…" if attribution["unexplained_polls"] > 5 else "")
             )
     stale_attribution = metrics.get("slots_stale_attribution")
     if stale_attribution and stale_attribution["unattributed"]:
@@ -1562,13 +1979,20 @@ def measure(
     stale_rate_target: float = 0.05,
     min_downtime_dispatches: int = 10,
     attribution_lookback_seconds: float = 600.0,
+    live_work_window_seconds: float = DEFAULT_LIVE_WORK_WINDOW_SECONDS,
+    attribution_extended_lookback_seconds: float = (
+        DEFAULT_ATTRIBUTION_EXTENDED_LOOKBACK_SECONDS
+    ),
 ) -> dict:
     """Full measurement: meta + metrics + coverage + attribution + verdict.
 
     The attribution block turns the violating ``saturated`` polls and the
     stale-poll source split into evidence-backed explanations (AC4-style
     attribution, LP-0MVOG7IP80003MLV), so a target miss ships with its cause
-    rather than a bare number.
+    rather than a bare number. Since LP-0MVVXGMGB004DUGR it joins three
+    evidence tiers — abandonment/restart inside the lookback, local dispatch
+    record lifetimes beside the poll, and an extended lookback — and gives
+    every violating poll an explicit reason.
     """
     metrics = analyse_status_stream(
         log_dir, since=since, until=until, limit=limit
@@ -1588,9 +2012,29 @@ def measure(
         # Read the lookback *before* the window too: the first polls of a
         # window are routinely explained by an abandonment moments earlier,
         # so scanning only from ``since`` would mark them unattributable for
-        # an artificial reason.
+        # an artificial reason. The scan covers the wider extended lookback so
+        # the lower-confidence tier can also explain a window's first polls.
         since=(
-            since - dt.timedelta(seconds=attribution_lookback_seconds)
+            since
+            - dt.timedelta(
+                seconds=max(
+                    attribution_lookback_seconds,
+                    attribution_extended_lookback_seconds,
+                )
+            )
+            if since is not None
+            else None
+        ),
+        until=until,
+    )
+    # Live-work corroboration (LP-0MVVXGMGB004DUGR AC1): local dispatch
+    # records' lifetimes, scanned from the extended lead-in so a long dispatch
+    # that opened before the window still covers a window-edge poll.
+    dispatch_lifetimes = analyse_dispatch_lifetimes(
+        log_dir,
+        since=(
+            since
+            - dt.timedelta(seconds=attribution_extended_lookback_seconds)
             if since is not None
             else None
         ),
@@ -1609,6 +2053,9 @@ def measure(
         metrics["saturated_without_live_work"]["rows"],
         events,
         lookback_seconds=attribution_lookback_seconds,
+        live_work_lifetimes=dispatch_lifetimes,
+        live_work_window_seconds=live_work_window_seconds,
+        extended_lookback_seconds=attribution_extended_lookback_seconds,
     )
     by_reason: dict[str, int] = {}
     in_window = 0
@@ -1697,6 +2144,16 @@ def write_artifacts(report: dict, out_dir: Path) -> list[Path]:
                 "local_owner_session_id",
                 "slots_stale",
                 "slot_counts_stale",
+                # LP-0MVVXGMGB004DUGR (AC2): the attribution tier and its
+                # evidence, appended — every violating poll carries a reason,
+                # so a residual can never be a bare empty ``cause``.
+                "reason",
+                "confidence",
+                "evidence_kind",
+                "evidence_session",
+                "extended_cause",
+                "extended_evidence_timestamp",
+                "extended_seconds_since_evidence",
             ],
         )
         writer.writeheader()
@@ -1833,7 +2290,8 @@ def render(report: dict) -> str:
         out.append(
             "  violating polls attributed    : "
             f"{attribution['attributed_polls']}/{violations['count']} "
-            f"({by_cause}; lookback {attribution['lookback_seconds']:.0f}s)"
+            f"({by_cause}; lookback {attribution['lookback_seconds']:.0f}s, "
+            f"live-work window {attribution['live_work_window_seconds']:.0f}s)"
         )
         if attribution["unattributed_polls"]:
             out.append(
@@ -1843,6 +2301,18 @@ def render(report: dict) -> str:
                 + ("…" if attribution["unattributed_polls"] > 5 else "")
                 + ")"
             )
+        if attribution.get("extended_polls"):
+            out.append(
+                "  extended evidence (outside   : "
+                f"{attribution['extended_polls']} poll(s) within "
+                f"{attribution['extended_lookback_seconds']:.0f}s, recorded "
+                "as extended_cause"
+            )
+        out.append(
+            "  attribution confidence        : "
+            f"{attribution['by_confidence']} "
+            f"(unexplained {attribution['unexplained_polls']})"
+        )
     abandonment = report.get("abandonment_events") or {}
     if abandonment:
         out.append(
@@ -1895,6 +2365,16 @@ def render(report: dict) -> str:
         "saturated, available_slots=0    : "
         f"{no_slots['count']} ({no_slots['rate_of_polls']:.2%} of polls)"
     )
+    stale_saturated = metrics.get("stale_saturated_without_live_work")
+    if stale_saturated is not None:
+        out.append(
+            "stale snapshot + saturated, no : "
+            f"{stale_saturated['violations']} "
+            f"({stale_saturated['violations_over_age']} over-age, "
+            f"{stale_saturated['violations_undatable']} undatable; "
+            f"judgeable polls {stale_saturated['judgeable_polls']}, "
+            f"over budget {stale_saturated['over_age_polls']})"
+        )
     if violations["worst_timestamps"]:
         worst = ", ".join(
             f"{entry['minute']}({entry['polls']})"
@@ -2005,6 +2485,26 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--live-work-window-seconds",
+        type=float,
+        default=DEFAULT_LIVE_WORK_WINDOW_SECONDS,
+        help=(
+            "how far either side of a violating poll a local dispatch "
+            "record's lifetime may sit and corroborate it (default "
+            f"{DEFAULT_LIVE_WORK_WINDOW_SECONDS:.0f})"
+        ),
+    )
+    parser.add_argument(
+        "--attribution-extended-lookback-seconds",
+        type=float,
+        default=DEFAULT_ATTRIBUTION_EXTENDED_LOOKBACK_SECONDS,
+        help=(
+            "second-tier lookback whose abandonment/restart evidence is "
+            "recorded as extended_* without moving the primary attribution "
+            f"(default {DEFAULT_ATTRIBUTION_EXTENDED_LOOKBACK_SECONDS:.0f})"
+        ),
+    )
+    parser.add_argument(
         "--write-artifacts",
         default=None,
         metavar="DIR",
@@ -2049,6 +2549,10 @@ def main(argv: list[str] | None = None) -> int:
         stale_rate_target=args.stale_rate_target,
         min_downtime_dispatches=args.min_downtime_dispatches,
         attribution_lookback_seconds=args.attribution_lookback_seconds,
+        live_work_window_seconds=args.live_work_window_seconds,
+        attribution_extended_lookback_seconds=(
+            args.attribution_extended_lookback_seconds
+        ),
     )
 
     if args.write_artifacts:

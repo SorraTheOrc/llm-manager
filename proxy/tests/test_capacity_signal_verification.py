@@ -1424,7 +1424,9 @@ def test_write_artifacts_emits_json_text_and_attribution_csv(csv, tmp_path):
         "timestamp,cause,evidence_timestamp,seconds_since_evidence,"
         "latency_ms,slots_detail_stale,available_slots,"
         "local_in_flight_requests,local_active_query,local_owner_session_id,"
-        "slots_stale,slot_counts_stale"
+        "slots_stale,slot_counts_stale,reason,confidence,evidence_kind,"
+        "evidence_session,extended_cause,extended_evidence_timestamp,"
+        "extended_seconds_since_evidence"
     )
     assert rows[1].startswith("2026-10-23 00:11:00,session_evicted,"
                              "2026-10-23 00:10:00,60,")
@@ -1492,6 +1494,15 @@ def test_write_artifacts_carries_live_work_evidence_columns(csv, tmp_path):
         "local_owner_session_id",
         "slots_stale",
         "slot_counts_stale",
+        # LP-0MVVXGMGB004DUGR: the attribution tier and its evidence, appended
+        # so every violating poll carries an explicit reason (AC2).
+        "reason",
+        "confidence",
+        "evidence_kind",
+        "evidence_session",
+        "extended_cause",
+        "extended_evidence_timestamp",
+        "extended_seconds_since_evidence",
     ]
     attributed = rows[0]
     assert attributed["timestamp"] == "2026-10-23 00:11:00"
@@ -1505,6 +1516,12 @@ def test_write_artifacts_carries_live_work_evidence_columns(csv, tmp_path):
     unattributed = rows[1]
     assert unattributed["timestamp"] == "2026-10-23 00:30:00"
     assert unattributed["cause"] == ""
+    # The 600 s verdict is unchanged (no ``cause``), but the extended tier now
+    # records the evidence that sits outside it instead of discarding it
+    # (LP-0MVVXGMGB004DUGR AC1).
+    assert unattributed["reason"] == "abandonment_beyond_lookback"
+    assert unattributed["confidence"] == "extended"
+    assert unattributed["extended_cause"] == "prefill_deadline"
     # Schema 2 carries no ``local_in_flight_requests``/owner/counts-stale
     # fields: those columns are empty, never fabricated. Its flag fallback is
     # present and truthfully false.
@@ -2070,3 +2087,413 @@ def test_prefill_thrash_csv_artifact_is_additional(csv, tmp_path):
     assert len(rows) == 2
     assert "herdr-a" in rows[1]
     assert ",True,True,idle," in rows[1]
+
+
+# ---------------------------------------------------------------------------
+# Attribution beyond the abandonment lookback (LP-0MVVXGMGB004DUGR AC1/AC2/AC4)
+#
+# The 24 h re-measurement of 2026-10-29 left 5 of 70 residual
+# ``saturated``-without-live-work polls unattributable. The structural reason
+# is that the nearest-abandonment rule can only explain a poll when something
+# *was* abandoned: a poll that races a **live** local dispatch — the proxy's
+# ``local_in_flight_requests`` counter reads 0 while llama-server is still
+# working, or the dispatch record has just been torn down for the next turn —
+# has no abandonment event to find. These tests pin the two added evidence
+# tiers (dispatch-record lifetimes and an extended lookback), the precedence
+# that keeps the recorded 600 s behaviour intact (AC4), and the rule that every
+# violating poll carries an explicit reason (AC2).
+# ---------------------------------------------------------------------------
+
+
+def local_stream_start_line(ts: str, *, session: str = "s1") -> str:
+    """A local dispatch record opens (``Stream started: provider=local``)."""
+    return (
+        f"{ts},000 - INFO - Stream started: provider=local model=Qwen3 "
+        f"session={session} request=[{{'type': 'text', 'text': 'hi'}}] "
+        "turn=abc123\n"
+    )
+
+
+def stream_finished_line(ts: str, *, session: str = "s1") -> str:
+    """A local dispatch record closes (``Stream finished``)."""
+    return (
+        f"{ts},000 - INFO - Stream finished: reason=stop tokens=10/2/12 "
+        f"session={session} provider=local model=Qwen3 turn=abc123\n"
+    )
+
+
+def violating_poll(ts: str, **kwargs) -> str:
+    """A ``capacity_hint=saturated`` poll with no live local work at all."""
+    kwargs.setdefault("hint", "saturated")
+    kwargs.setdefault("stale", "false")
+    kwargs.setdefault("detail_stale", "false")
+    kwargs.setdefault("in_flight", 0)
+    kwargs.setdefault("available", "0")
+    return status_line(ts, **kwargs)
+
+
+def test_lifetime_tail_corroborates_the_poll_that_raced_a_dispatch(csv, tmp_path):
+    """AC1: the 2026-11-16 17:32:11 residual class is attributed.
+
+    The dispatch record closed 1 s before the poll, llama-server still reported
+    the slot processing, and ``local_in_flight_requests`` had already dropped
+    to 0. There is no abandonment to find — the poll sits in the teardown tail
+    of a **completed** local dispatch — so the nearest-abandonment rule alone
+    leaves it unattributable (the exact structural blind spot this item closes).
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        local_stream_start_line("2026-10-23 00:05:00", session="herdr-a")
+        + stream_finished_line("2026-10-23 00:11:59", session="herdr-a")
+        + violating_poll("2026-10-23 00:12:00"),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    attribution = report["attribution"]
+    assert attribution["attributed_polls"] == 1
+    assert attribution["unattributed_polls"] == 0
+    assert attribution["by_cause"] == {"live_work_attribution_lag": 1}
+    row = attribution["rows"][0]
+    assert row["cause"] == "live_work_attribution_lag"
+    assert row["reason"] == "live_work_attribution_lag"
+    assert row["confidence"] == "corroborated"
+    assert row["evidence_kind"] == "dispatch_lifetime_tail"
+    assert row["evidence_session"] == "herdr-a"
+    assert row["evidence_timestamp"] == "2026-10-23 00:11:59"
+    assert row["seconds_since_evidence"] == 1
+
+
+def test_dispatch_lifetime_gap_attributes_a_poll_ahead_of_the_dispatch(
+    csv, tmp_path
+):
+    """AC1: a poll immediately *before* a local dispatch start is corroborated.
+
+    This is the 2026-11-06 shape recorded on the item: a lease renewed 330 ms
+    before the poll and the local POST 266 ms after it. The dispatch record's
+    lifetime starts after the poll, so the evidence timestamp is later than the
+    poll and the signed delta is negative — reported as such, never rounded to
+    zero.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        local_stream_start_line("2026-10-23 00:12:01", session="herdr-b")
+        + violating_poll("2026-10-23 00:12:00"),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    row = report["attribution"]["rows"][0]
+    assert row["cause"] == "live_work_attribution_lag"
+    assert row["evidence_kind"] == "dispatch_lifetime_head"
+    assert row["evidence_session"] == "herdr-b"
+    assert row["evidence_timestamp"] == "2026-10-23 00:12:01"
+    assert row["seconds_since_evidence"] == -1
+
+
+def test_live_work_corroboration_respects_its_window(csv, tmp_path):
+    """A dispatch ten minutes away is not evidence for the poll.
+
+    The corroboration window is a bound like the abandonment lookback: an
+    unrelated local dispatch hours or minutes from the poll must not be offered
+    as its explanation.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        local_stream_start_line("2026-10-23 00:01:00")
+        + stream_finished_line("2026-10-23 00:02:00")
+        + violating_poll("2026-10-23 00:12:00"),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    attribution = report["attribution"]
+    assert attribution["attributed_polls"] == 0
+    assert attribution["unattributed_polls"] == 1
+    assert attribution["rows"][0]["cause"] is None
+    assert attribution["rows"][0]["confidence"] == "unexplained"
+
+
+def test_primary_abandonment_outranks_live_work_corroboration(csv, tmp_path):
+    """AC4: the recorded 600 s attribution keeps precedence.
+
+    A poll that has both a preceding abandonment inside the lookback and a
+    local dispatch lifetime beside it is attributed to the abandonment, exactly
+    as before: the new tier only explains polls the first tier cannot.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason="prefill_deadline")
+        + local_stream_start_line("2026-10-23 00:10:30", session="herdr-c")
+        + violating_poll("2026-10-23 00:11:00"),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    attribution = report["attribution"]
+    assert attribution["by_cause"] == {"prefill_deadline": 1}
+    row = attribution["rows"][0]
+    assert row["cause"] == "prefill_deadline"
+    assert row["confidence"] == "primary"
+    assert row["evidence_timestamp"] == "2026-10-23 00:10:00"
+
+
+def test_extended_lookback_records_evidence_without_moving_the_verdict(
+    csv, tmp_path
+):
+    """AC1: a poll beyond 600 s gets its evidence, the 600 s verdict stands.
+
+    The extended tier is a *separate* record: it explains the poll (with a
+    lower-confidence tier) but ``attributed_polls`` / ``by_cause`` keep their
+    600 s meaning, so a window measured before this change stays comparable
+    with the same window measured after it (AC4).
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason="prefill_deadline")
+        + violating_poll("2026-10-23 00:30:00"),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    attribution = report["attribution"]
+    # Unchanged 600 s verdict.
+    assert attribution["attributed_polls"] == 0
+    assert attribution["unattributed_polls"] == 1
+    assert attribution["by_cause"] == {}
+    # ...and the evidence it could not use is recorded, not discarded.
+    assert attribution["extended_polls"] == 1
+    assert attribution["unexplained_polls"] == 0
+    row = attribution["rows"][0]
+    assert row["cause"] is None
+    assert row["confidence"] == "extended"
+    assert row["reason"] == "abandonment_beyond_lookback"
+    assert row["extended_cause"] == "prefill_deadline"
+    assert row["extended_evidence_timestamp"] == "2026-10-23 00:10:00"
+    assert row["extended_seconds_since_evidence"] == 1200
+
+
+def test_every_violating_poll_carries_an_explicit_reason(csv, tmp_path):
+    """AC2: no violating poll is silently dropped from the attribution.
+
+    A poll with no evidence in any tier is reported as ``unexplained`` — with
+    its timestamp, its confidence and a stated reason — and counted in the
+    verdict's residual note instead of vanishing behind an empty ``cause``.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        violating_poll("2026-10-23 00:12:00")
+        + violating_poll("2026-10-23 00:12:01"),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    attribution = report["attribution"]
+    assert attribution["unexplained_polls"] == 2
+    assert attribution["unexplained_timestamps"] == [
+        "2026-10-23 00:12:00",
+        "2026-10-23 00:12:01",
+    ]
+    assert [row["reason"] for row in attribution["rows"]] == [
+        "unexplained",
+        "unexplained",
+    ]
+    assert [row["confidence"] for row in attribution["rows"]] == [
+        "unexplained",
+        "unexplained",
+    ]
+    assert any(
+        "2 violating polls could not be attributed" in note
+        and "unexplained" in note
+        for note in report["verdict"]["notes"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC3 regression guard: a poll served from an over-budget snapshot must never
+# report ``saturated`` with no live local work.
+# ---------------------------------------------------------------------------
+
+
+def _aged_poll(ts: str, *, age, budget, **kwargs) -> str:
+    """A status poll that publishes the snapshot age/ceiling pair."""
+    per_phase = dict(kwargs.pop("per_phase", {}) or {})
+    per_phase["slots_snapshot_age_seconds"] = age
+    per_phase["slots_max_snapshot_age_seconds"] = budget
+    return violating_poll(ts, per_phase=per_phase, **kwargs)
+
+
+def test_stale_snapshot_never_reports_saturated_without_live_work(csv, tmp_path):
+    """AC3: the log-level guarantee behind the stale-capacity reconciliation.
+
+    A poll served from a snapshot older than its own published freshness budget
+    must not report ``capacity_hint=saturated`` while
+    ``local_in_flight_requests == 0``. The block is judged from the same
+    age/ceiling pair the stale-rate derivation uses, so a poll that cannot be
+    dated is reported separately rather than counted fresh.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        # Over the budget with no live work: the violation.
+        _aged_poll("2026-10-23 00:00:01", age=301.0, budget=300.0)
+        # Exactly at the budget: the last acceptable age, not a violation.
+        + _aged_poll("2026-10-23 00:00:02", age=300.0, budget=300.0)
+        # Over the budget but with live local work: saturation is allowed.
+        + _aged_poll("2026-10-23 00:00:03", age=301.0, budget=300.0, in_flight=1)
+        # Over the budget and no live work, but the hint is not saturated.
+        + _aged_poll(
+            "2026-10-23 00:00:04", age=301.0, budget=300.0, hint="idle"
+        )
+        # Undatable snapshot: reported separately, never silently fresh.
+        + _aged_poll("2026-10-23 00:00:05", age=None, budget=300.0)
+        # No budget field at all (a pre-ceiling build): not judgeable.
+        + violating_poll("2026-10-23 00:00:06"),
+    )
+
+    metrics = csv.analyse_status_stream(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 24, 0, 0),
+    )
+
+    block = metrics["stale_saturated_without_live_work"]
+    assert block["judgeable_polls"] == 5
+    assert block["over_age_polls"] == 3
+    assert block["undatable_polls"] == 1
+    # Two violations: the over-age poll and the undatable one (an undatable
+    # snapshot is stale under the delivered definition, so it cannot prove
+    # saturation either). The split keeps the two causes distinguishable.
+    assert block["violations"] == 2
+    assert block["violations_over_age"] == 1
+    assert block["violations_undatable"] == 1
+    assert block["violation_timestamps"] == [
+        "2026-10-23 00:00:01",
+        "2026-10-23 00:00:05",
+    ]
+
+    verdict = csv.evaluate(
+        metrics,
+        {"covered": True, "gaps": []},
+        {
+            "count": 0,
+            "covered": False,
+            "note": "no dispatch log",
+            "path": None,
+        },
+    )
+    check = next(
+        c for c in verdict["checks"] if "stale snapshot" in c["target"]
+    )
+    assert check["pass"] is False
+    assert check["observed"] == 2
+    assert any(
+        "served from a snapshot older" in note for note in verdict["notes"]
+    )
+
+
+def test_stale_saturated_check_passes_when_the_invariant_holds(csv, tmp_path):
+    """AC3: zero violations is a reported pass, not an absent check."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        _aged_poll("2026-10-23 00:00:01", age=1.0, budget=300.0)
+        + _aged_poll(
+            "2026-10-23 00:00:02", age=301.0, budget=300.0, hint="idle"
+        ),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    check = next(
+        c
+        for c in report["verdict"]["checks"]
+        if "stale snapshot" in c["target"]
+    )
+    assert check["pass"] is True
+    assert check["observed"] == 0
+    assert report["metrics"]["stale_saturated_without_live_work"][
+        "violations"
+    ] == 0
+
+
+def test_cli_honours_the_new_attribution_bounds(csv, tmp_path, capsys):
+    """The live-work window and the extended lookback are configurable."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        local_stream_start_line("2026-10-23 00:00:00")
+        + violating_poll("2026-10-23 00:12:00"),
+    )
+    argv = [
+        "--log-dir",
+        str(log_dir),
+        "--since",
+        "2026-10-23 00:00",
+        "--until",
+        "2026-10-23 07:00",
+        "--dispatch-log",
+        str(tmp_path / "absent.log"),
+        "--json",
+    ]
+
+    assert csv.main(argv) == 0
+    payload = json.loads(capsys.readouterr().out)
+    # 12 minutes is outside the default 10 s live-work window.
+    assert payload["attribution"]["unattributed_polls"] == 1
+    assert payload["attribution"]["live_work_window_seconds"] == 10.0
+
+    assert csv.main([*argv, "--live-work-window-seconds", "900"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["attribution"]["by_cause"] == {
+        "live_work_attribution_lag": 1
+    }
+
+    # The extended lookback is a separate bound with its own default.
+    assert payload["attribution"]["extended_lookback_seconds"] == 3600.0
+    assert (
+        csv.main([*argv, "--attribution-extended-lookback-seconds", "60"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["attribution"]["extended_lookback_seconds"] == 60.0

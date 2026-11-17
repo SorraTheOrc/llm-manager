@@ -74,6 +74,7 @@ class TestSlotsDetailCacheFallback:
         cache_value=None,
         current_model="test-model",
         config=None,
+        cache_age_seconds=None,
     ):
         """Issue /llama/local/status with controllable /slots detail + cache.
 
@@ -115,7 +116,11 @@ class TestSlotsDetailCacheFallback:
         counts_mock.return_value = slots_counts
         detail_mock = AsyncMock(side_effect=_detail)
         transport = httpx.ASGITransport(app=app)
-        cache_stamp = time.monotonic() - _CACHE_SNAPSHOT_AGE_SECONDS
+        cache_stamp = time.monotonic() - (
+            _CACHE_SNAPSHOT_AGE_SECONDS
+            if cache_age_seconds is None
+            else cache_age_seconds
+        )
         with patch(
             "proxy.server.query_llama_status", side_effect=fake_query
         ), patch("proxy.observability._last_slot_details_at", cache_stamp):
@@ -304,6 +309,77 @@ class TestSlotsDetailCacheFallback:
         assert j["slots_stale"] is False
         # Counts were fresh — the fallback is driven by the detail cache hit
         assert counts_mock.return_value == (2, 3)
+
+    # ------------------------------------------------------------------
+    # AC3 regression guard (LP-0MVVXGMGB004DUGR): a poll served from a
+    # snapshot older than its own freshness budget must never report
+    # ``capacity_hint=saturated`` while ``local_in_flight_requests == 0``.
+    # This is the 2026-10-29 residual class, pinned at the endpoint.
+    # ------------------------------------------------------------------
+
+    _ALL_PROCESSING = [
+        {"slot_id": 0, "is_processing": True, "n_decoded": 9},
+        {"slot_id": 1, "is_processing": True, "n_decoded": 9},
+    ]
+
+    @pytest.mark.asyncio
+    async def test_over_budget_snapshot_never_claims_saturated_without_live_work(
+        self,
+    ):
+        """A fossil snapshot cannot prove saturation (AC3).
+
+        The served detail says every slot is processing — the shape that makes
+        ``compute_capacity_hint`` return ``saturated`` — while the proxy has no
+        live dispatch. Past the freshness budget the contract is ``unknown``
+        (and, past the ceiling, the list is withheld with
+        ``snapshot_too_old``): a saturated claim must never be derived from a
+        snapshot the proxy itself calls too old.
+        """
+        j, _, _ = await self._get(
+            slots_counts=(0, 2),
+            slots_detail=[],
+            cache_value=self._ALL_PROCESSING,
+            cache_age_seconds=1000.0,
+            config={
+                "server": {
+                    "llama_server_port": 8080,
+                    "local_slots_max_snapshot_age_seconds": 300,
+                }
+            },
+        )
+
+        assert j["local_in_flight_requests"] == 0
+        assert (
+            j["slots_snapshot_age_seconds"]
+            > j["slots_max_snapshot_age_seconds"]
+        )
+        assert j["slots_stale"] is True
+        assert j["slots_stale_reason"] == "snapshot_too_old"
+        assert j["slots"] == []
+        assert j["capacity_hint"] == "unknown"
+        assert j["capacity_hint"] != "saturated"
+
+    @pytest.mark.asyncio
+    async def test_in_budget_cached_snapshot_without_live_work_is_unknown(
+        self,
+    ):
+        """Inside the budget the reconciliation, not the ceiling, decides.
+
+        The snapshot is 2 s old (fresh by the age-derived definition), so
+        ``slots_stale`` is false, but its ``is_processing`` fields are still a
+        cache-served fossil of a past request. With no live local request the
+        hint is ``unknown`` — never ``saturated``.
+        """
+        j, _, _ = await self._get(
+            slots_counts=(0, 2),
+            slots_detail=[],
+            cache_value=self._ALL_PROCESSING,
+        )
+
+        assert j["local_in_flight_requests"] == 0
+        assert j["slots_detail_stale"] is True
+        assert j["slots_stale"] is False
+        assert j["capacity_hint"] == "unknown"
 
 
 # ======================================================================

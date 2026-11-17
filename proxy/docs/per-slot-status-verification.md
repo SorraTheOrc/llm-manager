@@ -880,6 +880,55 @@ contains the endpoint-wide annotation) is a separate operational run; the
 history above is the baseline it is read against, with the widened
 `_ABANDON_REASONS` set noted as a discontinuity.
 
+## Residual attribution tiers and the stale-snapshot invariant (LP-0MVVXGMGB004DUGR)
+
+The 24 h run of 2026-10-29 left 5 of its 70 residual polls unattributable. The
+measurement tool now explains that class instead of leaving a bare empty
+`cause`. Three tiers are joined per poll, in precedence order:
+
+| Tier | Evidence | Reported as |
+|---|---|---|
+| primary | nearest preceding abandonment/restart within `--attribution-lookback-seconds` (600 s) — **unchanged** | `cause` / `confidence: primary` |
+| corroborated | a local dispatch record's lifetime (`Stream started: provider=local` → the next `Stream finished`/`lease_released` for the session) inside, or within `--live-work-window-seconds` (10 s) of, the poll | `cause: live_work_attribution_lag` / `confidence: corroborated` |
+| extended | nearest preceding abandonment/restart within `--attribution-extended-lookback-seconds` (3600 s) but outside the primary lookback | `extended_cause` / `extended_evidence_timestamp` / `extended_seconds_since_evidence`, `confidence: extended` |
+
+`lease_renewed` is deliberately **not** evidence on its own: it is a retention
+heartbeat that also fires for an idle retained lease, and a retained lease is
+not work. Only the primary and corroborated tiers move `attributed_polls` /
+`by_cause`, so a window measured before this change stays comparable with the
+same window measured after it. Every per-poll row (and CSV column) now carries
+`reason` and `confidence`; a poll no tier explains is reported `unexplained`,
+with its timestamp in `unexplained_timestamps` and a stated verdict note —
+never silently dropped.
+
+**Fresh-window evidence** (`2026-11-16 15:21` → `2026-11-17 22:00`, covered, 
+31,334 polls): 23 residual polls, **23 attributed / 0 unattributed / 0
+unexplained** — 19 `session_evicted`, 2 `measured_cache_deficit`, 1
+`proxy_restart`, 1 `live_work_attribution_lag`. The corroborated poll is the one
+the primary tier could not explain: `2026-11-16 17:32:11`, 575 ms after its own
+local dispatch's `Stream finished`, while llama-server still reported the slot
+processing and `local_in_flight_requests` had already dropped to 0. Artifacts:
+`~/proxy-usage-reports/2026-11-17_f5-residual-attribution/`.
+
+The 2026-10-29 window itself cannot be re-attributed from the log: retention
+now starts at `2026-11-10 00:00:23`, and the tool reports `outside_retention`
+for that window. Its five previously-unattributable polls are classified from
+the artifact columns instead: three (`01:47:19`, `18:41:05`, `18:44:22`) are
+fresh-detail polls with no live work — the dispatch-lifetime class corroborated
+live above — and two (`05:15:12`, latency 2.7 s / 2.3 s) carried
+`available_slots=1` beside `saturated`, which is either the documented
+leased-slot pairing or a counts-stale divergence; that artifact predates the
+`slot_counts_stale` column, so the two cannot be told apart from it. The
+per-poll table is in `~/proxy-usage-reports/2026-11-17_f5-residual-attribution/SUMMARY.md`.
+
+The same harness also checks the stale-snapshot invariant from the log:
+`stale_saturated_without_live_work` counts polls whose
+`slots_snapshot_age_seconds` exceeds their own published
+`slots_max_snapshot_age_seconds` (or whose snapshot cannot be dated) and that
+still report `capacity_hint=saturated` with `local_in_flight_requests=0`. The
+verdict fails on any such poll. Measured on the fresh window above: 31,334
+judgeable polls, 0 over-age, 2 undatable, **0 violations**.
+
 
 ## Read-path cost attribution and the child-port probe (LP-0MVVXGI490089OX5)
 
