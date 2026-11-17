@@ -402,18 +402,12 @@ def test_a_zero_target_has_a_zero_width_band():
 # ``reporting._scorecard_rows`` — not a new comparison surface, so the
 # scorecard and the ``--json`` block cannot diverge.
 #
-# Red-first: the above-target assertion fails against the current ±10 % band
-# and is marked ``xfail(strict=True)`` naming the implementation child
-# (LP-0MWJOUY4E002FNHP) that narrows ``fallback_rate.tolerance_pct``; the tree
-# stays green for the dev-push gate. The at/below-target and per-metric-band
-# assertions pass under both bands and run unmarked — they pin the sides of
-# the boundary that must not move either way.
-
-PENDING_STRICT_FALLBACK_VERDICT = (
-    "pending LP-0MWJOUY4E002FNHP (strict Fallback-rate verdict: committed "
-    "defaults narrow fallback_rate.tolerance_pct so only actual <= target "
-    "reads Met)"
-)
+# Red-first: the above-target assertion was written against the then-current
+# ±10 % band and pinned its expected pass as ``xfail(strict=True)`` naming the
+# implementation child (LP-0MWJOUY4E002FNHP). That child narrows
+# ``fallback_rate.tolerance_pct`` to a committed zero band, so the assertion is
+# now unmarked and green; the at/below-target and per-metric-band assertions
+# pin the sides of the boundary that must not move either way.
 
 #: The decision example from the parent item: a 64.9 % target whose former
 #: ±10 % band edge is 71.39 % with the window's 66.3 % inside that band.
@@ -425,7 +419,6 @@ FALLBACK_TARGET_MEASUREMENTS = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_STRICT_FALLBACK_VERDICT)
 def test_fallback_rate_is_unmet_above_the_target_inside_the_former_band():
     """The boundary the current ±10 % band gets wrong: 66.3 % against a
     64.9 % target is below the 71.39 % band edge, so the lax rule reads `Met`;
@@ -624,11 +617,30 @@ def test_an_invalid_tolerance_falls_back_to_the_default(value):
     )
 
 
-def test_the_committed_defaults_carry_a_ten_percent_tolerance_per_metric():
+def test_an_explicit_zero_tolerance_is_kept_as_a_strict_band():
+    """A falsy ``0`` is a deliberate zero-width band, not an absent value
+    (LP-0MWJOUY4E002FNHP): the normaliser must not restore the 10 % default."""
+    defaults = {"metrics": {"decode_speed": {"tolerance_pct": 0}}}
+
+    assert pm.tolerance_for("decode_speed", defaults) == pytest.approx(0.0)
+
+
+def test_the_committed_fallback_rate_band_is_the_strict_zero_band():
+    """The shipped defaults express the strict Fallback-rate verdict through
+    the ordinary per-metric band, so no bespoke comparison surface exists."""
+    assert pm.tolerance_for("fallback_rate") == pytest.approx(0.0)
+
+
+def test_the_committed_defaults_carry_the_strict_fallback_band_and_the_ten_percent_default():
+    """``fallback_rate`` deliberately opts out of the 10 % band
+    (LP-0MWJOUY4E002FNHP); every other metric keeps it."""
     defaults = pm.load_defaults()
 
     for metric in pm.METRIC_REGISTRY:
-        assert pm.tolerance_for(metric.id, defaults) == pytest.approx(10.0), metric.id
+        expected = 0.0 if metric.id == "fallback_rate" else 10.0
+        assert pm.tolerance_for(metric.id, defaults) == pytest.approx(
+            expected
+        ), metric.id
 
 
 def test_an_explicit_tolerance_widens_the_band_the_verdict_uses():

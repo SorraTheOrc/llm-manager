@@ -397,11 +397,14 @@ class TestPrefillEtaAccuracyDirection:
 
 
 class TestToleranceColumn:
-    def test_every_row_renders_the_default_ten_percent_band(self):
+    def test_every_row_renders_its_own_band(self):
         report = _report()
 
         for metric in pm.METRIC_REGISTRY:
-            assert _cells(report, metric.label)[TOLERANCE] == "±10 %", metric.id
+            # ``fallback_rate`` opts into a deliberate zero band
+            # (LP-0MWJOUY4E002FNHP); every other metric keeps the 10 % default.
+            expected = "±0 %" if metric.id == "fallback_rate" else "±10 %"
+            assert _cells(report, metric.label)[TOLERANCE] == expected, metric.id
 
     def test_the_header_names_target_tolerance_actual_and_result(self):
         section = _report().split(SUMMARY_HEADING, 1)[1].split("\n## ", 1)[0]
@@ -435,40 +438,43 @@ class TestToleranceColumn:
         assert _cells(report, "Decode speed")[TOLERANCE] == "±10 %"
 
     def test_the_verdict_uses_the_band_not_an_exact_comparison(self, tmp_path):
-        # fallback_rate is lower-is-better: three seeded 30.5 % windows give a
-        # 30.5 % target whose band edge is 33.55 %. This window's 33.3 % is
-        # worse than the target yet inside the band, so it must read Met. A
-        # 30.0 % seed makes the edge 33.0 %, which the same actual misses.
+        # contention_denials_per_hour is lower-is-better and keeps its ±10 %
+        # band (unlike fallback_rate, whose committed band is zero): the
+        # fixture window's 1.0 denials/h is worse than a 0.95 target yet inside
+        # its 1.045 band edge, so it reads Met. A 0.90 seed makes the edge 0.99,
+        # which the same actual misses.
         inside = tmp_path / "inside.yaml"
         _seed(
             inside,
-            "fallback_rate",
+            "contention_denials_per_hour",
             [
-                ("2026-07-01", 30.5, FINGERPRINT),
-                ("2026-07-02", 30.5, FINGERPRINT),
-                ("2026-07-03", 30.5, FINGERPRINT),
+                ("2026-07-01", 0.95, FINGERPRINT),
+                ("2026-07-02", 0.95, FINGERPRINT),
+                ("2026-07-03", 0.95, FINGERPRINT),
             ],
         )
         outside = tmp_path / "outside.yaml"
         _seed(
             outside,
-            "fallback_rate",
+            "contention_denials_per_hour",
             [
-                ("2026-07-01", 30.0, FINGERPRINT),
-                ("2026-07-02", 30.0, FINGERPRINT),
-                ("2026-07-03", 30.0, FINGERPRINT),
+                ("2026-07-01", 0.90, FINGERPRINT),
+                ("2026-07-02", 0.90, FINGERPRINT),
+                ("2026-07-03", 0.90, FINGERPRINT),
             ],
         )
 
-        inside_cells = _cells(_report(metrics_state=inside), "Fallback rate")
-        outside_cells = _cells(_report(metrics_state=outside), "Fallback rate")
+        inside_cells = _cells(_report(metrics_state=inside), "Contention denials per hour")
+        outside_cells = _cells(
+            _report(metrics_state=outside), "Contention denials per hour"
+        )
 
-        assert inside_cells[ACTUAL] == "33.3 % of requests"
+        assert inside_cells[ACTUAL] == "1.00 denials/h"
         assert inside_cells[RESULT] == "Met", (
-            "33.3 % is worse than the 30.5 % target but inside its ±10 % band"
+            "1.00 denials/h is worse than the 0.95 target but inside its ±10 % band"
         )
         assert outside_cells[RESULT] == "Unmet", (
-            "33.3 % is outside the 30.0 % target's ±10 % band"
+            "1.00 denials/h is outside the 0.90 target's ±10 % band"
         )
 
 
@@ -489,24 +495,18 @@ class TestToleranceColumn:
 # parity are pinned in ``test_performance_metrics.py`` and
 # ``test_performance_metrics_report.py``.
 
-PENDING_STRICT_FALLBACK_VERDICT = (
-    "pending LP-0MWJOUY4E002FNHP (strict Fallback-rate verdict: committed "
-    "defaults narrow fallback_rate.tolerance_pct so only actual <= target "
-    "reads Met)"
-)
-
 
 class TestStrictFallbackRateRow:
     """Rendered scorecard row for the lower-is-better Fallback-rate metric.
 
     The fixture window's fallback rate is 33.3 % (see ``MEASURABLE``): a
     seeded target below it exercises the above-target boundary, one above it
-    exercises the at/below-target side. The above-target row reads `Met`
-    against the current ±10 % band — the red-first case — and is marked
-    ``xfail(strict=True)`` until the implementation child narrows the band.
+    exercises the at/below-target side. The above-target row read `Met`
+    against the then-current ±10 % band — the red-first case, pinned as
+    ``xfail(strict=True)`` until this child narrowed the band; it is now
+    unmarked and green.
     """
 
-    @pytest.mark.xfail(strict=True, reason=PENDING_STRICT_FALLBACK_VERDICT)
     def test_row_reads_unmet_when_actual_is_above_the_target_inside_the_former_band(
         self, tmp_path
     ):

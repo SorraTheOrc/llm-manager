@@ -1287,7 +1287,10 @@ def _scorecard_rows(
     views can never disagree (LP-0MW1BUAQD001WL8X, parent AC7). *defaults* is
     the committed defaults mapping the per-metric ``tolerance_pct`` band is
     read from; ``None`` loads it, and an absent/invalid value falls back to the
-    10 % default (LP-0MWADHS83006QFQS).
+    10 % default (LP-0MWADHS83006QFQS). A valid explicit ``0`` is kept as a
+    deliberate strict zero-width band, so a metric that declares it (the
+    committed ``fallback_rate`` default, LP-0MWJOUY4E002FNHP) is ``Met`` only
+    when its actual is at least as good as its target.
     """
     rows: list[dict] = []
     for metric in performance_metrics.METRIC_REGISTRY:
@@ -1387,7 +1390,8 @@ def _append_performance_metrics_section(
         "**Baseline** is the best recorded value and the date it was measured; "
         "**Target** is the mean of the three best measurements (direction-aware); "
         "**Tolerance** is the relative band around the target that the verdict "
-        "was judged against (default ±10 %, overridable per metric); "
+        "was judged against (default ±10 %, overridable per metric — a metric "
+        "may set a zero band for a strict one-sided verdict, rendered `±0 %`); "
         "**Actual** is this window; **Result** compares the actual against the "
         "target and reads `Met` when the actual is within the tolerance band of "
         "the target (any actual better than the target is also `Met`), `Unmet` "

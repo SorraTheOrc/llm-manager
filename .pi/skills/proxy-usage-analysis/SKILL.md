@@ -192,7 +192,11 @@ The rules behind those numbers:
   produced each verdict. A metric whose own noise needs a wider or tighter
   band sets `tolerance_pct` in the committed defaults file (beside a one-line
   rationale for any value other than 10); an absent, non-numeric or negative
-  value falls back to the 10 % default and never fails the run. A **zero
+  value falls back to the 10 % default and never fails the run. An explicit
+  **`tolerance_pct: 0`** is not an absent value: it is a deliberate
+  zero-width, one-sided band, rendered `±0 %`, and the committed
+  `fallback_rate` default uses it so Fallback rate is `Met` only when the
+  window's actual is at or below its target. A **zero
   target** has a zero-width band — 10 % of zero is zero — so only an actual of
   zero is `Met` there; this is stated rather than replaced by an invented
   absolute epsilon.

@@ -369,15 +369,22 @@ class TestSummaryTable:
         assert len(labels) == len(set(labels)) == 10
         assert [cells[0] for cells in _summary_rows(_report())] == labels
 
-    def test_every_row_renders_the_default_tolerance_band(self):
+    def test_every_row_renders_its_own_tolerance_band(self):
         # LP-0MWADHS83006QFQS AC3: the band that decided each verdict is
         # visible, so a reader can tell a within-tolerance miss from a
-        # regression.
+        # regression. ``fallback_rate`` deliberately declares a zero band
+        # (LP-0MWJOUY4E002FNHP); every other metric renders the 10 % default.
         rows = _summary_rows(_report())
 
         assert len(rows) == len(pm.METRIC_REGISTRY)
         for cells in rows:
-            assert cells[3] == "±10 %", cells[0]
+            metric_id = next(
+                metric.id
+                for metric in pm.METRIC_REGISTRY
+                if metric.label.strip() == cells[0]
+            )
+            expected = "±0 %" if metric_id == "fallback_rate" else "±10 %"
+            assert cells[3] == expected, f"{cells[0]}: {metric_id}"
 
     def test_metrics_without_three_measurements_report_insufficient_history(self):
         # The committed defaults file is a template: it carries no measurement
@@ -717,16 +724,11 @@ class TestEndToEndDefaultRuns:
 # ``reporting._scorecard_rows`` (the single shared path), so they cannot
 # diverge; these tests pin the boundary on both at once.
 #
-# Red-first: the above-target case reads `Met` on both surfaces against the
-# current ±10 % band and is marked ``xfail(strict=True)`` naming the
-# implementation child (LP-0MWJOUY4E002FNHP) that narrows
-# ``fallback_rate.tolerance_pct``; the tree stays green for the dev-push gate.
-
-PENDING_STRICT_FALLBACK_VERDICT = (
-    "pending LP-0MWJOUY4E002FNHP (strict Fallback-rate verdict: committed "
-    "defaults narrow fallback_rate.tolerance_pct so only actual <= target "
-    "reads Met)"
-)
+# Red-first: the above-target case read `Met` on both surfaces against the
+# then-current ±10 % band and was pinned as ``xfail(strict=True)`` naming the
+# implementation child (LP-0MWJOUY4E002FNHP), which narrows
+# ``fallback_rate.tolerance_pct`` to a committed zero band; the case is now
+# unmarked and green.
 
 
 @needs_cli
@@ -747,7 +749,6 @@ class TestStrictFallbackRateSurfaces:
             "scorecard row and --json entry must report the same verdict"
         )
 
-    @pytest.mark.xfail(strict=True, reason=PENDING_STRICT_FALLBACK_VERDICT)
     def test_unmet_when_above_the_target_inside_the_former_band(self, tmp_path, capsys):
         log_dir = _write_log_dir(tmp_path)
         out_dir = tmp_path / "usage"
@@ -944,7 +945,11 @@ class TestJsonBlock:
             assert {"baseline", "target", "actual", "verdict"} <= set(entry), metric_id
             assert entry["verdict"] in VERDICTS, metric_id
             assert entry["actual"] is None or isinstance(entry["actual"], (int, float))
-            assert entry["tolerance_pct"] == pytest.approx(10.0), metric_id
+            # Each entry publishes the band its own verdict was judged against:
+            # the 10 % default except for the deliberately strict metric.
+            assert entry["tolerance_pct"] == pytest.approx(
+                pm.tolerance_for(metric_id)
+            ), metric_id
 
         by_label = {metric.label.strip(): metric.id for metric in pm.METRIC_REGISTRY}
         table = {by_label[cells[0]]: cells[5] for cells in _summary_rows((out_dir / "report.md").read_text())}
@@ -969,7 +974,14 @@ class TestJsonBlock:
 
         assert set(block) == {metric.id for metric in pm.METRIC_REGISTRY}
         for metric_id, entry in block.items():
-            assert entry["tolerance_pct"] == pytest.approx(10.0), metric_id
+            assert entry["tolerance_pct"] == pytest.approx(
+                pm.tolerance_for(metric_id)
+            ), metric_id
+            # ``fallback_rate`` opts into the strict zero band; every other
+            # metric keeps the 10 % default (LP-0MWJOUY4E002FNHP).
+            assert entry["tolerance_pct"] == pytest.approx(
+                0.0 if metric_id == "fallback_rate" else 10.0
+            ), metric_id
             # The pre-existing keys keep their meaning and type.
             assert {"baseline", "target", "actual", "verdict"} <= set(entry), metric_id
 

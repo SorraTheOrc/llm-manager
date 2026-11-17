@@ -36,7 +36,10 @@ Retention, target and verdict rules
   target, direction-aware, both edges met) and returns ``Met``/``Unmet``;
   fewer than three measurements always returns ``Insufficient history``, and
   an unmeasurable actual (``None``) returns ``n/a`` and is never recorded as
-  ``0``.
+  ``0``. A metric may declare an explicit zero band, which is a documented
+  strict rule rather than a missing value: ``fallback_rate`` does, so it is
+  ``Met`` only when the actual is at or below its target
+  (LP-0MWJOUY4E002FNHP).
 
 State schema
 ------------
@@ -103,7 +106,8 @@ NOT_AVAILABLE = "n/a"
 RETENTION_LIMIT = 3
 
 #: Default relative tolerance band around a target, as a percentage. A metric
-#: may override it with ``tolerance_pct`` in the committed defaults file.
+#: may override it with ``tolerance_pct`` in the committed defaults file; an
+#: explicit ``0`` is kept as a deliberate zero-width (strict) band.
 DEFAULT_TOLERANCE_PCT = 10.0
 
 #: Fingerprint recorded when the configuration era is unknown (backfill).
@@ -313,13 +317,21 @@ def derive_verdict(
     zero): only an actual of zero qualifies, which the documentation states
     rather than substituting an invented absolute epsilon.
 
+    A tolerance of ``0`` is also the strict rule for a metric that declares
+    it (``fallback_rate``, LP-0MWJOUY4E002FNHP): the band collapses onto the
+    target, so the comparison becomes one-sided — lower-is-better needs
+    ``actual <= target`` and higher-is-better ``actual >= target``, with no
+    allowance above/below it. This is the same path the scorecard uses, not a
+    second comparison surface.
+
     Returns ``"n/a"`` when the window has no actual value, ``"Insufficient
     history"`` when fewer than three measurements are recorded (never a
     misleading Met/Unmet), and otherwise ``"Met"``/``"Unmet"``.
 
     *tolerance_pct* is the metric's relative band width (see
     :func:`tolerance_for`); an absent, non-numeric or negative value falls
-    back to :data:`DEFAULT_TOLERANCE_PCT` and never raises.
+    back to :data:`DEFAULT_TOLERANCE_PCT` and never raises. An explicit ``0``
+    is preserved as the strict one-sided band rather than read as absent.
     """
     if actual is None:
         return NOT_AVAILABLE
@@ -574,6 +586,13 @@ def _normalise_tolerance(value: object) -> float:
     ``10 %`` is the default band, so a missing, non-numeric, boolean, NaN or
     negative value is the default rather than a failure: the scorecard must
     never stop a reporting run because one hand-edited number is wrong.
+
+    An explicit ``0`` is **not** one of those values: it is a deliberate
+    zero-width band and is returned as ``0.0``, so a metric can ask for the
+    strict one-sided rule (``Met`` only when the actual is at least as good as
+    the target — the committed ``fallback_rate`` default does). Reading a
+    falsy ``0`` as "absent → 10 %" would silently restore the lax band this
+    override exists to remove (LP-0MWJOUY4E002FNHP).
     """
     if isinstance(value, bool):
         return DEFAULT_TOLERANCE_PCT
@@ -590,9 +609,11 @@ def tolerance_for(metric_id: str, defaults: Mapping | None = None) -> float:
     """The relative tolerance band (percentage) for *metric_id*.
 
     Read from the committed defaults file's ``metrics.<id>.tolerance_pct`` when
-    present and valid, otherwise :data:`DEFAULT_TOLERANCE_PCT`. The file is
-    read-only at runtime, so this never writes. An unregistered metric id
-    raises, matching :func:`record_measurement` and :func:`detail_copy`.
+    present and valid, otherwise :data:`DEFAULT_TOLERANCE_PCT`. A valid
+    explicit ``0`` is returned as is — a deliberate strict zero-width band, not
+    a missing value (see :func:`_normalise_tolerance`). The file is read-only
+    at runtime, so this never writes. An unregistered metric id raises,
+    matching :func:`record_measurement` and :func:`detail_copy`.
     """
     if metric_id not in _METRICS_BY_ID:
         raise ValueError(f"unknown metric id {metric_id!r}")

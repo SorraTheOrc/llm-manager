@@ -23,7 +23,11 @@
 #                   (1 - tolerance_pct/100); lower-is-better: actual <= target x
 #                   (1 + tolerance_pct/100) — so run-to-run noise is not read as
 #                   a regression. An absent, non-numeric or negative value falls
-#                   back to the 10 % default. Any value other than 10 needs a
+#                   back to the 10 % default. An explicit `0` is a deliberate
+#                   zero-width band, not an absent value: it yields the strict
+#                   one-sided rule (`Met` only when the actual is at least as
+#                   good as the target) and is rendered as `±0 %` so a reader
+#                   can see the choice. Any value other than 10 needs a
 #                   one-line rationale comment beside it.
 
 metrics:
@@ -37,7 +41,13 @@ metrics:
     data_section_anchor: "## Local model utilization"
 
   fallback_rate:
-    tolerance_pct: 10
+    # Deliberate strictness (LP-0MWJOUY4E002FNHP, approved option (a)): a zero
+    # band, so this lower-is-better metric is `Met` only when the window's
+    # actual fallback rate is at or below the target — there is no +tolerance
+    # band above it. This is a zero *band*, not a zero *target*: it is an
+    # explicit choice, rendered as `±0 %`, and `_normalise_tolerance` keeps it
+    # rather than reading a falsy value as "absent → 10 % default".
+    tolerance_pct: 0
     measurements: []
     why: "The fallback rate states how often a request that could have run locally was sent to a remote provider, so it is the direct cost signal of local capacity shortfalls."
     calculation: "Share of window requests that produced Fallback triggered log events, as a percentage of all requests; the dominant reason is reported alongside it."

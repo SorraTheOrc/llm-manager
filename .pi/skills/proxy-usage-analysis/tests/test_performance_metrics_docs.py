@@ -126,6 +126,18 @@ def test_reference_documents_the_tolerance_rule_and_override_field():
     assert "zero-width band" in reference.lower()
 
 
+def test_docs_describe_the_strict_zero_band_as_deliberate():
+    """LP-0MWJOUY4E002FNHP: an explicit zero band is documented strictness,
+    never read as an absent value that would restore the 10 % default."""
+    skill = _read(SKILL_DOC)
+    reference = _read(REFERENCE_DOC)
+
+    for name, doc in (("SKILL.md", skill), ("REFERENCE.md", reference)):
+        assert "tolerance_pct: 0" in doc, f"{name} omits the strict zero band"
+        assert "±0 %" in doc, f"{name} omits the rendered zero band"
+    assert "fallback_rate" in reference
+
+
 def test_skill_states_the_0500_cron_invocation_is_unchanged():
     """The documented cron line still carries no performance-metric flag."""
     skill = _read(SKILL_DOC)

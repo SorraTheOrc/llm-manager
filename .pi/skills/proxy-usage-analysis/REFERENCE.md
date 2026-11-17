@@ -734,7 +734,9 @@ exists.)
   relative band is the only unit-free reading of "within 10 % of the target".
   A metric may override it with `tolerance_pct` in the committed defaults
   file; an absent, non-numeric or negative value falls back to the 10 %
-  default (see [Verdict rule](#verdict-rule-tolerance-band)).
+  default. An explicit `0` is a deliberate zero-width, one-sided band that is
+  rendered `±0 %` and preserved (see
+  [Verdict rule](#verdict-rule-tolerance-band)).
 - **Actual** — this window's measurement. `n/a` (never `0`) when the window
   cannot be measured: no GPU sample, no llama-server eval lines, no matched
   ETA pairs, and so on. A genuine measured zero renders as `0.0 <unit>`.
@@ -785,6 +787,14 @@ not reported as a regression. The band is relative and direction-aware
   back to 10 and never fails the run. A value other than 10 carries a one-line
   rationale comment beside it, because widening or tightening a metric's band
   weakens or strengthens its verdict.
+- **An explicit `tolerance_pct: 0` is a strict, one-sided band.** It is not
+  read as an absent value (a falsy `0` must not restore the 10 % default): the
+  band collapses onto the target, so a lower-is-better metric is `Met` only
+  when `actual <= target` and a higher-is-better metric only when
+  `actual >= target`. The row renders `±0 %` so the choice is visible. The
+  committed defaults use it for `fallback_rate` (LP-0MWJOUY4E002FNHP,
+  approved option (a)): an over-target window is `Unmet` even when it would
+  have sat inside the former ±10 % band.
 - **A zero target has a zero-width band.** 10 % of zero is zero, so a
   lower-is-better metric whose target is 0 is `Met` only at an actual of 0.
   This is stated rather than replaced by an invented absolute epsilon.
@@ -888,7 +898,9 @@ Every field except `measurements` is optional: a field a custom defaults file
 omits is reported as `not documented in the committed metrics defaults.`
 rather than invented. `tolerance_pct` is the metric's verdict band (default
 10, see [Verdict rule](#verdict-rule-tolerance-band)); it is a number, not
-prose. `data_section_anchor` is the `##` heading of the data
+prose. An explicit `0` is kept as a deliberate strict zero band, and the
+committed defaults declare it for `fallback_rate`. `data_section_anchor` is
+the `##` heading of the data
 section reporting the metric's figures; the renderer links to it instead of
 restating its tables. Loading either file never writes it, and
 `config_loader`'s guarded-import YAML pattern keeps PyYAML optional — no new
