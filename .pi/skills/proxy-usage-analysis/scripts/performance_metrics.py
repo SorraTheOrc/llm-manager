@@ -214,10 +214,14 @@ METRIC_REGISTRY: tuple[Metric, ...] = (
     ),
     Metric(
         id="prefill_eta_accuracy",
-        label="Prefill ETA accuracy",
+        label="Prefill ETA error",
         unit="%",
-        direction=HIGHER,
-        source="local_admission_guard prefill ETA and dispatch first-byte pairs",
+        direction=LOWER,
+        source=(
+            "median absolute relative error between the admission guard's "
+            "priced prefill ETA and the dispatch's observed first byte "
+            "(local_admission_guard and dispatch first-byte pairs)"
+        ),
     ),
 )
 

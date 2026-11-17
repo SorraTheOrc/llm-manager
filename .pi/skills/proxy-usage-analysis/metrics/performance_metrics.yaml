@@ -121,8 +121,8 @@ metrics:
   prefill_eta_accuracy:
     tolerance_pct: 10
     measurements: []
-    why: "The prefill ETA drives admission refusals, so its accuracy decides whether servable work is rejected or overload is admitted silently."
-    calculation: "Median absolute relative error between the priced ETA and the observed first byte, from local_admission_guard prefill ETA and dispatch first-byte pairs, reported as an accuracy percentage."
+    why: "The prefill ETA drives admission refusals, so its error decides whether servable work is rejected or overload is admitted silently."
+    calculation: "Median absolute relative error between the admission guard's priced prefill ETA and the dispatch's observed first byte (local_admission_guard and dispatch first-byte pairs). Lower is better: 0 % is a perfect prediction, 100 % means the ETA was double the observed first byte."
     levers: "ETA calibration and cache-cold reference costs in the admission guard, the prefill deadline budget, and cache-warm dispatch behaviour."
     trade_offs: "A conservative ETA protects first-byte latency but refuses more servable work; a tighter ETA admits more load at the risk of long prefills and queue growth."
     data_section_anchor: "## Local contention prediction vs reality"

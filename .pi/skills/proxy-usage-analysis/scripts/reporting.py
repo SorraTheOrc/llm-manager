@@ -1206,20 +1206,13 @@ def _performance_metric_actuals(
 ) -> dict[str, float | None]:
     """This window's actual per registry metric (``None`` renders ``n/a``).
 
-    Thin wrapper over :func:`aggregation.performance_metric_inputs` that
-    converts the one metric whose aggregation input has the opposite sense to
-    its registry direction: ``prefill_eta_accuracy`` is registered as a
-    higher-is-better percentage, while the aggregation helper reports the
-    median absolute **relative error**. Recording the error would make the
-    direction-aware best-3 retention keep the worst windows, so the scorecard
-    records ``100 - error`` (clamped at 0: an error above 100 % is no accuracy
-    at all) — as the helper's docstring instructs.
+    ``aggregation.performance_metric_inputs`` already returns every metric in
+    its registry-declared sense (LP-0MWJOUZG9008Q4RG): the aggregation's
+    ``prefill_eta_accuracy`` median absolute **relative error** is the
+    scorecard actual as-is, because the metric is registered lower-is-better
+    (a smaller error is a better prediction).
     """
-    actuals = aggregation.performance_metric_inputs(summary, config, mode_map)
-    error = actuals.get("prefill_eta_accuracy")
-    if error is not None:
-        actuals["prefill_eta_accuracy"] = round(max(0.0, 100.0 - float(error)), 1)
-    return actuals
+    return aggregation.performance_metric_inputs(summary, config, mode_map)
 
 
 def _cross_era_fingerprints(measurements: list[dict], direction: str) -> list[str]:

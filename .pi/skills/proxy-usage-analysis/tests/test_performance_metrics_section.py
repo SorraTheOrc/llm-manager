@@ -363,15 +363,18 @@ class TestCrossEraNote:
 class TestPrefillEtaAccuracyDirection:
     @pytest.mark.parametrize(
         ("error", "expected"),
-        [(0.0, 100.0), (40.0, 60.0), (100.0, 0.0), (140.0, 0.0)],
+        # The raw median absolute relative error is recorded as-is, lower is
+        # better (LP-0MWJOUZG9008Q4RG): no 100 - error conversion and no clamp,
+        # so an error above 100 % is reported above 100 %.
+        [(0.0, 0.0), (40.0, 40.0), (92.3, 92.3), (100.0, 100.0), (140.0, 140.0)],
     )
-    def test_the_recorded_actual_is_accuracy_not_the_error(
+    def test_the_recorded_actual_is_the_raw_error_not_an_accuracy(
         self, tmp_path, monkeypatch, error, expected
     ):
         # The aggregation helper reports a median absolute *relative error*
-        # (lower is better) while the registry declares the metric
-        # higher-is-better; recording the error would invert best-3 retention,
-        # so the scorecard records 100 - error (clamped at 0).
+        # (lower is better) and the registry declares the metric
+        # lower-is-better, so the scorecard records the error as-is rather
+        # than a 100 - error accuracy figure.
         monkeypatch.setattr(
             aggregation,
             "performance_metric_inputs",
@@ -386,7 +389,7 @@ class TestPrefillEtaAccuracyDirection:
             measurement["value"]
             for measurement in _measurements(state, "prefill_eta_accuracy")
         ] == [expected]
-        assert _cells(report, "Prefill ETA accuracy")[ACTUAL] == (
+        assert _cells(report, "Prefill ETA error")[ACTUAL] == (
             f"{expected:.1f} %"
         )
 

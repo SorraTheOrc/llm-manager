@@ -3173,11 +3173,11 @@ def prefill_eta_accuracy(summary: AnalysisResult) -> float | None:
     is inert for uncalibrated buckets and logs nothing in inactive observe
     mode), never ``0``.
 
-    Note for the scorecard: this is an *error*, so **lower is better**, while
+    Note for the scorecard: this figure is an *error*, so **lower is better**.
+    The scorecard records it as-is (LP-0MWJOUZG9008Q4RG):
     ``performance_metrics.METRIC_REGISTRY`` declares ``prefill_eta_accuracy``
-    as higher-is-better. A consumer recording this value as the metric actual
-    must invert it (e.g. ``100 − error``) or the direction-aware best-3
-    retention would keep the worst windows.
+    lower-is-better and its label/detail copy present the median absolute
+    relative error rather than an accuracy percentage.
     """
     errors = [abs(predicted - observed) / observed * 100.0
               for predicted, observed in prefill_eta_pairs(summary)

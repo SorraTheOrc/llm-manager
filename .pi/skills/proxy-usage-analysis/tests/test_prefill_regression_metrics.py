@@ -240,25 +240,14 @@ def test_report_omits_the_section_when_every_check_is_zero():
 # and registering ``prefill_eta_accuracy`` lower-is-better. The aggregation
 # helper already returns that error (p50 ≈ 1041 % on recent windows, because the
 # priced ETA is a cache-cold bound while the observed first byte is cache-warm);
-# ``reporting._performance_metric_actuals`` currently converts it to
-# ``max(0, 100 − error)`` for a higher-is-better registry entry, so a 1041 %
-# error renders as 0.0 % and a ≈92 % error as ≈8 %.
+# the implementation child (LP-0MWJOUZG9008Q4RG) removed the
+# ``max(0, 100 − error)`` conversion, so a 1041 % error renders as 1041.0 % and
+# a ≈92 % error as ≈92 %.
 #
 # These tests use real matched pairs (the same ``local_admission_guard`` and
 # ``dispatch_first_byte_ms`` lines the rest of this module parses), so the
 # assertion is that the scorecard's actual **is** the aggregation's figure, not
 # a transformed stand-in.
-#
-# Red-first: the raw-value assertions fail against the current conversion and
-# are marked ``xfail(strict=True)`` naming the implementation child
-# (LP-0MWJOUZG9008Q4RG); the tree stays green for the dev-push gate, and each
-# strict marker turns red once the conversion is removed so it cannot be left
-# behind.
-
-PENDING_RAW_PREFILL_ETA_ERROR = (
-    "pending LP-0MWJOUZG9008Q4RG (report the raw median absolute relative "
-    "error for prefill_eta_accuracy, registered lower-is-better)"
-)
 
 
 def _eta_guard_line(eta_prefill_s: float, session: str = USER_SESSION) -> str:
@@ -292,7 +281,6 @@ def _eta_pair_summary(eta_prefill_s: float, first_byte_ms: float):
     return _analyse([_eta_guard_line(eta_prefill_s), _eta_dispatch_line(first_byte_ms)])
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 def test_the_scorecard_actual_is_the_raw_median_error_from_the_aggregation():
     """A 1041.5 % median error is reported as 1041.5 — not clamped to 0.0.
 
@@ -307,7 +295,6 @@ def test_the_scorecard_actual_is_the_raw_median_error_from_the_aggregation():
     ] == pytest.approx(1041.5)
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 def test_a_ninety_two_percent_error_is_not_reported_as_eight_percent_accuracy():
     """The documented ≈8 % window: 92.3 % error must stay 92.3, not become
     7.7 % "accuracy"."""

@@ -818,7 +818,7 @@ key, the `--json` key and the detail-subsection prefix.
 | `context_pressure` | Context-size pressure | % | lower is better | `routing_skip_local estimated_tokens` lines |
 | `prompt_cache_hit_ratio` | Prompt cache hit ratio | ratio | higher is better | `cached_ratio` and `cache_state` log fields |
 | `contention_denials_per_hour` | Contention denials per hour | denials/h | lower is better | `local_dispatch_denied` log events |
-| `prefill_eta_accuracy` | Prefill ETA accuracy | % | higher is better | `local_admission_guard` prefill ETA and dispatch first-byte pairs |
+| `prefill_eta_accuracy` | Prefill ETA error | % | lower is better | median absolute relative error between the admission guard's priced prefill ETA and the dispatch's observed first byte (local_admission_guard and dispatch first-byte pairs) |
 
 How each value is calculated (`aggregation.performance_metric_inputs` is the
 single roll-up that produces exactly these keys):
@@ -868,12 +868,12 @@ single roll-up that produces exactly these keys):
 - **`prefill_eta_accuracy`** — median **absolute relative error** between the
   admission guard's priced ETA and the observed first byte over matched pairs
   (`median(|predicted − observed| / observed × 100)`, the
-  **Local contention prediction vs reality** section's M2 figure), recorded as
-  an accuracy percentage: **`100 − error`**, clamped at 0 because an error
-  above 100 % is no accuracy at all. The registry direction is
-  higher-is-better, so recording the raw error would make the best-3
-  retention keep the *worst* windows. `n/a` when no dispatch pairs with a
-  guard record.
+  **Local contention prediction vs reality** section's M2 figure), reported
+  as-is (LP-0MWJOUZG9008Q4RG): the registry direction is lower-is-better, so a
+  smaller error is a better prediction and the best-3 retention keeps the
+  *best* (smallest-error) windows. Errors above 100 % are reported above 100 %
+  — never clamped to an accuracy percentage. `n/a` when no dispatch pairs
+  with a guard record.
 
 ### Committed defaults: `metrics/performance_metrics.yaml`
 

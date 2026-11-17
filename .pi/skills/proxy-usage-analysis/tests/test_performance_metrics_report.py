@@ -791,21 +791,13 @@ class TestStrictFallbackRateSurfaces:
 # Parent LP-0MWEOGIUK006B1DD Q3 answer (a): `prefill_eta_accuracy` reports the
 # median absolute relative **error** directly and is registered
 # lower-is-better. The aggregation helper already returns that error (p50
-# ≈ 1041 % on recent windows); `reporting._performance_metric_actuals` converts
-# it to `max(0, 100 − error)` for a higher-is-better entry, so every recorded
-# window reads 0.0 % (≈8 % at ≈92 % error).
+# ≈ 1041 % on recent windows); the implementation child
+# (LP-0MWJOUZG9008Q4RG) removed the `max(0, 100 − error)` conversion from
+# ``reporting._performance_metric_actuals``, so every window now reads the
+# raw error (1041.0 rather than a clamped 0.0 %).
 #
-# Red-first: the raw-value assertions fail against the current conversion and
-# are marked ``xfail(strict=True)`` naming the implementation child
-# (LP-0MWJOUZG9008Q4RG); the tree stays green for the dev-push gate, and the
-# strict marker turns red once the conversion is gone so it cannot be left
-# behind. The `n/a` assertion passes under both definitions and runs unmarked:
-# it pins the behaviour the redefinition must not change.
-
-PENDING_RAW_PREFILL_ETA_ERROR = (
-    "pending LP-0MWJOUZG9008Q4RG (report the raw median absolute relative "
-    "error for prefill_eta_accuracy, registered lower-is-better)"
-)
+# The `n/a` assertion passes under both definitions and runs unmarked: it pins
+# the behaviour the redefinition must not change.
 
 
 def _prefill_actuals(monkeypatch, error: float) -> dict:
@@ -818,12 +810,11 @@ def _prefill_actuals(monkeypatch, error: float) -> dict:
     return reporting._performance_metric_actuals(_probe_summary(), None, None)
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 @pytest.mark.parametrize(
     ("error", "former_accuracy"),
     [
-        (1041.0, 0.0),  # the current window: clamped to "no accuracy at all"
-        (92.3, 7.7),  # the documented ≈8 % window
+        (1041.0, 0.0),  # the recent window: clamped (old) accuracy figure
+        (92.3, 7.7),  # the documented ≈8 % accuracy window
     ],
 )
 def test_the_scorecard_actual_is_the_raw_error_with_no_accuracy_conversion(
@@ -835,7 +826,6 @@ def test_the_scorecard_actual_is_the_raw_error_with_no_accuracy_conversion(
     assert actuals["prefill_eta_accuracy"] != pytest.approx(former_accuracy)
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 def test_the_json_actual_is_the_same_raw_error_as_the_scorecard(monkeypatch):
     """Both surfaces read ``_performance_metric_actuals``, so a conversion left
     in one of them would make them disagree."""

@@ -114,7 +114,7 @@ TEN_METRICS = {
     "context_pressure": LOWER,
     "prompt_cache_hit_ratio": HIGHER,
     "contention_denials_per_hour": LOWER,
-    "prefill_eta_accuracy": HIGHER,
+    "prefill_eta_accuracy": LOWER,
 }
 
 FP = "slots=2,ctx=131072"
@@ -490,31 +490,19 @@ def test_every_other_lower_is_better_metric_keeps_its_tolerance_band(metric_id):
     )
 
 
-# --- Prefill-ETA raw error metric (LP-0MWJOUV5P007R799) ---------------------
+# --- Prefill-ETA raw error metric (LP-0MWJOUV5P007R799 / LP-0MWJOUZG9008Q4RG) --
 #
 # Parent LP-0MWEOGIUK006B1DD Q3 answer (a): the producer approved reporting the
 # median absolute relative **error** for `prefill_eta_accuracy` directly and
 # registering the metric lower-is-better, so a smaller error is better. The
 # aggregation helper already returns that error (p50 ≈ 1041 % on recent
-# windows); the scorecard instead converts it to `max(0, 100 − error)` for a
-# higher-is-better entry, so every window reads ~0 % and best-3 retention keeps
-# the **worst** windows.
+# windows); the implementation child (LP-0MWJOUZG9008Q4RG) removed the
+# `max(0, 100 − error)` conversion and flipped the registry entry to lower-is-
+# better, so best-3 retention keeps the best (smallest-error) windows.
 #
-# Red-first: these assertions fail against the current higher-is-better entry
-# and are marked ``xfail(strict=True)`` naming the implementation child
-# (LP-0MWJOUZG9008Q4RG); the tree stays green for the dev-push gate, and once
-# the direction flips each strict marker turns red so it cannot be left behind.
-#
-# ``TEN_METRICS`` above still records the *parent* definition, which declared
-# this metric higher-is-better. The approved redefinition supersedes it, so the
-# implementation child flips that entry to ``LOWER`` alongside the registry
-# change (and ``test_registry_direction_matches_the_parent_definition`` follows
-# it).
-
-PENDING_RAW_PREFILL_ETA_ERROR = (
-    "pending LP-0MWJOUZG9008Q4RG (report the raw median absolute relative "
-    "error for prefill_eta_accuracy, registered lower-is-better)"
-)
+# ``TEN_METRICS`` above records the approved definition: this metric is
+# lower-is-better, and ``test_registry_direction_matches_the_parent_definition``
+# follows it. The aggregation helpers treat a smaller value as better.
 
 #: Median absolute relative errors of the matched prefill-ETA pairs: lower is
 #: better, so the three best measurements are the three smallest errors. Their
@@ -536,29 +524,26 @@ def prefill_direction() -> str:
     return registry_entry("prefill_eta_accuracy").direction
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 def test_prefill_eta_accuracy_is_registered_lower_is_better():
     """The reported figure is an error, so a smaller value must be better."""
     assert prefill_direction() == LOWER
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 def test_prefill_eta_best_three_keeps_the_smallest_errors():
-    """A higher-is-better entry retains the three largest errors — the worst
-    windows — which is exactly the inversion the redefinition removes."""
+    """A lower-is-better entry retains the three smallest errors (the best
+    windows); a higher-is-better entry would retain the three largest, which is
+    the inversion the redefinition removes."""
     retained = pm.retained(PREFILL_ERROR_MEASUREMENTS, prefill_direction())
 
     assert [(entry["value"], entry["date"]) for entry in retained] == PREFILL_ERROR_BEST_THREE
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 def test_prefill_eta_target_is_the_mean_of_the_three_smallest_errors():
     assert pm.target_from(PREFILL_ERROR_MEASUREMENTS, prefill_direction()) == pytest.approx(
         PREFILL_ERROR_TARGET
     )
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 def test_a_smaller_error_than_the_target_reads_met():
     """Under the redefinition the best window is the one whose error is
     smallest; judged higher-is-better a better-than-target error reads
@@ -576,7 +561,6 @@ def test_a_smaller_error_than_the_target_reads_met():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RAW_PREFILL_ETA_ERROR)
 def test_a_larger_error_than_the_target_reads_unmet():
     target = pm.target_from(PREFILL_ERROR_MEASUREMENTS, LOWER)
 
