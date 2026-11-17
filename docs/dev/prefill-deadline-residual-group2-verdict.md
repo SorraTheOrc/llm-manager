@@ -340,3 +340,160 @@ guard)**; stall-weighted combined **30.444 → 6.844 s/h = −77.5 % (NOT MET vs
 LP-0MWKQJHSM000CI6W) — a relabelling, not an elimination; **214** admissions
 refused by the deadline-capacity bound (`prefill_eta_exceeds_deadline`,
 `deadline_capacity_tokens=46153`).
+
+## 9. Regression check — no `prefill_deadline` increase and no local-coverage collapse (parent AC6)
+
+**Work item:** LP-0MW8EAV91002W5IN (child 5 of the group-2 validation epic
+LP-0MW7V14DN007F127). **Evidence artefact:**
+[`prefill-deadline-residual-group2-regression.json`](./prefill-deadline-residual-group2-regression.json)
+(every figure below, both windows, machine-readable).
+
+Parent AC6 asks a narrow question: did group 2 buy its residual reduction by
+**stalling more traffic** (a rising `prefill_deadline` count) or by
+**collapsing local coverage**? This section answers it on the two windows of
+§0 and adds no threshold, no decision and no re-reading of §0–§8: the verdict
+above stands unchanged. The regression is about *coverage and count*, not
+about stall cost — the stall-weighted regression is §5's finding and is not
+re-litigated here.
+
+### 9.1 `prefill_deadline` count and user-class rate (AC1)
+
+Both rows come from the **committed analyser datasets** for the same two
+windows, produced by the **same analyser command shape** (only `--start`,
+`--end` and `--output` differ between the windows; group 2 spells out
+`--deadline-seconds 180`, which is the analyser's own default
+`DEFAULT_PREFILL_DEADLINE_S = 180.0`, so the eviction count is unchanged — the
+group-1 recompute in §1 reproduces the committed counts exactly):
+
+```bash
+# group 2 (this epic's measurement child LP-0MW8EAU8P0079280)
+python3 proxy/scripts/analyse_prefill_deadline_residual.py \
+  --start "2026-11-16 15:20:47" --end "2026-11-17 18:20:00" \
+  --deadline-seconds 180 \
+  --llama-log "/var/log/llama-proxy/llama-server*.log" \
+  --json --output docs/dev/prefill-deadline-residual-group2-24h.json
+
+# group 1 (LP-0MW7V0S6A006DKZ4's measurement child, committed dataset)
+python3 proxy/scripts/analyse_prefill_deadline_residual.py \
+  --start "2026-11-10 14:18:26" --end "2026-11-11 15:18:26" \
+  --llama-log "/var/log/llama-proxy/llama-server*.log" \
+  --json --output proxy/docs/validation/group1-prefill-deadline-residual.json
+```
+
+| Figure | Group 1 (25.0 h) | Group 2 (26.987 h) | Change | Increased beyond group 1? |
+|---|---:|---:|---:|---|
+| `prefill_deadline` evictions (all classes) | 4 | 1 | −3 | **No** |
+| — user class | 4 | 1 | −3 | **No** |
+| — `audit-*` class | 0 | 0 | 0 | **No** |
+| User-class rate (`prefill_deadline`) | 0.160/h | 0.037/h | −0.123/h | **No** |
+| Combined (b2) user events, `prefill_deadline` + `measured_cache_deficit` | 18 | 4 | −14 | **No** |
+| Combined (b2) user rate | 0.720/h | 0.148/h | −0.572/h | **No** |
+
+**AC1 verdict: MET — the count did not increase.** `prefill_deadline` fell from
+**4** events (0.160/h) in group 1 to **1** (0.037/h) in group 2: the named
+reason did not buy any of its improvement by aborting more deadline traffic.
+
+> **The wider "stalling more traffic" reading, stated rather than buried.** The
+> `prefill_deadline` class did not grow, but the early-abort class beside it
+> did: `no_progress_watchdog` **4 → 184** events (0.160 → 6.818/h) and
+> `lease_evicted` 1 → 3 (§2). On the figure parent AC6 names — the
+> `prefill_deadline` count — the answer is "no increase", which is this AC's
+> met/not-met test; on "accepted and then released before the first byte" the
+> answer is that it rose sharply, which is §5's finding and the open defect
+> LP-0MWKQJHSM000CI6W. Both statements are true because the residual was
+> **relabelled**, not removed.
+
+### 9.2 Local coverage, admission refusals and remote fallbacks (AC2)
+
+Agreed threshold: **local share ≥ the group-1 window's local share − 5
+percentage points** (producer decision, 2026-11-08, Appendix Q2).
+
+| Figure | Group 1 (25.0 h) | Group 2 (26.987 h) | Change |
+|---|---:|---:|---:|
+| Requests (all) | 12 439 | 17 903 | +43.9 % |
+| Requests per hour | 497.56 | 663.39 | +33.3 % |
+| Local requests | 2 722 | 4 104 | +50.8 % |
+| **Local share of requests** | **21.88 %** | **22.92 %** | **+1.04 pp** |
+| Remote requests | 9 717 | 13 799 | +42.0 % |
+| **Remote fallback events** | **9 532** | **11 869** | +24.5 % |
+| Remote fallback rate (% of requests) | 76.63 % | 66.30 % | −10.33 pp |
+| Sessions that fell back | 270 | 315 | +16.7 % |
+| Local admissions (guard `admit`) | 2 704 | 4 756 | +75.9 % |
+| **Local admission refusals (guard `reject`)** | **4 040** | **3 182** | −21.2 % |
+| Refusal rate (% of requests) | 32.48 % | 17.77 % | −14.71 pp |
+| Refusals per hour | 161.60 | 117.91 | −27.0 % |
+| — `prefill_budget_exceeded` (25 k cold budget) | 3 707 | 2 709 | −26.9 % |
+| — `prefill_eta_exceeds_deadline` (deadline-capacity bound) | 110 | 214 | +94.5 % |
+| — `eta_exceeds_budget_direct` | 142 | 247 | +74.0 % |
+| — `prefill_eta_exceeds_safety_budget` | 81 | 0 | −81 |
+| — `eta_exceeds_budget` | 0 | 12 | +12 |
+
+**Threshold arithmetic.** Floor = 21.88 % − 5 pp = **16.88 %**; group 2 =
+**22.92 %**, which is **6.04 pp above the floor**. **AC2 verdict: MET — no
+local-coverage collapse.** Local share rose slightly (+1.04 pp), local serving
+grew faster than traffic (+50.8 % vs +43.9 %), and the remote-fallback *rate*
+fell 10.33 pp. The absolute remote-fallback **count** rose 24.5 %, but on a
+43.9 % larger request volume — the per-request fallback rate fell, so the rise
+is traffic, not lost coverage.
+
+**Definition.** "Local share" here is **local requests / all requests**, the
+usage report's own header figure; the producer's threshold is applied to that
+definition. It is a share of requests, not of stream-seconds or prompt tokens,
+so a change in prompt mix can move it independently of admission policy.
+
+**Method note — why a second command, and why it is still one comparison.**
+The residual analyser publishes no routing or coverage fields (it has no
+local/remote request counts and no admission decisions), so the three metrics
+AC2 names cannot come from it. They come from the repository's own proxy-usage
+CLI, invoked **identically over both windows** in this session — same binary,
+same flags, only `--start`/`--end` and the output directory differ:
+
+```bash
+python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+  --log-dir /var/log/llama-proxy \
+  --start "<window start>" --end "<window end>" \
+  --output-dir /tmp/lp-regression/<window> \
+  --no-discord --no-metrics-update --json --quiet
+# group 1: 2026-11-10 14:18:26 → 2026-11-11 15:18:26
+# group 2: 2026-11-16 15:20:47 → 2026-11-17 18:20:00
+```
+
+The group-1 coverage numbers are re-derived from the **same committed group-1
+window** above (its proxy logs are retained in `/var/log/llama-proxy`), never
+from a different window, which is what the item's constraint forbids; the
+constraint's intent — one tool and one window basis for both sides of the
+comparison — is what keeps this a regression comparison. As a
+cross-check, the CLI's admission counts equal an independent direct count of
+`local_admission_guard decision=` lines over the same two windows exactly —
+4 040 / 3 182 refusals, 2 704 / 4 756 admits, `prefill_budget_exceeded`
+3 707 / 2 709 — and its `prefill_eta_exceeds_deadline` line count reproduces
+§4.3's **214** for group 2. (The CLI's `denial_attribution.by_guard_reason`
+block reports 7 / 10 for that reason: it only attributes denials joined to a
+dispatch inside 60 s, a subset — the admission-line counts above are the
+refusals AC2 asks for.)
+
+### 9.3 Regression-check verdict
+
+| Parent AC6 sub-question | Answer | Basis |
+|---|---|---|
+| Did the `prefill_deadline` count increase beyond group 1? | **No** — 4 → 1 (0.160 → 0.037/h) | §9.1, committed analyser datasets |
+| Did local coverage collapse beyond the agreed threshold? | **No** — 21.88 % → 22.92 %, floor 16.88 % (+6.04 pp margin) | §9.2, identical proxy-usage runs |
+| Was more traffic stalled? (all early-abort classes) | **Yes** — `no_progress_watchdog` 4 → 184 | §2, §5 — outside AC1/AC2 as written |
+
+Group 2 did **not** buy its residual reduction by aborting more
+`prefill_deadline` traffic and **not** by collapsing local coverage: local
+share held (and rose 1.04 pp) while request volume grew 43.9 %. What it did do
+is move the cost into the uncounted `no_progress_watchdog` class (§5) — that is
+the "stalling more traffic" reading of parent AC6, and it is a finding, not a
+pass.
+
+### 9.4 Reproduction
+
+Per-window figures: the `analyze_proxy_usage.py` commands above (add `--json`
+to split the counts by reason from `local_admission_by_*`); the direct
+admission-line count over the same two windows reproduces every per-reason
+figure recorded under `local_coverage.*.admission_refusals_by_reason` in the
+committed artefact
+[`prefill-deadline-residual-group2-regression.json`](./prefill-deadline-residual-group2-regression.json)
+(keys `prefill_deadline`, `local_coverage`, `threshold`). The same artefact is
+pinned by `tests/test_prefill_deadline_residual_group2_regression.py`.

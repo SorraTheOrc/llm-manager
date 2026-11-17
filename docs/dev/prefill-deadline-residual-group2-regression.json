@@ -1,0 +1,104 @@
+{
+  "work_item": "LP-0MW8EAV91002W5IN",
+  "parent_work_item": "LP-0MW7V14DN007F127",
+  "generated": "2026-11-17T20:10:00Z",
+  "windows": {
+    "group1": {
+      "start": "2026-11-10 14:18:26",
+      "end": "2026-11-11 15:18:26",
+      "hours": 25.0
+    },
+    "group2": {
+      "start": "2026-11-16 15:20:47",
+      "end": "2026-11-17 18:20:00",
+      "hours": 26.987
+    }
+  },
+  "prefill_deadline": {
+    "analyser": "proxy/scripts/analyse_prefill_deadline_residual.py",
+    "group1": {
+      "dataset": "proxy/docs/validation/group1-prefill-deadline-residual.json",
+      "command": "python3 proxy/scripts/analyse_prefill_deadline_residual.py --start \"2026-11-10 14:18:26\" --end \"2026-11-11 15:18:26\" --llama-log \"/var/log/llama-proxy/llama-server*.log\" --json --output proxy/docs/validation/group1-prefill-deadline-residual.json",
+      "count": 4,
+      "user": 4,
+      "audit": 0,
+      "user_per_hour": 0.16,
+      "combined_b2_user": 18,
+      "combined_b2_user_per_hour": 0.72
+    },
+    "group2": {
+      "dataset": "docs/dev/prefill-deadline-residual-group2-24h.json",
+      "command": "python3 proxy/scripts/analyse_prefill_deadline_residual.py --start \"2026-11-16 15:20:47\" --end \"2026-11-17 18:20:00\" --deadline-seconds 180 --llama-log \"/var/log/llama-proxy/llama-server*.log\" --json --output docs/dev/prefill-deadline-residual-group2-24h.json",
+      "count": 1,
+      "user": 1,
+      "audit": 0,
+      "user_per_hour": 0.037,
+      "combined_b2_user": 4,
+      "combined_b2_user_per_hour": 0.148
+    },
+    "increased": false
+  },
+  "local_coverage": {
+    "tool": ".pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py",
+    "group1": {
+      "command": "python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py --log-dir /var/log/llama-proxy --start \"2026-11-10 14:18:26\" --end \"2026-11-11 15:18:26\" --output-dir /tmp/lp-regression/g1 --no-discord --no-metrics-update --json --quiet",
+      "total_requests": 12439,
+      "local_requests": 2722,
+      "remote_requests": 9717,
+      "local_share_pct": 21.88,
+      "requests_per_hour": 497.56,
+      "local_requests_per_hour": 108.88,
+      "remote_fallback_events": 9532,
+      "remote_fallback_rate_pct": 76.63,
+      "remote_fallback_sessions": 270,
+      "remote_fallback_events_per_hour": 381.28,
+      "admission_admits": 2704,
+      "admission_refusals": 4040,
+      "admission_refusal_rate_pct_of_requests": 32.48,
+      "admission_refusals_per_hour": 161.6,
+      "admission_refusals_by_reason": {
+        "eta_exceeds_budget": 0,
+        "eta_exceeds_budget_direct": 142,
+        "prefill_budget_exceeded": 3707,
+        "prefill_eta_exceeds_deadline": 110,
+        "prefill_eta_exceeds_safety_budget": 81
+      },
+      "prefill_budget_refusals": 3707
+    },
+    "group2": {
+      "command": "python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py --log-dir /var/log/llama-proxy --start \"2026-11-16 15:20:47\" --end \"2026-11-17 18:20:00\" --output-dir /tmp/lp-regression/g2 --no-discord --no-metrics-update --json --quiet",
+      "total_requests": 17903,
+      "local_requests": 4104,
+      "remote_requests": 13799,
+      "local_share_pct": 22.92,
+      "requests_per_hour": 663.39,
+      "local_requests_per_hour": 152.07,
+      "remote_fallback_events": 11869,
+      "remote_fallback_rate_pct": 66.3,
+      "remote_fallback_sessions": 315,
+      "remote_fallback_events_per_hour": 439.8,
+      "admission_admits": 4756,
+      "admission_refusals": 3182,
+      "admission_refusal_rate_pct_of_requests": 17.77,
+      "admission_refusals_per_hour": 117.91,
+      "admission_refusals_by_reason": {
+        "eta_exceeds_budget": 12,
+        "eta_exceeds_budget_direct": 247,
+        "prefill_budget_exceeded": 2709,
+        "prefill_eta_exceeds_deadline": 214,
+        "prefill_eta_exceeds_safety_budget": 0
+      },
+      "prefill_budget_refusals": 2709
+    },
+    "method": "The residual analyser publishes no routing or coverage fields, so the three coverage metrics come from identical window-matched invocations of the proxy-usage CLI; the group-1 side is the committed group-1 window, re-derived from its retained proxy logs (no different window, no different tool per side)."
+  },
+  "threshold": {
+    "rule": "local share >= the group-1 window's local share - 5 percentage points (producer decision, 2026-11-08, Appendix Q2)",
+    "group1_local_share_pct": 21.88,
+    "floor_pct": 16.88,
+    "group2_local_share_pct": 22.92,
+    "delta_pp": 1.04,
+    "margin_above_floor_pp": 6.04,
+    "met": true
+  }
+}
