@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from proxy.observability import (
     SLOTS_STALE_REASON_CHILD_PORT_UNDISCOVERED,
     SLOTS_STALE_REASON_ROUTER_MODEL_MISSING,
+    slots_read_scope,
 )
 from proxy.provider import clear_usage_limit_quarantine, get_model_type
 
@@ -552,9 +553,14 @@ async def get_llama_local_status(request: Request):
     so slot identity survives transient failures (LP-0MUFSVXID0039ZAQ); when
     that cache is also empty the field is an empty array. It is an empty
     array when llama-server is not running or no model is loaded yet — never
-    a malformed payload. The fetch reuses ``_query_slots_detail()``'s own
-    httpx timeout bounded by the ``STATUS_QUERY_TIMEOUT`` window so a slow
-    /slots response cannot blow the endpoint's response budget.
+    a malformed payload. ``slots`` and the counts pair are derived from ONE
+    shared ``/slots`` snapshot per poll (LP-0MVVXGLTM008ROJ9): the poll
+    performs at most one bounded upstream fetch, bounded by the
+    ``STATUS_QUERY_TIMEOUT`` window, and reuses the shared snapshot while it
+    is within its freshness window. A fetch that outlives the budget keeps
+    running in the background instead of extending the poll; the payload then
+    serves the last-known snapshot (with its stale flags) and later polls pick
+    the fetch's result up from the coalesced cache.
 
     Abandoned work (LP-0MVRMI5HK00558TB AC1, ``status_schema_version: 4``):
     a local dispatch the proxy has given up on (prefill deadline, session
@@ -827,119 +833,134 @@ async def get_llama_local_status(request: Request):
                     _model_source = None
                 if _model_source == "last_resort":
                     slots_resolver_reason = SLOTS_STALE_REASON_ROUTER_MODEL_MISSING
-                if llama_port is None:
-                    total_slots = 0
-                    available_slots = 0
-                    model_absent = True
-                    detail = []
-                    slots_counts_ms = 0
-                    slots_detail_ms = 0
-                    counts_provenance = {}
-                    detail_provenance = {}
-                else:
-                    client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
-                    from proxy.observability import (
-                        _last_slot_details_cache,
-                        _query_slots,
-                        _query_slots_detail,
-                        last_known_slot_counts,
-                        slots_failure_is_definitive_model_absent,
-                    )
-                    # The outcome of the fresh counts query (status + reason) lets
-                    # the handler tell a definitive "this model is not loaded"
-                    # (HTTP 400/404 from llama-server's router) from a transient
-                    # failure, so a fossil cache snapshot is never served as
-                    # current capacity (LP-0MVKSXR4P001V0CM AC3).
-                    counts_outcome: dict = {}
-                    counts_provenance: dict = {}
-                    _counts_t0 = time.monotonic()
-                    available_slots, total_slots = await _query_slots(
-                        client,
-                        llama_port,
-                        timeout=2.0,
-                        model=cm,
-                        status_out=counts_outcome,
-                        provenance_out=counts_provenance,
-                    )
-                    slots_counts_ms = int((time.monotonic() - _counts_t0) * 1000)
-                    model_absent = slots_failure_is_definitive_model_absent(
-                        counts_outcome
-                    )
-                # Graceful degradation (LP-0MSVP7XJ6008QPKX): a /slots failure
-                # (e.g. HTTP 500 during a model reload after cheap-mode restart)
-                # previously surfaced as total_slots=0, fail-closing the herdr
-                # downtime worker. Serve the last known counts when fresh, and
-                # flag the degraded state so monitoring sees it.
-                if total_slots == 0:
-                    if model_absent:
-                        # Definitive: the idle model instance is not loaded
-                        # (llama-server's router unloads idle models). That is
-                        # a fresh, truthful "no slots yet", not staleness:
-                        # fail open on the configured pool — the first
-                        # dispatched job loads the model (LP-0MSI06HPB0043MV1)
-                        # — and do not resurrect cached occupancy.
-                        try:
-                            total_slots = int(
-                                server_cfg.get("session_slot_pool_size", 3) or 3
-                            )
-                        except (TypeError, ValueError):
-                            total_slots = 3
-                        available_slots = total_slots
+                # LP-0MVVXGLTM008ROJ9: one poll, one shared /slots snapshot.
+                # The counts and detail reads below are grouped so the second
+                # one reuses the first's payload instead of performing its own
+                # fetch; ``budget_seconds`` bounds each wait by the poll's
+                # ``STATUS_QUERY_TIMEOUT`` budget, and a fetch that outlives it
+                # keeps running in the background rather than extending the
+                # poll (the refresher's own fetch serves later polls).
+                with slots_read_scope(budget_seconds=timeout):
+                    if llama_port is None:
+                        total_slots = 0
+                        available_slots = 0
+                        model_absent = True
+                        detail = []
+                        slots_counts_ms = 0
+                        slots_detail_ms = 0
+                        counts_provenance = {}
+                        detail_provenance = {}
                     else:
-                        last_known = last_known_slot_counts()
-                        if last_known is not None:
-                            available_slots, total_slots = last_known
-                            counts_stale = True
-                # Per-slot details (LP-0MSORPUMX002LLIA): best-effort, empty
-                # list on any failure (helper catches HTTP/connect/timeout
-                # errors internally; the handler guard keeps the response
-                # well-formed even on unexpected exceptions). Bounded by the
-                # STATUS_QUERY_TIMEOUT window via the helper's own httpx
-                # timeout, so a slow /slots response cannot blow the
-                # endpoint's response budget (AC3).
-                detail_provenance: dict = {}
-                detail_outcome: dict = {}
-                _detail_t0 = time.monotonic()
-                try:
-                    detail = await _query_slots_detail(
-                        llama_port, timeout=timeout, model=cm,
-                        provenance_out=detail_provenance,
-                        status_out=detail_outcome,
+                        client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
+                        from proxy.observability import (
+                            _last_slot_details_cache,
+                            _query_slots,
+                            _query_slots_detail,
+                            last_known_slot_counts,
+                            slots_failure_is_definitive_model_absent,
+                        )
+                        # The outcome of the fresh counts query (status + reason) lets
+                        # the handler tell a definitive "this model is not loaded"
+                        # (HTTP 400/404 from llama-server's router) from a transient
+                        # failure, so a fossil cache snapshot is never served as
+                        # current capacity (LP-0MVKSXR4P001V0CM AC3).
+                        counts_outcome: dict = {}
+                        counts_provenance: dict = {}
+                        _counts_t0 = time.monotonic()
+                        available_slots, total_slots = await _query_slots(
+                            client,
+                            llama_port,
+                            timeout=timeout,
+                            model=cm,
+                            status_out=counts_outcome,
+                            provenance_out=counts_provenance,
+                        )
+                        slots_counts_ms = int((time.monotonic() - _counts_t0) * 1000)
+                        model_absent = slots_failure_is_definitive_model_absent(
+                            counts_outcome
+                        )
+                    # Graceful degradation (LP-0MSVP7XJ6008QPKX): a /slots failure
+                    # (e.g. HTTP 500 during a model reload after cheap-mode restart)
+                    # previously surfaced as total_slots=0, fail-closing the herdr
+                    # downtime worker. Serve the last known counts when fresh, and
+                    # flag the degraded state so monitoring sees it.
+                    if total_slots == 0:
+                        if model_absent:
+                            # Definitive: the idle model instance is not loaded
+                            # (llama-server's router unloads idle models). That is
+                            # a fresh, truthful "no slots yet", not staleness:
+                            # fail open on the configured pool — the first
+                            # dispatched job loads the model (LP-0MSI06HPB0043MV1)
+                            # — and do not resurrect cached occupancy.
+                            try:
+                                total_slots = int(
+                                    server_cfg.get("session_slot_pool_size", 3) or 3
+                                )
+                            except (TypeError, ValueError):
+                                total_slots = 3
+                            available_slots = total_slots
+                        else:
+                            last_known = last_known_slot_counts()
+                            if last_known is not None:
+                                available_slots, total_slots = last_known
+                                counts_stale = True
+                    # Per-slot details (LP-0MSORPUMX002LLIA): best-effort, empty
+                    # list on any failure (helper catches HTTP/connect/timeout
+                    # errors internally; the handler guard keeps the response
+                    # well-formed even on unexpected exceptions). LP-0MVVXGLTM008ROJ9:
+                    # the read reuses the counts phase's shared snapshot, so it
+                    # cannot issue a second upstream fetch; a shared fetch still
+                    # in flight is left to complete for later polls.
+                    detail_provenance: dict = {}
+                    detail_outcome: dict = {}
+                    _detail_t0 = time.monotonic()
+                    try:
+                        detail = await _query_slots_detail(
+                            llama_port, timeout=timeout, model=cm,
+                            provenance_out=detail_provenance,
+                            status_out=detail_outcome,
+                        )
+                    except Exception:
+                        detail = None
+                    slots_detail_ms = int((time.monotonic() - _detail_t0) * 1000)
+                    # LP-0MW3ED73W007JYGI: a detail-phase failure on the status
+                    # path is recorded in ``llama_slots_query_failures_total`` with
+                    # its reason (``timeout`` / ``http_<code>`` / …), so the
+                    # measured ~36 % failure rate is visible in the metrics
+                    # surface instead of only a debug log. Only the status path
+                    # opts in (via ``status_out``); the counts phase records its
+                    # own outcome in ``_query_slots`` and the general caller-tagged
+                    # call-site instrumentation remains LP-0MVTDMXXH005D5D5's.
+                    # LP-0MVVXGLTM008ROJ9: a shared read (``shared_read``) reused
+                    # the counts phase's attempt, whose failure the counts phase
+                    # already recorded — recording it again would double-count
+                    # one upstream failure.
+                    _detail_failure_reason = (
+                        detail_outcome.get("reason")
+                        if isinstance(detail_outcome, dict)
+                        else None
                     )
-                except Exception:
-                    detail = None
-                slots_detail_ms = int((time.monotonic() - _detail_t0) * 1000)
-                # LP-0MW3ED73W007JYGI: a detail-phase failure on the status
-                # path is recorded in ``llama_slots_query_failures_total`` with
-                # its reason (``timeout`` / ``http_<code>`` / …), so the
-                # measured ~36 % failure rate is visible in the metrics
-                # surface instead of only a debug log. Only the status path
-                # opts in (via ``status_out``); the counts phase records its
-                # own outcome in ``_query_slots`` and the general caller-tagged
-                # call-site instrumentation remains LP-0MVTDMXXH005D5D5's.
-                _detail_failure_reason = (
-                    detail_outcome.get("reason")
-                    if isinstance(detail_outcome, dict)
-                    else None
-                )
-                if _detail_failure_reason:
-                    from proxy.observability import _record_slots_query_failure
+                    if _detail_failure_reason and not (
+                        isinstance(detail_outcome, dict)
+                        and detail_outcome.get("shared_read")
+                    ):
+                        from proxy.observability import _record_slots_query_failure
 
-                    _record_slots_query_failure(_detail_failure_reason)
-                if isinstance(detail, list) and detail:
-                    slots = detail
-                else:
-                    # Graceful degradation for per-slot detail
-                    # (LP-0MUFSVXID0039ZAQ): the fresh query failed or
-                    # returned nothing, so serve the last-known per-slot
-                    # detail (updated by _periodic_broadcast_loop() and the
-                    # SSE handlers) instead of blanking slot identity. Mirrors
-                    # the counts fallback above; when the cache is empty the
-                    # payload stays a well-formed empty array (AC3).
-                    cached_detail = _last_slot_details_cache
-                    if cached_detail and not model_absent:
-                        slots = list(cached_detail)
-                        detail_stale = True
+                        _record_slots_query_failure(_detail_failure_reason)
+                    if isinstance(detail, list) and detail:
+                        slots = detail
+                    else:
+                        # Graceful degradation for per-slot detail
+                        # (LP-0MUFSVXID0039ZAQ): the fresh query failed or
+                        # returned nothing, so serve the last-known per-slot
+                        # detail (updated by _periodic_broadcast_loop() and the
+                        # SSE handlers) instead of blanking slot identity. Mirrors
+                        # the counts fallback above; when the cache is empty the
+                        # payload stays a well-formed empty array (AC3).
+                        cached_detail = _last_slot_details_cache
+                        if cached_detail and not model_absent:
+                            slots = list(cached_detail)
+                            detail_stale = True
             except Exception:
                 # slots query is best-effort; default to 0 on failure
                 pass
@@ -960,10 +981,11 @@ async def get_llama_local_status(request: Request):
     # Aggregate the per-phase provenance into the three additive fields on
     # the status_request line so a stale (> budget) poll can be attributed to
     # a phase and a cache path (parent AC1). ``slots_upstream_calls`` counts
-    # every upstream ``/slots`` fetch this poll caused (0 or 1 today — the
-    # single-flight + TTL coalescing means the detail phase shares the counts
-    # phase's payload). ``slots_snapshot_source`` labels where the served
-    # snapshot came from and ``slots_snapshot_age_seconds`` its age.
+    # every upstream ``/slots`` fetch this poll caused — **at most one** since
+    # LP-0MVVXGLTM008ROJ9: the detail phase reuses the counts phase's shared
+    # snapshot instead of fetching its own payload. ``slots_snapshot_source``
+    # labels where the served snapshot came from and
+    # ``slots_snapshot_age_seconds`` its age.
     slots_upstream_calls = int(
         counts_provenance.get("upstream_calls", 0)
         if isinstance(counts_provenance, dict)

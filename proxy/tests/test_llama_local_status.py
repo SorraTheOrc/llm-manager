@@ -2619,16 +2619,6 @@ async def _status_poll_with_hanging_fetch(backend):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVVXGHHB0073W1B red-first (AC1): the pre-fix path serialises the "
-        "counts (2 s) + detail (1 s) awaits, so a hanging backend makes the "
-        "handler take ~3 s; the shared snapshot read path (LP-0MVVXGLTM008ROJ9) "
-        "must bound the handler by STATUS_QUERY_TIMEOUT + 250 ms — remove the "
-        "xfail when it lands."
-    ),
-)
 async def test_status_handler_within_budget_when_slots_never_answers():
     """AC3: a never-answering /slots backend must not serialise the counts
     (2 s) + detail (1 s) awaits; the handler returns within
@@ -2833,3 +2823,139 @@ async def test_stale_snapshot_never_saturated_without_live_work(fixture):
         f"{j['capacity_hint']!r} with no live local work (LP-0MVKSXR4P001V0CM "
         f"AC3 must survive the snapshot read-path change)"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared /slots snapshot read path (LP-0MVVXGLTM008ROJ9)
+#
+# The status poll serves ONE shared snapshot: a single bounded upstream fetch
+# produces both the counts pair and the per-slot detail (AC1/AC3), the payload
+# keeps its documented shape (AC4), and the failure paths stay well-formed and
+# bounded (AC2/AC5).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _SnapshotSlotsBackend:
+    """Raw ``/slots`` fetch stub that records attempts and answers from a script."""
+
+    def __init__(self, payload=None, status: int = 200, delay: float = 0.0):
+        self.payload = payload
+        self.status = status
+        self.delay = delay
+        self.calls: list[str] = []
+
+    async def __call__(self, url, timeout, client=None):
+        self.calls.append(url)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return self.status, self.payload
+
+
+_MIXED_SLOTS_PAYLOAD = [
+    {"id": 0, "is_processing": False, "next_token": {"n_decoded": 4}, "n_past": 100, "id_task": 0},
+    {"id": 1, "is_processing": True, "next_token": {"n_decoded": 12}, "n_past": 1000, "id_task": 11},
+    # A build that omits ``is_processing``: the counts and the detail must
+    # still agree (both read the one derivation).
+    {"id": 2},
+]
+
+
+@pytest.mark.asyncio
+async def test_available_slots_is_derived_from_the_served_slot_detail():
+    """AC3: ``available_slots`` is counted from the SAME ``slots[]`` served."""
+    backend = _SnapshotSlotsBackend(_MIXED_SLOTS_PAYLOAD)
+    j, _elapsed, calls = await _status_poll_with_hanging_fetch(backend)
+
+    assert len(calls) == 1, (
+        f"one poll must issue exactly one upstream /slots fetch, got {len(calls)}"
+    )
+    assert j["total_slots"] == 3
+    served = [slot["is_processing"] for slot in j["slots"]]
+    assert served == [False, True, False]
+    assert j["available_slots"] == sum(1 for processing in served if not processing)
+    assert j["available_slots"] == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_snapshot_payload_parity_for_equivalent_backend_data():
+    """AC4: the fields consumers read are unchanged on equivalent backend data."""
+    backend = _SnapshotSlotsBackend(_MIXED_SLOTS_PAYLOAD)
+    j, _elapsed, calls = await _status_poll_with_hanging_fetch(backend)
+
+    assert len(calls) == 1
+    assert j["slots_stale"] is False
+    assert j["slot_counts_stale"] is False
+    assert j["slots_detail_stale"] is False
+    assert j["available_slots"] == 2
+    assert j["total_slots"] == 3
+    assert j["capacity_hint"] == "idle"
+    assert [
+        (slot["slot_id"], slot["is_processing"], slot["n_decoded"], slot["context_tokens"])
+        for slot in j["slots"]
+    ] == [
+        (0, False, 4, 100),
+        (1, True, 12, 1000),
+        (2, False, None, None),
+    ]
+    # The per-slot capacity annotation is still applied on the shared path.
+    for key in ("owner_session_id", "lease_state", "phase", "prefill_eta_seconds"):
+        assert key in j["slots"][0], f"missing per-slot annotation {key}"
+
+
+@pytest.mark.asyncio
+async def test_empty_shared_snapshot_serves_an_empty_slot_array():
+    """AC5: an empty (but valid) snapshot stays a well-formed empty array."""
+    backend = _SnapshotSlotsBackend([])
+    j, _elapsed, calls = await _status_poll_with_hanging_fetch(backend)
+
+    assert len(calls) == 1
+    assert j["slots"] == []
+    assert j["available_slots"] == 0
+    assert j["total_slots"] == 0
+
+
+@pytest.mark.asyncio
+async def test_over_age_counts_cache_is_never_served_as_current_capacity():
+    """AC5: past ``SLOT_COUNTS_STALE_AFTER_SECONDS`` the cache fails closed."""
+    import time as _time
+    from unittest.mock import patch as _patch
+
+    backend = _SnapshotSlotsBackend(status=500)
+    with _patch(
+        "proxy.observability._last_slot_counts_cache",
+        (2, 3, _time.monotonic() - 4000.0),
+    ):
+        j, _elapsed, calls = await _status_poll_with_hanging_fetch(backend)
+
+    assert len(calls) == 1
+    # The over-age cached pair (2 of 3 free) is not served as live capacity.
+    assert j["available_slots"] == 0
+    assert j["total_slots"] == 0
+    assert j["slots"] == []
+
+
+@pytest.mark.asyncio
+async def test_one_bounded_fetch_per_poll_when_the_backend_hangs():
+    """AC1/AC2: a hanging backend costs one attempt and never the budgets twice."""
+    import os as _os
+    from unittest.mock import patch as _patch
+
+    from proxy.observability import acancel_slots_snapshot_tasks
+
+    backend = _SnapshotSlotsBackend([], delay=3600.0)
+    try:
+        with _patch.dict(_os.environ, {"STATUS_QUERY_TIMEOUT": "0.3"}):
+            j, elapsed, calls = await _status_poll_with_hanging_fetch(backend)
+    finally:
+        await acancel_slots_snapshot_tasks()
+
+    assert len(calls) == 1, (
+        f"the counts and detail phases must share one bounded fetch, got {len(calls)}"
+    )
+    assert elapsed < 0.3 + 0.25, (
+        f"the poll took {elapsed:.2f}s with a hanging backend; it must fit "
+        "STATUS_QUERY_TIMEOUT (0.3 s) + 250 ms slack"
+    )
+    assert j["available_slots"] == 0
+    assert j["total_slots"] == 0
+    assert j["slots"] == []

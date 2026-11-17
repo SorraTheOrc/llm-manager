@@ -32,9 +32,12 @@ Reuse from a sibling test module (``proxy/tests`` is on ``sys.path`` via
 
     from test_slots_busy_engine_policy import BusySlotsStub, call_local_status
 
-The two proxy poll budgets the stub must exceed to reproduce the defect are
-:data:`COUNTS_BUDGET_SECONDS` (2.0 s, hard-coded in the status handler) and
-:data:`DEFAULT_DETAIL_BUDGET_SECONDS` (1.0 s, ``STATUS_QUERY_TIMEOUT``).
+The status poll's ``/slots`` budget is ``STATUS_QUERY_TIMEOUT``
+(:data:`DEFAULT_DETAIL_BUDGET_SECONDS`, 1.0 s): since LP-0MVVXGLTM008ROJ9 one
+bounded shared fetch serves both the counts pair and the per-slot detail, so a
+stub slower than that budget reproduces the busy-engine degradation with a
+single upstream attempt (the legacy 2.0 s counts budget,
+:data:`COUNTS_BUDGET_SECONDS`, is kept as a stub-delay margin).
 """
 
 import asyncio
@@ -50,7 +53,12 @@ import pytest
 # Documented proxy poll budgets. The stub latency must exceed BOTH to
 # reproduce the measured busy-engine degradation.
 COUNTS_BUDGET_SECONDS = 2.0
-"""Counts-phase ``/slots`` budget, hard-coded in ``get_llama_local_status``."""
+"""Legacy counts-phase ``/slots`` budget (pre-LP-0MVVXGLTM008ROJ9).
+
+The status path now performs ONE bounded fetch per poll at
+``STATUS_QUERY_TIMEOUT``; tests keep this constant only as a stub-delay margin
+that is comfortably above the real budget.
+"""
 
 DEFAULT_DETAIL_BUDGET_SECONDS = 1.0
 """Detail-phase ``/slots`` budget (``STATUS_QUERY_TIMEOUT`` default)."""
@@ -320,12 +328,19 @@ class TestBusyEngineBaseline:
             "slots_stale is the union of both fallbacks; a degraded poll must "
             "never read fresh"
         )
-        # Both phases actually hit the (too-slow) upstream, and both exceeded
-        # the budget they were given.
-        assert len(stub.budget_exceeding_calls()) >= 2, (
-            "both the counts and the detail phase must have exceeded their "
-            f"budgets; observed calls: {stub.calls}"
+        # LP-0MVVXGLTM008ROJ9: exactly ONE bounded upstream fetch serves both
+        # phases (the detail phase reuses the counts phase's shared snapshot),
+        # so the busy-engine degradation costs one attempt at the
+        # STATUS_QUERY_TIMEOUT budget — not two serialised attempts.
+        assert len(stub.calls) == 1, (
+            "the counts and detail phases must share one upstream fetch; "
+            f"observed calls: {stub.calls}"
         )
+        assert stub.calls[0]["timeout"] == DEFAULT_DETAIL_BUDGET_SECONDS, (
+            "the shared fetch must be bounded by STATUS_QUERY_TIMEOUT; "
+            f"observed budgets: {[c['timeout'] for c in stub.calls]}"
+        )
+        assert len(stub.budget_exceeding_calls()) == 1
 
     @pytest.mark.asyncio
     async def test_degraded_poll_returns_well_formed_payload_within_budget(self):
@@ -415,7 +430,7 @@ class TestHarnessReuse:
 
     @pytest.mark.asyncio
     async def test_detail_budget_override_is_applied(self):
-        """``detail_timeout`` is threaded into the detail phase's fetch."""
+        """``detail_timeout`` is threaded into the shared ``/slots`` fetch."""
         stub = BusySlotsStub(delay=COUNTS_BUDGET_SECONDS + 0.5)
         _, _ = await call_local_status(stub=stub, detail_timeout=0.25)
 

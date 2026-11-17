@@ -234,10 +234,15 @@ class TestNoRegressionInSlotAccuracy:
         import inspect
 
         import proxy.observability as obs
+        # Schema guard: these keys are the contract with the routing /
+        # contention logic (LP-0MSUO5Z0K007HBSS).
+        # LP-0MVVXGLTM008ROJ9: the per-slot schema is derived once, by
+        # ``derive_slots_from_payload`` — guard the contract where it lives so
+        # the check cannot pass on a docstring alone.
+        derivation = inspect.getsource(obs.derive_slots_from_payload)
+        assert "is_processing" in derivation
+        assert "n_decoded" in derivation
         for name in ("_query_slots_detail", "_query_slots_progress"):
             src = inspect.getsource(getattr(obs, name))
-            # Schema guard: these keys are the contract with the routing /
-            # contention logic (LP-0MSUO5Z0K007HBSS).
             assert "is_processing" in src
-        assert "n_decoded" in inspect.getsource(obs._query_slots_detail)
         assert "n_past" in inspect.getsource(obs._query_slots_progress)

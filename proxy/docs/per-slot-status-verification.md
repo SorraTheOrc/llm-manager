@@ -806,9 +806,12 @@ change:
      `discovered-from:LP-0MVUTYHG7001S6BM`.
 2. **`latency_ms=3355` with `slots_detail_stale=false` (06:57:36).**
    **Not reproduced as a distinct defect.** `latency_ms` is the whole poll, not
-   the `/slots` detail budget: the handler issues up to three sequential bounded
-   queries (`query_llama_status` 1 s, counts 2 s, detail 1 s → 4 s envelope), so
-   3,355 ms is inside the envelope. That second also produced three concurrent
+   the `/slots` detail budget: the handler issued up to three sequential bounded
+   queries (`query_llama_status` 1 s, counts 2 s, detail 1 s → 4 s envelope) at
+   the time of the window, so 3,355 ms is inside that envelope. (Since
+   LP-0MVVXGLTM008ROJ9 the counts and detail phases share one snapshot and one
+   bounded fetch, so the `/slots` envelope is a single `STATUS_QUERY_TIMEOUT`
+   budget; see [the shared-snapshot read path](#read-path-delivered-lp-0mvvxgltm008roj9).) That second also produced three concurrent
    polls (3,355 / 856 / 26 ms) — the leader fetched and the two followers reused
    the single-flight payload — and `slots_detail_stale=false` truthfully says the
    detail query returned 200 within its own budget.
@@ -877,6 +880,32 @@ to tens of seconds (idle/decode cost is 1–18 ms). Proxy-side serialisation is 
 the cause**: the handler issues counts and detail as two sequential bounded queries, so 28 % of
 stale polls pay that blocking cost twice, and the 2 s + 1 s budgets guarantee the poll is reported
 stale long before the backend answers.
+
+### Read path delivered (LP-0MVVXGLTM008ROJ9)
+
+The status poll now serves **one shared snapshot** per request:
+
+- `_query_slots()` and `_query_slots_detail()` are grouped by
+  `observability.slots_read_scope()`; the first read fetches (at most one
+  bounded upstream request), and both the counts pair and the per-slot detail
+  are derived from that one payload by `derive_slots_from_payload()`. The
+  summary therefore cannot contradict its own `slots[]` — including the
+  previously inconsistent default for a slot that omits `is_processing`.
+- A snapshot within the coalescer's freshness window
+  (`SLOTS_POLL_TTL_SECONDS`, default 1 s) is reused with **zero** upstream
+  calls; otherwise the poll joins the URL's one shared fetch task.
+- The fetch is bounded by `STATUS_QUERY_TIMEOUT`. If it outlives the poll's
+  budget the poll degrades to the last-known snapshot and the fetch **keeps
+  running**, landing in the coalesced cache for later polls — a slow backend no
+  longer extends the poll, and concurrent polls never promote a second fetch.
+- The per-phase fields keep their names and meanings: `slots_counts_ms` now
+  carries the shared fetch, `slots_detail_ms` is the shared-snapshot read
+  (≈0), and `slots_upstream_calls` is 0 or 1 by construction.
+
+To re-measure the backend cost after this change, run
+`scripts/probe_child_slots.py` while a slot is processing and compare it with
+the same-moment `slots_counts_ms` / `slots_detail_ms` (the probe bypasses the
+proxy; the handler's phases are clamped by their budgets).
 
 Consequences recorded for the follow-up items (LP-0MVVXGLTM008ROJ9, LP-0MVVXGM54009TOXD): serving
 one shared snapshot removes the double fetch and keeps poll latency inside budget, but it cannot

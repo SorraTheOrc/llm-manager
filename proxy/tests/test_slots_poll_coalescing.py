@@ -63,6 +63,7 @@ def _fresh_cache(monkeypatch):
     yield
     obs.reset_slots_poll_cache()
     obs._slots_poll_inflight.clear()
+    obs.reset_slots_snapshot_state()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -556,16 +557,6 @@ class _FakeLock:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVVXGHHB0073W1B red-first (AC1): the pre-fix path fans out to one "
-        "upstream /slots fetch per poll (counts + detail cascade), so 5 concurrent "
-        "polls issue 5 fetches; the shared snapshot read path "
-        "(LP-0MVVXGLTM008ROJ9) must collapse this to exactly 1 — remove the "
-        "xfail when the contract lands."
-    ),
-)
 async def test_status_path_fanout_exactly_one_upstream_fetch_for_5_concurrent_polls():
     """AC2: 5 concurrent status polls inside the freshness window issue exactly
     one upstream /slots request (exact call count, not a ``<=`` bound).
@@ -617,3 +608,153 @@ async def test_status_path_fanout_exactly_one_upstream_fetch_for_5_concurrent_po
         f"5 concurrent status polls inside the freshness window must issue exactly "
         f"one upstream /slots request, got {len(backend.calls)}: {backend.calls}"
     )
+    # The shared fetch outlives every poll's budget by design (that is what
+    # stops the polls from promoting a second fetch); reap it so no task leaks
+    # into the next test.
+    await obs.acancel_slots_snapshot_tasks()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared snapshot read path (LP-0MVVXGLTM008ROJ9)
+#
+# One poll ⇒ one snapshot ⇒ one bounded upstream fetch. The counts pair and the
+# per-slot detail are derived from that single payload (AC3), the poll reuses
+# the snapshot while it is within the coalescer's freshness window (AC1), and a
+# poll whose budget expires degrades without cancelling the shared fetch, which
+# lands for later polls instead of extending this one (AC2).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _ScriptedBackend:
+    """Raw ``/slots`` fetch stub: records attempts, answers from a script."""
+
+    def __init__(self, status: int = 200, payload=None, delay: float = 0.0, error=None):
+        self.status = status
+        self.payload = payload if payload is not None else list(_SLOTS_PAYLOAD)
+        self.delay = delay
+        self.error = error
+        self.calls: list[str] = []
+
+    async def __call__(self, url: str, timeout: float, client=None):
+        self.calls.append(url)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return self.status, self.payload
+
+
+def _with_default_slots_model(monkeypatch):
+    """Pin the model id so the shared fetch URL is deterministic."""
+    monkeypatch.setattr(obs, "_resolve_slots_model_id", lambda model: model or "m")
+
+
+@pytest.mark.asyncio
+async def test_read_scope_derives_counts_and_detail_from_one_fetch(monkeypatch):
+    """AC1/AC3: one poll's counts and detail share one upstream fetch."""
+    _with_default_slots_model(monkeypatch)
+    backend = _ScriptedBackend()
+    monkeypatch.setattr(obs, "_do_slots_fetch", backend)
+
+    with obs.slots_read_scope(budget_seconds=1.0):
+        available, total = await obs._query_slots(None, 8080, model="m", timeout=1.0)
+        details = await obs._query_slots_detail(8080, timeout=1.0, model="m")
+
+    assert len(backend.calls) == 1, (
+        "a poll's counts and detail reads must share ONE upstream /slots fetch, "
+        f"got {len(backend.calls)}"
+    )
+    assert (available, total) == (1, 2)
+    assert [slot["is_processing"] for slot in details] == [False, True]
+    # AC3: the summary is counted from the SAME list that is served.
+    assert available == sum(1 for slot in details if not slot["is_processing"])
+
+
+@pytest.mark.asyncio
+async def test_read_scope_dedupes_a_failed_attempt_across_phases(monkeypatch):
+    """AC1: a failed fetch is not retried by the detail phase of the same poll."""
+    _with_default_slots_model(monkeypatch)
+    backend = _ScriptedBackend(error=TimeoutError("backend hung"))
+    monkeypatch.setattr(obs, "_do_slots_fetch", backend)
+    counts_out: dict = {}
+    detail_out: dict = {}
+
+    with obs.slots_read_scope(budget_seconds=1.0):
+        counts = await obs._query_slots(
+            None, 8080, model="m", timeout=1.0, status_out=counts_out
+        )
+        details = await obs._query_slots_detail(
+            8080, timeout=1.0, model="m", status_out=detail_out
+        )
+
+    assert len(backend.calls) == 1, (
+        "the detail phase must reuse the counts phase's failed attempt instead "
+        f"of issuing a second fetch, got {len(backend.calls)}"
+    )
+    assert counts == (0, 0)
+    assert details == []
+    assert counts_out.get("reason") == "timeout"
+    assert detail_out.get("reason") == "timeout"
+    # The detail read reused the shared attempt, so the handler must not record
+    # the same failure a second time.
+    assert detail_out.get("shared_read") is True
+
+
+@pytest.mark.asyncio
+async def test_pending_snapshot_degrades_without_cancelling_the_shared_fetch(monkeypatch):
+    """AC2: a fetch slower than the poll budget neither blocks nor dies."""
+    _with_default_slots_model(monkeypatch)
+    backend = _ScriptedBackend(delay=0.3)
+    monkeypatch.setattr(obs, "_do_slots_fetch", backend)
+
+    started = time.monotonic()
+    with obs.slots_read_scope(budget_seconds=0.05):
+        counts = await obs._query_slots(None, 8080, model="m", timeout=5.0)
+        details = await obs._query_slots_detail(8080, timeout=5.0, model="m")
+    elapsed = time.monotonic() - started
+
+    assert len(backend.calls) == 1
+    assert counts == (0, 0), "a pending fetch asserts no counts"
+    assert details == [], "a pending fetch serves no detail"
+    assert elapsed < 0.25, (
+        f"the poll must degrade at its budget instead of waiting out the fetch "
+        f"(took {elapsed:.2f}s)"
+    )
+    # The shared fetch survived the poll's budget.
+    assert obs._slots_snapshot_tasks, (
+        "the shared fetch must keep running after the poll's budget expires"
+    )
+
+    # ... and its payload is available to the next poll from the coalesced
+    # cache (the fetch lands at ~0.3 s; the default TTL then serves it).
+    await asyncio.sleep(0.4)
+    available, total = await obs._query_slots(None, 8080, model="m", timeout=1.0)
+    assert (available, total) == (1, 2)
+    assert len(backend.calls) == 1, (
+        "the completed shared fetch must serve the next poll from the cache, "
+        f"not trigger another fetch (got {len(backend.calls)})"
+    )
+
+
+def test_derive_slots_from_payload_is_the_single_source_of_counts():
+    """AC3: counts and detail come from one derivation, never two readings."""
+    payload = [
+        {"id": 0, "is_processing": False, "next_token": {"n_decoded": 3}, "n_past": 12},
+        {"id": 1, "is_processing": True, "next_token": None, "id_task": 7},
+        # No ``is_processing`` field at all: the counts and the detail must
+        # still agree on the same interpretation (not processing).
+        {"id": 2},
+    ]
+    available, total, slots = obs.derive_slots_from_payload(payload)
+
+    assert total == 3
+    assert [slot["slot_id"] for slot in slots] == [0, 1, 2]
+    assert [slot["is_processing"] for slot in slots] == [False, True, False]
+    assert available == sum(1 for slot in slots if not slot["is_processing"]) == 2
+    assert slots[0]["n_decoded"] == 3
+    assert slots[0]["context_tokens"] == 12
+    assert slots[1]["id_task"] == 7
+    # A malformed payload is rejected rather than half-derived.
+    assert obs.derive_slots_from_payload("not-a-list") is None
+    assert obs.derive_slots_from_payload([1, 2]) is None
+    assert obs.derive_slots_from_payload([]) == (0, 0, ())

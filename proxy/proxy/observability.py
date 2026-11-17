@@ -24,7 +24,10 @@ HTTP JSON parsing and URL building patterns found in both
   endpoint, returning ``(available_slots, total_slots)``. Records the last
   successful counts (``_last_slot_counts_cache``) and increments
   ``llama_slots_query_failures_total`` on failure (graceful degradation,
-  LP-0MSVP7XJ6008QPKX).
+  LP-0MSVP7XJ6008QPKX). Reads inside :func:`slots_read_scope` share one
+  snapshot with ``_query_slots_detail``, so a poll performs at most one
+  upstream fetch and the counts pair cannot disagree with the detail
+  (LP-0MVVXGLTM008ROJ9).
 - ``last_known_slot_counts()`` — Last successful ``(available, total)`` when
   fresh (bounded by ``SLOT_COUNTS_STALE_AFTER_SECONDS``), served by the
   status endpoint when a fresh ``/slots`` query fails so orchestrators see
@@ -32,6 +35,8 @@ HTTP JSON parsing and URL building patterns found in both
 - ``_query_slots_detail(llama_port, timeout, model)`` — Query the ``/slots``
   endpoint with an optional ``model`` query parameter, returning a list of
   per-slot dicts with keys ``slot_id``, ``is_processing``, and ``n_decoded``.
+  Both query helpers derive their values from one shared payload via
+  ``derive_slots_from_payload()`` (LP-0MVVXGLTM008ROJ9).
 - ``_query_slots_progress(llama_port, timeout, model)`` — Query the ``/slots``
   endpoint and return a dict mapping slot id -> prefill state
   ``{"progress": int|None, "processing": bool}`` where *progress* is the max
@@ -53,11 +58,14 @@ See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 
 import asyncio
 import contextlib
+import contextvars
 import errno
+import functools
 import json
 import re
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1255,6 +1263,422 @@ async def _fetch_slots_payload(
     )
 
 
+# ===================================================================
+# Shared /slots snapshot for the status path (LP-0MVVXGLTM008ROJ9)
+#
+# ``GET /llama/local/status`` used to read ``/slots`` twice in series: a
+# counts query with its own 2 s budget and a detail query with
+# ``STATUS_QUERY_TIMEOUT``. Each read could promote its own upstream fetch,
+# so a busy backend doubled the upstream load and the two budgets added up in
+# the poll's latency (F2 measured 28 % of stale polls issuing two fetches and
+# child-port ``/slots`` answering in p95 ~32 s while a prefill ran).
+#
+# One shared snapshot provider now performs **at most one** bounded fetch per
+# poll and derives BOTH the counts pair and the per-slot detail from that one
+# payload, so ``available_slots``/``total_slots`` can never disagree with the
+# ``is_processing`` values in ``slots[]`` (AC1/AC3). A ``slots_read_scope()``
+# groups the counts and detail reads of one poll behind one snapshot; the
+# fetch itself is a per-URL shared task so concurrent polls (and the 1 s
+# refresh loop) join one upstream request. A poll whose budget expires
+# degrades to the last-known snapshot **without cancelling the shared fetch**,
+# which still lands in the coalesced cache for later polls (AC2).
+# ===================================================================
+
+
+@dataclass(frozen=True)
+class SlotsSnapshot:
+    """Counts and per-slot detail derived from ONE ``/slots`` payload.
+
+    Attributes:
+        status: HTTP status of the payload (``None`` when unknown/pending).
+        reason: failure label (``timeout``, ``http_<code>``,
+            ``invalid_payload``, …) or ``None`` on success.
+        fetched_at: ``time.monotonic()`` stamp of the fetch that produced the
+            payload; ``None`` when unknown (never re-stamped on reuse).
+        available_slots: slots derived as *not* processing, counted from the
+            same derived detail list as ``slots`` — never a second read.
+        total_slots: number of slots in the payload.
+        slots: the derived per-slot detail dicts.
+        source: how the read was served (``upstream`` | ``ttl_cache`` |
+            ``failure_backoff`` | ``none``).
+        upstream_calls: upstream fetches this read caused (0 or 1).
+        pending: a shared fetch is still in flight and this poll's budget
+            expired before it landed; nothing is asserted about the backend.
+    """
+
+    status: int | None = None
+    reason: str | None = None
+    fetched_at: float | None = None
+    available_slots: int = 0
+    total_slots: int = 0
+    slots: tuple[dict, ...] = ()
+    source: str = "none"
+    upstream_calls: int = 0
+    pending: bool = False
+
+    @property
+    def ok(self) -> bool:
+        """True when a payload was derived successfully (possibly empty)."""
+        return self.reason is None and not self.pending
+
+    @property
+    def model_absent(self) -> bool:
+        """True for llama-server's definitive "no such model" answer."""
+        return self.reason in ("http_400", "http_404")
+
+
+def derive_slots_from_payload(
+    payload: object,
+) -> tuple[int, int, tuple[dict, ...]] | None:
+    """Derive ``(available, total, slots)`` from ONE raw ``/slots`` payload.
+
+    This is the single derivation behind both the counts pair and the served
+    per-slot detail (AC3): ``available`` is counted from the *derived* list,
+    not re-read from the raw payload, so the summary can never contradict its
+    own ``slots[]``. Returns ``None`` when the payload is not a list of
+    objects, which callers classify as ``invalid_payload``.
+
+    The per-slot dict shape is unchanged from the previous detail query
+    (``slot_id``, ``is_processing``, ``n_decoded``, ``context_tokens``,
+    ``id_task``) so payload parity holds for consumers (AC4).
+    """
+    if not isinstance(payload, list):
+        return None
+    slots: list[dict] = []
+    for i, raw in enumerate(payload):
+        if not isinstance(raw, dict):
+            return None
+        next_token = raw.get("next_token")
+        n_decoded = None
+        if isinstance(next_token, dict):
+            n_decoded = next_token.get("n_decoded")
+        elif isinstance(next_token, list) and next_token:
+            first = next_token[0]
+            if isinstance(first, dict):
+                n_decoded = first.get("n_decoded")
+        slots.append(
+            {
+                "slot_id": raw.get("id", i),
+                "is_processing": bool(raw.get("is_processing", False)),
+                "n_decoded": n_decoded,
+                "context_tokens": _slot_context_tokens(raw),
+                "id_task": raw.get("id_task"),
+            }
+        )
+    total = len(slots)
+    available = sum(1 for slot in slots if not slot["is_processing"])
+    return available, total, tuple(slots)
+
+
+_slots_read_scope_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "slots_read_scope", default=None
+)
+"""Per-poll scope grouping the counts and detail reads behind one snapshot.
+
+A ``ContextVar`` (not module state) so two concurrent status polls never
+share a snapshot: each request runs in its own context.
+"""
+
+_SLOTS_READ_SCOPE_URL = "url"
+_SLOTS_READ_SCOPE_SNAPSHOT = "snapshot"
+_SLOTS_READ_SCOPE_BUDGET = "budget_seconds"
+
+_SLOTS_SNAPSHOT_WAIT_GRACE_SECONDS: float = 0.05
+"""Grace a bounded reader waits past its budget for the shared fetch's outcome.
+
+The shared fetch is bounded by the same ``STATUS_QUERY_TIMEOUT`` budget as the
+reader, so without a hair of grace the two expiries race and a genuine fetch
+timeout can be misreported as "still pending" (no failure recorded). 50 ms is
+well inside the AC2 slack (250 ms) and only applies when the reader's own
+budget is positive.
+"""
+
+_slots_snapshot_tasks: dict[str, "asyncio.Task"] = {}
+"""One in-flight shared ``/slots`` fetch task per URL.
+
+Everything that reads ``/slots`` on a poll cadence (``/llama/local/status``,
+``_query_slots_detail()`` callers, the refresh loop) joins the same task, so
+concurrent callers produce one upstream fetch instead of one each. A caller
+whose own budget expires stops awaiting the task but never cancels it.
+"""
+
+
+@contextlib.contextmanager
+def slots_read_scope(budget_seconds: float | None = None):
+    """Group one poll's ``/slots`` reads behind a single shared snapshot.
+
+    Inside the scope the first read performs (at most) one bounded fetch; the
+    subsequent reads reuse its snapshot instead of fetching again, so a poll
+    cannot fan out into a counts fetch plus a detail fetch (AC1).
+    *budget_seconds* bounds each read's wait; when it expires the read degrades
+    and the shared fetch keeps running in the background (AC2).
+
+    Yields the scope dict (the snapshot is recorded under a private key) —
+    callers must not depend on its shape.
+    """
+    token = _slots_read_scope_var.set(
+        {
+            _SLOTS_READ_SCOPE_URL: None,
+            _SLOTS_READ_SCOPE_SNAPSHOT: None,
+            _SLOTS_READ_SCOPE_BUDGET: budget_seconds,
+        }
+    )
+    try:
+        yield _slots_read_scope_var.get()
+    finally:
+        _slots_read_scope_var.reset(token)
+
+
+def _discard_slots_snapshot_task(url: str, task: "asyncio.Task") -> None:
+    """Forget a finished shared fetch and retrieve its outcome.
+
+    Retrieving the outcome keeps asyncio from logging "Future exception was
+    never retrieved" when every reader timed out before the fetch failed (the
+    same discipline as ``_consume_slots_inflight_outcome``).
+    """
+    if _slots_snapshot_tasks.get(url) is task:
+        _slots_snapshot_tasks.pop(url, None)
+    if not task.cancelled():
+        with contextlib.suppress(BaseException):
+            task.exception()
+
+
+def _shared_slots_snapshot_task(
+    url: str, timeout: float, client
+) -> tuple["asyncio.Task", bool]:
+    """Return ``(task, created)`` for *url*'s in-flight shared fetch."""
+    task = _slots_snapshot_tasks.get(url)
+    if task is not None:
+        try:
+            usable = task.get_loop() is asyncio.get_running_loop() and not task.done()
+        except Exception:  # pragma: no cover - defensive
+            usable = False
+        if usable:
+            return task, False
+        if _slots_snapshot_tasks.get(url) is task:
+            _slots_snapshot_tasks.pop(url, None)
+    task = asyncio.create_task(_fetch_slots_payload(url, timeout, client))
+    _slots_snapshot_tasks[url] = task
+    task.add_done_callback(functools.partial(_discard_slots_snapshot_task, url))
+    return task, True
+
+
+def reset_slots_snapshot_state() -> None:
+    """Cancel in-flight shared ``/slots`` fetches and forget them.
+
+    Best-effort and loop-safe: a task bound to another (closed) loop is only
+    forgotten. Used by test isolation and shutdown; callers that can await
+    should use :func:`acancel_slots_snapshot_tasks` instead.
+    """
+    for task in list(_slots_snapshot_tasks.values()):
+        try:
+            if not task.done():
+                task.cancel()
+        except Exception:  # pragma: no cover - closed loop
+            pass
+    _slots_snapshot_tasks.clear()
+
+
+async def acancel_slots_snapshot_tasks() -> None:
+    """Cancel and await this loop's in-flight shared fetches (tests)."""
+    tasks = [
+        task
+        for task in _slots_snapshot_tasks.values()
+        if not task.done()
+        and task.get_loop() is asyncio.get_running_loop()
+    ]
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with contextlib.suppress(BaseException):
+            await task
+    reset_slots_snapshot_state()
+
+
+def _snapshot_from_payload(
+    status,
+    payload,
+    *,
+    fetched_at: float | None,
+    source: str,
+    upstream_calls: int,
+    status_out: dict | None,
+) -> SlotsSnapshot:
+    """Build a :class:`SlotsSnapshot` from one raw fetch result."""
+    if status == 200:
+        derived = derive_slots_from_payload(payload)
+        if derived is not None:
+            _set_slots_status_out(status_out, status=200, reason=None)
+            available, total, slots = derived
+            return SlotsSnapshot(
+                status=200,
+                fetched_at=fetched_at,
+                available_slots=available,
+                total_slots=total,
+                slots=slots,
+                source=source,
+                upstream_calls=upstream_calls,
+            )
+        reason = "invalid_payload"
+    else:
+        reason = f"http_{status}"
+    _set_slots_status_out(status_out, status=status, reason=reason)
+    return SlotsSnapshot(
+        status=status,
+        reason=reason,
+        fetched_at=fetched_at,
+        source=source,
+        upstream_calls=upstream_calls,
+    )
+
+
+async def _read_slots_snapshot(
+    url: str,
+    *,
+    timeout: float,
+    client=None,
+    budget_seconds: float | None = None,
+    provenance_out: dict | None = None,
+    status_out: dict | None = None,
+) -> SlotsSnapshot:
+    """Read one shared ``/slots`` snapshot, at most one fetch per call.
+
+    Serves the coalesced cache when it is within its freshness window
+    (``SLOTS_POLL_TTL_SECONDS``); otherwise joins — or starts — the URL's one
+    shared fetch task. With *budget_seconds* the wait is bounded: on expiry the
+    snapshot is reported ``pending`` and the shared fetch is left running so a
+    later poll can serve its payload (AC2). Never raises for a backend
+    failure — the failure is classified into the snapshot instead.
+    """
+    entry = _cached_slots_payload_entry(url)
+    if entry is not None:
+        fetched_at, status, payload = entry
+        source = "failure_backoff" if status != 200 else "ttl_cache"
+        _note_slots_provenance(
+            provenance_out, source=source, fetched_at=fetched_at, upstream_calls=0
+        )
+        return _snapshot_from_payload(
+            status,
+            payload,
+            fetched_at=fetched_at,
+            source=source,
+            upstream_calls=0,
+            status_out=status_out,
+        )
+
+    task, created = _shared_slots_snapshot_task(url, timeout, client)
+    calls = 1 if created else 0
+    _note_slots_provenance(
+        provenance_out, source="upstream", fetched_at=None, upstream_calls=calls
+    )
+    try:
+        if budget_seconds is None:
+            status, payload = await task
+        else:
+            wait_seconds = max(0.0, float(budget_seconds))
+            if wait_seconds > 0.0:
+                # Let the shared fetch's own (equal) timeout land first so a
+                # genuine timeout is classified as a failure, not "pending".
+                wait_seconds += _SLOTS_SNAPSHOT_WAIT_GRACE_SECONDS
+            status, payload = await asyncio.wait_for(
+                asyncio.shield(task), timeout=wait_seconds
+            )
+    except asyncio.CancelledError:
+        if task.cancelled():
+            # The shared fetch was cancelled (shutdown/test cleanup), not this
+            # caller: report it as pending instead of cancelling the request.
+            return SlotsSnapshot(source="upstream", upstream_calls=calls, pending=True)
+        raise
+    except TimeoutError:
+        if task.done() and not task.cancelled():
+            exc = task.exception()
+            if exc is None:
+                # The shared fetch landed as our bound expired. A cancelled
+                # shared fetch falls through to the pending result below.
+                status, payload = task.result()
+            elif isinstance(exc, TimeoutError):
+                _set_slots_status_out(status_out, reason="timeout")
+                return SlotsSnapshot(
+                    reason="timeout", source="upstream", upstream_calls=calls
+                )
+            else:
+                reason = classify_slots_transport_failure(exc)
+                _set_slots_status_out(status_out, reason=reason)
+                return SlotsSnapshot(
+                    reason=reason, source="upstream", upstream_calls=calls
+                )
+        else:
+            # Our budget expired; the shared fetch keeps running.
+            return SlotsSnapshot(source="upstream", upstream_calls=calls, pending=True)
+    except Exception as exc:
+        reason = classify_slots_transport_failure(exc)
+        _set_slots_status_out(status_out, reason=reason)
+        return SlotsSnapshot(reason=reason, source="upstream", upstream_calls=calls)
+
+    fetched_at = time.monotonic()
+    cached = _slots_poll_cache.get(url)
+    if cached is not None and cached[1] == status and cached[2] is payload:
+        fetched_at = cached[0]
+    return _snapshot_from_payload(
+        status,
+        payload,
+        fetched_at=fetched_at,
+        source="upstream",
+        upstream_calls=calls,
+        status_out=status_out,
+    )
+
+
+async def _shared_slots_snapshot(
+    url: str,
+    *,
+    timeout: float,
+    client=None,
+    provenance_out: dict | None = None,
+    status_out: dict | None = None,
+) -> SlotsSnapshot:
+    """Return the poll-scoped shared snapshot, fetching only when needed."""
+    scope = _slots_read_scope_var.get()
+    if (
+        scope is not None
+        and scope.get(_SLOTS_READ_SCOPE_URL) == url
+        and scope.get(_SLOTS_READ_SCOPE_SNAPSHOT) is not None
+    ):
+        snapshot = scope[_SLOTS_READ_SCOPE_SNAPSHOT]
+        _set_slots_status_out(
+            status_out,
+            status=None if snapshot.pending else snapshot.status,
+            reason=None if snapshot.pending else snapshot.reason,
+        )
+        if isinstance(status_out, dict):
+            # ``shared_read`` tells the status handler this read reused the
+            # poll's snapshot, so a failure it observes was already recorded
+            # by the read that performed the fetch (no double metric).
+            status_out["shared_read"] = True
+        _note_slots_provenance(
+            provenance_out,
+            source=snapshot.source,
+            fetched_at=snapshot.fetched_at,
+            upstream_calls=0,
+        )
+        return snapshot
+
+    snapshot = await _read_slots_snapshot(
+        url,
+        timeout=timeout,
+        client=client,
+        budget_seconds=(
+            scope.get(_SLOTS_READ_SCOPE_BUDGET) if scope is not None else None
+        ),
+        provenance_out=provenance_out,
+        status_out=status_out,
+    )
+    if scope is not None:
+        scope[_SLOTS_READ_SCOPE_URL] = url
+        scope[_SLOTS_READ_SCOPE_SNAPSHOT] = snapshot
+    return snapshot
+
+
 def _resolve_slots_model_id(model: str | None) -> str:
     """Return *model*, or a cached ``/models``-derived id when none was given.
 
@@ -1326,29 +1750,33 @@ async def _query_slots(
         # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls behind a
         # short TTL so N status pollers produce a bounded number of upstream
         # requests (not N per interval).
-        status, slots_data = await _fetch_slots_payload(
-            url, timeout, client, provenance_out=provenance_out
+        # LP-0MVVXGLTM008ROJ9: the counts pair and the per-slot detail of the
+        # same poll are derived from ONE shared snapshot, so this read performs
+        # at most one bounded upstream fetch per poll.
+        snapshot = await _shared_slots_snapshot(
+            url,
+            timeout=timeout,
+            client=client,
+            provenance_out=provenance_out,
+            status_out=status_out,
         )
-        if status == 200:
-            if isinstance(slots_data, list):
-                total_slots = len(slots_data)
-                available_slots = sum(
-                    1 for s in slots_data if not s.get("is_processing", True)
+        if snapshot.ok:
+            if snapshot.total_slots > 0:
+                _record_last_slot_counts(
+                    snapshot.available_slots, snapshot.total_slots
                 )
-                if total_slots > 0:
-                    _record_last_slot_counts(available_slots, total_slots)
-                    # A successful counts read is fresh evidence: clear any
-                    # recorded staleness reason so the published field never
-                    # lingers from an earlier failed poll
-                    # (LP-0MW1VVIPG008896N).
-                    reset_slots_stale_reason()
-                _set_slots_status_out(status_out, status=status)
-                return available_slots, total_slots
-            _record_slots_query_failure("invalid_payload")
-            _set_slots_status_out(status_out, status=status, reason="invalid_payload")
+                # A successful counts read is fresh evidence: clear any
+                # recorded staleness reason so the published field never
+                # lingers from an earlier failed poll
+                # (LP-0MW1VVIPG008896N).
+                reset_slots_stale_reason()
+            return snapshot.available_slots, snapshot.total_slots
+        if snapshot.pending:
+            # The poll's budget expired while the shared fetch is still in
+            # flight. Nothing failed (yet), so no failure metric and no stale
+            # reason are recorded: the caller's caches serve the poll.
             return 0, 0
-        _record_slots_query_failure(f"http_{status}")
-        _set_slots_status_out(status_out, status=status, reason=f"http_{status}")
+        _record_slots_query_failure(snapshot.reason or "unknown")
         return 0, 0
     except TimeoutError:
         _record_slots_query_failure("timeout")
@@ -1512,6 +1940,11 @@ async def _query_slots_detail(
 
     Returns an empty list on any failure (HTTP error, connection error,
     timeout, or unexpected response shape).
+
+    LP-0MVVXGLTM008ROJ9: when the read runs inside ``slots_read_scope()`` it is
+    served from the same shared snapshot as ``_query_slots()``, so a status
+    poll performs at most one upstream fetch and the per-slot
+    ``is_processing`` values cannot disagree with the counts pair.
     """
     resolved_model = _resolve_slots_model_id(model)
     url = ""
@@ -1519,61 +1952,41 @@ async def _query_slots_detail(
         url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
         url = f"{url}?model={resolved_model}"
         if _client is not None:
+            # Test-only direct path: one caller-supplied client, no coalescing.
             _note_slots_provenance(
                 provenance_out, source="upstream", fetched_at=None, upstream_calls=1
             )
             slots_resp = await _client.get(url)
             status = int(getattr(slots_resp, "status_code", 0) or 0)
-            if status == 200:
-                slots_data = await _safe_parse_json_response(slots_resp)
-            else:
-                slots_data = None
+            payload = (
+                await _safe_parse_json_response(slots_resp) if status == 200 else None
+            )
+            snapshot = _snapshot_from_payload(
+                status,
+                payload,
+                fetched_at=None,
+                source="upstream",
+                upstream_calls=1,
+                status_out=status_out,
+            )
         else:
             # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls.
-            status, slots_data = await _fetch_slots_payload(
-                url, timeout, None, provenance_out=provenance_out
+            snapshot = await _shared_slots_snapshot(
+                url,
+                timeout=timeout,
+                provenance_out=provenance_out,
+                status_out=status_out,
             )
-        # LP-0MW3ED73W007JYGI: publish the phase outcome (opt-in via
-        # ``status_out``) so the status handler can record the failure reason
-        # instead of the detail path swallowing it into a debug log (the
-        # measured 36 % failure rate was invisible in the metrics surface).
-        if status != 200:
-            _set_slots_status_out(status_out, status=status, reason=f"http_{status}")
-            slots_data = None
-        elif not isinstance(slots_data, list):
-            _set_slots_status_out(status_out, status=status, reason="invalid_payload")
-        else:
-            _set_slots_status_out(status_out, status=status, reason=None)
-        if isinstance(slots_data, list):
-            result = []
-            for i, slot in enumerate(slots_data):
-                is_processing = bool(slot.get("is_processing", False))
-                next_token = slot.get("next_token")
-                n_decoded = None
-                if isinstance(next_token, dict):
-                    n_decoded = next_token.get("n_decoded")
-                elif isinstance(next_token, list) and len(next_token) > 0:
-                    first = next_token[0]
-                    if isinstance(first, dict):
-                        n_decoded = first.get("n_decoded")
-                result.append({
-                    "slot_id": slot.get("id", i),
-                    "is_processing": is_processing,
-                    "n_decoded": n_decoded,
-                    # Per-slot prompt progress (LP-0MVGDUVGE0024YAI AC3/AC5):
-                    # the single source for context_tokens, sourced from the
-                    # same raw fields ``_query_slots_progress`` reads.
-                    "context_tokens": _slot_context_tokens(slot),
-                    # LP-0MW959RRO008AAH9 AC10b: the llama task id the deployed
-                    # build publishes for the slot, carried additively so a
-                    # dispatched request can be associated with the backend task
-                    # it used without a second ``/slots`` call. Raw value: a
-                    # published sentinel (``-1``, an idle slot) and an absent
-                    # field (a build that does not publish it) mean different
-                    # things to the resolver, so neither is normalised here.
-                    "id_task": slot.get("id_task"),
-                })
-            return result
+        if snapshot.reason and not snapshot.pending:
+            # LP-0MW3ED73W007JYGI: publish the phase outcome (opt-in via
+            # ``status_out``) so the status handler can record the failure
+            # reason instead of the detail path swallowing it into a debug log
+            # (the measured 36 % failure rate was invisible in the metrics
+            # surface).
+            _srv().logger.debug(
+                "Slot detail query failed [%s] for %s", snapshot.reason, url
+            )
+        return [dict(slot) for slot in snapshot.slots]
     except TimeoutError:
         # LP-0MW3ED73W007JYGI: distinguish a timeout from an HTTP error on the
         # status detail path (``_query_slots`` already does this for counts).
