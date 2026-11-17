@@ -21,6 +21,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -217,3 +219,72 @@ class TestCrossEraFlag:
         for state_path in (same_era, backfilled, tmp_path / "absent.yaml"):
             body = _detail_blocks(_report(metrics_state=state_path))["decode_speed"]
             assert ERA_FLAG not in body, state_path.name
+
+
+# ---------------------------------------------------------------------------
+# Context-pressure metric names the population it samples (LP-0MWJOUUG6003WO79)
+# ---------------------------------------------------------------------------
+#
+# Parent LP-0MWEOGIUK006B1DD Q2 answer (a): the Context-size pressure metric
+# samples the share of **sessions at or above 80 % of their effective per-slot
+# context** — the same population the report's "Context sizes approaching
+# per-slot limits" recommendation already measures. The committed `source`
+# (registry) and `calculation` (defaults) copy must name that input, so the
+# metric and its documentation cannot drift apart: copy that still advertises
+# `routing_skip_local estimated_tokens` lines or per-request prompt sizes
+# describes a population that is structurally unpressed (oversized requests
+# are routed away by the large-context bypass).
+#
+# Red-first: both copies currently name the wrong input, so the assertions are
+# marked ``xfail(strict=True)`` naming the implementation child
+# (LP-0MWJOUYUL0005H95) that rewrites them; the tree stays green for the
+# dev-push gate. The behavioural half of the same rule is pinned in
+# ``test_performance_metrics.py`` (non-zero share from session peaks, 0.0 %
+# without pressure, n/a without a resolvable limit).
+
+PENDING_CONTEXT_PRESSURE_80_PCT = (
+    "pending LP-0MWJOUYUL0005H95 (context-pressure share at 80 % of per-slot "
+    "context: CONTEXT_PRESSURE_THRESHOLD_RATIO 1.0 -> 0.80 over the "
+    "per-session peak context)"
+)
+
+#: Words a copy may use for "the largest context each session reached".
+_PEAK_CONTEXT_WORDS = ("peak", "max", "largest", "highest")
+
+
+def _copy_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _names_the_session_peak_population(copy: str) -> bool:
+    text = _copy_text(copy)
+    return (
+        "session" in text
+        and "context" in text
+        and any(word in text for word in _PEAK_CONTEXT_WORDS)
+    )
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_CONTEXT_PRESSURE_80_PCT)
+def test_context_pressure_registry_source_names_the_session_peak_population():
+    """The registry's `source` names the per-session peak context, not the
+    `routing_skip_local estimated_tokens` lines the metric never samples."""
+    entry = next(
+        metric for metric in pm.METRIC_REGISTRY if metric.id == "context_pressure"
+    )
+
+    assert _names_the_session_peak_population(entry.source), entry.source
+    assert "routing_skip_local" not in _copy_text(entry.source), entry.source
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_CONTEXT_PRESSURE_80_PCT)
+def test_context_pressure_calculation_names_the_session_peak_population():
+    """The defaults' `calculation` describes the share of sessions at or above
+    the per-slot threshold, not a share of individual requests whose prompt
+    size is estimated from routing-skip lines."""
+    copy = pm.detail_copy("context_pressure", pm.load_defaults())
+
+    assert _names_the_session_peak_population(copy["calculation"]), copy["calculation"]
+    text = _copy_text(copy["calculation"])
+    assert "routing_skip_local" not in text, copy["calculation"]
+    assert "estimated prompt size" not in text, copy["calculation"]

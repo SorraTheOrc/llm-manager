@@ -75,6 +75,9 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import aggregation  # noqa: E402
+
+from tests import fixtures  # noqa: E402
 from tests.fixtures import (  # noqa: E402
     ARCHIVED_REPORT_ERA_A,
     ARCHIVED_REPORT_ERA_B,
@@ -573,6 +576,117 @@ def test_a_larger_error_than_the_target_reads_unmet():
         )
         == "Unmet"
     )
+
+
+# --- Context-size pressure at 80 % of the per-slot context (LP-0MWJOUUG6003WO79)
+#
+# Parent LP-0MWEOGIUK006B1DD Q2 answer (a): the scorecard's Context-size
+# pressure is the share of sessions at or above **80 % of the effective
+# per-slot context**, the ratio the report's own "Context sizes approaching
+# per-slot limits" recommendation already uses
+# (``recommendations.CONTEXT_PRESSURE_RATIO = 0.80``). The current
+# implementation samples only *served local requests* against **100 %** of the
+# per-slot limit, and the large-context bypass routes oversized requests away,
+# so the row is structurally 0.0 % every window.
+#
+# Red-first: the non-zero assertions fail against that implementation and are
+# marked ``xfail(strict=True)`` naming the implementation child
+# (LP-0MWJOUYUL0005H95) that lowers ``CONTEXT_PRESSURE_THRESHOLD_RATIO`` to
+# 0.80 and samples each session's peak context; the tree stays green for the
+# dev-push gate. The no-pressure and n/a assertions hold under both
+# definitions and run unmarked — they pin the sides that must not move either
+# way (the fix must never fabricate pressure, nor a fabricated 0).
+#
+# The fixture windows (``tests.fixtures.context_pressure_window``) describe a
+# 1 000-token profile across 2 slots, so the per-slot context is 500 tokens
+# and the 80 % threshold is 400. Their request-level prompt samples sit at
+# half each session's peak — every one below 400 — so a 0.0 % reading can only
+# come from measuring the wrong population (the served requests).
+
+PENDING_CONTEXT_PRESSURE_80_PCT = (
+    "pending LP-0MWJOUYUL0005H95 (context-pressure share at 80 % of per-slot "
+    "context: CONTEXT_PRESSURE_THRESHOLD_RATIO 1.0 -> 0.80 over the "
+    "per-session peak context)"
+)
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_CONTEXT_PRESSURE_80_PCT)
+def test_context_pressure_counts_sessions_at_80_percent_of_per_slot_context():
+    """Two of four sessions peak at or above the 400-token threshold: one at
+    480 (96 %) and one at exactly 400 (80 %, which is "at or above"), while
+    399 (79.8 %) and 120 are not pressured — so the share is 50.0 %.
+
+    The exact percentage is pinned because the defect is not "a bit low" but
+    structurally zero: under the current request-level, 100 %-of-per-slot
+    definition every sample here is below its limit and the row reads 0.0 %.
+    """
+    summary = fixtures.context_pressure_window(
+        [
+            fixtures.context_pressure_session("pressured", 480),
+            fixtures.context_pressure_session("at-the-threshold", 400),
+            fixtures.context_pressure_session("comfortable", 399),
+            fixtures.context_pressure_session("light", 120),
+        ]
+    )
+
+    stats = aggregation.context_pressure(
+        summary, fixtures.context_pressure_config()
+    )
+
+    assert stats is not None
+    assert stats.at_or_above == 2
+    assert stats.share_pct == 50.0
+
+
+def test_context_pressure_reports_zero_when_no_session_reaches_80_percent():
+    """No session peaks at or above 80 % of its per-slot context, so the row
+    reads 0.0 % — real pressure must not be fabricated."""
+    summary = fixtures.context_pressure_window(
+        [
+            fixtures.context_pressure_session("comfortable", 399),
+            fixtures.context_pressure_session("light", 120),
+        ]
+    )
+
+    stats = aggregation.context_pressure(
+        summary, fixtures.context_pressure_config()
+    )
+
+    assert stats is not None
+    assert stats.at_or_above == 0
+    assert stats.share_pct == 0.0
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_CONTEXT_PRESSURE_80_PCT)
+def test_context_pressure_uses_each_sessions_own_per_slot_context():
+    """The threshold follows each session's own profile rather than one
+    analysis-time context: session ``fast`` (1 000 tokens over 2 slots, 500 per
+    slot) at 400 is at 80 %, while ``cheap`` (2 000 tokens over 2 slots, 1 000
+    per slot) at 400 is only at 40 % — so the shared peak counts once."""
+    summary = fixtures.context_pressure_window(
+        [
+            fixtures.context_pressure_session("fast", 400, ctx_size=1000),
+            fixtures.context_pressure_session("cheap", 400, ctx_size=2000),
+        ]
+    )
+
+    stats = aggregation.context_pressure(summary)
+
+    assert stats is not None
+    assert stats.at_or_above == 1
+    assert stats.share_pct == 50.0
+
+
+def test_context_pressure_is_not_available_without_a_resolvable_limit():
+    """A session with no resolvable slot geometry yields ``n/a`` (``None``),
+    never a fabricated ``0`` — the same rule the parent item's other metrics
+    keep (LP-0MWEOGIUK006B1DD constraints)."""
+    summary = fixtures.context_pressure_window(
+        [fixtures.context_pressure_session("unresolvable", 490, slots=None)]
+    )
+
+    assert aggregation.context_pressure(summary) is None
+    assert aggregation.performance_metric_inputs(summary)["context_pressure"] is None
 
 
 # --- Per-metric tolerance override -----------------------------------------
