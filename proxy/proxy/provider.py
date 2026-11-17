@@ -163,6 +163,12 @@ def _budget_diagnostics(decision) -> dict[str, str]:
 # In-memory cooldown tracking: provider_name -> expiry_timestamp (seconds since epoch)
 _provider_unavailable_until: dict[str, float] = {}
 
+#: Clock seam (LP-0MWL58KAK003JZ41): tests override this to drive cooldown
+#: expiry deterministically; production reads ``time.time`` via the wrapper.
+def _cooldown_now() -> float:
+    return time.time()
+
+
 # Consecutive failure count for exponential backoff: provider_name -> count
 # Incremented on each failure, reset to 0 on success.
 _provider_failure_count: dict[str, int] = {}
@@ -5752,7 +5758,7 @@ def mark_provider_unavailable(
         cooldown_seconds = min(backoff, cooldown_seconds)
         _provider_failure_count[provider_name] = count + 1
 
-    _provider_unavailable_until[provider_name] = time.time() + cooldown_seconds
+    _provider_unavailable_until[provider_name] = _cooldown_now() + cooldown_seconds
     _persist_provider_state_best_effort()
 
 
@@ -5786,7 +5792,7 @@ def _provider_cooldown_remaining(provider_name: str) -> int:
     expiry = _provider_unavailable_until.get(provider_name)
     if expiry is None:
         return 0
-    remaining = expiry - time.time()
+    remaining = expiry - _cooldown_now()
     if remaining <= 0:
         # Cooldown expired — clean up entry
         del _provider_unavailable_until[provider_name]
