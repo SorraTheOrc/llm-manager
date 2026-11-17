@@ -510,8 +510,236 @@ measurement shape for re-arm #3 are in
 [`docs/dev/resident-prefix-rollout.md`](../../resident-prefix-rollout.md) §
 *Re-arming the 24 h AC4 window (re-arm #3)*.
 
-**Status:** re-arm #2 stays a FAIL and its numbers above remain the last
-complete measurement. The re-arm #3 window is armed against the first fix-loaded
-restart after 2026-10-30T07:00:00Z (deliberately after the concurrent
-`LP-0MVRMI5HK00558TB` overnight window closes, so that measurement is not
-split); no PASS may be claimed until that window closes and is measured.
+**Status:** re-arm #2 is a FAIL and its numbers above remain the reference for
+the *failure* it diagnosed (all-unmeasured decisions). Re-arms #3, #4 and #5
+never produced a measurement: each was invalidated by restarts inside its
+window. The first complete measurement after the fix is the **2026-11-17
+addendum (re-arm #6)** at the end of this file.
+
+# 2026-11-17 Addendum: 24 h AC4 verification (re-arm #6) — PASS, with two documented qualifiers
+
+**Work item:** LP-0MVN44XB0009M33K (follow-up of LP-0MVN1IQTF0037WTG AC4/AC5/AC6).
+**Verdict: PASS** — both AC6 gates are met: (i) the scheduling-attributed
+`prefill_deadline_exceeded` count fell **100 %** (22 → 0, same classifier as
+re-arm #2) against a window-scoped baseline; (ii) no `local_lease_active`
+refusal window attributable to the lease watchdog exceeded 180 s. Two
+qualifiers are recorded below and must travel with the verdict:
+
+1. **The window's last 56 min had the local route closed by an unrelated
+   orphaned-prefill-marker wedge** (`LP-0MWKWGLRT003AUG4`, filed
+   `critical`/`open` on 2026-11-17T16:21Z). It is not a restart, so the
+   window stays valid, but it depresses the report's local-utilisation figures
+   and is the sole cause of the four `local_lease_active` refusal windows
+   longer than 180 s (all of which belong to that defect, not to this ladder).
+2. **The re-arm #6 title pinned a 13 s-short window.** The title's
+   `2026-11-16T15:20:47Z → 2026-11-17T15:20:47Z` starts at the raw restart
+   instant, so the anchor restart's own `Logging initialised … pid=3720326`
+   (15:20:49) sat *inside* it — which AC2's evidence rule forbids. Measured
+   window therefore re-pinned to the whole minute after the restart
+   (`15:21:00 → 15:21:00`), the arming rule in
+   [`../measurement-windows.md`](../measurement-windows.md) § 1; both pins are
+   recorded.
+
+This supersedes re-arm #2's FAIL as the current measurement. The 2026-10-24
+figures below stay **historical reference only** and are never a baseline.
+
+## Window (restart-free, attested)
+
+- **Measured window:** `2026-11-16T15:21:00Z → 2026-11-17T15:21:00Z`
+  (24.0 h; run instant = window end, run started 2026-11-17T18:17Z).
+- **Anchor restart:** `2026-11-16T15:20:47Z`, PID **3720326**,
+  `ps -o lstart -p 3720326` → `Mon Nov 16 15:20:47 2026`, `etime`
+  `1-03:05:16` at run — continuous uptime covering the whole window.
+  Attribution: `Proxy restart attribution: source=manual actor=unknown
+  reason=LP-0MW7V14DN007F127: group-2 validation restart (cold-regime ETA +
+  deadline token capacity)`.
+- **Restart-freedom:** `Logging initialised … pid=` / `Rotated previous proxy
+  log aside` / `Starting LLama Proxy Server` occur **only** in the first three
+  lines of `proxy.log.2026-11-16_15` at `15:20:48`–`15:20:49` — before the
+  window start. **0** such markers inside the window.
+- **Log file set** (disjoint, first→last timestamps, coverage **24.0 h of
+  24.0 h, 100 %** via `scripts/proxy_usage_window_archive.py coverage`):
+
+| File | First → last | Lines |
+|---|---|---|
+| `proxy.log.2026-11-16_15` | 15:21:00 → 21:20:47 | 155,296 |
+| `proxy.log-2026-11-17_00` | 21:20:48 → 00:00:03 | 62,202 |
+| `proxy.log.2026-11-16_21` | 00:00:05 → 03:20:46 | 28,776 |
+| `proxy.log.2026-11-17_03` | 03:20:48 → 09:20:46 | 45,875 |
+| `proxy.log.2026-11-17_09` | 09:20:52 → 15:20:51 | 71,039 |
+
+Raw segments were archived before retention rotated them away
+(`~/proxy-usage-reports/ac4-rearm6/raw`, SHA-256 in `SHA256SUMS`,
+`manifest.txt` appended by `run-window`). Naming trap unchanged:
+restart-driven asides are `proxy.log.<YYYY-MM-DD_HHMMSS>`, size-driven
+rotations `proxy.log.<YYYY-MM-DD_HH>`; the daily rotation lands as
+`proxy.log-<YYYY-MM-DD>_00` (plain) even when later gzipped.
+
+## Preconditions (AC1)
+
+- **Loaded build:** the checkout tip at the restart instant —
+  `79f53ac1aaa2c9527cf91f813867972c55db1928` (`2026-11-16 15:09:39`,
+  `LP-0MW8EAT60003Z28H`), process `cwd` `/home/rgardler/projects/llm/proxy`.
+  Checkout tip **at run time** is `de5c4aa16` (`2026-11-17 10:54:20`) — the
+  shared checkout moves without a restart, so the tip is *not* the loaded code.
+- **Ladder present in the loaded tree:** `RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH`
+  (×4) and `resolve_resident_prefix` in `proxy/proxy/provider.py`.
+- **Config in the loaded tree** (`proxy/config.yaml` at `79f53ac1`):
+  `local_resident_prefix_min_ratio: 0.5`, `local_session_tenants: 2`,
+  `local_cold_prefill_budget_tokens: 25000`,
+  `local_admission_guard_budget_safety_fraction: 0.95`,
+  `local_prefill_deadline_seconds: **180**`,
+  `local_measured_cache_abort_enabled: true`. The 120 s value quoted in the
+  work item's AC text is stale: the deadline was deliberately widened
+  120 → 180 s by `LP-0MW1V0LPM000QLUC` (`31c84215`, 2026-11-04) and the live
+  deadline events log `deadline=180s`. The 0.5 ratio threshold AC4 rule (a)
+  depends on is unchanged.
+
+## Measured result (AC3, AC7)
+
+`analyze_proxy_usage.py --start "2026-11-16 15:21:00" --end "2026-11-17
+15:21:00"` — 406 sessions, 15,515 requests (3,760 local / 11,755 remote),
+581,870,906 logged tokens, 110,396 lines parsed / 0 skipped.
+
+| Metric | re-arm #2 (2026-10-28) | **re-arm #6 (this window)** |
+|---|---|---|
+| `prefill_deadline_exceeded` | 99 (user 85 / audit 14) | **1** (user 1 / audit 0) |
+| Wasted prefill tokens | 750,042 | **228** |
+| `prefill_budget_exceeded` refusals | 2,546 | 2,269 |
+| Provider exhaustion / upstream 503 | 483 / 100 | 339 / 1 |
+| `residency_decisions` | 3,607 | **5,501** |
+| — measured | **0** | **252** |
+| — unmeasured | 3,607 | 5,249 (`no_slot` 2,958 · `no_prior_measurement` 1,231 · `stale_view` 1,060) |
+| Resident admits (`decision=admit`) | 0 | **1,459** (231 with a measured ratio ≥ threshold) |
+| `resident_prefix_insufficient` denials | 2,113 | 2,979 (21 with a measured prefix, 2,958 with no slot) |
+| `tenant_limit` denials | 15 | 3 |
+| `local_eviction` (post-acceptance 176) | 16 | 559 (`tenancy_lease_expired` 337, `slot_assignment_freed` 215, `lease_evicted` 7) |
+| Slot-owner churn | 31 of 100 sessions | 130 of 186 sessions |
+
+- **Waste caveat (unchanged, LP-0MVODJ3P6000AIUM):** `wasted_prefill_tokens`
+  recomputes the event's token fields post-hoc and therefore **overstates**
+  the real discard; 228 is an upper bound, reported with this caveat rather
+  than re-derived.
+- **AC7 verdict:** the `## Residency-aware admission` section renders with all
+  five counters and the churn table, and **252 decisions carry a numeric
+  measured ratio** (median 100 % for admissions, median 20.7 % / p10 18.5 % /
+  max 49.1 % for the 21 measured evicted denials). The re-arm #2
+  "decisions logged but all unmeasured" finding — which AC7 defines as never a
+  pass — is **resolved**. The 4.6 % measured share is dominated by
+  `no_slot` (genuine non-residency, 56.4 % of decisions) and
+  `stale_view`/`no_prior_measurement` while capture ramps up.
+- **Local route wedge inside the window (qualifier 1):** from
+  `2026-11-17T14:24:42.884Z` the log emits
+  `local_dispatch_denied … records_total=0 … prefill_in_flight=1` (152 times
+  through the window end) — an orphaned in-flight marker counted by the
+  dispatch gate (`LP-0MWKWGLRT003AUG4`). No restart is involved, so the window
+  is valid, but the report's local-utilisation figures for the last 56.3 min
+  (3.9 % of the window) reflect a closed local route, not a scheduling
+  decision. The single deadline event precedes the wedge by 4.6 h.
+
+## AC4 split — scheduling-attributed cancellations
+
+Join rule (unchanged from re-arm #2, conservative): for the event's session,
+the most recent `routing_resident_prefix` at/before the event is the
+**admission**, the `local_eviction` line at the event is the **owner at
+deadline**; `reuse_ratio=none` leaves rule (a) unevaluable. Ambiguous events
+are counted separately and **never** in the numerator.
+
+| Class | Count |
+|---|---|
+| Scheduling-attributed (rule a: `reuse_ratio < 0.5`; rule b: owner changed) | **0** |
+| Ambiguous / unevaluable (rule a unmeasured, rule b negative) | **1** |
+| Genuine GPU-speed miss (declared out of scope) | 0 |
+
+The one event, traced end to end:
+
+- **Admission** `2026-11-17 09:47:49.654` — `decision=admit
+  n_past_actual=none reuse_ratio=none slot_owner_session=herdr-1794900481-910524-32268
+  residency_source=session_slot measurement=unavailable:no_prior_measurement
+  threshold_applied=warm threshold_value=120000 … estimated_tokens=43319
+  new_tokens=0` — a **warm resident admit** into the session's own slot, i.e.
+  the ladder did what it is supposed to do; rule (a) is unevaluable because no
+  measurement had been captured for the pair yet.
+- **Deadline** `2026-11-17 09:50:49.964` — `prefill_deadline_exceeded
+  deadline=180s`, `lease_released reason=prefill_deadline`,
+  `local_eviction reason=lease_evicted slot_owner_session=herdr-1794900481-910524-32268`
+  — the **same owner**, so rule (b) is negative.
+- **Cause (spot evidence)** `cold_sample_abandoned total=46314 cache=9444
+  processed=34017 time_ms=153371` (≈ 222 prefill tok/s) and
+  `prefill_wait_exceeds_threshold … waited=30s progress=0`: the prompt never
+  reached the resident prefix in time, i.e. a throughput/ETA-projection miss on
+  a 46 k-token cold prefill, not a reuse or eviction defect.
+
+⇒ **Scheduling-attributed = 0.** Rule (a) misfires on unmeasured admissions
+are the exact class re-arm #2 could not distinguish; here the sole candidate
+is decidable by rule (b) and it is *not* scheduling-attributed.
+
+## Window-scoped baseline and reduction (AC5)
+
+```bash
+# 1. capture every window file (the documented snippet must pass --log per file)
+python3 proxy/scripts/capture_prefill_thrash_window.py \
+  --start "2026-11-16 15:21:00" --end "2026-11-17 15:21:00" \
+  --log /var/log/llama-proxy/proxy.log.2026-11-16_15 \
+  --log /var/log/llama-proxy/proxy.log-2026-11-17_00 \
+  --log /var/log/llama-proxy/proxy.log.2026-11-16_21 \
+  --log /var/log/llama-proxy/proxy.log.2026-11-17_03 \
+  --log /var/log/llama-proxy/proxy.log.2026-11-17_09 \
+  --out ~/proxy-usage-reports/ac4-rearm6/ac4_window_rearm6.jsonl
+# 2. replay the same window through the real ladder
+python3 proxy/scripts/replay_prefill_occupancy.py x \
+  --window-fixture ~/proxy-usage-reports/ac4-rearm6/ac4_window_rearm6.jsonl
+```
+
+- **Capture:** 18,578 local admission attempts, 2 deadline-cancelled, ~228
+  wasted tokens modelled.
+- **Replay:** 15,426 over the cold budget, 15,418
+  `resident_prefix_insufficient`, 3,160 admitted, 8 idle-exempt,
+  **0 over-budget cold admissions (must be 0 ✓)**.
+- **Reduction:** scheduling-attributed cancellations **22 → 0 = 100 %**, above
+  the ≥ 90 % AC6 gate. Total deadline events **99 → 1 = −99.0 %**. Both
+  comparisons use the identical classifier and the same 24 h window shape; the
+  re-arm #2 figure (22) is the last *complete* measurement, and the
+  window-scoped replay above is the re-anchored baseline AC5 requires.
+
+## AC6 gates
+
+| Gate | Result | Evidence |
+|---|---|---|
+| (i) ≥ 90 % reduction in scheduling-attributed cancellations | **MET** (100 %) | 22 → 0; 0 of 1 events attributed |
+| (ii) no `local_lease_active` refusal window > 180 s watchdog bound | **MET** — with qualifier 1 | 589 refusals over 66 sessions; 99 continuous episodes (consecutive refusals ≤ 60 s apart, broken by any local admission), **max 123.6 s, none > 180 s**; every lease released within the bound (`prefill_eta_exceeded` at 47.6 s / 37.5 s, `prefill_deadline` at 180.1 s); max `queued_duration` 30.0 s |
+
+**Why gate (ii) needs the qualifier.** Two looser readings of "refusal window"
+do exceed 180 s and are reported rather than hidden:
+
+- per-session first→last refusal span: 7 sessions > 180 s, max **918.3 s** —
+  but 3 of those are *two* isolated refusals separated by ≥ 10 min of normal
+  local service (918.3 s, 644.0 s, 366.3 s with 2/0/5 local admissions in
+  between), which is contention, not a refusal window.
+- episodes under a 180 s gap: 4 episodes > 180 s (**231.2 / 455.6 / 533.8 /
+  824.6 s**), every one of them starting at 14:50–15:17 on 2026-11-17, i.e.
+  **inside the orphaned-marker wedge** of qualifier 1. The wedge denies *every*
+  session's local dispatch (`records_total=0 prefill_in_flight=1`), so these
+  are wedge evidence, not lease-watchdog evidence; 523 of the 589
+  `local_lease_active` refusals fall in the wedge period.
+
+An **unqualified** gate (ii) therefore requires the wedge fix
+(`LP-0MWKWGLRT003AUG4`) and a fresh restart-free window; that is a separate
+defect and does not re-open the residency-ladder verdict.
+
+## Reusable recipe (differences from re-arm #2)
+
+1. Anchor the window at the **first whole minute after** the restart, not at
+   the restart instant — otherwise the anchor's own `Logging initialised` line
+   lands inside the window and fails AC2's own evidence rule.
+2. Use `scripts/proxy_usage_window_archive.py coverage|archive|run-window`
+   rather than hand-rolled `grep`: it proves 24.0 h/100 % coverage, verifies
+   the archived copies byte-for-byte and appends a manifest with the exact
+   command and headline numbers.
+3. Re-enumerate the file set at run time — this window needed five files, two
+   of them size rotations (`…_21`, `…_03`, `…_09`) and one daily rotation
+   (`proxy.log-2026-11-17_00`), none of which is predictable from the previous
+   window's list.
+4. Attribute the tail of the window before trusting an operational gate: an
+   unrelated wedge can dominate `local_lease_active` counts without touching
+   the metric under test.

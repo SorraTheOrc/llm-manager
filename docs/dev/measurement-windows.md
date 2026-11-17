@@ -116,7 +116,7 @@ coordination record.
 
 | Item | What it measures | Required deploy commit(s) | Window it expects | State / next action |
 |---|---|---|---|---|
-| **LP-0MVN44XB0009M33K** | 24 h AC4 resident-prefix admission (scheduling-attributed `prefill_deadline` drop ≥ 90 %) | running build at anchor — re-arm #4 loaded the `fad873c7` tree; record `git log -1` when re-arming | re-arm #4 `2026-10-31T00:42Z → 2026-11-01T00:42Z` — **expired and invalidated** by later restarts | **Re-arm required** (owned by this item): re-anchor to the current anchor → `2026-11-02T10:39:25Z → 2026-11-03T10:39:25Z` |
+| **LP-0MVN44XB0009M33K** | 24 h AC4 resident-prefix admission (scheduling-attributed `prefill_deadline` drop ≥ 90 %) | loaded build at the 2026-11-16T15:20:47Z anchor = `79f53ac1` (`LP-0MW8EAT60003Z28H`) | **measured** — re-arm #6 `2026-11-16T15:21:00Z → 2026-11-17T15:21:00Z` (see § 3.4) | **Done**: PASS — 0 scheduling-attributed of 1 deadline event (22 → 0); see `slot-thrashing-investigation/findings.md`. Open qualifier: the tail-of-window orphaned-marker wedge (`LP-0MWKWGLRT003AUG4`) |
 | **LP-0MVP7HX2S008IU57** | router-responder `GET /slots … 500 == 0` after the child-port discovery fix | `f58e8964` + `189864fc` (LP-0MVP7525P008RXMF, deployed 2026-10-26T21:01:42Z) | `2026-10-27T12:00Z → 2026-10-28T12:00Z` — **expired** | Superseded in practice by the `/health`-fix measurement (LP-0MVVLKPBM007F6U6, RED); needs an explicit disposition, not a fresh 24 h window |
 | **LP-0MVVLQMG1000843Q** | writer-side sidecar pairing, ≥ 24 h post-deploy | `5c0f80f9` (LP-0MVVI8TEU006KTOZ, 2026-10-31T06:18:04Z) — **in the loaded anchor build** | `deploy + 24 h`; current anchor `2026-11-02T10:39:25Z → 2026-11-03T10:39:25Z` | Assignee hold (`Map`); fix is deployed, so a window is available once the hold is released |
 | **LP-0MVU8003X0018WT8** | router-responder `GET /slots … 400 == 0` after the `?model=` fixes | LP-0MVU7ZZTH005FSFL slices (merged; record loaded build at anchor) | `earliest 2026-11-01T23:56Z` (based on the 2026-10-31T23:56 restart) — **superseded** | **Re-arm** to the current anchor (`→ 2026-11-03T10:39:25Z`) |
@@ -131,6 +131,18 @@ coordination record.
 | **LP-0MVV29XDW006VTWK** | restate the abandoned-wait baseline on a diurnally matched 24 h window | fix under LP-0MVV1V213002QAIR | 24 h | **Blocked** on the diagnosis/fix chain |
 | **LP-0MVV29YP6006PLNP** | re-measure the 24 h post-fix abandoned-wait share | fix under LP-0MVV1V213002QAIR | 24 h after fix | **Blocked** on the diagnosis/fix chain |
 | **LP-0MVVXGI490089OX5** | profile a 24 h window; name the dominant `/slots` refresh contributor | record `git log -1` at the anchor | 24 h window | Open (child of LP-0MVVCO1N7004TNGY); arm against the current/next anchor |
+
+### 3.4 Measured windows (completed — precedent, not actionable)
+
+| Item | Window (UTC) | Anchor / loaded build | Outcome |
+|---|---|---|---|
+| **LP-0MVN44XB0009M33K** (re-arm #6, AC4 resident-prefix) | `2026-11-16T15:21:00Z → 2026-11-17T15:21:00Z` — 24.0 h, 100 % covered, five log segments | restart `2026-11-16T15:20:47Z` pid 3720326 (`reason=LP-0MW7V14DN007F127: group-2 validation restart`); loaded build `79f53ac1` | **PASS** (both AC6 gates): scheduling-attributed cancellations 22 → **0**, `residency_measured_decisions` 0 → **252**. Qualifier: 14:24:42Z–15:21Z had the local route closed by an orphaned prefill marker (`LP-0MWKWGLRT003AUG4`). Record: `slot-thrashing-investigation/findings.md` § *2026-11-17 Addendum (re-arm #6)* |
+
+**Lesson recorded by that run:** anchor the window at the **first whole minute
+after** the restart. Pinning the raw restart instant (`15:20:47`) leaves the
+anchor's own `Logging initialised … pid=` line (two seconds later) inside the
+window, which fails the restart-free evidence rule in § 1 even though no
+subsequent restart occurred.
 
 ### 3.2 Items with a shorter post-deploy window (same batching rule)
 

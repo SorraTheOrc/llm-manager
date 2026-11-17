@@ -288,6 +288,20 @@ streaming (buffered dispatches carry no `prompt_progress`) and that
 the classifier rewrite stay with `LP-0MVN44XB0009M33K` and
 `LP-0MVQ4X1S30034BQ1`.
 
+**Measured outcome (re-arm #6, 2026-11-17).** Re-arms #3, #4 and #5 were each
+invalidated by restarts inside their windows and produced no measurement. The
+first complete window after the fix was
+`2026-11-16T15:21:00Z → 2026-11-17T15:21:00Z` (anchor restart
+`2026-11-16T15:20:47Z`, pid 3720326, loaded build `79f53ac1`) and it **passed
+both AC6 gates**: `residency_measured_decisions` **252** of 5,501 (the
+all-unmeasured finding is resolved) and scheduling-attributed
+`prefill_deadline_exceeded` **0** of 1 event, against re-arm #2's 22 of 99.
+The `15:20:47` pin in that item's dated title is 13 s short: pin the **first
+whole minute after** the restart, or the anchor's own `Logging initialised`
+line falls inside the window. Full record:
+[`slot-thrashing-investigation/findings.md`](slot-thrashing-investigation/findings.md)
+§ *2026-11-17 Addendum (re-arm #6)*.
+
 ## Rollback
 
 Single knob, no restart needed for the *decision* (config reload picks it up):
