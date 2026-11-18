@@ -3803,6 +3803,38 @@ def _get_live_prefill_in_flight_count(srv) -> int:
         return 0
 
 
+def _pop_prefill_marker(srv, session_id: str | None) -> bool:
+    """Pop *session_id*'s ``local_prefill_in_flight`` marker.
+
+    Invariant (LP-0MWKWGLRT003AUG4, LP-0MWL5KLN1003E990): **every dispatch-
+    record deletion pops the marker.** The marker set is process-wide and the
+    admission gate prices the prefill cap with it, so a marker that outlives
+    its dispatch record denies every local dispatch while the GPU sits idle —
+    the 2026-11-17 incident shape ``records_total=0 ... prefill_in_flight=1
+    ... llama_available_slots=2``. Every deletion path (stale-record prune,
+    explicit release, client disconnect, request completion, no-progress
+    watchdog, orphan sweep, session invalidation) routes its pop through this
+    one helper so the invariant has a single home.
+
+    Idempotent, session-keyed, fail-soft and synchronous: a single-key
+    ``dict.pop`` on the event loop is atomic, so no lock is taken and the
+    admission-gate prune path stays ``await``-free (AC5). Returns ``True``
+    when a marker was removed, ``False`` when there was nothing to remove —
+    a falsy/missing session, a missing registry attribute, or an unexpected
+    error, none of which may escape into a dispatch or invalidation path
+    (AC4).
+    """
+    if not session_id:
+        return False
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if markers is None:
+            return False
+        return markers.pop(session_id, None) is not None
+    except Exception:
+        return False
+
+
 def _live_prefill_remaining_seconds(
     srv,
     *,
@@ -4934,6 +4966,11 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     the existing lock. Returns ``True`` if a record was removed, or
     ``False`` if no matching record existed (idempotent no-op).
 
+    Invariant (LP-0MWL5KLN1003E990): **every dispatch-record deletion pops
+    the session's ``local_prefill_in_flight`` marker** via
+    :func:`_pop_prefill_marker`, so a release can never leave an orphan marker
+    that denies every later local dispatch.
+
     When *endpoint* is provided, only the per-endpoint record for that
     llama-server instance is released (LP-0MRPILSMW004T4H8); otherwise
     the legacy single-server record keyed by *session_id* is removed.
@@ -5027,12 +5064,9 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     except Exception:
         raise
     # Free the slot registry entry
-    try:
-        _p = getattr(srv, "local_prefill_in_flight", None)
-        if _p is not None and session_id and session_id in _p:
-            _p.pop(session_id, None)
-    except Exception:
-        pass
+    # AC (LP-0MWL5KLN1003E990): every record deletion pops the marker — use the
+    # shared helper so this path cannot drift from the invariant.
+    _pop_prefill_marker(srv, session_id)
     if session_id:
         try:
             from proxy.session import _free_slot_assignment
@@ -6509,14 +6543,9 @@ def _release_client_disconnect_dispatch(
             endpoint=endpoint,
         )
 
-    marker_popped = False
-    try:
-        markers = getattr(srv, "local_prefill_in_flight", None)
-        if markers is not None and session_key in markers:
-            markers.pop(session_key, None)
-            marker_popped = True
-    except Exception:
-        marker_popped = False
+    # AC (LP-0MWL5KLN1003E990): every record deletion pops the marker — the
+    # shared helper reports whether a marker was actually present.
+    marker_popped = _pop_prefill_marker(srv, session_key)
 
     # AC1 (LP-0MVRMI5HK00558TB): resolve the slot identity **before** the
     # assignment is freed below (the released record's pinned ``slot_id`` first,
@@ -6592,6 +6621,11 @@ async def _release_completed_dispatch(
     request: Request | None = None,
 ) -> bool:
     """Release a local dispatch lease that outlived its completed request.
+
+    Invariant (LP-0MWL5KLN1003E990): **every dispatch-record deletion pops the
+    session's ``local_prefill_in_flight`` marker** via
+    :func:`_pop_prefill_marker`, so a completed request cannot leave an orphan
+    marker behind.
 
     Parent LP-0MVWEZCB0006WPBQ **AC8** — *no post-completion evictions*
     (LP-0MVWFKI8O001X694).
@@ -6711,13 +6745,9 @@ async def _release_completed_dispatch(
         return False
 
     # A completed request has no prefill in flight: a leftover marker counts
-    # against the pool's prefill cap until the sweep pops it.
-    try:
-        markers = getattr(srv, "local_prefill_in_flight", None)
-        if markers is not None:
-            markers.pop(session_key, None)
-    except Exception:
-        pass
+    # against the pool's prefill cap until the sweep pops it. AC
+    # (LP-0MWL5KLN1003E990): every record deletion pops the marker.
+    _pop_prefill_marker(srv, session_key)
 
     for record in released:
         endpoint = _endpoint_from_record(record)
@@ -6914,6 +6944,12 @@ def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
+    Invariant (LP-0MWL5KLN1003E990): **every dispatch-record deletion pops the
+    session's ``local_prefill_in_flight`` marker** via
+    :func:`_pop_prefill_marker`, so no sweep branch (completed reaping,
+    no-progress watchdog, idle timeout, orphan cleanup) can leave an orphan
+    marker behind.
+
     Three categories of stale records are cleaned:
 
     0a. **Completed records** (LP-0MVWFKI8O001X694, parent LP-0MVWEZCB0006WPBQ
@@ -7019,12 +7055,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
-                    try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and session_key in _p:
-                            _p.pop(session_key, None)
-                    except Exception:
-                        pass
+                    # AC (LP-0MWL5KLN1003E990): every record deletion pops the
+                    # marker — the completed-record reaping included.
+                    _pop_prefill_marker(srv, session_key)
                     continue
 
                 # LP-0MUCEFB8E003YVFF: no-progress watchdog. Runs on every
@@ -7138,13 +7171,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
-                    try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and _dispatch_key_session_id(sid) in _p:
-                            _p.pop(_dispatch_key_session_id(sid), None)
-
-                    except Exception:
-                        pass
+                    # AC (LP-0MWL5KLN1003E990): every record deletion pops the
+                    # marker — the idle-timeout path included.
+                    _pop_prefill_marker(srv, _dispatch_key_session_id(sid))
                     # LP-0MVN4LCED00661MX AC1 (``idle_timeout``): classified by
                     # the record's ``first_byte_seen`` flag, NOT by this path —
                     # an inactive record that already served its response is
@@ -7270,12 +7299,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         record=record,
                     )
                     del srv.local_dispatch_records[sid]
-                    try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and _dispatch_key_session_id(sid) in _p:
-                            _p.pop(_dispatch_key_session_id(sid), None)
-                    except Exception:
-                        pass
+                    # AC (LP-0MWL5KLN1003E990): every record deletion pops the
+                    # marker — the orphan sweep included.
+                    _pop_prefill_marker(srv, _dispatch_key_session_id(sid))
                     removed += 1
                     # LP-0MVIQ0FJC000YLX0: cancel the upstream stream so the
                     # llama-server slot is actually freed. Without this the
@@ -7427,13 +7453,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 endpoint=endpoint_from_record,
                 reason="no_progress_watchdog",
             )
-            # Pop from preflight tracking.
-            try:
-                _p = getattr(srv, "local_prefill_in_flight", None)
-                if _p is not None and session_key in _p:
-                    _p.pop(session_key, None)
-            except Exception:
-                pass
+            # Pop from preflight tracking (AC LP-0MWL5KLN1003E990: every
+            # record deletion pops the marker).
+            _pop_prefill_marker(srv, session_key)
     # Removed stale leases frees slots — wake the cross-session contention
     # queue (LP-0MSORQVK50012Q4D AC2).
     if removed > 0:
@@ -7986,7 +8008,11 @@ def _prune_stale_dispatch_records(srv, now: float) -> list:
     watchdog's concern, never the admission gate's — so it is left alone.
 
     The freed session-slot assignment is released alongside the record so the
-    registry cannot describe a slot the gate has already forgotten.
+    registry cannot describe a slot the gate has already forgotten, and the
+    pruned record's ``local_prefill_in_flight`` marker is popped through
+    :func:`_pop_prefill_marker` — **every record deletion pops the marker**
+    (LP-0MWL5KLN1003E990), so an orphan can never deny local dispatches while
+    llama-server reports free slots.
 
     Returns the keys removed (for diagnostics/tests).
     """
@@ -8013,6 +8039,10 @@ def _prune_stale_dispatch_records(srv, now: float) -> list:
             _free_slot_assignment(_dispatch_key_session_id(existing_key))
         except Exception:
             pass
+        # AC (LP-0MWL5KLN1003E990): the pruned record's prefill marker is
+        # popped alongside the record and slot assignment, so no orphaned
+        # marker can survive the deletion and deny every later local dispatch.
+        _pop_prefill_marker(srv, _dispatch_key_session_id(existing_key))
     return removed
 
 

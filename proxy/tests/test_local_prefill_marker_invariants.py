@@ -29,13 +29,12 @@ Each row seeds one record plus its marker — and a second, genuinely live
 session whose record and marker must survive (the negative control that stops
 the invariant being satisfied by over-popping).
 
-Red-first encoding (the repository convention, see
-``test_abandoned_local_dispatch.py``): the two paths that leak today —
-``prune`` and ``session_invalidation`` — are marked
-``pytest.mark.xfail(strict=True)`` so this test-only item lands green on
+Encoding: every row runs unmarked. The two paths that used to leak —
+``prune`` and ``session_invalidation`` — were marked
+``pytest.mark.xfail(strict=True)`` while the test-only item landed green on
 ``dev`` with the defect present. ``[impl] Every record deletion pops the
-marker`` (LP-0MWL5KLN1003E990) removes the markers as it turns the rows green;
-``strict`` makes a leftover marker fail the suite, so it cannot be forgotten.
+marker`` (LP-0MWL5KLN1003E990) turned the rows green and removed the markers;
+a regression on any path now fails the suite outright.
 
 Every row is hermetic: a throwaway ``SimpleNamespace`` server, fresh
 ``asyncio.Lock``s, a frozen monotonic clock (no sleeps), and the slot registry
@@ -67,11 +66,6 @@ OTHER_ENDPOINT = "http://127.0.0.1:8081"
 
 #: Frozen ``time.monotonic()`` value every row is built and driven against.
 NOW = 10_000.0
-
-XFAIL_REASON = (
-    "this deletion path leaves the prefill marker behind until "
-    "[impl] Every record deletion pops the marker (LP-0MWL5KLN1003E990) lands"
-)
 
 SERVER_CONFIG = {
     "server": {
@@ -259,31 +253,28 @@ async def _drive_session_invalidation(srv, monkeypatch):
 
 
 #: One row per production deletion helper. ``records`` builds the seeded
-#: registry (the target session plus the live negative control), ``defect``
-#: marks the rows that leak today and therefore carry ``xfail(strict=True)``.
+#: registry (the target session plus the live negative control). Every row now
+#: runs unmarked: the ``prune`` and ``session_invalidation`` rows that used to
+#: carry ``xfail(strict=True)`` were turned green by LP-0MWL5KLN1003E990.
 _DELETION_MATRIX: dict[str, dict] = {
     "prune": {
         # Inactive *and* past expiry: the incident's stale-lease shape.
         "drive": _drive_prune,
         "records": lambda: {SESSION: _record(active=False, expires_in=-5.0)},
-        "defect": True,
     },
     "explicit_release": {
         "drive": _drive_explicit_release,
         "records": lambda: {SESSION: _record(active=True)},
-        "defect": False,
     },
     "client_disconnect": {
         "drive": _drive_client_disconnect,
         "records": lambda: {SESSION: _record(active=True)},
-        "defect": False,
     },
     "request_completed": {
         # The ghost lease: a record left active on an endpoint other than the
         # one the request completed on.
         "drive": _drive_request_completed,
         "records": lambda: {(OTHER_ENDPOINT, SESSION): _record(active=True)},
-        "defect": False,
     },
     "no_progress_watchdog": {
         # Active with a far-out adaptive lease, but no progress for an hour.
@@ -291,7 +282,6 @@ _DELETION_MATRIX: dict[str, dict] = {
         "records": lambda: {
             SESSION: _record(active=True, expires_in=600.0, progress_ago=3600.0)
         },
-        "defect": False,
     },
     "orphan_sweep": {
         # Legacy shape (no ``last_progress_ts``) so the watchdog passes it to
@@ -302,24 +292,15 @@ _DELETION_MATRIX: dict[str, dict] = {
                 active=True, expires_in=-5.0, model_name=None, progress_ago=None
             )
         },
-        "defect": False,
     },
     "session_invalidation": {
         "drive": _drive_session_invalidation,
         "records": lambda: {SESSION: _record(active=True)},
-        "defect": True,
     },
 }
 
 _MATRIX_PARAMS = [
-    pytest.param(
-        name,
-        marks=pytest.mark.xfail(strict=True, reason=XFAIL_REASON),
-        id=name,
-    )
-    if row["defect"]
-    else pytest.param(name, id=name)
-    for name, row in _DELETION_MATRIX.items()
+    pytest.param(name, id=name) for name in _DELETION_MATRIX
 ]
 
 
@@ -401,3 +382,57 @@ async def test_gate_refusal_never_drops_a_live_sessions_marker():
         "a refusal must not pop a live holder's prefill marker: "
         f"{srv.local_prefill_in_flight}"
     )
+
+
+# ======================================================================
+# AC4 + AC5 (LP-0MWL5KLN1003E990): the shared pop helper's contract
+# ======================================================================
+
+
+def test_pop_prefill_marker_is_idempotent_and_fail_soft():
+    """AC4: popping a missing marker is a no-op; nothing escapes.
+
+    The helper is the single home of the invariant, so its fail-soft contract
+    is pinned directly: a present marker is removed and reported, a second pop
+    of the same session is a silent no-op, and a missing registry, a falsy
+    session or an exploding mapping all return ``False`` instead of raising
+    into a dispatch or invalidation path.
+    """
+    srv = _make_srv(records={}, markers={SESSION: True, LIVE_SESSION: True})
+
+    assert helpers._pop_prefill_marker(srv, SESSION) is True
+    assert SESSION not in srv.local_prefill_in_flight
+    # Idempotent: the marker is already gone, so this is a no-op.
+    assert helpers._pop_prefill_marker(srv, SESSION) is False
+    # The live control's marker is untouched by an unrelated pop.
+    assert srv.local_prefill_in_flight == {LIVE_SESSION: True}
+
+    # A falsy session never pops anything (and never raises).
+    assert helpers._pop_prefill_marker(srv, None) is False
+    assert helpers._pop_prefill_marker(srv, "") is False
+
+    # A server with no marker registry at all: no-op, no exception.
+    bare = SimpleNamespace()
+    assert helpers._pop_prefill_marker(bare, SESSION) is False
+
+    # A registry whose ``pop`` raises must not leak the exception outward.
+    class _ExplodingMarkers(dict):
+        def pop(self, *args, **kwargs):
+            raise RuntimeError("registry exploded")
+
+    exploding = SimpleNamespace(local_prefill_in_flight=_ExplodingMarkers({SESSION: True}))
+    assert helpers._pop_prefill_marker(exploding, SESSION) is False
+
+
+def test_prune_path_stays_await_free():
+    """AC5: the prune path and the shared pop stay synchronous.
+
+    The admission gate calls ``_prune_stale_dispatch_records`` without
+    awaiting it, so neither it nor the pop helper may become a coroutine
+    function (and no lock may creep in). This pins the ``await``-free
+    contract the gate depends on.
+    """
+    import inspect
+
+    assert not inspect.iscoroutinefunction(helpers._prune_stale_dispatch_records)
+    assert not inspect.iscoroutinefunction(helpers._pop_prefill_marker)

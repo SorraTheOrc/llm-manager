@@ -1735,6 +1735,13 @@ async def _invalidate_session_and_slot(
         session_id: The session to invalidate.
         reason: Invalidation reason string.
         slot_filename: Path to the slot persistence file to remove.
+
+    Invariant (LP-0MWL5KLN1003E990): **every dispatch-record deletion pops the
+    session's ``local_prefill_in_flight`` marker.** The resident record is
+    deleted below, so the marker is popped through the shared
+    :func:`proxy.router_helpers._pop_prefill_marker` helper — otherwise an
+    orphaned marker outlives the session and denies every later local
+    dispatch while llama-server reports free slots (the 2026-11-17 incident).
     """
     if session_id:
         try:
@@ -1780,6 +1787,17 @@ async def _invalidate_session_and_slot(
                         )
                     except Exception:
                         pass
+        except Exception:
+            pass
+
+        # AC (LP-0MWL5KLN1003E990): every dispatch-record deletion pops the
+        # marker. Imported inside the function (session.py does not import
+        # router_helpers at module scope) and fail-soft, so an invalidation can
+        # never fail on the pop.
+        try:
+            from proxy.router_helpers import _pop_prefill_marker
+
+            _pop_prefill_marker(_srv(), session_id)
         except Exception:
             pass
     # Free the slot registry entry (the measured prefill survives an ordinary

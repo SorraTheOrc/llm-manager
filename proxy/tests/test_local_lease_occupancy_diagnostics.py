@@ -152,14 +152,6 @@ async def test_prune_removes_only_inactive_expired_records():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "_prune_stale_dispatch_records leaves the pruned record's "
-        "local_prefill_in_flight marker behind until [impl] Every record "
-        "deletion pops the marker (LP-0MWL5KLN1003E990) lands"
-    ),
-)
 async def test_prune_pops_the_stale_records_prefill_marker():
     """AC2 (LP-0MWKWGLRT003AUG4): pruning a stale record pops its marker.
 
