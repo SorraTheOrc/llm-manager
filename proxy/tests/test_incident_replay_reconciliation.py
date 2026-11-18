@@ -36,9 +36,9 @@ Two rows, one per parent AC:
   already-orphaned marker (no record at all, the 14:24:42 shape) must be
   dropped by the reconciliation pass the cleanup loop calls, within a single
   tick, logged exactly once with the session id, and the following tick must
-  reclaim nothing. Marked ``pytest.mark.xfail(strict=True)`` until
-  ``[impl] Bounded orphan-marker reconciliation sweep`` (LP-0MWL5KM8X00193B3)
-  lands; that impl removes the marker in the same change that adds the sweep.
+  reclaim nothing. Runs unmarked: the sweep landed with
+  ``[impl] Bounded orphan-marker reconciliation sweep``
+  (LP-0MWL5KM8X00193B3), and a regression turns the row red.
 
 Every row is hermetic: a throwaway ``SimpleNamespace`` server, fresh
 ``asyncio.Lock``s, a frozen monotonic clock (no sleeps), the real
@@ -435,6 +435,12 @@ def _cleanup_loop_state(srv):
     …) and logs through the module ``llama-proxy`` logger. Patching the module
     attributes at the throwaway server keeps the row hermetic while still
     driving the *real* loop body — no re-implemented simulation.
+
+    The logger's level is lowered to ``DEBUG`` for the tick and restored
+    afterwards: under pytest the ``llama-proxy`` logger inherits the root
+    ``WARNING`` level, so an attached handler would never *see* the ``info``
+    lines this row asserts on (handler level and logger level filter
+    independently).
     """
     sleeps = {"n": 0}
 
@@ -444,24 +450,31 @@ def _cleanup_loop_state(srv):
             raise _StopTick()
         return None
 
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(
-            patch.object(server_module, "asyncio", _AsyncioShim(_sleep))
-        )
-        for attr in (
-            "config",
-            "local_dispatch_records",
-            "local_dispatch_records_lock",
-            "local_prefill_in_flight",
-            "local_prefill_in_flight_lock",
-            "local_active_queries",
-            "local_active_queries_lock",
-            "local_generating_queries",
-            "local_generating_queries_lock",
-            "local_generating_sessions",
-        ):
-            stack.enter_context(patch.object(server_module, attr, getattr(srv, attr)))
-        yield
+    previous_level = server_module.logger.level
+    server_module.logger.setLevel(logging.DEBUG)
+    try:
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(server_module, "asyncio", _AsyncioShim(_sleep))
+            )
+            for attr in (
+                "config",
+                "local_dispatch_records",
+                "local_dispatch_records_lock",
+                "local_prefill_in_flight",
+                "local_prefill_in_flight_lock",
+                "local_active_queries",
+                "local_active_queries_lock",
+                "local_generating_queries",
+                "local_generating_queries_lock",
+                "local_generating_sessions",
+            ):
+                stack.enter_context(
+                    patch.object(server_module, attr, getattr(srv, attr))
+                )
+            yield
+    finally:
+        server_module.logger.setLevel(previous_level)
 
 
 async def _run_one_cleanup_tick(srv) -> None:
@@ -482,14 +495,6 @@ def _reclaim_lines(lines: list[str]) -> list[str]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "No bounded reconciliation exists until [impl] Bounded orphan-marker "
-        "reconciliation sweep (LP-0MWL5KM8X00193B3) lands; the loop reclaims "
-        "nothing today, so the 2026-11-17 orphan survives indefinitely."
-    ),
-)
 async def test_orphaned_marker_reclaimed_within_one_cleanup_tick(monkeypatch):
     """LP-0MWKWGLRT003AUG4 AC6: one tick drops an already-orphaned marker.
 
@@ -578,3 +583,74 @@ async def test_reconciliation_keeps_a_live_backed_marker(monkeypatch):
         )
     finally:
         server_module.logger.removeHandler(collector)
+
+
+# ===========================================================================
+# AC6 — the reconciliation pass itself (shape guards around the cleanup tick)
+# ===========================================================================
+
+
+def test_reclaim_orphans_handles_endpoint_and_legacy_dispatch_keys():
+    """AC6: per-endpoint ``(endpoint, session)`` records back their markers.
+
+    Production keys are ``(endpoint, session)`` tuples once per-endpoint
+    records are in use (LP-0MRPILSMW004T4H8); legacy string keys are still
+    accepted. The sweep must derive session ids through
+    ``_dispatch_key_session_id`` for both, so a live dispatch is never
+    misread as an orphan.
+    """
+    srv = _make_srv(
+        records={
+            ("http://gpu-a:8080", "session-a"): _live_record(),
+            "session-b": _live_record(),
+        },
+        markers={"session-a": True, "session-b": True},
+    )
+
+    assert helpers._reclaim_orphaned_prefill_markers(srv) == []
+    assert srv.local_prefill_in_flight == {
+        "session-a": True,
+        "session-b": True,
+    }, "a marker backed by an endpoint or legacy record must survive"
+
+
+def test_reclaim_orphans_drops_every_phantom_in_one_pass():
+    """AC6: one pass reclaims all phantom markers and returns each session id."""
+    srv = _make_srv(
+        records={INCIDENT_NEWCOMER_SESSION: _live_record()},
+        markers={
+            INCIDENT_LEAKED_SESSION: True,
+            "another-orphan": True,
+            INCIDENT_NEWCOMER_SESSION: True,
+        },
+    )
+
+    reclaimed = helpers._reclaim_orphaned_prefill_markers(srv)
+
+    assert sorted(reclaimed) == sorted([INCIDENT_LEAKED_SESSION, "another-orphan"])
+    assert srv.local_prefill_in_flight == {INCIDENT_NEWCOMER_SESSION: True}, (
+        "only the backed marker may remain; "
+        f"markers={srv.local_prefill_in_flight!r}"
+    )
+    assert helpers._reclaim_orphaned_prefill_markers(srv) == [], (
+        "a second pass must reclaim nothing — the sweep is idempotent"
+    )
+
+
+def test_reclaim_orphans_keeps_a_marker_backed_by_an_inactive_record():
+    """AC6 conservative guard: only *record-less* markers are phantom.
+
+    A retained inactive lease is still a backing record; its marker is the
+    per-deletion-path pops' responsibility, never the sweep's, so the
+    reconciliation cannot discount a marker whose record still exists.
+    """
+    srv = _make_srv(
+        records={INCIDENT_LEAKED_SESSION: _stale_record()},
+        markers={INCIDENT_LEAKED_SESSION: True},
+    )
+
+    assert helpers._reclaim_orphaned_prefill_markers(srv) == []
+    assert srv.local_prefill_in_flight.get(INCIDENT_LEAKED_SESSION) is True, (
+        "a marker with a retained (inactive) record must survive; "
+        f"markers={srv.local_prefill_in_flight!r}"
+    )

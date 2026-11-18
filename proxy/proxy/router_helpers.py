@@ -3835,6 +3835,57 @@ def _pop_prefill_marker(srv, session_id: str | None) -> bool:
         return False
 
 
+def _reclaim_orphaned_prefill_markers(srv) -> list[str]:
+    """Drop every ``local_prefill_in_flight`` marker with no dispatch record.
+
+    LP-0MWKWGLRT003AUG4 AC6, LP-0MWL5KM8X00193B3: the bounded recovery for an
+    **already-orphaned** marker. Before this pass the only ways out of the
+    2026-11-17 wedge were a proxy restart or a hand-issued
+    ``POST /v1/leases/release``; a marker left by an older build (or by any
+    future leak that misses the per-deletion-path pop of
+    :func:`_pop_prefill_marker`) is now reclaimed by the regularly scheduled
+    cleanup tick, in process, with no operator action.
+
+    One synchronous pass over both registries: build the set of session ids
+    that still have a dispatch record, then drop every marker whose session is
+    absent from it. Cost is ``O(records + markers)`` — no new thread, timeout,
+    lock or configuration knob, and no blocking I/O, so it is safe inside the
+    async cleanup loop.
+
+    Conservative by construction: a marker backed by *any* record (``active``
+    or a retained inactive lease) is left alone. Deleting a record is the
+    per-path pops' job (:func:`_pop_prefill_marker`), so the sweep can only
+    discount phantom markers and can never race a live prefill — the marker is
+    written **after** its record is inserted
+    (``_try_acquire_local_dispatch``), and this pass holds no ``await``, so no
+    concurrent admission can be misclassified as orphaned.
+
+    Returns the reclaimed session ids, in registry order, for the cleanup
+    loop's ``prefill_marker_reclaimed`` log line and for tests. An empty list
+    means a healthy tick, which must log nothing at all. Never raises: the
+    cleanup loop must keep ticking on an observability gap.
+    """
+    reclaimed: list[str] = []
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if not markers:
+            return reclaimed
+        records = getattr(srv, "local_dispatch_records", None) or {}
+        backed_sessions: set[str] = set()
+        for key in list(records.keys()):
+            session_id = _dispatch_key_session_id(key)
+            if session_id is not None:
+                backed_sessions.add(session_id)
+        for session_id in list(markers.keys()):
+            if session_id in backed_sessions:
+                continue
+            if _pop_prefill_marker(srv, session_id):
+                reclaimed.append(session_id)
+    except Exception:
+        return reclaimed
+    return reclaimed
+
+
 def _live_prefill_remaining_seconds(
     srv,
     *,
