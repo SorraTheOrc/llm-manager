@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MWM1S06M007BUKC
+# smell: formatting
+# severity: high
+# description: Ambiguous variable name: `l`
+# -->
 """Local dispatch-lease occupancy: stale records, denial evidence, divergence.
 
 LP-0MW0KZTWC004HXQ5. On 2026-11-03 the proxy refused local dispatches while
@@ -143,6 +149,38 @@ async def test_prune_removes_only_inactive_expired_records():
 
     assert removed == ["stale"], f"only the inactive expired record is stale: {removed}"
     assert set(srv.local_dispatch_records) == {"cooldown", "live", "lapsed-live"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "_prune_stale_dispatch_records leaves the pruned record's "
+        "local_prefill_in_flight marker behind until [impl] Every record "
+        "deletion pops the marker (LP-0MWL5KLN1003E990) lands"
+    ),
+)
+async def test_prune_pops_the_stale_records_prefill_marker():
+    """AC2 (LP-0MWKWGLRT003AUG4): pruning a stale record pops its marker.
+
+    The incident shape: an inactive, expired record is pruned and its slot is
+    freed, but the session's ``local_prefill_in_flight`` entry survives — with
+    ``local_max_concurrent_prefills: 1`` that single orphan denies every later
+    local dispatch while llama-server reports free slots.
+    """
+    srv = _make_srv(
+        records={"stale-session": _record(active=False, expires_in=-5.0)},
+        markers={"stale-session": True},
+    )
+
+    removed = helpers._prune_stale_dispatch_records(srv, time.monotonic())
+
+    assert removed == ["stale-session"]
+    assert srv.local_dispatch_records == {}, "the stale record must be pruned"
+    assert srv.local_prefill_in_flight == {}, (
+        "pruning a stale record must pop its prefill marker: "
+        f"markers={srv.local_prefill_in_flight}"
+    )
 
 
 @pytest.mark.asyncio
@@ -579,7 +617,6 @@ async def test_all_slots_busy_reports_zero_available_slots():
     because the lease registry happens to be empty.
     """
     import httpx
-
     from proxy.server import app
 
     async def fake_query():
