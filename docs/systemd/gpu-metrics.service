@@ -104,6 +104,43 @@ scanned by the same guard, so re-adding the attribute to the sampler fails
 `proxy/tests/test_monitoring_deployment.py` instead of silently republishing a
 counter nobody reads.
 
+## Decision: no `gpu_metrics` activity series is published
+
+**Status:** negative verdict, recorded 2026-11-18. The sampler is **unchanged**
+by this decision: it still emits only the three memory series in the table
+above. No `gpu_metrics` activity series is published, and no new daemon, port or
+scrape job is added.
+
+**Why, measured rather than argued.** `average_gfx_activity` from the
+`amd_gpu_metrics_v3_0` blob at
+`/sys/class/drm/card0/device/gpu_metrics` was the last candidate for a direct
+hardware utilisation percentage. On capture **2026-11-18** (kernel
+**7.0.0-38**, 61 samples at 1 s: **23 idle** below 60 W and **25 compute** at
+or above 90 W, sampled with `scripts/gpu_metrics_probe.py --verdict`) it read
+**100 % in both bands** — a 100 % idle-band false-busy share against the
+<= 10 % bar:
+
+| Statistic | Measured | Bar | Result |
+|---|---|---|---|
+| Compute minus idle band separation | 0 pp | >= 30 pp | fail |
+| Pearson r against package power | undefined (zero variance) | >= 0.6 | fail |
+| Idle-band false-busy share | 100 % | <= 10 % | fail |
+
+The capture reproduces the 2026-10-29 intake measurement (120 samples,
+`average_gfx_activity` = 100 % from 42 W to 123 W), so the field reports "GFX
+domain powered", not "GFX busy". The full verdict — the v3.0 decode layout,
+the candidate field table and the re-measure recipe — is recorded under
+LP-0MVSQT7YC0045HFW and its children. A positive re-measure after a kernel,
+firmware or driver change would have to add the series here and to the sampler
+together; `tests/test_gpu_metrics_textfile_series.py` fails if the documented
+table and the emitted set diverge in either direction.
+
+**Resolution floor.** Had a field passed, its series would have been sampled
+every **10 s** by this unit and scraped every **15 s** by Prometheus. Those are
+the resolution floor: the `gpu_metrics` values are SMU time-filtered with an
+undocumented window, so no claim finer than the sample interval is supportable,
+and publishing the series would not have changed that.
+
 ## The sampler script
 
 **File location**: `~/.local/bin/gpu-metrics-textfile.sh` (executable)
