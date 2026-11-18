@@ -2522,9 +2522,19 @@ matching lease returns `200 OK` (no-op). This is useful for automated
 workflows that want to clean up after completing a task without knowing
 whether the lease is still active.
 
-**Important:** This endpoint only releases the dispatch lease record from
-`local_dispatch_records`. It does **not** release the scheduler slot (job
-ownership), which is managed separately via disconnect detection or timeout.
+The release also pops the session's `local_prefill_in_flight` marker, even when
+no dispatch record matches, so it is the **manual fallback** for a local route
+wedged by an orphaned prefill marker (LP-0MWKWGLRT003AUG4). Recovery is
+normally automatic: the 10 s dispatch-cleanup sweep reclaims a marker with no
+backing dispatch record and logs `prefill_marker_reclaimed session=<id>
+reason=orphaned`, with no proxy restart required. Prefer the sweep; use this
+endpoint when the route needs reopening immediately (the 2026-11-17 incident
+was cleared this way after 505 denial lines).
+
+**Important:** This endpoint releases the dispatch lease record from
+`local_dispatch_records` and pops the session's `local_prefill_in_flight`
+marker. It does **not** release the scheduler slot (job ownership), which is
+managed separately via disconnect detection or timeout.
 
 #### Dispatch Lease
 

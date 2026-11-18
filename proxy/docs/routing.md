@@ -1312,6 +1312,89 @@ no-progress watchdog's concern, never the admission gate's — so it is left for
 the watchdog. Pruning also releases the freed session-slot assignment, so the
 slot registry cannot describe a slot the gate has already forgotten.
 
+#### The prefill cap is priced on live prefills (LP-0MWKWGLRT003AUG4)
+
+The prefill cap is priced with `_get_live_prefill_in_flight_count`, not the raw
+marker count. A `local_prefill_in_flight` entry is **evidence of a prefill only
+when an `active` dispatch record backs it** (a dispatch that is still running:
+prefill or generation); a marker with no live record is an orphan and counts as
+zero, and a marker whose record survives only as an inactive post-request lease
+does not count either. The raw `_get_prefill_in_flight_count` is retained for
+observability and back-compat, but it is not the quantity the gate — or the
+denial evidence below — prices. Serialisation is unchanged for a genuine
+prefill: a marker backed by an `active` record is still counted exactly as
+before, so `local_max_concurrent_prefills` keeps bounding concurrent prefills.
+
+#### Every record deletion pops its marker (LP-0MWL5KLN1003E990)
+
+A marker's lifetime is its dispatch record's lifetime. Every deletion path pops
+the session's marker in the same release: the admission-path prune, the
+explicit `POST /v1/leases/release`, the client-disconnect release, the
+end-of-request completion release, every branch of
+`_cleanup_stale_local_dispatch` (completed-record reaping, no-progress
+watchdog, idle timeout, orphan cleanup), and session invalidation
+(`session._invalidate_session_and_slot`). The prefill-deadline and
+measured-cache-deficit aborts already pop it inline in the shared
+`_release_unserved_dispatch` core. The marker set is therefore always a subset
+of the dispatch-record session ids: a record deletion cannot leave an orphan.
+Most paths share `router_helpers._pop_prefill_marker`, which is idempotent,
+fail-soft and synchronous, so the admission gate's prune path stays
+`await`-free.
+
+#### An orphaned marker is reclaimed within one cleanup tick (AC6)
+
+`_dispatch_cleanup_loop` (every 10 s) runs `_reclaim_orphaned_prefill_markers`
+immediately after `_cleanup_stale_local_dispatch`. One synchronous pass over
+both registries drops every marker whose session has **no** dispatch record and
+logs one line per reclaimed marker:
+
+```
+prefill_marker_reclaimed session=<id> reason=orphaned
+```
+
+A healthy tick logs nothing. The pass is deliberately more conservative than
+the pricing count: a marker backed by *any* record (an `active` dispatch or a
+retained inactive lease) is left alone, and deleting a record remains the
+per-path pop's job, so the sweep only ever discounts phantom markers and can
+never race a live prefill — the marker is written *after* its record is
+inserted, and the pass holds no `await`. Recovery needs **no proxy restart**
+and no configuration change, and is bounded by one tick (~10 s; the cleanup
+loop's documented end-to-end self-healing bound is ~20 s). One residual,
+bounded raw-count use remains outside the lease gate:
+`provider._local_slot_saturation` treats any marker as possible prefill
+saturation for the contention-queue wake decision, so an orphan can delay a
+queued wake until the tick (tracked as LP-0MWM8BQ5H008N3WF). It can never deny
+the direct dispatch path.
+
+#### Motivating measurement (2026-11-17)
+
+One orphaned marker (`01a1e9e4-90be-70d7-a899-aa39b5c753ca`) survived the
+prune at **14:24:42**: the record had been deleted (`records_total=0`,
+`owner=none`), the marker had not. From then until the manual release, every
+local dispatch was denied with
+
+```
+local_dispatch_denied ... records_total=0 ... prefill_in_flight=1
+  prefill_cap=1 llama_available_slots=2 llama_total_slots=2
+```
+
+while `/llama/local/status` on the same machine reported
+`local_prefills_in_flight=0 available_slots=2 local_route_available=true` —
+the gate priced a marker that no record backed. Since 14:24:42 the log held
+505 such denial lines and 413 `local_only_refused ... preference=local-preferred
+verdict=deferrable` refusals (among them 160 `cause=queue_depth_exceeded` and
+187 `cause=queue_wait_expired`), i.e. a hard outage for locally-pinned sessions
+while the GPU sat idle.
+
+The in-place mitigation was a targeted
+`POST /v1/leases/release {"session_id": "<leaked session>"}`: the release pops
+`local_prefill_in_flight[session_id]` even when no dispatch record matches
+(idempotent), and denial lines stopped immediately. That call remains the
+documented manual fallback (see [Lease Release](../README.md#lease-release)),
+but it is no longer the only recovery — the sweep above reclaims an orphan
+within one tick. Together these three changes are what let the
+`prefill_in_flight` evidence field mean "live prefill" again.
+
 ### The denial line carries its evidence (AC2)
 
 Every `local_dispatch_denied` line is followed on the SAME line by an
@@ -1329,6 +1412,14 @@ local_dispatch_denied session=… owner=… active=… cold_start=… <turn>
 (`None` when unavailable) so "no data" is never confused with "zero".
 `prefill_cap` is the *effective* cap (`local_max_concurrent_prefills`, clamped
 to the slot pool), which is what the prefill branch actually compares against.
+`prefill_in_flight` is the gate's **own live count** — the same
+`_get_live_prefill_in_flight_count` value the gate prices, produced by the same
+helper that publishes `local_prefills_in_flight` on `/llama/local/status` —
+never the raw marker count. The denial line therefore cannot contradict the
+status payload: an orphaned marker is invisible to both, and
+`prefill_in_flight>0` always means an `active` record really is prefilling.
+(The `records=` tail still lists the raw registry entries, so an operator can
+see the state the count was derived from.)
 The field vocabulary is published as `OCCUPANCY_EVIDENCE_FIELDS` so the log
 contract cannot drift from the code.
 
@@ -1417,13 +1508,17 @@ server:
   exactly as before when those caps are hit; the prefill-ETA admission guard
   refuses waits that cannot succeed rather than parking the request.
 - **No added delay for a lone request** — with nothing else prefilling the
-  gate is open (the in-flight count is 0).
+  gate is open (the live in-flight count is 0; an orphaned marker with no
+  `active` record is not counted — see
+  [Stale records never block](#stale-records-never-block-ac1)).
 - **Observability** — each local dispatch logs
   `prefill_gate_wait_ms=… saturation=… session=… model=… provider=…` (the time
   the request waited specifically for the prefill gate; `0.0` when it was not
   prefill-gated), and `/llama/local/status` publishes
-  `local_prefills_in_flight`, `local_max_concurrent_prefills` and
-  `prefill_gate_waiters` (the contention queue depth).
+  `local_prefills_in_flight` (the same liveness-filtered count the gate prices,
+  so the status payload and the `local_dispatch_denied` evidence cannot
+  disagree), `local_max_concurrent_prefills` and `prefill_gate_waiters` (the
+  contention queue depth).
 
 ## Residency-aware admission ladder (LP-0MVN1IQTF0037WTG)
 
@@ -4097,13 +4192,17 @@ cannot hold the pool:
    own session, and the record is addressed by
    `_dispatch_lease_key(endpoint, session_id)` — another session's open
    request can never refresh this record's `expires_at`/`last_progress_ts`.
-3. **Occupancy counts only live leases.** The admission gate's
+3. **Occupancy counts only live prefills.** The admission gate's
    `in_flight_prefills` (and therefore `busy_slots`) uses
    `_get_live_prefill_in_flight_count`, which counts an in-flight marker only
-   when a live (active/unexpired) dispatch record backs it. An orphan marker
-   left by a released/deleted record no longer reports
-   `busy_slots=1 … available_slots=0` for every other session (the incident's
-   52 admission-guard rejections in the hour).
+   when an **`active`** dispatch record backs it (a retained inactive lease
+   does not count). An orphan marker left by a released/deleted record no
+   longer reports `busy_slots=1 … available_slots=0` for every other session
+   (the incident's 52 admission-guard rejections in the hour). The invariant is
+   enforced at both ends: every record deletion pops its marker
+   (LP-0MWL5KLN1003E990), and the 10 s cleanup tick reclaims any marker that
+   still has no record (`prefill_marker_reclaimed`, LP-0MWL5KM8X00193B3) — see
+   [Stale records never block](#stale-records-never-block-ac1).
 
 Coverage: `proxy/tests/test_lease_truthfulness.py` (release on deadline,
 two-session extension isolation, orphan-marker occupancy, watchdog firing for
