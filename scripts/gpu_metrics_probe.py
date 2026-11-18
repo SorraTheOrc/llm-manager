@@ -65,6 +65,17 @@ Every value in the record is SMU **time filtered**
 undocumented window, so no claim finer than the sample interval is implied.
 The CSV comment line, the JSON ``meta.note`` and the verdict header all say so.
 
+Recorded verdict
+----------------
+The verdict is **negative** and is recorded, with numbers, in
+``docs/systemd/gpu-metrics.service`` under
+"Decision: no `gpu_metrics` activity series is published": capture 2026-11-18,
+kernel 7.0.0-38-generic, 181 samples, on
+which ``average_gfx_activity`` read 100 % in both power bands and was identical
+to ``gpu_busy_percent`` on every sample. Nothing is published; a re-measurement
+after a kernel, firmware or driver change must follow the recipe in that same
+document (the probe command and the bar this module's ``--verdict`` applies).
+
 Exit status
 -----------
 ``0`` — the capture completed (a negative verdict is a complete outcome, not a

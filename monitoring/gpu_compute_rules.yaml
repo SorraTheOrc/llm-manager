@@ -34,6 +34,20 @@
 # and `amdtop`/`rocm-smi` surface this same counter (LP-0MVSQQO910077LYL,
 # LP-0MW5K7WKZ005VJXA).
 #
+# WHY NOT gpu_metrics
+# -------------------
+# The last candidate for a direct percentage was the amd_gpu_metrics_v3_0 blob
+# at /sys/class/drm/card0/device/gpu_metrics (`average_gfx_activity`). Measured
+# 2026-11-18 on kernel 7.0.0-38-generic (181 samples at 1 s: 54 idle < 60 W,
+# 122 compute >= 90 W, package power 42.1-119.0 W): idle-band mean 100.00 %,
+# compute-band mean 99.98 %, separation -0.02 pp, Pearson r -0.068 and 100.0 %
+# idle-band false-busy against a <= 10 % bar. On all 181 samples the field was
+# identical to gpu_busy_percent, so it is the same two-state counter under a
+# second name and fails every element of the bar. No rule may use a
+# gpu_metrics activity field; the power rule below stays authoritative.
+# Verdict, pinned layout and re-measure recipe: docs/systemd/gpu-metrics.service,
+# "Decision: no `gpu_metrics` activity series is published".
+#
 # WHAT IS USED INSTEAD
 # --------------------
 # Power draw is the discriminating signal on this hardware:

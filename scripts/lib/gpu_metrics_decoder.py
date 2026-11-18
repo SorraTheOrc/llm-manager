@@ -48,6 +48,17 @@ this host) with an undocumented window, so they support no claim finer than the
 sample interval. Activity fields are percentages; power is milliwatts; clocks
 are megahertz; bandwidths are megabytes per second.
 
+Recorded verdict
+----------------
+The verdict for the only candidate activity field is **negative** and recorded:
+``docs/systemd/gpu-metrics.service``,
+"Decision: no `gpu_metrics` activity series is published" (capture 2026-11-18,
+kernel 7.0.0-38-generic). ``average_gfx_activity``
+read 100 % in both power bands and was identical to ``gpu_busy_percent`` on all
+181 samples of that capture, so it is the same two-state counter and not an
+independent measure. The layout below remains the reproduction source for a
+future re-measurement, whose recipe is documented alongside the verdict.
+
 Example
 -------
 >>> from pathlib import Path

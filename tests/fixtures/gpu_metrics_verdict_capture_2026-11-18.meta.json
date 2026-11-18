@@ -1,0 +1,25 @@
+{
+  "work_item": "LP-0MVZEW7R1004GLJN",
+  "parent": "LP-0MVSQT7YC0045HFW",
+  "captured_at": "2026-11-18T20:58:36Z",
+  "capture_window": {
+    "started_at": "2026-11-18T20:58:36.319+00:00",
+    "finished_at": "2026-11-18T21:01:36.319+00:00"
+  },
+  "host_kernel": "7.0.0-38-generic",
+  "host": "gfx1151 (Strix Halo APU), amdgpu card0",
+  "probe_command": "python3 scripts/gpu_metrics_probe.py --duration 180 --interval 1 --verdict",
+  "columns_source": "scripts/gpu_metrics_probe.py COLUMNS (26 candidate activity columns, power1_average_watts and gpu_busy_percent)",
+  "capture": {
+    "duration_seconds": 180,
+    "interval_seconds": 1,
+    "sample_count": 181
+  },
+  "paths": {
+    "metrics": "/sys/class/drm/card0/device/gpu_metrics",
+    "power": "/sys/class/drm/card0/device/hwmon/hwmon5/power1_average",
+    "busy": "/sys/class/drm/card0/device/gpu_busy_percent"
+  },
+  "csv_sha256": "756c261c5e59cdabb65deca6999462c0ecaabb3e9ec2f9136fea316215f5d1f8",
+  "note": "gpu_metrics values are SMU time-filtered with an undocumented window (time_filter_alphavalue); no claim finer than the sample interval is implied."
+}
