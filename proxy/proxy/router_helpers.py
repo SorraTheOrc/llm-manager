@@ -3744,11 +3744,20 @@ def _server_config_of(srv) -> dict:
 
 
 def _get_prefill_in_flight_count(srv) -> int:
-    """Return the number of sessions currently in prefill (dispatch→first-byte).
+    """Return the raw number of ``local_prefill_in_flight`` markers.
 
-    Prefill-aware guard (LP-0MTJET4I5009EHNX): caps concurrent prefills to
-    ``parallel`` (``session_slot_pool_size`` / ``max_local``) so the llama-
-    server internal queue does not saturate under generating-only occupancy.
+    This is the *unfiltered* marker count, including orphans left behind by a
+    deletion path that pruned the dispatch record without popping the marker
+    (LP-0MWKWGLRT003AUG4). It is kept exported for observability/back-compat
+    and for tests that pin the marker bookkeeping itself, but it is **not** the
+    quantity the dispatch gate prices: ``_try_acquire_local_dispatch`` and the
+    denial evidence use :func:`_get_live_prefill_in_flight_count`, so a marker
+    with no live dispatch record cannot deny a dispatch (LP-0MWL5KL0J006ZVDG).
+
+    Prefill-aware guard (LP-0MTJET4I5009EHNX): the live count caps concurrent
+    prefills to ``parallel`` (``session_slot_pool_size`` / ``max_local``) so the
+    llama-server internal queue does not saturate under generating-only
+    occupancy.
     """
     try:
         d = getattr(srv, "local_prefill_in_flight", None)
@@ -4709,7 +4718,16 @@ async def _try_acquire_local_dispatch(
                         if first_occupied_owner is None:
                             first_occupied_owner = _dispatch_key_session_id(existing_key)
                 _generating_count = _get_generating_only_count(srv)
-                _prefill_count = _get_prefill_in_flight_count(srv)
+                # LP-0MWL5KL0J006ZVDG: price the cap with the *live* prefill
+                # count. A ``local_prefill_in_flight`` marker with no backing
+                # dispatch record (an orphan left by a deletion path that did
+                # not pop it) is not a running prefill and must not deny a
+                # dispatch. A marker backed by an ``active`` record is still
+                # counted, so ``local_max_concurrent_prefills`` serialisation
+                # is preserved exactly. The raw count is kept exported for
+                # observability/back-compat (``_get_prefill_in_flight_count``),
+                # but it is not the priced quantity.
+                _prefill_count = _get_live_prefill_in_flight_count(srv)
                 has_generating_state = (
                     hasattr(srv, "local_generating_queries")
                     or hasattr(srv, "local_generating_sessions")
@@ -8015,6 +8033,12 @@ async def _local_dispatch_occupancy_evidence(srv, max_local: int | None = None) 
     effective prefill cap, and llama-server's last known slot counts (which
     makes an AC3 divergence visible on the same line).
 
+    ``prefill_in_flight`` is the **liveness-filtered** count (the same count
+    the gate prices, LP-0MWL5KL0J006ZVDG), not the raw marker count: an orphaned
+    marker must never appear here as an in-flight prefill, or a denial line
+    could contradict itself (``records_total=0`` with ``prefill_in_flight>0``)
+    while llama-server reports free slots.
+
     Read-only: it takes ``local_dispatch_records_lock`` only to snapshot the
     registry, never mutates it, and never prunes (AC1's prune belongs to the
     admission path, not to diagnostics). Best-effort throughout — every field
@@ -8073,7 +8097,13 @@ async def _local_dispatch_occupancy_evidence(srv, max_local: int | None = None) 
     except (TypeError, ValueError):
         evidence["active_counter"] = 0
     evidence["generating"] = _get_generating_only_count(srv)
-    evidence["prefill_in_flight"] = _get_prefill_in_flight_count(srv)
+    # LP-0MWL5KL0J006ZVDG: report the count the gate itself prices (the
+    # liveness-filtered count), so a ``local_dispatch_denied`` line can never
+    # carry ``records_total=0`` with ``prefill_in_flight>0`` while llama-server
+    # reports free slots. The field name and line shape are unchanged; the raw
+    # ``_get_prefill_in_flight_count`` stays exported for observability and
+    # back-compat.
+    evidence["prefill_in_flight"] = _get_live_prefill_in_flight_count(srv)
     try:
         evidence["prefill_cap"] = _effective_prefill_cap(
             _server_config_of(srv), max_local or 1

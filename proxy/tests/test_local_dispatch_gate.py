@@ -2343,18 +2343,18 @@ async def test_prefill_guard_releases_on_stream_end_or_abort():
 #
 # Parent AC1 + AC5, test half. A ``local_prefill_in_flight`` marker is only
 # evidence of a prefill when a *live* dispatch record backs it
-# (``_get_live_prefill_in_flight_count``). The raw marker count
-# (``_get_prefill_in_flight_count``) prices the cap today, so a single orphan
-# closes the local route permanently — the 2026-11-17 incident where a pruned
-# record left ``prefill_in_flight=1`` behind and every later dispatch was
-# denied while ``llama_available_slots=2``.
+# (``_get_live_prefill_in_flight_count``). The dispatch gate and the denial
+# evidence both price the live count (LP-0MWL5KL0J006ZVDG), so a single orphan
+# can no longer close the local route permanently — the 2026-11-17 incident
+# where a pruned record left ``prefill_in_flight=1`` behind and every later
+# dispatch was denied while ``llama_available_slots=2``.
 #
-# Red-first encoding: the defect rows are ``xfail(strict=True)`` so this
-# test-only item lands green on ``dev`` with the defect still present;
-# ``[impl] Gate prices the live prefill count`` (LP-0MWL5KL0J006ZVDG) removes
-# the markers. The conservative-guard rows run unmarked and must stay green
-# after that impl: the liveness filter drops *orphans only*, never a live
-# prefill, so prefill serialisation is preserved.
+# The defect rows ran ``xfail(strict=True)`` while the gate priced the raw
+# marker count; ``[impl] Gate prices the live prefill count``
+# (LP-0MWL5KL0J006ZVDG) removed the markers when it landed. The
+# conservative-guard rows run unmarked and must stay green: the liveness
+# filter drops *orphans only*, never a live prefill, so prefill serialisation
+# is preserved.
 # ---------------------------------------------------------------------------
 
 
@@ -2388,13 +2388,6 @@ def _live_dispatch_record(now: float) -> dict:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Gate prices the raw marker count until [impl] Gate prices the live "
-        "prefill count (LP-0MWL5KL0J006ZVDG) lands"
-    ),
-)
 async def test_prefill_marker_liveness_orphan_marker_cannot_deny_dispatch(monkeypatch):
     """LP-0MWKWGLRT003AUG4 AC1: an orphaned marker cannot deny a dispatch.
 
@@ -2402,8 +2395,8 @@ async def test_prefill_marker_liveness_orphan_marker_cannot_deny_dispatch(monkey
     ``local_dispatch_records``. The raw marker count is 1 (equal to the default
     prefill cap), but the liveness-filtered count is 0, so a ``max_local=2``
     pool has a free prefill slot and ``_try_acquire_local_dispatch`` must
-    return ``(True, ...)``. Today the raw count prices the cap and the
-    dispatch is refused permanently.
+    return ``(True, ...)``. The gate prices the live count (LP-0MWL5KL0J006ZVDG),
+    so an orphan can no longer close the route permanently.
     """
     from proxy.router_helpers import (
         _get_live_prefill_in_flight_count,
@@ -2511,23 +2504,14 @@ async def test_prefill_marker_liveness_helpers_agree_when_all_markers_live(monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Denial evidence reports the raw marker count until [impl] Gate prices "
-        "the live prefill count (LP-0MWL5KL0J006ZVDG) lands"
-    ),
-)
 async def test_prefill_marker_liveness_evidence_reports_gate_priced_count(monkeypatch):
     """LP-0MWKWGLRT003AUG4 AC4/AC5: the denial evidence reports the priced count.
 
-    Phantom-marker state with a free slot (``llama_available_slots=2``). Today
-    the evidence carries ``records_total=0`` with ``prefill_in_flight=1`` while
-    llama-server reports two free slots — a self-contradicting denial line that
-    cannot be reconciled from the log alone. After the impl,
-    ``prefill_in_flight`` is the liveness-filtered count (0), equal both to
-    ``_get_live_prefill_in_flight_count`` and to what the gate prices, so the
-    contradiction cannot be emitted.
+    Phantom-marker state with a free slot (``llama_available_slots=2``). The
+    evidence carries ``records_total=0`` with ``prefill_in_flight=0`` — the
+    liveness-filtered count (LP-0MWL5KL0J006ZVDG), equal both to
+    ``_get_live_prefill_in_flight_count`` and to what the gate prices, so a
+    self-contradicting denial line cannot be emitted.
     """
     from proxy.router_helpers import (
         _get_live_prefill_in_flight_count,
