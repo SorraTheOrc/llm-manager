@@ -1315,6 +1315,38 @@ pre-change rule keyed on `active` alone. Excluding the requester's own finished
 record removes a false refusal only; it does **not** add waiting, so `remote-ok`
 (the default preference) still never queues.
 
+### Re-measuring the impact (LP-0MWNHBI6A001V5DD)
+
+The raw `reason=local_concurrency_limit` count cannot confirm the fix, because
+the line is still emitted for genuine contention. The measurement therefore
+classifies each fall-through by **occupancy composition** from `proxy.log`:
+for every event it reconstructs the requesting session's own dispatch-record
+state (`local_preference_resolved outcome=local` → `Stream finished
+provider=local` → `lease_renewed` → `lease_released` / `local_eviction`) and
+counts the other sessions' present records at that instant.
+
+```bash
+python3 .pi/skills/proxy-usage-analysis/scripts/attribute_local_concurrency.py \
+    --log-dir /var/log/llama-proxy \
+    --start '2026-11-18 22:38:00' --until '2026-11-19 22:38:00' --json
+```
+
+It splits the events into four classes:
+
+| class | meaning | post-fix expectation |
+| --- | --- | --- |
+| `own_non_streaming_attributable` | own record present with **no** streaming dispatch token (idle lease or finished-but-not-released) and the others alone below the pool | ~0 — the fix excludes the own record |
+| `own_streaming_gated` | own record holds a streaming token (a genuinely concurrent same-session request) | unchanged |
+| `other_sessions_contention` | the other sessions' records already fill the pool | unchanged |
+| `unattributable` | neither the own nor the other records explain the refusal at the log timestamp (decision/log-line skew, the prefill cap, or a log gap) | unchanged |
+
+It reuses the method established on LP-0MW0VH2LB008JSKQ (own local turn
+finished inside the lease timeout → own-attributable), extended to the
+finished-but-not-released window this change fixes. Run it over a **≥24 h**
+window **after the fixed proxy code is running** (a restart is required — the
+measurement is of the live process, not the repository); the pre-fix baseline
+is reproduced by pointing the same command at a window before that restart.
+
 ## Dispatch-lease occupancy and the denial line (LP-0MW0KZTWC004HXQ5)
 
 `_try_acquire_local_dispatch` (`proxy/router_helpers.py`) is the single
