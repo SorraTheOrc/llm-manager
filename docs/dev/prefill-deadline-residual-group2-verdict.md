@@ -497,3 +497,107 @@ committed artefact
 [`prefill-deadline-residual-group2-regression.json`](./prefill-deadline-residual-group2-regression.json)
 (keys `prefill_deadline`, `local_coverage`, `threshold`). The same artefact is
 pinned by `tests/test_prefill_deadline_residual_group2_regression.py`.
+
+## 10. AC3 closure verdict — tracking item LP-0MVO8H7VQ003B12I
+
+**Work item:** LP-0MVO8H7VQ003B12I (*Residual 120 s deadline evictions with
+zero prefill progress…*), recorded by its verdict child
+**LP-0MVRMOV8K0007NFO**. This section records the verdict only: it adds no
+threshold, changes no admission decision, config or proxy behaviour, and
+re-reads §0–§9 rather than recomputing any figure. Parent AC4 text is **not**
+changed here — that needs an explicit producer reply, which is exactly what
+§10.5 asks for.
+
+### 10.1 Verdict — AC3 is not closed
+
+The tracking item's AC3 allows exactly two closure paths. Neither is met.
+
+| AC3 path | Test applied | Result |
+|---|---|---|
+| **(a)** scheduler epic lands and a post-landing window shows **zero** user-traffic `prefill_deadline` evictions after acceptance | user-class `prefill_deadline` count in the certified group-2 window (§9.1) | **NOT MET** — **1** event (0.037/h), not zero |
+| **(b)** producer re-scopes parent AC4 with an agreed threshold and **the re-scoped criterion is met** | the (b2) criterion agreed 2026-11-02: user-class `prefill_deadline` + `measured_cache_deficit` ≤ **0.5/h** over a ≥ 24 h restart-free window, **not certified** if occupancy-attributed ≥ 25 % or capacity-attributed ≥ 50 % of the `prefill_deadline` events | **rate met (0.148/h); NOT CERTIFIED** — occupancy guard **100 % (1/1) ≥ 25 %** (§4.1) |
+| **(b)** producer stall-weighted target agreed 2026-11-08 | ≥ **90 %** reduction in user-class Σ `elapsed_s`/h versus the group-1 window | **NOT MET** — **−77.5 %** on the counted pair (30.444 → 6.844 s/h); **+280.6 %** across all user-class reasons (60.572 → 230.556 s/h) (§3.2) |
+
+**Reading.** On the two reasons the (b2) criterion names, the residual is
+almost gone: 18 → 4 events, 0.720 → 0.148/h, stall cost −77.5 %. It is not
+gone. The single surviving `prefill_deadline` event is 100 %
+occupancy-attributed and trips the guard by arithmetic; the ≥ 90 % stall target
+is short by 12.5 points; and the user-visible cost of "accepted, then released
+before the first byte" **rose 3.81×**, because that work now carries the
+`no_progress_watchdog` label (§5). The counted rate is therefore a
+**relabelling**, not an elimination, and AC3 stays open.
+
+### 10.2 AC status of the tracking item
+
+| AC | Status | Basis |
+|---|---|---|
+| **AC1** — Evidence recorded | **met** | The 22-event / 7.4 h baseline with the `progress=0` signature and the audit split is referenced from a parent-AC4 comment on LP-0MVN3KMGI009BZ0D (`LP-C0MVVG65WC008OF77`, refreshed 2026-11-19) and re-confirmed against the group-1 (25.0 h) and group-2 (26.987 h) windows (§0, §2). |
+| **AC2** — Link established | **met** | `depends-on` edge to LP-0MVN1IQTF0037WTG present and completed. |
+| **AC2b** — Successor link recorded | **met** | Successor links (LP-0MVQIT9QY007QU27, LP-0MVR7IXAI002QXXD, LP-0MVVEQW5Y00962T2) recorded on the verdict item as description + related-to links; the superseded occupancy hypothesis is stated explicitly. |
+| **AC3** — Closure | **open** | Path (a) not met; the re-scoped (b2) criterion is not certified; a producer decision is required (§10.5). |
+| **AC4** — Rollback note | **met** | No rollback recommended; re-affirmed with the group-2 numbers (§10.4). |
+
+### 10.3 Why "not certified" is the honest verdict
+
+The (b2) rate is met on a **four-event** base, one of whose two counted reasons
+is the fast `measured_cache_deficit` detour (0.5 s median). The single
+`prefill_deadline` event is occupancy-attributed on an **n = 1** base, which
+makes the occupancy share 100 % by arithmetic rather than by population
+(§4.1, §7). Beside it, `no_progress_watchdog` moved from 4 events (0.160/h) to
+**184** (6.818/h; user 173, 6.411/h) — the same client-visible outcome
+(accepted, then released before the first byte) in a class the criterion does
+not count (§5). Mechanism: defect **LP-0MWKQJHSM000CI6W** (open, `blocked`).
+
+So neither reading closes AC3: the counted rate improved by more than the
+stall-weighted cost did, and the total user-class stall cost rose. Certifying
+on the rate alone would record the residual as resolved in the same window in
+which its client-visible cost tripled.
+
+### 10.4 AC4 rollback note re-affirmed
+
+No rollback is recommended. On the committed group-1 → group-2 comparison:
+
+| Figure | Group 1 (25.0 h) | Group 2 (26.987 h) | Change |
+|---|---:|---:|---:|
+| `prefill_deadline` evictions (user) | 4 (0.160/h) | 1 (0.037/h) | −3 |
+| Combined (b2) events (user) | 18 (0.720/h) | 4 (0.148/h) | −14 |
+| Local share of requests | 21.88 % | 22.92 % | +1.04 pp |
+| Local admission refusals | 4 040 | 3 182 | −21.2 % |
+| Remote-fallback rate | 76.63 % | 66.30 % | −10.33 pp |
+| Deadline-capacity refusals (`prefill_eta_exceeds_deadline`) | 110 | 214 | +94.5 % (bound live) |
+
+Rolling group 2 back restores *more* full-deadline stalls (4 → 1 lost), loses
+1.04 pp of local coverage, and does not touch the `no_progress_watchdog` class
+that carries the remaining cost (§3.1, §9.1–§9.2). The rollback note therefore
+stands unchanged and is strengthened by the group-2 numbers.
+
+### 10.5 Producer decision required
+
+`needsProducerReview` is set on LP-0MVO8H7VQ003B12I. One decision unblocks both
+this tracking item and the residual's next step:
+
+1. **Count the relabelled class (recommended).** Fold
+   `no_progress_watchdog` into the counted user class and judge the residual on
+   the **all-reasons** stall-weighted rate (§3.2: 230.556 s/h in group 2 versus
+   60.572 s/h in group 1) with an agreed threshold and horizon. AC3 then closes
+   only on the umbrella-label fix LP-0MWKQJHSM000CI6W landing plus a fresh
+   ≥ 24 h restart-free window. This is the only option under which an improved
+   rate cannot be produced again simply by renaming a reason.
+2. **Certify on the rate and waive the guard.** Accept the 100 % occupancy
+   share on n = 1 as non-diagnostic and close AC3 on the ≤ 0.5/h rate. Closes
+   the item immediately; records the residual as resolved while its
+   client-visible stall cost rose 3.81×. Not recommended.
+3. **Re-scope parent AC4 to the shape only.** Zero predicted-warmth-attributed
+   evictions with the rate and stall cost stated numerically and no threshold;
+   close this tracking item as *measured, documented, owned elsewhere*, with
+   the residual on LP-0MWKQJHSM000CI6W.
+
+Until one is answered, no further agent work is possible on this item: the
+measurement is complete and certified, the verdict is this section, and any
+further change would have to alter a producer-agreed threshold.
+
+### 10.6 Reproduction
+
+No new figures are computed here. Every number above comes from §0–§9 and the
+committed artefacts listed in §1 and §9.4; the reproduction commands are §8 and
+§9.4.
