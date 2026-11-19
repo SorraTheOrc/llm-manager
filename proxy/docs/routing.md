@@ -1255,7 +1255,7 @@ session's own** dispatch record:
 
 | Gate | Where | Own record |
 | --- | --- | --- |
-| routing concurrency (`cur_local >= max_local` → `local_concurrency_limit`) | `_proxy_with_fallback_cycle` → `_local_concurrency_info` | **idle lease excluded** |
+| routing concurrency (`cur_local >= max_local` → `local_concurrency_limit`) | `_proxy_with_fallback_cycle` → `_local_concurrency_info` | **own record with no streaming dispatch token excluded** (idle lease, or finished-but-not-yet-released) |
 | dispatch lease (`_try_acquire_local_dispatch`) | lease choke point | same-session re-acquisition permitted (`own_has_lease`) |
 
 Before this, the routing gate counted *every* active-or-unexpired record —
@@ -1275,12 +1275,45 @@ local→remote for no capacity reason, one of them pushed remote on four
 consecutive turns 4.5–26.2 s after its own local turn.
 
 **The rule.** `_get_local_concurrency_info(..., session_id=…)` excludes the
-requesting session's own record **only while it is an idle lease**
-(`active: false`). A record that is still `active` is genuine in-flight work, so
-a second concurrent request from the same session is gated exactly as before.
+requesting session's own record whenever it holds **no streaming dispatch
+token** (the `_is_own_record_non_occupancy` predicate, also exported under the
+historical alias `_is_own_idle_lease`). That one predicate covers both shapes
+that must not gate the returning session:
+
+- an **idle lease** — `active: false`, the slot a finished turn keeps reserved
+  for its owner during the no-preemption cooldown (LP-0MW0VH2LB008JSKQ);
+- **finished-but-not-yet-released** — `active: true` with an empty
+  `streaming_dispatch_tokens` set: the response has reached its terminal chunk
+  but request teardown has not yet released the dispatch credit
+  (LP-0MWNHBG7D002NH5S). A sequential client's next turn lands in this window
+  (measured ~145 ms after the stream ends, against ~1.41 s of teardown latency)
+  and was previously refused with `local_concurrency_limit`.
+
+**Genuine in-flight work still counts.** A record that holds **at least one**
+streaming dispatch token — a second concurrent request from the same session —
+is genuine in-flight work and keeps occupying its slot, so that request is gated
+exactly as before. The discriminator is the streaming set, deliberately not the `active`
+flag: clearing `active` at the terminal chunk would change the branch key in
+`_try_acquire_local_dispatch` and could lose an outstanding credit, so the
+marker sits beside it instead.
+
+The marker (`streaming_dispatch_tokens`) is a subset of the record's
+`dispatch_credits`, keyed on the **dispatch credit token**: a token enters the
+set when its dispatch takes its credit (`_try_acquire_local_dispatch` /
+`_increment_local_active_queries`), leaves it the moment the response reaches
+its terminal chunk (`_mark_local_dispatch_stream_finished`), and is pruned by
+`_claim_local_dispatch_credit` in the same critical section that releases the
+credit — so a released credit never leaves a stale streaming token behind. The
+marker never touches `active` or `dispatch_credits`, so exactly-once release is
+unchanged.
+
 `session_id=None` (anonymous callers, and the pool-description readers behind
 `/llama/local/status` and `/llama/local/reserve`) excludes nothing, so the
-engine-capacity view and the pure-legacy global-counter path are unchanged.
+engine-capacity view and the pure-legacy global-counter path are unchanged. A
+record that predates the marker (no `streaming_dispatch_tokens` key) keeps the
+pre-change rule keyed on `active` alone. Excluding the requester's own finished
+record removes a false refusal only; it does **not** add waiting, so `remote-ok`
+(the default preference) still never queues.
 
 ## Dispatch-lease occupancy and the denial line (LP-0MW0KZTWC004HXQ5)
 
