@@ -233,4 +233,10 @@ exits. If you need unattended operation, install the units
   suite shared `/tmp/proxy-startup.log`, and a pytest run at 12:03 overwrote the
   incident's real startup log. The launcher now writes a per-invocation file
   (`/tmp/proxy-startup-<UTC>-<pid>.log`) and keeps `proxy-startup.log` as a
-  symlink to the newest, so old logs survive.
+  symlink to the newest, so old logs survive. Each of those files is written by
+  the detached child, which prints its banner lines (`Using config:`, `=== LLM
+  Proxy API Key Check ===`, `=== Starting proxy server ===`) before the final
+  uvicorn exec line; a log that stops at one of those banners is a startup that
+  died before serving, and the banner's position shows how far it got. Tests
+  must therefore wait for the uvicorn line, not for the file to be non-empty
+  (LP-0MWJK9ZJF00667UE).
