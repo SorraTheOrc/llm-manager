@@ -219,9 +219,9 @@ class TestCitationsStillResolve:
         ("proxy/proxy/provider.py", 2715, "def compute_hard_routing_cap"),
         ("proxy/proxy/session.py", 1648, "effective_per_slot_threshold"),
         # 5 — dispatch-lease cap
-        ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
-        ("proxy/proxy/router.py", 1611, "_try_acquire_local_dispatch"),
-        ("proxy/proxy/router_helpers.py", 4598, "async def _try_acquire_local_dispatch"),
+        ("proxy/proxy/router.py", 240, "def _get_local_max_concurrent_queries"),
+        ("proxy/proxy/router.py", 1674, "_try_acquire_local_dispatch"),
+        ("proxy/proxy/router_helpers.py", 4834, "async def _try_acquire_local_dispatch"),
         ("proxy/proxy/provider.py", 8201, "def _get_local_concurrency_info"),
         # 6 — slot-ID space
         ("proxy/proxy/session.py", 1210, "def _slot_id_for_session"),
@@ -230,7 +230,7 @@ class TestCitationsStillResolve:
         ("proxy/proxy/session.py", 1604, "session_slot_pool_size"),
         ("proxy/proxy/session.py", 848, "def plan_eviction_snapshot"),
         # 8 — tenancy default
-        ("proxy/proxy/router_helpers.py", 4217, "def _default_tenants"),
+        ("proxy/proxy/router_helpers.py", 4453, "def _default_tenants"),
         ("proxy/config.yaml", 1583, "session_slot_pool_size"),
         ("proxy/config.yaml", 1591, "local_session_tenants: 2"),
         # 9 — capacity admission + status fail-open

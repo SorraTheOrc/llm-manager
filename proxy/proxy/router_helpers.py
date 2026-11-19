@@ -3314,6 +3314,175 @@ def _dispatch_credit_tokens(record) -> list | None:
     return list(credits)
 
 
+def _dispatch_streaming_tokens(record) -> list | None:
+    """Return the record's tokens whose stream has not finished (or ``None``).
+
+    Parent LP-0MWMSQR3O002YNPW **AC1/AC2**, implementation child
+    LP-0MWNHBFN6000GH2J. ``streaming_dispatch_tokens`` is the subset of
+    ``dispatch_credits`` whose dispatch has *not* yet emitted its response's
+    terminal chunk. A token is added when the dispatch takes its credit
+    (:func:`_try_acquire_local_dispatch` /
+    :func:`_increment_local_active_queries`) and removed when the response's
+    terminal chunk is seen, so a reader can tell a finished-but-not-yet-
+    released turn from genuinely in-flight work without a timestamp heuristic.
+
+    The marker deliberately leaves ``active`` and ``dispatch_credits``
+    untouched: clearing ``active`` at the terminal chunk would flip the branch
+    key in :func:`_try_acquire_local_dispatch` (an ``active: true`` record
+    appends a credit, an inactive one is overwritten) and could lose an
+    outstanding credit while it is still held, breaking exactly-once release.
+
+    ``None`` means the record predates the marker (a legacy record, or a
+    hand-built record in a test): callers must keep the pre-change behaviour,
+    which is keyed on ``active`` alone.
+    """
+    if not isinstance(record, dict):
+        return None
+    streaming = record.get("streaming_dispatch_tokens")
+    if not isinstance(streaming, list):
+        return None
+    return list(streaming)
+
+
+def _prune_streaming_dispatch_tokens(record) -> None:
+    """Drop streaming tokens whose credit the record no longer holds.
+
+    AC2 invariant (LP-0MWNHBFN6000GH2J): ``streaming_dispatch_tokens`` is
+    always a subset of ``dispatch_credits``. Every credit claim prunes the
+    streaming set inside the *same* critical section, so a released credit can
+    never leave a streaming token behind — the teardown half of the lifecycle.
+    """
+    if not isinstance(record, dict):
+        return
+    streaming = record.get("streaming_dispatch_tokens")
+    if not isinstance(streaming, list):
+        return
+    credits = _dispatch_credit_tokens(record)
+    if credits is None:
+        # No credit list to be a subset of (legacy/hand-built record): leave
+        # the marker untouched rather than inventing a subset relation.
+        return
+    held = set(credits)
+    record["streaming_dispatch_tokens"] = [
+        token for token in streaming if token in held
+    ]
+
+
+def _add_streaming_dispatch_token(record, token) -> None:
+    """Mark *token*'s dispatch as streaming (it just took its credit)."""
+    if not isinstance(record, dict) or not isinstance(token, int):
+        return
+    streaming = record.get("streaming_dispatch_tokens")
+    if not isinstance(streaming, list):
+        streaming = []
+    if token not in streaming:
+        streaming = [*streaming, token]
+    record["streaming_dispatch_tokens"] = streaming
+    _prune_streaming_dispatch_tokens(record)
+
+
+def _mark_request_stream_finished(request) -> None:
+    """Set the per-request guard that prevents a double terminal-chunk mark."""
+    if request is None:
+        return
+    try:
+        request._local_dispatch_stream_finished = True
+    except Exception:
+        pass
+
+
+def _reset_request_stream_finished(request) -> None:
+    """Clear the per-request guard when this request takes a new dispatch."""
+    if request is None:
+        return
+    try:
+        request._local_dispatch_stream_finished = False
+    except Exception:
+        pass
+
+
+async def _mark_local_dispatch_stream_finished(
+    srv,
+    session_key: str | None,
+    endpoint: str | None = None,
+    request=None,
+) -> bool:
+    """Mark this dispatch's response stream finished (terminal chunk reached).
+
+    LP-0MWNHBFN6000GH2J **AC1**: the dispatch's existing credit token leaves the
+    record's ``streaming_dispatch_tokens`` set the moment its response reaches
+    the terminal chunk. The credit itself is untouched — ``active`` stays
+    ``True`` and the token stays in ``dispatch_credits`` until teardown claims
+    it — so exactly-once release is unchanged (AC3): this function never
+    releases a ``local_active_queries`` credit and never clears ``active``.
+
+    *request* carries the per-dispatch credit token
+    (LP-0MVYZEYZY003IQAH) and the per-request guard: once a request has marked
+    its stream finished, a repeated terminal-chunk detection (a second
+    ``finish_reason`` chunk, a synthetic ``[DONE]``) is a no-op, so the token
+    cannot be removed twice. When the same request later takes a *new* dispatch
+    the acquisition paths clear the guard again.
+
+    Best-effort (AC6): a missing registry, a legacy record without the marker,
+    an unidentifiable dispatch or any unexpected error is logged and leaves the
+    record counting — the conservative outcome, because a record that still
+    counts only costs the requester a slot for the remaining teardown window,
+    while a wrongly-marked record would let a concurrent dispatch past the gate.
+
+    Returns ``True`` only when this call actually removed a streaming token.
+    """
+    try:
+        if request is not None and getattr(
+            request, "_local_dispatch_stream_finished", False
+        ):
+            # The per-request guard: the terminal chunk was already marked.
+            return False
+        records = getattr(srv, "local_dispatch_records", None)
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        if records is None or lock is None:
+            return False
+        token = _dispatch_token_from_request(request)
+        key = _dispatch_lease_key(endpoint, session_key) if session_key else None
+        marked = False
+        async with lock:
+            record = records.get(key) if key is not None else None
+            if not isinstance(record, dict) and session_key is not None:
+                # Legacy string-key form (pre per-endpoint keys).
+                fallback = records.get(session_key)
+                if isinstance(fallback, dict):
+                    record = fallback
+            if not isinstance(record, dict):
+                return False
+            streaming = _dispatch_streaming_tokens(record)
+            if streaming is None:
+                # Legacy record with no marker: keep the ``active``-only shape.
+                return False
+            if token is None:
+                # Untracked caller (no dispatch identity): never guess which
+                # dispatch finished, so the record keeps counting.
+                return False
+            if token in streaming:
+                streaming.remove(token)
+                record["streaming_dispatch_tokens"] = streaming
+                _prune_streaming_dispatch_tokens(record)
+                marked = True
+        # Idempotent either way: a token that is already absent (a repeated
+        # detection, or a credit already released) also satisfies the request.
+        _mark_request_stream_finished(request)
+        return marked
+    except Exception as exc:
+        try:
+            srv.logger.warning(
+                "Failed to mark dispatch stream finished for session=%s: %s: %s",
+                session_key if session_key else "unknown",
+                type(exc).__name__,
+                exc,
+            )
+        except Exception:
+            pass
+        return False
+
+
 def _outstanding_dispatch_credits(srv) -> int:
     """Count the counter credits currently held by dispatch records.
 
@@ -3400,6 +3569,13 @@ async def _claim_local_dispatch_credit(
                         credits.pop(0)
                     srv.local_active_queries = max(0, srv.local_active_queries - 1)
                     record["dispatch_credits"] = credits
+                    # LP-0MWNHBFN6000GH2J AC2: the streaming marker is a subset
+                    # of the held credits, so the claimed credit's token leaves
+                    # the streaming set in this same critical section. A record
+                    # can never show a streaming token it no longer holds, and
+                    # a teardown of an already-finished dispatch is a no-op for
+                    # the marker.
+                    _prune_streaming_dispatch_tokens(record)
                     if credits:
                         # Another dispatch of the session is still in flight:
                         # keep the record active and hand the attribution to the
@@ -3613,6 +3789,10 @@ async def _increment_local_active_queries(
                             dispatch_token,
                         ]
                         existing["dispatch_token"] = dispatch_token
+                        # LP-0MWNHBFN6000GH2J AC1: this sibling's stream has not
+                        # reached its terminal chunk, so its token joins the
+                        # streaming set (and its own credit was appended above).
+                        _add_streaming_dispatch_token(existing, dispatch_token)
                         existing["expires_at"] = now + lease_timeout
                         existing["turn"] = get_turn_id() or ""
                     else:
@@ -3640,7 +3820,9 @@ async def _increment_local_active_queries(
                             # one), so an overwritten record's leftover credit is
                             # still releasable by the counter-vs-outstanding rule.
                             "dispatch_credits": [dispatch_token],
-                            # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                            # LP-0MWNHBFN6000GH2J AC1: the dispatch is streaming
+                            # until its response's terminal chunk is seen.
+                            "streaming_dispatch_tokens": [dispatch_token],
                             # A record that never makes progress is bounded by
                             # ``local_dispatch_no_progress_timeout_seconds`` from
                             # creation (no waiting on an unobservable signal).
@@ -3671,6 +3853,9 @@ async def _increment_local_active_queries(
                     if request is not None:
                         try:
                             request._local_dispatch_token = dispatch_token
+                            # LP-0MWNHBFN6000GH2J: a newly acquired dispatch has
+                            # its own stream, so the terminal-chunk guard resets.
+                            _reset_request_stream_finished(request)
                         except Exception:
                             pass
         except Exception:
@@ -4900,6 +5085,9 @@ async def _try_acquire_local_dispatch(
                         _credit_taken = False
                         if _existing_credits is None:
                             own_record["dispatch_credits"] = [dispatch_token]
+                            own_record["streaming_dispatch_tokens"] = [
+                                dispatch_token
+                            ]
                     else:
                         dispatch_token = _new_dispatch_token()
                         _credit_taken = True
@@ -4908,6 +5096,10 @@ async def _try_acquire_local_dispatch(
                             dispatch_token,
                         ]
                         own_record["dispatch_token"] = dispatch_token
+                        # LP-0MWNHBFN6000GH2J AC1: an overlapping dispatch of
+                        # this session is streaming until its own terminal
+                        # chunk, so its token joins the record's streaming set.
+                        _add_streaming_dispatch_token(own_record, dispatch_token)
                     own_record["expires_at"] = now + lease_timeout
                     # LP-0MVYWLHNI000AQ7X AC1: a re-acquired record belongs to
                     # this turn now, so the clamp names the live turn.
@@ -4937,6 +5129,9 @@ async def _try_acquire_local_dispatch(
                         # credits this record holds, oldest first, so every
                         # dispatch's increment can be released exactly once.
                         "dispatch_credits": [dispatch_token],
+                        # LP-0MWNHBFN6000GH2J AC1: the dispatch is streaming
+                        # until its response's terminal chunk is seen.
+                        "streaming_dispatch_tokens": [dispatch_token],
                         # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                         "last_progress": 0,
                         "last_progress_ts": now,
@@ -4959,6 +5154,9 @@ async def _try_acquire_local_dispatch(
                 if request is not None:
                     try:
                         request._local_dispatch_token = dispatch_token
+                        # LP-0MWNHBFN6000GH2J: a re-acquired/new dispatch has
+                        # its own stream, so the terminal-chunk guard resets.
+                        _reset_request_stream_finished(request)
                     except Exception:
                         pass
                 # LP-0MVUVHAQP001IRKK: pin the slot identity on the record at

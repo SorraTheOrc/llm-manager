@@ -208,6 +208,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_per_model_query,
     _local_dispatch_gate,
     _local_dispatch_occupancy_evidence,
+    _mark_local_dispatch_stream_finished,
     _mark_local_dispatch_terminal,
     _normalize_outgoing_headers,
     _note_local_dispatch_release,
@@ -887,6 +888,20 @@ async def _cleanup_after_request(
     await _decrement_active_queries(srv)
     await _decrement_per_model_query(srv, model_name)
     if decrement_local:
+        # LP-0MWNHBFN6000GH2J AC4: a non-streaming local response reaches its
+        # terminal state here, so its dispatch is marked stream-finished
+        # immediately before the credit is claimed and released. The streaming
+        # path has already marked at its terminal chunk (a no-op here thanks to
+        # the per-request guard). A client disconnect is deliberately NOT a
+        # terminal chunk: the record keeps counting for as long as its credit
+        # is held (AC5).
+        if not disconnected:
+            try:
+                await _mark_local_dispatch_stream_finished(
+                    srv, session_id, endpoint=backend, request=request
+                )
+            except Exception:
+                pass
         await _decrement_local_active_queries(
             srv,
             session_key=session_id,
@@ -2751,6 +2766,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         collected_content: list[str] = []
                         saw_done = False
                         saw_finish = False
+                        # LP-0MWNHBFN6000GH2J: the dispatch's stream reaches its
+                        # terminal chunk at most once; the per-request guard in
+                        # ``_mark_local_dispatch_stream_finished`` makes a
+                        # repeated detection a no-op too.
+                        _stream_finished_marked = False
                         # Client disconnect detection (LP-0MQTHP828000JYM6)
                         disconnected = False
                         _disconnect_check_count = 0
@@ -3174,6 +3194,32 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                 pass
                                 except Exception:
                                     pass
+
+                                # Terminal-chunk finished marking
+                                # (LP-0MWNHBFN6000GH2J AC1): the moment the
+                                # response's terminal chunk is seen, this
+                                # dispatch's credit token leaves the record's
+                                # ``streaming_dispatch_tokens`` set, so the
+                                # routing gate can tell a finished-but-not-yet-
+                                # released turn from genuinely in-flight work.
+                                # The credit itself is untouched — teardown
+                                # still claims and releases it (AC3) — and a
+                                # marking failure is logged and leaves the
+                                # record counting (AC6).
+                                if (
+                                    (saw_done or saw_finish)
+                                    and not _stream_finished_marked
+                                ):
+                                    _stream_finished_marked = True
+                                    try:
+                                        await _mark_local_dispatch_stream_finished(
+                                            srv,
+                                            session_id,
+                                            endpoint=endpoint,
+                                            request=request,
+                                        )
+                                    except Exception:
+                                        pass
 
                                 if _has_actual_data:
                                     # Dispatch→first-byte capture: first actual data chunk marks the
