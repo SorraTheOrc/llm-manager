@@ -1,6 +1,10 @@
 """Red regression: a sequential turn refused by its own finished record.
 
-Parent LP-0MWMSQR3O002YNPW (AC1); test item LP-0MWNHBBMS002WBLQ.
+Parent LP-0MWMSQR3O002YNPW (AC1); test item LP-0MWNHBBMS002WBLQ. Both contract
+assertions used to carry ``xfail(strict=True)`` while the own-record predicate
+keyed on ``active`` alone; LP-0MWNHBG7D002NH5S turned them green and the markers
+are gone, so this module is now a plain regression guard (an unexpected red here
+is a real regression, not an unimplemented slice).
 
 The production ordering pinned here (incident trace 2026-11-18 22:38:52,
 ``herdr-1795041420-110182-25266``) — no wall-clock sleeps anywhere:
@@ -24,14 +28,13 @@ record counts toward ``cur_local``. With ``session_slot_pool_size: 2`` and one
 ``status=local_concurrency_limit`` and exiles the request remote — even though
 the dispatch-lease gate (``own_has_lease``) would have admitted it.
 
-Red-first encoding: the two contract assertions that only hold once
-LP-0MWNHBG7D002NH5S (the own-record predicate keyed on
-``streaming_dispatch_tokens``) lands carry ``xfail(strict=True)`` — the
+Red-first encoding (historical): the two contract assertions that only hold
+once LP-0MWNHBG7D002NH5S (the own-record predicate keyed on
+``streaming_dispatch_tokens``) lands carried ``xfail(strict=True)`` — the
 repository's red-first pattern (cf. ``test_local_active_queries_invariant.py``
-and ``test_abandoned_dispatch_starvation.py``). ``strict`` makes the marker
-self-cleaning: the implementation item must remove it, because an unexpected
-pass is a failure. The guards that already hold on both trees (a streaming own
-dispatch still counts; the gate is a read) are deliberately **not** xfail.
+and ``test_abandoned_dispatch_starvation.py``). That item removed the markers;
+the guards that already held on both trees (a streaming own dispatch still
+counts; the gate is a read) were never xfail.
 
 The record shape asserted here is the one the plan fixed
 (LP-0MWMSQR3O002YNPW §"Mechanism decision"): ``streaming_dispatch_tokens`` is a
@@ -62,8 +65,8 @@ OTHER = "session-other"
 ME_TOKEN = 9001
 OTHER_TOKEN = 9002
 
-#: The implementation item that turns this module's contract assertions green.
-#: It removes the ``xfail(strict=True)`` markers (kept here for provenance).
+#: The implementation item that turned these contract assertions green and
+#: removed the ``xfail(strict=True)`` markers (kept here for provenance).
 IMPL_ITEM = "LP-0MWNHBG7D002NH5S"
 
 
@@ -168,13 +171,6 @@ def test_own_streaming_dispatch_still_counts(install_state):
     ) == (POOL, POOL)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "red until the own-record predicate keys on streaming_dispatch_tokens "
-        f"({IMPL_ITEM}): a finished-but-not-released own record still counts"
-    ),
-)
 def test_own_finished_record_is_not_occupancy(install_state):
     """AC1/AC4: ME's own finished record must not make the pool read saturated.
 
@@ -277,13 +273,6 @@ async def _route(calls: list[str]) -> Response:
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "red until the own-record predicate keys on streaming_dispatch_tokens "
-        f"({IMPL_ITEM}): the sequential turn is exiled with local_concurrency_limit"
-    ),
-)
 @pytest.mark.asyncio
 async def test_sequential_turn_after_terminal_chunk_routes_locally(
     monkeypatch, install_state, caplog

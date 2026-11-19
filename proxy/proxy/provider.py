@@ -8128,9 +8128,11 @@ def _local_concurrency_info(
     target accepts (LP-0MRPILSMW004T4H8).
 
     *session_id* (LP-0MW0VH2LB008JSKQ) lets the routing gate exclude the
-    requesting session's own idle lease; it is forwarded only when the target
-    accepts it, so ``(config)``-only and ``(config, endpoint=…)`` stubs used by
-    existing tests keep working unchanged.
+    requesting session's own non-occupying record — its idle lease, and since
+    LP-0MWNHBG7D002NH5S also its finished-but-not-yet-released record; it is
+    forwarded only when the target accepts it, so ``(config)``-only and
+    ``(config, endpoint=…)`` stubs used by existing tests keep working
+    unchanged.
     """
     fn = _get_local_concurrency_info
     try:
@@ -8172,10 +8174,10 @@ def _dispatch_local(ptr_local, request, path, endpoint: str | None):
     return ptr_local(request, path)
 
 
-def _is_own_idle_lease(
+def _is_own_record_non_occupancy(
     key, record: dict, session_id: str | None
 ) -> bool:
-    """True when *key* is the requesting session's own **idle** lease.
+    """True when *key* is the requesting session's own **non-occupying** record.
 
     LP-0MW0VH2LB008JSKQ: the routing concurrency gate and the dispatch-lease
     gate must agree about the requesting session's own record. The lease gate
@@ -8186,16 +8188,56 @@ def _is_own_idle_lease(
     own lease window was pushed remote while nothing was generating (measured
     2026-11-03: 15 of 82 ``local_concurrency_limit`` fall-throughs).
 
-    Only an **inactive** record is excluded. A record that is still ``active``
-    is genuine in-flight work — a second concurrent request from the same
-    session must be gated exactly as before — so active records always count.
+    LP-0MWNHBG7D002NH5S: the predicate is keyed on the record's **explicit
+    streaming state**, not on ``active`` and not on a teardown timestamp. The
+    record is the requester's own non-occupancy when it holds **no** streaming
+    dispatch token, which covers both shapes that must not gate the returning
+    session:
+
+    - an **idle lease** — ``active: False`` (the LP-0MW0VH2LB008JSKQ case);
+    - **finished-but-not-yet-released** — ``active: True`` with an empty
+      ``streaming_dispatch_tokens`` set, i.e. the stream has emitted its
+      terminal chunk
+      (``router_helpers._mark_local_dispatch_stream_finished``) but
+      ``request._cleanup_after_request`` has not released the credit yet. A
+      sequential client's next turn lands inside that window (~145 ms measured
+      against ~1.41 s of teardown latency) and used to be exiled with
+      ``local_concurrency_limit``.
+
+    While the own record holds **at least one** streaming dispatch token it is
+    genuine in-flight work (a second concurrent request from the same session),
+    so it keeps counting exactly as before.
+
+    A record **without** a ``streaming_dispatch_tokens`` key predates the
+    marker (legacy or hand-built record): :func:`_dispatch_streaming_tokens`
+    reports ``None`` for it and the predicate falls back to the pre-change
+    behaviour — only an ``active: False`` own record is excluded.
+
+    ``session_id`` of ``None``/empty excludes nothing (AC3), and the predicate
+    is a pure read (it never mutates the record, the registry or a counter).
     """
     if not session_id or not isinstance(record, dict):
         return False
-    if record.get("active"):
-        return False
     key_session = key[1] if isinstance(key, tuple) and len(key) == 2 else key
-    return key_session == session_id
+    if key_session != session_id:
+        return False
+    # Local import: ``router_helpers`` lazily imports the server to avoid a
+    # cycle, so this module keeps its imports of it function-local. Only the
+    # requester's own record reaches here, at most a couple per routing pass.
+    from proxy.router_helpers import _dispatch_streaming_tokens
+
+    streaming = _dispatch_streaming_tokens(record)
+    if streaming is None:
+        # Legacy record (no marker): keyed on ``active`` alone, as before.
+        return not record.get("active")
+    return not streaming
+
+
+#: Backwards-compatible alias (LP-0MWNHBG7D002NH5S). The predicate used to be
+#: called ``_is_own_idle_lease`` because it only recognised an ``active: False``
+#: record; it now recognises any own record that is not streaming. Kept so
+#: existing callers, guards and docs that name the old predicate keep working.
+_is_own_idle_lease = _is_own_record_non_occupancy
 
 
 def _get_local_concurrency_info(
@@ -8214,9 +8256,11 @@ def _get_local_concurrency_info(
     single-server mode), the global ``local_generating_queries`` counter is
     used.
 
-    *session_id* is the requesting session. Its **own idle lease** is not
-    occupancy (see :func:`_is_own_idle_lease`), so a returning session keeps
-    the slot its lease reserved. ``None`` (anonymous/legacy callers, and the
+    *session_id* is the requesting session. Its own **non-occupying** record is
+    not occupancy (see :func:`_is_own_record_non_occupancy`), so a returning
+    session keeps the slot its lease reserved — including the
+    finished-but-not-yet-released window between a turn's terminal chunk and its
+    teardown (LP-0MWNHBG7D002NH5S). ``None`` (anonymous/legacy callers, and the
     pool-description readers used by the status surface) excludes nothing and
     keeps today's count exactly (LP-0MW0VH2LB008JSKQ AC3).
 
@@ -8262,14 +8306,14 @@ def _get_local_concurrency_info(
                     now = time.monotonic()
                     for key, record in records.items():
                         if isinstance(key, tuple) and len(key) == 2 and key[0] == endpoint:
-                            if _is_own_idle_lease(key, record, session_id):
+                            if _is_own_record_non_occupancy(key, record, session_id):
                                 continue
                             if record.get("active") or record.get("expires_at", 0) > now:
                                 cur_active += 1
                         elif not isinstance(key, tuple) and endpoint == default_ep:
                             # Legacy plain-key record occupies the default
                             # server's pool alongside tuple-keyed records.
-                            if _is_own_idle_lease(key, record, session_id):
+                            if _is_own_record_non_occupancy(key, record, session_id):
                                 continue
                             if record.get("active") or record.get("expires_at", 0) > now:
                                 cur_active += 1
