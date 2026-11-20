@@ -1307,6 +1307,30 @@ credit — so a released credit never leaves a stale streaming token behind. The
 marker never touches `active` or `dispatch_credits`, so exactly-once release is
 unchanged.
 
+**Which chunks count as terminal (LP-0MWOZFF7T001YA87).** Both of the local
+stream's terminal chunks mark, because both mean the client has its complete
+response:
+
+- the **upstream** `finish_reason` chunk or `[DONE]` marker, marked in the
+  streaming loop; and
+- the **synthesised** `finish_reason=error` + `[DONE]` pair the router emits
+  when the upstream stream fails (`ReadError`/`RemoteProtocolError`), marked in
+  the loop's exception handler.
+
+Without the second one the marker survived until request teardown, and teardown
+runs after the generator's `finally` slot save — measured **10–25 s** on that
+path (against ~1.41 s for a clean finish). A client retrying after a local
+stream error was therefore still counted as its own occupier and exiled with
+`local_concurrency_limit` for that whole window (17.13 h post-fix window,
+2026-11-19T19:37Z → 2026-11-20T12:45Z: 14 such fall-throughs, every one 10–25 s
+after a local `Local stream error (ReadError)`).
+
+**A client disconnect is still not "finished".** `GeneratorExit` /
+`CancelledError` take their own handlers and never mark, so a
+disconnected-but-credit-holding stream keeps counting until its credit is
+released — the conservative direction, because the slot may still be draining
+upstream work.
+
 `session_id=None` (anonymous callers, and the pool-description readers behind
 `/llama/local/status` and `/llama/local/reserve`) excludes nothing, so the
 engine-capacity view and the pure-legacy global-counter path are unchanged. A

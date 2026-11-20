@@ -105,6 +105,21 @@ def test_remote_ok_still_never_queues() -> None:
     assert "`remote-ok` (the default preference) still never queues" in text
 
 
+def test_occupancy_section_states_the_error_path_terminal_chunk() -> None:
+    """LP-0MWOZFF7T001YA87 AC6: the synthesised error chunk is terminal too."""
+    section = _section()
+
+    assert "synthesised" in section, (
+        "the section must state that the router's synthesised "
+        "finish_reason=error chunk marks the dispatch finished"
+    )
+    assert "finish_reason=error" in section
+    assert "client disconnect" in section.lower(), (
+        "the section must keep stating that a client disconnect is not "
+        "'finished'"
+    )
+
+
 def test_retired_old_rule_wording_is_gone() -> None:
     """No stale statement of the ``active``-keyed rule survives."""
     offenders: list[str] = []

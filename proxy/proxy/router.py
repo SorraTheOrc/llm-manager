@@ -3633,6 +3633,36 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             # Drop any trailing partial so the synthetic error is
                             # emitted as its own event (LP-0MUOBUPBC002GYTL).
                             _reframer.discard_pending()
+                            # Terminal-chunk finished marking on the error path
+                            # (LP-0MWOZFF7T001YA87 AC1): the synthesised
+                            # ``finish_reason=error`` + ``[DONE]`` pair emitted
+                            # below *is* this dispatch's terminal chunk, so the
+                            # credit token leaves ``streaming_dispatch_tokens``
+                            # here exactly as it does for an upstream terminal
+                            # chunk above. Without this the marker survived
+                            # until request teardown — which the slot save in
+                            # this generator's ``finally`` block delays by
+                            # ~10-25 s — so the routing gate kept counting the
+                            # session's own record and exiled its retry with
+                            # ``local_concurrency_limit``.
+                            #
+                            # Marking only removes the token from the marker
+                            # set: ``active`` and ``dispatch_credits`` are
+                            # untouched, so teardown still claims and releases
+                            # exactly its own credit. A client disconnect never
+                            # reaches this branch (``GeneratorExit`` /
+                            # ``CancelledError`` have their own handlers), so a
+                            # disconnected-but-credit-holding stream keeps
+                            # counting.
+                            try:
+                                await _mark_local_dispatch_stream_finished(
+                                    srv,
+                                    session_id,
+                                    endpoint=endpoint,
+                                    request=request,
+                                )
+                            except Exception:
+                                pass
                             # Synthesize a final SSE event so the client receives a
                             # proper finish_reason marker even on stream error.
                             final_obj = _build_stream_error_event(

@@ -41,6 +41,16 @@ Acceptance-criterion map
 - **AC6** — ``test_marking_is_best_effort_and_never_raises`` pins that a
   failure logs and leaves the record counting (the conservative outcome).
 
+Follow-up LP-0MWOZFF7T001YA87 (the synthesised error chunk is a terminal chunk):
+
+- ``test_stream_error_terminal_chunk_marks_finished_before_teardown`` — a local
+  stream that fails (``Local stream error``) has its token removed as the
+  synthesised ``finish_reason=error`` chunk is forwarded, while the credit is
+  still held;
+- ``test_stream_error_finished_window_admits_the_next_turn`` — with one other
+  session holding a slot the pool reads 1/2 at that moment, so the retry is not
+  refused ``local_concurrency_limit``.
+
 Blocks LP-0MWNHBG7D002NH5S (the own-record predicate that reads the marker):
 the read side is exercised by ``test_local_concurrency_finished_own_record.py``
 and is deliberately not changed here.
@@ -57,6 +67,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import proxy.provider as provider
 import proxy.router as router
 import proxy.router_helpers as helpers
 import proxy.server as server
@@ -654,3 +665,201 @@ async def test_streaming_terminal_chunk_marks_finished_before_teardown(monkeypat
         "the marker must not disturb exactly-once counter accounting: "
         f"{observations.clamped}"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC1 / AC2 — the synthesised error terminal chunk is a terminal chunk too
+# ---------------------------------------------------------------------------
+
+
+class _ErroringUpstream(_PacedUpstream):
+    """A fake SSE upstream that raises a transport error instead of ending.
+
+    Models the incident's local failure: the llama-server connection died
+    (``ReadError``) after the watchdog evicted the slot, so the router's
+    ``except Exception`` branch synthesises the client's terminal chunk.
+    """
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self.exc = exc
+
+    async def aiter_bytes(self):
+        self.entered.set()
+        while True:
+            self.parked.set()
+            item = await self._queue.get()
+            self.parked.clear()
+            if item is None:
+                raise self.exc
+            yield item
+
+
+SESSION_ERROR = "sess-stream-error-marking"
+OTHER_SESSION = "sess-stream-error-other"
+
+
+def _record_key(session: str):
+    """Return the dispatch-record key for *session* (plain or per-endpoint)."""
+    for key in server.local_dispatch_records:
+        if isinstance(key, tuple) and len(key) == 2:
+            if key[1] == session:
+                return key
+        elif key == session:
+            return key
+    raise AssertionError(
+        f"no dispatch record for {session}: {list(server.local_dispatch_records)}"
+    )
+
+
+class _ErrorWindowObservation:
+    """Snapshot of the record at the moment the error chunk reaches the client."""
+
+    def __init__(self, record: dict, counter: int) -> None:
+        self.streaming = list(record.get("streaming_dispatch_tokens") or [])
+        self.credits = list(record.get("dispatch_credits") or [])
+        self.active = record.get("active")
+        self.counter = counter
+
+
+async def _drive_observing_error_chunk(request, session: str):
+    """Drain one streaming local dispatch, sampling its record at the error chunk."""
+    response = await router.proxy_to_local(request, "v1/chat/completions")
+    assert isinstance(response, StreamingResponse), type(response)
+    received = b""
+    observations: list[_ErrorWindowObservation] = []
+    async for chunk in response.body_iterator:
+        received += chunk
+        if b"stream_exception" in chunk:
+            key = _record_key(session)
+            observations.append(
+                _ErrorWindowObservation(
+                    server.local_dispatch_records[key],
+                    server.local_active_queries,
+                )
+            )
+    return received, observations
+
+
+def _install_error_scenario(monkeypatch) -> _ErroringUpstream:
+    """Install the real lease bookkeeping with a pool of ``POOL`` slots."""
+    helpers._reset_prefill_thrash_cooldowns()
+    _install_server(monkeypatch)
+    server.config["server"]["session_slot_pool_size"] = POOL
+    server.config["server"]["local_max_concurrent_prefills"] = POOL
+    upstream = _ErroringUpstream(_ReadError("llama-server went away"))
+    sent: list[tuple[str, dict]] = []
+    _patch_router(monkeypatch, {SESSION_ERROR: upstream}, sent)
+    return upstream
+
+
+class _ReadError(Exception):
+    """Stand-in for the httpx transport error the incident logged."""
+
+
+@pytest.mark.asyncio
+async def test_stream_error_terminal_chunk_marks_finished_before_teardown(
+    monkeypatch,
+):
+    """AC1: the synthesised error chunk is a terminal chunk and clears the marker.
+
+    The client has its complete response (``finish_reason=error`` + ``[DONE]``)
+    the moment this chunk is forwarded, so the dispatch is no longer streaming:
+    the record's streaming token must already be gone while the credit is still
+    held — exactly the finished-but-not-yet-released shape the routing gate
+    keyed on for a clean finish.
+    """
+    upstream = _install_error_scenario(monkeypatch)
+    request = _StreamRequest(SESSION_ERROR, SESSION_ERROR)
+
+    task = asyncio.create_task(
+        _drive_observing_error_chunk(request, SESSION_ERROR)
+    )
+
+    await _wait(upstream.parked, "first-byte park")
+    record = server.local_dispatch_records[_record_key(SESSION_ERROR)]
+    token = record["dispatch_token"]
+    assert record["streaming_dispatch_tokens"] == [token]
+
+    upstream.push(_CONTENT_CHUNK)
+    await _wait(upstream.parked, "content chunk consumed")
+    assert record["streaming_dispatch_tokens"] == [token], (
+        "a non-terminal chunk must not mark the stream finished"
+    )
+
+    upstream.end()  # raises inside the upstream iterator
+    received, observations = await asyncio.wait_for(task, timeout=10)
+
+    assert b"stream_exception" in received, received[:200]
+    assert len(observations) == 1, (
+        "exactly one synthetic error chunk must be observed: "
+        f"{[o.streaming for o in observations]}"
+    )
+    seen = observations[0]
+    assert seen.streaming == [], (
+        "the synthesised error terminal chunk must remove this dispatch's "
+        f"streaming token; it still shows {seen.streaming}"
+    )
+    assert seen.credits == [token], (
+        "marking must not release the credit — teardown owns that: "
+        f"{seen.credits}"
+    )
+    assert seen.active is True
+    assert seen.counter == 1
+
+    # Teardown still releases exactly the one credit and settles the record.
+    assert record["dispatch_credits"] == []
+    assert record["streaming_dispatch_tokens"] == []
+    assert record.get("active") is False
+    assert server.local_active_queries == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_error_finished_window_admits_the_next_turn(monkeypatch):
+    """AC2: after the error the session's own record stops gating its retry.
+
+    One *other* session occupies one of the two slots. With the own record
+    excluded the pool reads 1/2 and a retry is admitted; before the marker was
+    removed on this path it read 2/2 and the retry was exiled with
+    ``local_concurrency_limit`` (the incident's 10-25 s tail).
+    """
+    upstream = _install_error_scenario(monkeypatch)
+    other_request = SimpleNamespace()
+    acquired, owner, _count, _retry = await helpers._try_acquire_local_dispatch(
+        server, POOL, OTHER_SESSION, ENDPOINT, model_name=MODEL,
+        request=other_request,
+    )
+    assert acquired is True, f"the other session must hold a real lease ({owner})"
+
+    request = _StreamRequest(SESSION_ERROR, SESSION_ERROR)
+    task = asyncio.create_task(
+        _drive_observing_error_chunk(request, SESSION_ERROR)
+    )
+
+    await _wait(upstream.parked, "first-byte park")
+    upstream.push(_CONTENT_CHUNK)
+    await _wait(upstream.parked, "content chunk consumed")
+    upstream.end()
+    _received, observations = await asyncio.wait_for(task, timeout=10)
+
+    seen = observations[0]
+    assert seen.streaming == [], (
+        "the error terminal chunk must clear the own streaming token: "
+        f"{seen.streaming}"
+    )
+    cur, max_local = provider._get_local_concurrency_info(
+        server.config, endpoint=ENDPOINT, session_id=SESSION_ERROR
+    )
+    assert max_local == POOL
+    assert cur == 1, (
+        "only the other session may occupy a slot once this session's stream "
+        f"has errored terminally; got {cur}/{max_local} "
+        f"(records={server.local_dispatch_records})"
+    )
+    assert cur < max_local, "the retry would still be refused local_concurrency_limit"
+
+    # The other session's credit is untouched by this session's teardown.
+    other = server.local_dispatch_records[_record_key(OTHER_SESSION)]
+    assert other["active"] is True
+    assert other["dispatch_credits"] == [other["dispatch_token"]]
+    assert server.local_active_queries == 1
