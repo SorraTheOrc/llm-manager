@@ -227,6 +227,12 @@ RE_GUARD_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
 #: predate the field, never a fabricated value.
 RE_GUARD_OCCUPANT_HOLD = re.compile(r"\boccupant_hold_s=([\d.]+)")
 RE_GUARD_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
+#: The ETA pricing basis the guard priced the request with
+#: (LP-0MWRQ6LSV009DVP4 AC1): ``measured`` when a measured resident prefix
+#: priced ``new_tokens``, else ``predicted``. Additive — absent on pre-change
+#: lines, where it stays ``None`` so the report can report them as ``unknown``
+#: rather than silently re-labelling them.
+RE_GUARD_ETA_PRICING_BASIS = re.compile(r"\beta_pricing_basis=([A-Za-z_]+)")
 
 # Status-poll payload (LP-0MVGR2OXT0096OGK M3): ``status_request`` lines carry
 # the calibrated ``prefill_eta_seconds`` prediction and the truthful
@@ -783,6 +789,10 @@ class LogEvent:
     rate_bucket: str | None = None
     contended_samples: int | None = None
     eta_occupancy_s: str | None = None
+    #: ETA pricing basis on the guard record (LP-0MWRQ6LSV009DVP4 AC1):
+    #: ``measured`` when a measured resident prefix priced ``new_tokens``,
+    #: ``predicted`` otherwise. ``None`` on pre-change lines.
+    eta_pricing_basis: str | None = None
     #: The measured occupant hold taken into the occupancy term
     #: (LP-0MVV29YDQ00437N6). ``None`` on lines that predate the field.
     occupant_hold_s: str | None = None
@@ -1355,6 +1365,9 @@ def parse_log_line(line: str) -> LogEvent | None:
             rate_bucket=_first(RE_GUARD_RATE_BUCKET, msg),
             contended_samples=_int(RE_GUARD_CONTENDED_SAMPLES, msg),
             eta_occupancy_s=_first(RE_GUARD_ETA_OCCUPANCY, msg),
+            # ETA pricing basis (LP-0MWRQ6LSV009DVP4 AC1/AC3): additive and
+            # absent on pre-change lines, where it stays ``None``.
+            eta_pricing_basis=_first(RE_GUARD_ETA_PRICING_BASIS, msg),
             # Measured blocker evidence (LP-0MVV29YDQ00437N6 AC5): additive and
             # absent on earlier lines, so a refusal can be attributed to the
             # measured occupant hold instead of inferred from the aggregate

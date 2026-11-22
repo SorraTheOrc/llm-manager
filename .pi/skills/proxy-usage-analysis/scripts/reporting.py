@@ -4240,6 +4240,28 @@ def _append_contention_prediction_section(
        f"{matched['relative_error_p50_pct'] if matched['relative_error_p50_pct'] is not None else '-'}% / "
        f"{matched['relative_error_p90_pct'] if matched['relative_error_p90_pct'] is not None else '-'}% |")
     ap("")
+    # Measured-basis coverage (LP-0MWRQ6LSV009DVP4 AC3/AC4): what share of
+    # ETA-priced admissions the guard priced from a MEASUREMENT, plus the
+    # p50/p90 of the ABSOLUTE relative error the parent's metric quotes. The
+    # 2026-11-21 pre-change baseline (2.3 % measured, p50 863.4 %) is quoted
+    # for context so a later run states before/after without re-deriving it.
+    basis = eta.get("basis_split") or {}
+    basis_share = basis.get("measured_share_pct")
+    basis_share_label = (
+        f"{basis_share}%" if basis_share is not None else "n/a"
+    )
+    ap("| Metric | Value |")
+    ap("|---|---:|")
+    ap(f"| ETA pricing basis (measured / predicted / unknown) | "
+       f"{basis.get('measured', 0)} / {basis.get('predicted', 0)} / "
+       f"{basis.get('unknown', 0)} |")
+    ap(f"| Measured-basis share | {basis_share_label} "
+       "(2026-11-21 baseline: 2.3 % ladder-gated) |")
+    ap(f"| Absolute relative error p50 / p90 | "
+       f"{eta['accuracy']['p50_pct'] if eta['accuracy']['p50_pct'] is not None else '-'}% / "
+       f"{eta['accuracy']['p90_pct'] if eta['accuracy']['p90_pct'] is not None else '-'}% "
+       "(2026-11-21 baseline p50: 863.4 %) |")
+    ap("")
     ap("Unmatched dispatches are never folded into the matched figure: an "
        "inert (uncalibrated) guard, or an inactive `observe`-mode decision, "
        "logs no priced ETA and cannot be scored, and an enforced refusal "
@@ -5866,6 +5888,17 @@ def prefill_eta_error_json(
         # Matched per-dispatch accuracy (AC1): the 25 % two-sided tolerance
         # applies here, where predicted and observed describe one dispatch.
         "matched": _matched_prefill_eta(summary),
+        # Measured-basis coverage (LP-0MWRQ6LSV009DVP4 AC3/AC4): the share of
+        # ETA-priced admissions backed by a measurement, and the p50/p90 of
+        # the **absolute** relative error on matched pairs (the parent's
+        # ``prefill_eta_accuracy`` figure and its tail). All ADDITIVE — no key
+        # above changes value or meaning.
+        "basis_split": aggregation.prefill_eta_basis_share(summary),
+        "accuracy": {
+            "samples": len(aggregation.prefill_eta_pairs(summary)),
+            "p50_pct": aggregation.prefill_eta_accuracy(summary),
+            "p90_pct": aggregation.prefill_eta_accuracy_p90(summary),
+        },
     }
 
 

@@ -3829,6 +3829,66 @@ def resolve_resident_prefix(
     )
 
 
+#: Residency sources that carry a real reusable-prefix MEASUREMENT
+#: (LP-0MWRQ6LSV009DVP4 AC1). ``session_slot`` is deliberately excluded — the
+#: slot is owned but its size is unknown (``n_past_actual is None``), so there
+#: is no measurement to price from.
+_ETA_MEASURED_SOURCES = (
+    RESIDENCY_SOURCE_MEASURED,
+    RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
+)
+
+
+def _eta_measured_n_past(facts) -> int | None:
+    """The measured ``n_past_actual`` the ETA may price from, or ``None``.
+
+    Parent AC1 (LP-0MWRQ6LSV009DVP4): when a *measured* resident prefix exists
+    (``source`` is ``measured`` — live ``context_tokens`` — or
+    ``measured_last_dispatch`` — the ``(model, session)`` measurement store),
+    the ETA is priced from ``min(n_past_actual, estimated_tokens)``. Every
+    other source (``session_slot`` with ``n_past_actual is None``,
+    ``non_resident``, ``unknown``, a stale view) returns ``None`` so the guard
+    keeps the predicted ratio: no measurement is inferred from absent data.
+    """
+    if facts is None:
+        return None
+    if getattr(facts, "source", None) in _ETA_MEASURED_SOURCES:
+        return getattr(facts, "n_past_actual", None)
+    return None
+
+
+def _resolve_eta_residency(
+    model_name: str | None,
+    session_id: str | None,
+    estimated_tokens: int,
+    *,
+    endpoint: str | None = None,
+    server_config: dict | None = None,
+    view=None,
+) -> tuple[int | None, "ResidentPrefixFacts | None"]:
+    """Resolve the measured resident prefix for ETA pricing **once**.
+
+    Returns ``(measured_n_past, facts)``. Facts are read from the
+    **already-cached** residency view (:func:`resolve_resident_prefix`) — never
+    a synchronous ``/slots`` query (llama-server holds ``/slots`` >15 s while
+    processing a prompt batch, LP-0MUXTW4MD003TVIC). Fail-open: any error
+    returns ``(None, None)``, so the guard keeps the predicted-ratio price and
+    never breaks routing on an observability path (LP-0MWRQ6LSV009DVP4 AC1).
+    """
+    try:
+        facts = resolve_resident_prefix(
+            session_id,
+            estimated_tokens,
+            view=view,
+            endpoint=endpoint,
+            model_name=model_name,
+            server_config=server_config,
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None, None
+    return _eta_measured_n_past(facts), facts
+
+
 #: Skip reason emitted when the tenancy bound refuses a new session (AC2).
 #: Mirrors ``proxy.router_helpers.TENANCY_SKIP_REASON``; kept local so the
 #: ladder does not need a module-level import of ``router_helpers`` (which
@@ -4759,6 +4819,13 @@ def _idle_admission_budget_verdict(
         model_name = provider_cfg.get("llama_model", "") if isinstance(
             provider_cfg, dict
         ) else ""
+        # Measured-basis ETA pricing (LP-0MWRQ6LSV009DVP4 AC1): resolve the
+        # measured resident prefix once so the idle-admit verdict prices the
+        # same way the direct guard does.
+        measured_n_past, _eta_facts = _resolve_eta_residency(
+            model_name, session_id, estimated_tokens,
+            server_config=server_cfg,
+        )
         decision = prefill_eta.evaluate_admission(
             config,
             model_name,
@@ -4766,6 +4833,7 @@ def _idle_admission_budget_verdict(
             cached_ratio,
             "medium",
             residency_measured=_residency_is_measured(model_name, session_id),
+            measured_n_past=measured_n_past,
         )
         # LP-0MVODJ3P6000AIUM AC1: return the decision for BOTH verdicts so
         # the idle-admit accept path can thread the ETA the guard actually
@@ -9304,6 +9372,15 @@ async def _promote_too_large_local_request(
     # (single-implementation contract LP-0MVSLZY470051ZB2 AC3). An
     # uncalibrated capacity stays fail-open (AC5).
     model_name = local_entry.get("llama_model") or ""
+    # Measured-basis ETA pricing (LP-0MWRQ6LSV009DVP4 AC1): resolve the measured
+    # resident prefix once so the pre-dispatch capacity classifier prices the
+    # request exactly as the in-loop admission guard does.
+    measured_n_past, _eta_facts = _resolve_eta_residency(
+        model_name,
+        session_id,
+        estimated,
+        server_config=(config.get("server", config) if isinstance(config, dict) else None),
+    )
     try:
         decision = prefill_eta.evaluate_admission(
             config,
@@ -9312,6 +9389,7 @@ async def _promote_too_large_local_request(
             cached_ratio,
             priority,
             residency_measured=_residency_is_measured(model_name, session_id),
+            measured_n_past=measured_n_past,
         )
     except Exception:  # pragma: no cover - defensive, mirrors the guard
         logger.debug("too-large verdict: admission guard failed", exc_info=True)
@@ -10478,6 +10556,19 @@ async def _prefill_admission_guard(
             messages,
             server_config=server_cfg,
         )
+        # Measured-basis ETA pricing (LP-0MWRQ6LSV009DVP4 AC1): resolve the
+        # session's measured resident prefix once, from the already-cached
+        # residency view (never a synchronous /slots query). The measured
+        # figure prices new_tokens only when a REAL measurement exists
+        # (``measured`` / ``measured_last_dispatch``); every other source keeps
+        # the predicted ratio.
+        measured_n_past, _eta_facts = _resolve_eta_residency(
+            model_name,
+            session_id,
+            estimated_tokens,
+            endpoint=endpoint,
+            server_config=server_cfg,
+        )
         # Occupancy-aware verdict (LP-0MVICD2YW004DJPV): the wait a newcomer
         # actually faces is its own prefill *plus* the occupied gate ahead of
         # it, so the guard needs the occupants before it can compare against
@@ -10507,6 +10598,9 @@ async def _prefill_admission_guard(
             # whole prompt, so a predicted-warm prompt can never slip past the
             # capacity on optimism.
             residency_measured=_residency_is_measured(model_name, session_id),
+            # Measured resident prefix for the ETA price (LP-0MWRQ6LSV009DVP4
+            # AC1); ``None`` keeps the predicted ratio.
+            measured_n_past=measured_n_past,
         )
         if not decision.active:
             # An inert decision admits without adjudicating (an uncalibrated
@@ -10797,6 +10891,44 @@ def _queue_new_tokens_from_request(request) -> int | None:
 #: including the slot-retry re-dispatches) inherits the same verbatim numbers
 #: instead of re-pricing the prompt at record creation.
 LOCAL_ADMISSION_EVIDENCE_ATTR = "_local_admission_evidence"
+
+
+def _stamp_pricing_for_decision(
+    decision,
+    routing_cached_ratio: float,
+    routing_new_tokens: int,
+    estimated_tokens: int,
+) -> tuple[float, int]:
+    """The ``(cached_ratio, new_tokens)`` the dispatch record should stamp.
+
+    Parent AC2 (LP-0MWRQ6LSV009DVP4): when the governing decision priced from a
+    **measured** resident prefix (``eta_pricing_basis == "measured"``), stamp the
+    ratio and new-token count the ETA actually enforced, so
+    ``prefill_eta_accuracy`` scores the priced figure instead of a re-derived
+    prediction. Every other case — no decision, a predicted-basis decision, the
+    ``predicted`` rollback — returns the routing-time values byte-for-byte.
+
+    Best-effort: a malformed decision or estimate falls back to the routing
+    values; the stamp must never break a routing decision.
+    """
+    try:
+        if (
+            decision is None
+            or getattr(decision, "eta_pricing_basis", None) != "measured"
+        ):
+            return routing_cached_ratio, routing_new_tokens
+        measured_ratio = getattr(decision, "eta_pricing_ratio", None)
+        if measured_ratio is None:
+            return routing_cached_ratio, routing_new_tokens
+        decided_new = getattr(decision, "new_tokens", None)
+        if isinstance(decided_new, int) and not isinstance(decided_new, bool):
+            return float(measured_ratio), decided_new
+        return float(measured_ratio), max(
+            0,
+            int(round(float(estimated_tokens or 0) * (1.0 - float(measured_ratio)))),
+        )
+    except Exception:
+        return routing_cached_ratio, routing_new_tokens
 
 
 def _stamp_local_admission_evidence(
@@ -17991,12 +18123,26 @@ async def _proxy_with_fallback_cycle(
                     ) if _admission_snapshot_decision is not None else None
                 except Exception:
                     _snapshot_busy, _snapshot_in_flight = None, None
+                # Stamped-evidence basis (LP-0MWRQ6LSV009DVP4 AC2): when the
+                # governing decision priced from a MEASURED resident prefix,
+                # stamp that measured ratio and its new-token count, so
+                # ``prefill_eta_accuracy`` scores the figure the guard actually
+                # enforced rather than the routing-time prediction. Every other
+                # case (prediction, ``session_slot``, stale view, the
+                # ``predicted`` rollback) keeps the routing values
+                # byte-for-byte.
+                _stamp_cached_ratio, _stamp_new_tokens = _stamp_pricing_for_decision(
+                    _admission_snapshot_decision,
+                    _routing_cached_ratio,
+                    _routing_new_tokens,
+                    _estimated_tokens,
+                )
                 try:
                     _stamp_local_admission_evidence(
                         request,
                         estimated_tokens=_estimated_tokens,
-                        cached_ratio=_routing_cached_ratio,
-                        new_tokens=_routing_new_tokens,
+                        cached_ratio=_stamp_cached_ratio,
+                        new_tokens=_stamp_new_tokens,
                         decision=_admission_snapshot_decision,
                         model_name=_llama_model or provider_name,
                         busy_slots=_snapshot_busy,

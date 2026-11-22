@@ -150,6 +150,35 @@ VALID_POLICIES = (POLICY_REJECT, POLICY_OBSERVE, POLICY_OFF)
 DEFAULT_POLICY = POLICY_REJECT
 
 # ---------------------------------------------------------------------------
+# ETA pricing basis (LP-0MWRQ6LSV009DVP4, parent AC1/AC6)
+# ---------------------------------------------------------------------------
+#
+# The admission guard historically priced the ETA from the *predicted* cache
+# ratio (``expected_cached_ratio``), even when a *measured* resident prefix
+# (the session's live ``context_tokens``, or its last measured dispatch) was
+# available on the same admission path. That discarded evidence made a prompt
+# whose KV prefix was already resident look cold on last turn's estimate:
+# measured 2026-11-21, ``prefill_eta_accuracy`` read 863.4 % median absolute
+# relative error (predicted p50 34.95 s vs observed p50 3.44 s).
+#
+# ``measured`` (default) prices ``new_tokens`` from
+# ``min(n_past_actual, estimated_tokens)`` whenever a measured source exists —
+# ``measured`` (live ``context_tokens``) or ``measured_last_dispatch`` (the
+# ``(model, session)`` measurement store). ``session_slot`` (slot owned, size
+# unknown, ``n_past_actual is None``) and every unmeasured/absent/stale view
+# keep the predicted ratio: pricing them warm would admit arbitrarily large
+# prompts on an unverified assumption.
+#
+# ``predicted`` is the single-value rollback (parent AC6): it restores the
+# pre-change predicted-ratio pricing byte-for-byte at both the guard and the
+# stamped dispatch evidence.
+ETA_PRICING_BASIS_MEASURED = "measured"
+ETA_PRICING_BASIS_PREDICTED = "predicted"
+VALID_ETA_PRICING_BASES = (ETA_PRICING_BASIS_MEASURED, ETA_PRICING_BASIS_PREDICTED)
+DEFAULT_ETA_PRICING_BASIS = ETA_PRICING_BASIS_MEASURED
+ETA_PRICING_BASIS_KEY = "local_eta_pricing_basis"
+
+# ---------------------------------------------------------------------------
 # Defaults (evidence 2026-10-19/20 window: 254 new tok/s solitary ≈ 3.9 ms per
 # fresh token; a cache-served prefix costs a small fraction of that, 0.5 ms).
 #
@@ -484,6 +513,10 @@ class GuardConfig:
     #: admission, so an enabled deployment is a deliberate, measured choice
     #: (see ``docs/routing.md`` for the trade-off evidence).
     free_gate_deadline_budget: bool = DEFAULT_FREE_GATE_DEADLINE_BUDGET
+    #: ETA pricing basis (LP-0MWRQ6LSV009DVP4 AC1/AC6): ``measured`` prices
+    #: ``new_tokens`` from a measured resident prefix when one is supplied;
+    #: ``predicted`` is the pre-change predicted-ratio pricing (rollback).
+    eta_pricing_basis: str = DEFAULT_ETA_PRICING_BASIS
 
 
 def resolve_config(config: dict | None) -> GuardConfig:
@@ -585,6 +618,22 @@ def resolve_config(config: dict | None) -> GuardConfig:
             DEFAULT_BUDGET_SAFETY_FRACTION,
         )
         safety_fraction = DEFAULT_BUDGET_SAFETY_FRACTION
+    # ETA pricing basis (LP-0MWRQ6LSV009DVP4 AC6): ``measured`` (default) or
+    # ``predicted`` (the single-value rollback). A malformed value keeps the
+    # target behaviour — a typo must not silently disable the fix.
+    raw_basis = str(
+        server_cfg.get(ETA_PRICING_BASIS_KEY, DEFAULT_ETA_PRICING_BASIS)
+        or DEFAULT_ETA_PRICING_BASIS
+    ).strip().lower()
+    if raw_basis not in VALID_ETA_PRICING_BASES:
+        logger.warning(
+            "Invalid %s=%r — using %r (valid: %s)",
+            ETA_PRICING_BASIS_KEY,
+            server_cfg.get(ETA_PRICING_BASIS_KEY),
+            DEFAULT_ETA_PRICING_BASIS,
+            ", ".join(VALID_ETA_PRICING_BASES),
+        )
+        raw_basis = DEFAULT_ETA_PRICING_BASIS
     if budget_tokens > 0 and percentile_min_tokens > budget_tokens:
         logger.warning(
             "%s=%d exceeds %s=%d — percentile pricing would never engage, so "
@@ -608,6 +657,7 @@ def resolve_config(config: dict | None) -> GuardConfig:
         reference_window_samples=reference_window,
         reference_max_tokens=reference_max,
         free_gate_deadline_budget=free_gate,
+        eta_pricing_basis=raw_basis,
     )
 
 
@@ -1560,6 +1610,18 @@ class AdmissionDecision:
     #: inferred from the aggregate occupancy term. ``None`` only when no
     #: projection was costed at all (``policy_off`` / cold-prefill refusal).
     occupant_hold_seconds: float | None = None
+    #: Basis the ``new_tokens`` price was derived from (LP-0MWRQ6LSV009DVP4
+    #: AC1): ``measured`` when a measured resident prefix priced the request,
+    #: ``predicted`` when the predicted ratio did (or the ``predicted``
+    #: rollback is configured). Additive — every pre-change line reports
+    #: ``predicted``, which is exactly what those decisions used.
+    eta_pricing_basis: str = ETA_PRICING_BASIS_PREDICTED
+    #: The cache ratio this decision actually priced ``new_tokens`` with
+    #: (LP-0MWRQ6LSV009DVP4 AC2): the measured reuse ratio when
+    #: ``eta_pricing_basis == measured``, else the predicted ratio. The stamp
+    #: reads this so the dispatch record's ``cached_ratio`` / ``new_tokens``
+    #: match the price ``prefill_eta_accuracy`` scores.
+    eta_pricing_ratio: float | None = None
 
     @property
     def active(self) -> bool:
@@ -1617,6 +1679,7 @@ def evaluate_admission(
     contended: bool | None = None,
     capacity_admitted: bool = False,
     residency_measured: bool | None = None,
+    measured_n_past: int | None = None,
 ) -> AdmissionDecision:
     """Decide whether a local dispatch can finish inside the wait budget.
 
@@ -1699,6 +1762,19 @@ def evaluate_admission(
     :data:`REASON_DEADLINE_CAPACITY` before the calibration-dependent bounds,
     because a request that is itself too large cannot be healed by waiting
     (AC1/AC2/AC3).
+
+    *measured_n_past* (LP-0MWRQ6LSV009DVP4 AC1) is the session's **measured**
+    resident prefix (``n_past_actual``) resolved by the caller from the cached
+    residency view, or ``None`` when no measured source exists
+    (``session_slot`` with an unknown size, ``non_resident``, ``unknown``, a
+    stale view, or the ``predicted`` rollback). When
+    ``server.local_eta_pricing_basis`` is ``measured`` (the default) and it is
+    not ``None``, ``new_tokens`` is priced from
+    ``min(measured_n_past, prompt_tokens)`` — the real prefill work — instead
+    of the predicted ratio; the decision reports the basis
+    (``eta_pricing_basis``) and the priced ratio (``eta_pricing_ratio``) so the
+    stamped dispatch evidence and ``prefill_eta_accuracy`` score the enforced
+    figure. ``predicted`` ignores it entirely (the byte-for-byte rollback).
     """
     guard_cfg = resolve_config(config)
     # Deadline token capacity (LP-0MW957RB3000ER79). Initialised inert and
@@ -1717,9 +1793,42 @@ def evaluate_admission(
 
     try:
         ratio = min(1.0, max(0.0, float(cached_ratio or 0.0)))
-        new_tokens = max(0, int(round(float(prompt_tokens or 0) * (1.0 - ratio))))
     except (TypeError, ValueError):
-        new_tokens = 0
+        ratio = 0.0
+    # Measured-basis pricing (LP-0MWRQ6LSV009DVP4 AC1). When a measured resident
+    # prefix is supplied (the guard resolved it from the cached residency view)
+    # and the configured basis is ``measured`` (default), price ``new_tokens``
+    # from ``min(n_past_actual, estimated_tokens)`` instead of the predicted
+    # ratio. ``session_slot`` (``n_past_actual is None``) and every
+    # unmeasured/absent/stale view pass ``None`` and keep the predicted price.
+    # ``predicted`` (the rollback) ignores the measurement entirely, so the
+    # pre-change numbering is byte-for-byte.
+    priced_ratio = ratio
+    eta_basis = ETA_PRICING_BASIS_PREDICTED
+    priced_new_tokens: int | None = None
+    if guard_cfg.eta_pricing_basis == ETA_PRICING_BASIS_MEASURED:
+        try:
+            measured = None if measured_n_past is None else max(0, int(measured_n_past))
+        except (TypeError, ValueError):
+            measured = None
+        try:
+            estimated = max(0, int(prompt_tokens or 0))
+        except (TypeError, ValueError):
+            estimated = 0
+        if measured is not None and estimated > 0:
+            reusable = min(measured, estimated)
+            priced_ratio = min(1.0, max(0.0, reusable / float(estimated)))
+            priced_new_tokens = max(0, estimated - reusable)
+            eta_basis = ETA_PRICING_BASIS_MEASURED
+    if priced_new_tokens is not None:
+        new_tokens = priced_new_tokens
+    else:
+        try:
+            new_tokens = max(
+                0, int(round(float(prompt_tokens or 0) * (1.0 - priced_ratio)))
+            )
+        except (TypeError, ValueError):
+            new_tokens = 0
 
     try:
         occupancy = max(0, int(busy_slots or 0))
@@ -1775,6 +1884,8 @@ def evaluate_admission(
             occupant_hold_seconds=(
                 projected.measured_occupancy_seconds if projected else None
             ),
+            eta_pricing_basis=eta_basis,
+            eta_pricing_ratio=priced_ratio,
             deadline_capacity_tokens=capacity.tokens,
             deadline_capacity_calibrated=capacity.calibrated,
             cold_ms_per_token=capacity.cold_ms_per_token,
@@ -1807,6 +1918,8 @@ def evaluate_admission(
             new_tokens=new_tokens,
             budget_tokens=guard_cfg.cold_prefill_budget_tokens,
             deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
+            eta_pricing_basis=eta_basis,
+            eta_pricing_ratio=priced_ratio,
             deadline_capacity_tokens=capacity.tokens,
             deadline_capacity_calibrated=capacity.calibrated,
             cold_ms_per_token=capacity.cold_ms_per_token,
@@ -1843,6 +1956,8 @@ def evaluate_admission(
             new_tokens=new_tokens,
             budget_tokens=guard_cfg.cold_prefill_budget_tokens,
             deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
+            eta_pricing_basis=eta_basis,
+            eta_pricing_ratio=priced_ratio,
         )
     # Deadline token capacity (LP-0MW957RB3000ER79). The bound is expressed in
     # cold tokens (``local_prefill_deadline_seconds * 1000 / cold_ms_per_token``)
@@ -1897,7 +2012,7 @@ def evaluate_admission(
     projected = projected_wait_seconds(
         model,
         prompt_tokens,
-        cached_ratio,
+        priced_ratio,
         wait_occupancy,
         config,
         occupant_prefill_seconds=occupant_prefill_seconds,
@@ -2000,6 +2115,8 @@ def evaluate_admission(
         contended_samples=coeffs.contended_samples,
         cold_samples=coeffs.cold_samples,
         occupant_hold_seconds=projected.measured_occupancy_seconds,
+        eta_pricing_basis=eta_basis,
+        eta_pricing_ratio=priced_ratio,
         deadline_capacity_tokens=capacity.tokens,
         deadline_capacity_calibrated=capacity.calibrated,
         cold_ms_per_token=capacity.cold_ms_per_token,
@@ -2392,7 +2509,7 @@ def record_guard_decision(
         "rate_bucket=%s contended_samples=%d cold_samples=%d "
         "busy_slots=%d in_flight_prefills=%d gate_occupancy=%d "
         "free_slot=%s priority=%s policy=%s model=%s samples=%d provider=%s "
-        "session=%s",
+        "session=%s eta_pricing_basis=%s eta_pricing_ratio=%s",
         verdict,
         reason_logged,
         reason_suffix,
@@ -2438,4 +2555,12 @@ def record_guard_decision(
         decision.samples,
         provider or "unknown",
         session_id or "unknown",
+        # ETA pricing basis (LP-0MWRQ6LSV009DVP4 AC1): additive, after every
+        # pre-existing field, so existing log consumers are unaffected.
+        decision.eta_pricing_basis or ETA_PRICING_BASIS_PREDICTED,
+        (
+            f"{float(decision.eta_pricing_ratio):.4f}"
+            if decision.eta_pricing_ratio is not None
+            else "unknown"
+        ),
     )

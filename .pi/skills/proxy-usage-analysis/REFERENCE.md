@@ -267,6 +267,29 @@ Outputs written to:
       matched pairs are scored; a dispatch whose guard logged no priced ETA
       (inert/uncalibrated, or an inactive observe-mode decision) is counted as
       unmatched and never folded in.
+    - **measured-basis coverage** — `basis_split`
+      (LP-0MWRQ6LSV009DVP4 AC3): the measured-vs-predicted split of
+      ETA-priced admissions, sourced from each `local_admission_guard` line's
+      additive `eta_pricing_basis=` field. Entries: `measured`, `predicted`,
+      `unknown` (lines that predate the field — never relabelled `predicted`),
+      `total`, and `measured_share_pct` = `measured / (measured + predicted)`
+      (`null` when neither basis was observed, so an empty window renders
+      `n/a`, not `0`). Only **admitted** guard records with a positive
+      `eta_prefill_s` are counted (enforced refusals never dispatched). The
+      pre-change 2026-11-21 baseline was `2.3 %` measured (103 of 4 457
+      residency decisions, ladder-gated).
+    - **absolute error p50/p90** — `accuracy`: `samples` (matched pairs),
+      `p50_pct` (the same figure as `prefill_eta_accuracy`) and `p90_pct`
+      (LP-0MWRQ6LSV009DVP4 AC4), both the **absolute** relative error
+      `|predicted − observed| / observed × 100`. The 2026-11-21 pre-change
+      baseline p50 was `863.4 %` (predicted p50 34.95 s vs observed p50
+      3.44 s).
+  - `prefill_eta_accuracy` — the guard's priced prefill ETA vs the dispatch's
+    observed first byte over matched pairs, **median absolute relative error**
+    (see `performance_metric_inputs`). Its `local_admission_guard` line now
+    carries `eta_pricing_basis=measured|predicted` and `eta_pricing_ratio=`, so
+    the report can state the basis the ETA was priced on and the basis split
+    above can be derived. Both fields are absent on pre-change lines.
   - `status_capacity_hint` — the same `capacity_hint` distribution as a
     top-level key (`{idle: n, prefill_bound: n, saturated: n}`), so
     `jq .status_capacity_hint` answers "what did the payload claim while the

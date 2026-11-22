@@ -3194,6 +3194,64 @@ def prefill_eta_accuracy(summary: AnalysisResult) -> float | None:
     return _percentile(sorted(errors), 50)
 
 
+def prefill_eta_accuracy_p90(summary: AnalysisResult) -> float | None:
+    """90th-percentile **absolute relative error** of the prefill ETA, in %.
+
+    Companion to :func:`prefill_eta_accuracy` (LP-0MWRQ6LSV009DVP4 AC4): the
+    same matched-pair error population and the module's shared percentile
+    convention, so the p90 tail the report quotes is derived exactly as the
+    p50 is. ``None`` when no dispatch pairs with a guard record — never ``0``.
+    """
+    errors = [abs(predicted - observed) / observed * 100.0
+              for predicted, observed in prefill_eta_pairs(summary)
+              if observed > 0.0]
+    if not errors:
+        return None
+    return _percentile(sorted(errors), 90)
+
+
+def prefill_eta_basis_share(summary: AnalysisResult) -> dict[str, object]:
+    """Measured-vs-predicted basis split of ETA-priced admissions.
+
+    LP-0MWRQ6LSV009DVP4 AC3: makes the share of ETA-priced admissions whose
+    ``new_tokens`` price was backed by a **measurement** visible, so the
+    2.3 %-measured baseline can be compared before and after the change
+    without ad-hoc log archaeology.
+
+    Counts every *admitted* guard record that carried a positive priced ETA
+    (``eta_prefill_s > 0``) and was not an enforced refusal — the population
+    ``prefill_eta_accuracy`` scores. ``unknown`` covers lines that predate the
+    ``eta_pricing_basis=`` field (never re-labelled ``predicted``).
+    ``measured_share_pct`` is ``measured / (measured + predicted)`` (the
+    lines we can classify); ``None`` when neither basis was observed, so an
+    empty window renders ``n/a`` rather than a fabricated ``0``.
+    """
+    counts = {"measured": 0, "predicted": 0, "unknown": 0}
+    for event in getattr(summary, "local_admission_events", []) or []:
+        eta = _float_or_none(getattr(event, "eta_prefill_s", None))
+        if eta is None or eta <= 0.0:
+            continue
+        if getattr(event, "enforced", None) == "true":
+            continue
+        basis = getattr(event, "eta_pricing_basis", None)
+        if basis not in counts:
+            basis = "unknown"
+        counts[basis] += 1
+    total = sum(counts.values())
+    classified = counts["measured"] + counts["predicted"]
+    return {
+        "measured": counts["measured"],
+        "predicted": counts["predicted"],
+        "unknown": counts["unknown"],
+        "total": total,
+        "measured_share_pct": (
+            round(counts["measured"] / classified * 100.0, 1)
+            if classified
+            else None
+        ),
+    }
+
+
 def per_slot_context_limit(
     session: SessionStats | None,
     config: Mapping | None = None,

@@ -163,3 +163,44 @@ which is triaged in `LP-0MVV9JWL9003A6XR`.
 
 Related: [`docs/dev/contended-prefill-pricing.md`](contended-prefill-pricing.md)
 (the contended pricing and rollback page).
+
+## ETA pricing basis (LP-0MWRQ6LSV009DVP4)
+
+The prefill-ETA admission guard prices `new_tokens = estimated * (1 − ratio)`.
+Historically `ratio` was always the *predicted* cache ratio
+(`expected_cached_ratio`), even when a **measured** resident prefix — the
+session's live `context_tokens` (`measured`) or its last measured dispatch
+(`measured_last_dispatch`) — was available on the same admission path and
+silently discarded. Measured 2026-11-21, this priced a resident prefix as a
+cold prefill: `prefill_eta_accuracy` read **863.4 %** median absolute relative
+error (predicted p50 34.95 s vs observed p50 3.44 s).
+
+`server.local_eta_pricing_basis` (default `measured`) selects the basis:
+
+- **`measured`** — when a *measured* resident prefix exists (`source ∈
+  {measured, measured_last_dispatch}`), the guard prices `new_tokens` from
+  `min(n_past_actual, estimated_tokens)`. The decision and the
+  `local_admission_guard` log line carry `eta_pricing_basis=measured` and
+  `eta_pricing_ratio=`, the stamped dispatch evidence records that same ratio
+  and `new_tokens`, and `prefill_eta_accuracy` scores the enforced figure. The
+  facts are resolved **once** per admission from the already-cached residency
+  view — never a synchronous `/slots` query (llama-server holds `/slots` >15 s
+  during a batch, `LP-0MUXTW4MD003TVIC`).
+- **`predicted`** — the single-value rollback: the pre-change predicted-ratio
+  pricing is restored byte-for-byte at both the guard and the stamped
+  evidence.
+
+`session_slot` (slot owned, size unknown, `n_past_actual is None`),
+`non_resident`, `unknown` and stale views keep the predicted ratio — no
+measurement is inferred from absent data (pricing an unknown-size slot warm
+would admit arbitrarily large prompts on an unverified assumption). The
+deliberate conservatism (`CONSERVATISM_FACTOR = 1.2`, the p75 percentile uplift
+for large prompts, the never-below-p50 floor) is unchanged.
+
+The 24 h report surfaces the change additively: `prefill_eta_error.basis_split`
+(the measured-vs-predicted share of ETA-priced admissions) and
+`prefill_eta_error.accuracy.p90_pct` (the absolute relative error tail beside
+the p50), rendered in the **M3b** section. The pre-change 2026-11-21 baseline
+(local share 20.3 %, ETA refusal 58.3 %, evictions 57, measured share 2.3 %,
+error p50 863.4 %) is the "before" figure.
+
