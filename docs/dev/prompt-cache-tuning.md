@@ -603,6 +603,154 @@ the restart-dominated window prevent a load-matched comparison to the
 > between runs is expected; the committed artifacts are the canonical
 > snapshot.
 
+## What the proxy cannot see (cold-labelled dispatches that were cache hits)
+
+LP-0MWRQVLFY003BK5L. The proxy's `cache_state` / `cached_ratio` on a
+`dispatch_first_byte_ms` line is a **routing prediction**, not a measurement:
+`_lookup_dispatch_cache_state()` reads `provider._get_cached_ratio(model,
+session)`, a table keyed by ``(model, session)``
+(`proxy/proxy/router_helpers.py`, threshold `_WARM_CACHE_RATIO_THRESHOLD =
+0.5`). A fresh session — or one whose entry was invalidated or evicted — has no
+entry, so the ratio defaults to ``0.0`` and the dispatch is labelled ``cold``
+*whatever the backend actually did*.
+
+llama-server's prompt cache is **global and cross-session**:
+`server_prompt_cache` restores a matching prefix into any slot, for any
+session, as long as it is still in `--cache-ram`. The proxy therefore cannot
+see a genuine hit when the routing table has no entry. On the 2026-11-21 window
+that gap produced a large population of sub-second dispatches labelled
+``cached_ratio=0.0`` that were, in fact, almost entirely served from the
+prompt cache.
+
+### Window and figures (2026-11-21, UTC)
+
+The window is the whole of 2026-11-21 as carried by the proxy logs
+(00:00:00 → 23:04:06). The independent cross-check reads the rotated
+`llama-server.log-2026-11-22` file (llama-server lines carry no timestamps, so
+the file *is* the 2026-11-21 window). Every figure in the log-analysis tables
+below is produced by `proxy/scripts/analyse_cold_labelled_cache_hits.py` and is
+reproducible from the commands at the end of this section; the replay figures
+come from `proxy/scripts/replay_cold_labelled_cache_hit.py`.
+
+A dispatch is in the audited set when it is cold-labelled
+(`cache_state=cold` or `cached_ratio=0.0`), its
+`dispatch_to_first_byte_ms` is under **800 ms**, and `estimated_tokens` is
+above **3 000**.
+
+| metric | value |
+|---|---|
+| dispatch lines in window | 2,449 |
+| cold-labelled | 910 |
+| **cold-labelled, sub-800 ms, > 3 000 est tokens** | **572** |
+| distinct sessions | 40 |
+| — one session repeating an identical prompt | 527 (526 at `estimated_tokens=7 185`) |
+| dispatches with a server-side measurement | 572 / 572 (100.0 %) |
+| llama-server `measured_cached_ratio` | median **0.9996** (p10 0.9996 / p90 0.9996, min 0.9841, max 0.9999) |
+| measured new tokens / request | median **4** (max 148) |
+| reused / measured prompt tokens | **5,861,226 / 5,864,993 (99.94 %)** |
+| time-to-first-byte | median 132.9 ms |
+| implied prefill throughput | median **54,063 tok/s** (p10 49,792 / p90 55,784) |
+| engine aggregate prefill rate (same window) | **207.2 tok/s** ⇒ implied is **261×** higher |
+
+> The 572 count differs by one from the 571 quoted when the item was filed; the
+difference is threshold-boundary drift on a re-run, not a change in the data.
+
+**Why the implied rate settles it.** The engine reports its own bulk prefill
+rate in the same window: 3,555,647 tokens prefilled across 2,359 `prompt eval`
+lines, wall time 17,159,629 ms ⇒ **207.2 tok/s**. A dispatch that moves 7,185
+estimated tokens to first byte in 132.9 ms is an implied 54,063 tok/s — 261×
+what the engine can compute inline. (The proxy's `estimated_tokens` relies on a
+char/4 heuristic that *under*-counts here: the repeated prompt tokenises to
+10,011 real tokens, so the true implied rate is higher still.) 54,000 tok/s is
+not a prefill; it is a cache restore.
+
+### Signal 1 — llama-server reuse captured on the dispatch itself
+
+With `local_measured_cache_abort_enabled` on, the proxy injects
+`return_progress` and llama-server reports `cache = n_prompt_tokens_cache`
+against `total`. The proxy logs this as `prefill_progress_measured` **immediately
+before** the dispatch line for the same session. Joining each audited dispatch
+to its own measurement (consumed once, same session) gives, for the example
+line from the item (`estimated_tokens=11499 cached_ratio=0.0`):
+
+```
+prefill_progress_measured session=… total=10011 cache=10007 processed=10007
+    measured_cached_ratio=0.9996 measured_new_tokens=4 priced_new_tokens=100
+ dispatch_first_byte_ms=127.8 dispatch_to_first_byte_ms=127.5
+    cache_state=cold cached_ratio=0.000 estimated_tokens=7185
+```
+
+Every one of the 572 audited dispatches carries such a line, and the median
+measured reuse is **99.96 %** while the routing label said **0 %**.
+
+### Signal 2 — independent llama-server slot-log cross-check
+
+The same file gives a second, proxy-independent derivation. Each task logs
+`new prompt … task.n_tokens = N` and then
+`n_tokens = X, memory_seq_rm [X, end)`; `X` is the retained (reused) prefix and
+`N - X` the tokens actually prefilled:
+
+| metric | value |
+|---|---|
+| tasks / with a reuse line | 2,540 / 2,540 |
+| reused / prompt tokens over the window | **50,343,878 / 51,048,581 (98.62 %)** |
+| dominant repeated prompt | **10,011 tokens × 527 → 99.96 % reused** (exactly `n_past=10,007` each time) |
+| `prompt eval` lines / tokens | 2,359 / 3,555,647 |
+
+So the repeated prompt the proxy priced at `cached_ratio=0.0` reused 10,007 of
+its 10,011 tokens **in the engine's own slot log**, 527 times over.
+
+### Signal 3 — bounded controlled replay
+
+`proxy/scripts/replay_cold_labelled_cache_hit.py` sends the **same** prompt
+twice, each from a fresh `X-Session-Id`, and records both sides. The proxy prices
+every fresh session cold; the engine caches the prefix across sessions. A live
+run on 2026-11-22 11:36 UTC (prompt 4,146 real tokens, proxy estimate 3,651):
+
+| request | proxy label | first byte | llama-server `prompt eval` |
+|---|---|---|---|
+| cold (first session) | `cold / 0.0` | 6,504.7 ms | `5821.42 ms / 4146 tokens` (712.20 tok/s) |
+| warm (second, **fresh** session) | `cold / 0.0` | **92.2 ms** | **`50.04 ms / 4 tokens`** |
+
+The second request was priced `cached_ratio=0.0` / `cache_state=cold` yet
+llama-server reports `measured_cached_ratio=0.999` (4,142 of 4,146 tokens
+reused) and computes only **4** tokens — a **60.6×** first-byte speedup. That is
+a warm prefix the proxy did not price.
+
+Scope/constraints honoured: no synchronous `/slots` call is added to the
+admission path (the replay speaks only the normal chat-completions protocol),
+and no proxy restart was needed — the replay ran against the running proxy.
+The `private` local-only alias is used, whose `force_full_prompt` sends the
+whole prompt each turn: exactly the cross-session-cache case. The replay is
+bounded to two requests and retries the proxy's retryable 503 (capacity) rather
+than disturbing an in-flight prefill.
+
+### Reproduction
+
+```bash
+# Log-only analysis (two independent signals; --llama-log is optional)
+./proxy/scripts/analyse_cold_labelled_cache_hits.py \
+    --date 2026-11-21 \
+    --llama-log /var/log/llama-proxy/llama-server.log-2026-11-22
+
+# Same window, machine readable (the figures above)
+./proxy/scripts/analyse_cold_labelled_cache_hits.py \
+    --date 2026-11-21 \
+    --llama-log /var/log/llama-proxy/llama-server.log-2026-11-22 --json
+
+# Any other window; proxy-log timestamps are the authoritative boundary
+./proxy/scripts/analyse_cold_labelled_cache_hits.py \
+    --start '2026-11-21 00:00' --end '2026-11-22 00:00'
+
+# Bounded controlled replay (two requests; retries a capacity 503 only)
+./proxy/scripts/replay_cold_labelled_cache_hit.py
+```
+
+The analysis exits 0 and prints the audited set, its measured reuse and the
+implied-vs-engine rate. The replay exits 0 only when the second (fresh) session
+is priced cold but measured warm; `--json` on either script is the canonical
+artifact to commit for a later comparison.
+
 ## Non-goals
 
 * `force_full_prompt` / delta-routing behaviour.
