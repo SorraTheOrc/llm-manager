@@ -4270,6 +4270,13 @@ def _append_contention_prediction_section(
        "dispatches (a 0.3 s first byte against a several-second ETA is a huge "
        "percentage). "
        f"**(matched prefill ETA verdict: {matched['verdict']})**")
+    ap("**Part of the over-prediction is unobservable prompt-cache warmth, not "
+       "calibration error** (LP-0MWRQ6ZID000HZAZ): the ETA prices per-session "
+       "KV residency while llama-server's cross-session prompt cache can still "
+       "serve a dispatch logged as cold, so a large error is not the "
+       "calibration to retune. A measured resident prefix that is available in "
+       "the admission path but not wired into the ETA is a separate cause "
+       "(LP-0MWRQ6LSV009DVP4).")
     ap("")
 
 

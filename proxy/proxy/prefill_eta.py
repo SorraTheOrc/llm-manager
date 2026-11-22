@@ -127,6 +127,38 @@ log line both publish that context (``prefill_eta_kind`` =
 its own request's cost. A dispatcher that knows its prompt size and cache state
 should price *its own* request with :func:`estimate_prefill_seconds` (the same
 per-request path the admission guard enforces).
+
+What the ETA cannot see (LP-0MWRQ6ZID000HZAZ)
+---------------------------------------------
+
+The ETA prices **per-session KV residency, not llama-server's cross-session
+prompt cache**. ``cached_ratio`` is a per-``(model, session)`` ratio — the share
+of the prompt served from the slot's own KV — while llama-server's
+``--cache-ram`` prompt cache (``40960`` MiB in the shipped ``models.ini``; see
+``docs/dev/prompt-cache-tuning.md``) is shared *across* sessions. A dispatch
+logged with ``cached_ratio=0.0`` can therefore still be **warm** and fast to
+first byte: that cache is unpriced input, not a zero-cost one.
+
+Why the gap is unobservable at admission
+-----------------------------------------
+
+Warmth cannot be read on the admission hot path. There is no synchronous
+``/slots`` probe there — ``/slots`` was measured held for more than 15 s during
+a prompt batch (LP-0MUXTW4MD003TVIC) — so ``proxy/residency.py`` serves a
+*cached* snapshot instead, and the ETA is priced from a prediction
+(``expected_cached_ratio``), never from the cache's actual contents. What
+warmth there was becomes knowable only **after the fact**:
+``update_cached_ratio`` records turn N's usage from its own response and
+``record_measured_divergence`` corrects turn N+1, so the turn being priced is
+always scored from the best prior guess.
+
+This blind spot is a named limitation, distinct from
+LP-0MWRQ6LSV009DVP4 — a **measured** resident prefix (``n_past_actual``) that is
+available in the admission path but not yet wired into the ETA. That one is a
+defect and is fixable; cross-session warmth is not observable at admission at
+all, so part of any ETA over-prediction is unobservable prompt-cache warmth
+rather than calibration error. Retuning the calibration cannot recover it — do
+not try.
 """
 
 from __future__ import annotations

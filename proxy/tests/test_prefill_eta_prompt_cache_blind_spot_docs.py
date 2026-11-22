@@ -22,11 +22,12 @@ limitation** in the module documentation, not an inference from the code.
 
 Red-first ordering (LP-0MWJOUV5P007R799 convention)
 ---------------------------------------------------
-The assertion that fails against today's documentation is marked
-``xfail(strict=True)`` with a reason naming the documentation child. The
-dev-push gate therefore stays green while the red witness is recorded; once the
-prose lands the strict marker turns red (XPASS) and forces its removal. Do not
-weaken the assertion to make it green — land the prose instead.
+The assertion that failed against the pre-change documentation was marked
+``xfail(strict=True)`` with a reason naming the documentation child, so the
+dev-push gate stayed green while the red witness was recorded and the marker
+turned red (XPASS) once the prose landed — it was removed by
+LP-0MWRQVG4C002C5YV, the documentation child. Do not weaken an assertion to
+keep it green.
 
 The checker accepts any wording that states the facts; the canonical paragraph
 below is offered so the documentation child can satisfy the contract without
@@ -38,8 +39,6 @@ from __future__ import annotations
 import configparser
 import re
 from pathlib import Path
-
-import pytest
 
 from proxy import prefill_eta
 
@@ -175,13 +174,6 @@ def test_the_shipped_model_configures_a_cross_session_prompt_cache():
 # The shipped module documentation
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the limitation is prose and lands in "
-        f"{DOCS_CHILD}; this is the red-first witness (LP-0MWRQVFDU005WN76)"
-    ),
-)
 def test_the_module_documentation_names_the_cross_session_prompt_cache():
     """AC1/AC2: the ETA contract states the input it cannot price.
 

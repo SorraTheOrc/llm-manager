@@ -901,7 +901,13 @@ single roll-up that produces exactly these keys):
   smaller error is a better prediction and the best-3 retention keeps the
   *best* (smallest-error) windows. Errors above 100 % are reported above 100 %
   — never clamped to an accuracy percentage. `n/a` when no dispatch pairs
-  with a guard record.
+  with a guard record. **Part of the over-prediction is unobservable
+  prompt-cache warmth, not calibration error** (LP-0MWRQ6ZID000HZAZ): the ETA
+  prices per-session KV residency while llama-server's cross-session prompt
+  cache can still serve a dispatch logged as cold, so a large error is not the
+  calibration to retune (see the prompt-cache blind spot in
+  [Limitations](#limitations); the separate measured-prefix defect is
+  LP-0MWRQ6LSV009DVP4).
 
 ### Committed defaults: `metrics/performance_metrics.yaml`
 
@@ -2202,6 +2208,26 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   and applies the 25 % tolerance. A window with no guard records (inert guard,
   or pre-change logs) reports the matched figure as `inconclusive` with
   `unmatched_dispatches` counted — never as a fabricated match.
+- **The ETA prices per-session KV residency, not llama-server's cross-session
+  prompt cache (LP-0MWRQ6ZID000HZAZ, parent; blind spot named with
+  LP-0MVGDUV5E005UWBQ).** `cached_ratio` is a per-(model, session) ratio — the
+  share of the prompt served from the slot's own KV — while llama-server's
+  `--cache-ram` prompt cache (shipped cap `40960` MiB) is
+  shared *across* sessions. A dispatch logged with `cached_ratio=0.0` can
+  therefore still be **warm** and fast to first byte, and the cache is unpriced
+  input: warmth is unobservable at admission (there is no synchronous `/slots`
+  probe on the hot path — `/slots` was measured held >15 s during a prompt
+  batch, LP-0MUXTW4MD003TVIC — so `proxy/proxy/residency.py` prices a *cached*
+  snapshot and the guard uses a prediction) and only knowable post hoc
+  (`update_cached_ratio` writes turn N's usage, `record_measured_divergence`
+  corrects turn N+1). So a large `prefill_eta_accuracy` — 863 % median in the
+  2026-11-21 window — is partly over-conservative pricing of warmth the ETA
+  could not see, **not** only calibration error; retuning the conservatism
+  factor or the percentile knobs cannot recover it. **Distinct from
+  LP-0MWRQ6LSV009DVP4**, which is a *measured* resident prefix (`n_past_actual`)
+  available in the admission path but not yet wired into the ETA — a fixable
+  defect. The two causes must not be conflated when attributing an
+  over-prediction.
 
 - **Engine eval timings are summed, never placed in time
   (LP-0MVNWULLI006ZYXX).** llama-server writes no per-line timestamps

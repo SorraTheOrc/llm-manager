@@ -2300,6 +2300,42 @@ either case, and the deadline + safety bounds still refuse anything that could
 not finish. The log line carries `budget_s` (the resolved queue budget) and
 `bound_s` (the bound actually enforced), so the two can never be confused.
 
+### What the ETA cannot see: the cross-session prompt cache (LP-0MWRQ6ZID000HZAZ)
+
+The formula above prices **per-session KV residency, not llama-server's
+cross-session prompt cache**. `cached_ratio` is a per-(model, session) ratio —
+the share of the prompt served from the slot's own KV — while llama-server's
+`--cache-ram` prompt cache (`40960` MiB in the shipped `models.ini`, see
+[docs/dev/prompt-cache-tuning.md](../../docs/dev/prompt-cache-tuning.md)) is
+shared *across* sessions. A dispatch logged with `cached_ratio=0.0` can
+therefore still be **warm** and fast to first byte: the cache is unpriced
+input, so the `coded_tokens` term under-counts what it actually saved.
+
+It has to be unpriced, because the warmth is unobservable at admission. There
+is no synchronous `/slots` probe on the admission hot path — `/slots` was
+measured held for more than 15 s during a prompt batch
+(LP-0MUXTW4MD003TVIC) — so `proxy/proxy/residency.py` serves a *cached*
+snapshot instead and the guard prices a prediction
+(`expected_cached_ratio`). Warmth becomes knowable only post hoc:
+`update_cached_ratio` writes turn N's usage from its own response and
+`record_measured_divergence` corrects turn N+1.
+
+Two consequences for anyone reading an ETA verdict or the report's
+`prefill_eta_accuracy`:
+
+- A refusal can be over-conservative for a prompt that is in fact warm from
+  another session's prefill — the guard cannot prove it, and admitting on an
+  unverified assumption is the failure mode the guard exists to prevent.
+- Part of the observed over-prediction (the 863 % median in the 2026-11-21
+  window) is **unobservable prompt-cache warmth, not calibration error**. Do
+  not retune the conservatism factor or the percentile knobs to chase it.
+
+This is a named limitation, **distinct from LP-0MWRQ6LSV009DVP4** — a
+*measured* resident prefix (`n_past_actual`) that is already available in the
+admission path but is not yet wired into the ETA. That one is a fixable defect;
+cross-session warmth is not observable at admission at all. The two causes must
+not be conflated when attributing an over-prediction.
+
 ### The ETA refusal is only taken when a remote can serve (LP-0MW0KZR7A003UFQK)
 
 The guard's refusal is a **capacity** judgement about the local engine, so it

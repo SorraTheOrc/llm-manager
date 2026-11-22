@@ -26,10 +26,11 @@ The three surfaces an operator or maintainer reads are pinned separately:
 
 Red-first ordering (LP-0MWJOUV5P007R799 convention)
 ---------------------------------------------------
-Each shipped-prose assertion is marked ``xfail(strict=True)`` with a reason
-naming the documentation child, so the dev-push gate stays green while the red
-witness is recorded. Once the prose lands each strict marker turns red (XPASS)
-and forces its removal. Do not weaken an assertion to make it green.
+Each shipped-prose assertion was marked ``xfail(strict=True)`` with a reason
+naming the documentation child, so the dev-push gate stayed green while the red
+witness was recorded and each strict marker turned red (XPASS) once the prose
+landed — the markers were removed by LP-0MWRQVG4C002C5YV, the documentation
+child. Do not weaken an assertion to keep it green.
 
 The checkers assert *facts* (which cache, priced how, knowable when), so the
 prose may be rewritten freely; the canonical wordings below are offered so the
@@ -42,8 +43,6 @@ import re
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
@@ -269,13 +268,6 @@ def _assert_states_caveat(name: str, text: str, missing: list[str]) -> None:
 # The shipped surfaces
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the limitation is prose and lands in "
-        f"{DOCS_CHILD}; this is the red-first witness (LP-0MWRQVFDU005WN76)"
-    ),
-)
 def test_the_limitations_section_states_the_blind_spot():
     """AC2: a reader of ``## Limitations`` learns the ETA cannot see warmth."""
     section = _limitations_section()
@@ -290,13 +282,6 @@ def test_the_limitations_section_states_the_blind_spot():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the caveat is prose and lands in "
-        f"{DOCS_CHILD}; this is the red-first witness (LP-0MWRQVFDU005WN76)"
-    ),
-)
 def test_the_prefill_eta_accuracy_definition_states_the_caveat():
     """AC4: the metric definition says part of the error is unobservable warmth."""
     name = "REFERENCE.md `prefill_eta_accuracy` definition"
@@ -305,13 +290,6 @@ def test_the_prefill_eta_accuracy_definition_states_the_caveat():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the M3b copy lands in "
-        f"{DOCS_CHILD}; this is the red-first witness (LP-0MWRQVFDU005WN76)"
-    ),
-)
 def test_the_m3b_copy_states_the_caveat():
     """AC3: the rendered M3b copy does not read as pure calibration error."""
     rendered = _render_m3b()
