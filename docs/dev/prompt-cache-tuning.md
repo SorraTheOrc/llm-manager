@@ -751,6 +751,272 @@ implied-vs-engine rate. The replay exits 0 only when the second (fresh) session
 is priced cold but measured warm; `--json` on either script is the canonical
 artifact to commit for a later comparison.
 
+The measurement above establishes *that* warmth is invisible. Which detection
+path, if any, can make it visible to the ETA — and what each would cost — is
+assessed below in
+[Detection paths assessed](#detection-paths-assessed-lp-0mwrrqvm5l006rc05)
+(LP-0MWRQVM5L006RC05).
+
+## Detection paths assessed (LP-0MWRQVM5L006RC05)
+
+Work item: [investigation] Assess warm-prefix detection paths and file
+follow-ups. The question is narrow: **can anything turn cross-session prompt-
+cache warmth into an input the admission ETA can price?** Three candidate paths
+are assessed — (a) llama-server prompt-cache metrics on `/metrics` or `/slots`,
+(b) an **asynchronous** warm-prefix sampler feeding the residency sidecar, and
+(c) charging the observed cold-first-byte outcome back into the calibration
+window.
+
+Each is scored on the measurement it needs, the cost/latency it adds to the
+admission path, and a verdict. Everything below was measured on this host on
+2026-11-22 against llama-server build `e97492369` (the deployed
+`/home/rgardler/llama.cpp/build/bin/llama-server`, router mode over
+`models.ini`, `Qwen3` loaded).
+
+| path | measurement it needs | available? | cost added to admission | verdict |
+|---|---|---|---|---|
+| (a) `/metrics` or `/slots` cache metrics | per-request cache-hit tokens or cache-ram contents | **no** — `/metrics` 501, and aggregates only; `/slots` carries no cache contents | none if scraped, but a `--metrics` flag + restart, and fleet-level only | **not viable** |
+| (b) async warm-prefix sampler → sidecar | the measured `prompt_progress` `cache / total` of a completed dispatch, keyed by prompt-prefix fingerprint | **yes** — already captured by `local_measured_cache_abort_enabled` | ~0.06 ms per admission (fingerprint + lookup), no upstream call | **viable with conditions** — recommended |
+| (c) charge the observed outcome back into the calibration window | the same measured `cache / total`, read where the sample is recorded | **yes** — the measurement is already in scope ~20 lines below the sample call | **zero** (no new work, no new call) | **viable with conditions** — required, not sufficient on its own |
+
+### (a) llama-server prompt-cache metrics on `/metrics` or `/slots` — not viable
+
+**What it would need.** A per-request cache-hit count (or the current contents of
+the prompt cache, keyed by prompt) so admission can ask "is *this* incoming
+prefix warm?".
+
+**What the deployed build actually exposes.**
+
+```console
+$ curl -s 'http://localhost:8080/metrics?model=Qwen3'
+{"error":{"code":501,"message":"This server does not support metrics endpoint. Start it with `--metrics`","type":"not_supported_error"}}
+```
+
+The metrics endpoint is not enabled by the running process (`ps` shows no
+`--metrics`; `models.ini` sets none), so enabling it is a preset edit **plus a
+restart**. More decisively, the endpoint could not answer the question even when
+enabled: at this build the whole metric set is aggregate
+(`tools/server/server-context.cpp`, `get_metrics`) — counters
+`prompt_tokens_total`, `prompt_seconds_total`, `tokens_predicted_total`,
+`tokens_predicted_seconds_total`, `n_decode_total`, `n_tokens_max`,
+`n_busy_slots_per_decode`; gauges `prompt_tokens_seconds`,
+`predicted_tokens_seconds`, `requests_processing`, `requests_deferred`. There is
+**no cache-hit counter, no `cache-ram` occupancy gauge and no prompt identity**.
+
+`/slots` is no better. A live probe (2026-11-22, 1.07 s round-trip on a busy
+slot) returned exactly:
+
+```json
+["id", "n_ctx", "speculative", "is_processing", "id_task", "params", "next_token"]
+```
+
+The current task's prompt text and generated text appear only under
+`LLAMA_SERVER_SLOTS_DEBUG` (`slots_debug`, `server_slot::to_json`), and even then
+they describe **the slot's own task**, not the global prompt cache. The cache
+itself (`server_prompt_cache`, `tools/server/server-task.cpp`) has no HTTP
+surface at all: `load()`/`alloc()`/`update()` are internal, and `update()`
+evicts `states.front()` — **oldest-first by bytes** against the `cache-ram`
+limit — which the proxy cannot observe.
+
+**Cost.** Zero on the admission path if scraped asynchronously, but the signal
+is a fleet-level delta (`prompt_tokens_total` counts only tokens actually
+pushed into a batch, i.e. *after* prefix reuse — verified at
+`server-context.cpp:2540`, so Σ submitted − Δ counter is an aggregate hit
+volume). It cannot attribute warmth to the request being admitted.
+
+**Verdict: not viable** as a warm-prefix detector. It remains useful as a
+coarse aggregate cross-check, which the committed log analysis already provides
+for free (§"Signal 1/2" above), so no follow-up is filed for enabling it.
+
+### (b) asynchronous warm-prefix sampler feeding the sidecar — viable with conditions (recommended)
+
+**What it needs.** The only measured warmth the proxy ever sees: the
+`prompt_progress` event's `cache` / `total` for a **completed** dispatch
+(`measured_prefill.get_measured_prefill`), plus a tokenizer-free fingerprint of
+that dispatch's message list (`slot_cache_ratio.message_fingerprints`). Written
+into an in-process index keyed by `(model, fingerprint prefix)` →
+`(measured total, measured cache, observed_at)`.
+
+**Why "asynchronous", and why not `/slots`.** The AC forbids a synchronous
+hot-path `/slots` call for the measured reason (`/slots` held >15 s during a
+prompt batch, LP-0MUXTW4MD003TVIC). A sampler *of `/slots`* would also be
+useless here: `/slots` carries no cache-ram contents (above), and the proxy's
+existing ~1 s snapshot (`observability._last_slot_details_cache`, consumed by
+`residency.py`) therefore can only ever describe **slot** residency — the
+per-session fact the ETA already prices. The sampler that works is the one that
+writes the **measurement the dispatch already produced**, off the admission
+path, at first-byte time — the same place `record_dispatch_sample` and
+`record_cold_measured_sample` already run.
+
+**Cost added to the admission path.** One fingerprint pass plus one prefix
+comparison, no HTTP:
+
+```console
+$ python3 -c "...message_fingerprints on 31 messages / 97.5 KB..."
+# 200 iterations, 2026-11-22, this host
+fingerprint:   0.057 ms per call
+prefix_match:  0.0005 ms per call
+```
+
+0.06 ms against a 30 s queue budget is ~5 orders of magnitude of headroom.
+
+**Conditions for viability.**
+
+1. **Measured evidence only.** An entry may be written only from a real
+   `prompt_progress` measurement — never from a prediction, or the index
+   inherits the very optimism it exists to remove.
+2. **The credit is capped at the measurement** (as
+   `slot_cache_ratio.safety_margin` caps the slot-snapshot credit), because the
+   entry can go stale: llama-server evicts oldest-first by bytes, so a still-held
+   entry can be a prefix it has already dropped.
+3. **The failure mode is over-credit, and it is bounded by an existing
+   backstop.** A mis-credited, actually-cold dispatch is released early by the
+   measured-cache-abort path (`reason=measured_cache_deficit`, measured p50
+   3.8 s versus the 120 s prefill deadline in force when that was measured —
+   180 s today). That backstop must stay armed.
+4. **It cannot help a first occurrence.** A novel prefix has no measurement, so
+   the blind spot remains for the first time a prompt is ever seen — by
+   construction, not by omission.
+
+**Expected effect — measurable.** The audited population is a *repeat* prefix,
+so it is exactly what this path can price:
+
+| figure | measured baseline | with the measured-warmth credit |
+|---|---|---|
+| own-ETA of a 12,176-token repeat (guard records, 2026-11-22) | **29.7 s** (p50 over the 33 audited pairs) | **≈25.6 s** on today's coded coefficient (≈2.1 ms/token, inferred from 1,125 guard records), **< 1 s** once the coded coefficient is fixed (LP-0MWL0VHOY0065EI8) |
+| `prefill_eta_accuracy` p50 over those matched pairs | **10,764 %** | ≈7,000 % on today's coefficient, **≈40–100 %** with the coded fix |
+| admission behind one occupant (`projected_wait = eta × (busy + 1)`) | 59.4 s vs a 30 s budget → **refused** | 51.2 s → still refused; **< 2 s → admitted** |
+
+The last two rows are the reason (b) is *recommended* rather than *sufficient*:
+the credit changes what the ETA multiplies, and today the multiplier itself is
+inflated — 182 guard records on 2026-11-22 price a prompt with **≤ 60 new
+tokens** at **≥ 20 s** of own prefill, e.g.
+
+```
+2026-11-22 00:02:43,513 local_admission_guard decision=reject reason=eta_exceeds_budget
+  eta_prefill_s=60.0 eta_occupancy_s=120.0 new_tokens=22 projected_wait_s=179.9 budget_s=30.0
+  rate_bucket=solitary samples=200 busy_slots=2 …
+```
+
+A request with 22 new tokens priced at 60 s of own prefill — that is the
+coded-coefficient defect already filed as LP-0MWL0VHOY0065EI8, not the blind
+spot, and no warmth credit can repair it.
+
+### (c) charging the observed outcome back into the calibration window — viable with conditions
+
+**What it needs.** Nothing new: the router holds the measured ratio of the
+dispatch it is recording. In `proxy/proxy/router.py` the priced window is fed the
+**prediction** (~l.3327)
+
+```python
+record_dispatch_sample(model_name, _estimated_tokens, _cached_ratio,
+                       _first_byte_service_ms, contended=_is_contended)
+```
+
+while ~20 lines below the same scope reads the **measurement** for
+`record_cold_measured_sample` (`measured_prefill.get_measured_prefill(model,
+session_id)`). A cross-session hit therefore enters the window as
+`(coded=0, new=<whole prompt>, ms≈130)`.
+
+**Cost added to the admission path: zero.** The measurement is already in scope;
+this is a change of argument, not a new call.
+
+**Evidence that this matters.** 2026-11-22 partial window (00:00 → 13:10 UTC): of
+the 1,317 measured dispatches ≥ 3,000 estimated tokens, **42.3 %** were priced at
+≥ 2× their measured new tokens (Σ priced 4,884,984 vs Σ measured 3,384,634 new
+tokens), and the audited set's median measured reuse is 0.9997 against a routing
+label of 0.0. Replaying the solitary window over the same 1,102 dispatches
+through the shipped `_fit` / `estimate_prefill_seconds`:
+
+| window fed | coded ms/token | prefill ms/token | 14,548-token cold ETA | 12,176-token fully-warm ETA |
+|---|---|---|---|---|
+| the **predicted** ratio (today) | 0.352 | 1.987 | 28.9 s | 5.13 s |
+| the **measured** ratio | 0.228 | **3.975** | **57.8 s** | 3.33 s |
+
+Phantom-cold samples **halve** the fitted cold-prefill rate; fed measured data
+the fit lands on 3.98 ms/token, agreeing with the engine's own aggregate prefill
+rate (207.2 tok/s ≈ 4.8 ms/token) and the shipped 3.9 ms/token default.
+
+#### Reproduction
+
+The replay reuses the committed analyser for parsing and joining, then feeds the
+shipped sampler and fit — no proxy import, no upstream call:
+
+```python
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location(
+    "an", "proxy/scripts/analyse_cold_labelled_cache_hits.py")
+an = importlib.util.module_from_spec(spec); sys.modules["an"] = an
+spec.loader.exec_module(an)
+sys.path.insert(0, "proxy")
+from proxy import prefill_eta
+
+lines = an.read_log_lines(an.discover_proxy_logs(an.DEFAULT_LOG_DIR))
+events = sorted(
+    (e for e in (an.parse_dispatch(l) or an.parse_measurement(l) for l in lines)
+     if e is not None and START <= e.ts <= END),
+    key=lambda e: e.ts)
+paired = an.join_measurements(events)
+
+for use_measured in (False, True):          # predicted (today) / measured (path c)
+    prefill_eta._samples.clear()
+    for p in paired:
+        d = p.dispatch
+        ratio = d.cached_ratio
+        if use_measured and p.measurement is not None:
+            ratio = p.measurement.measured_cached_ratio
+        prefill_eta.record_dispatch_sample(
+            d.model, d.estimated_tokens, ratio, d.to_first_byte_ms)
+    eta, coeffs = prefill_eta.estimate_prefill_seconds(d.model, 14_548, 0.0)
+    print(use_measured, eta, coeffs.coded_ms_per_token, coeffs.prefill_ms_per_token)
+```
+
+with `START`/`END` set to the window above (`2026-11-22T00:00:00` …
+`2026-11-22T23:59:59`). The replay models the **solitary** window only; the live
+proxy also populates a contended window, which is why the live fitted rates
+differ from these — the direction and the ≈2× gap are the claim, not the
+absolute milliseconds. As everywhere else in this document the window is live,
+so a re-run over a longer corpus drifts by a few percent (the committed table is
+the snapshot).
+
+**Conditions for viability.**
+
+1. **It does not detect anything.** It re-rates the estimator; an unmeasured
+   prompt is still priced cold, so on its own it changes no admission decision
+   for the blind-spot population.
+2. **It must not ship alone.** Honest cold prices are *higher*: the 14,548-token
+   cold prompt moves 28.9 s → 57.8 s, i.e. from "admitted inside a 30 s budget"
+   to "refused". Shipping (c) without (b) converts admits into refusals for
+   prompts that are, in fact, warm.
+3. **It is the right sample source for (b).** Crediting a warmth ratio against
+   rates fitted from phantom-cold samples is half a fix — which is why it is the
+   blocking prerequisite of the recommended path.
+
+**Verdict: viable with conditions** — a strict calibration-fidelity fix, and the
+prerequisite of (b). Filed as LP-0MWRWBJPP001Q5JX.
+
+### Recommendation
+
+**Path (b)** — the asynchronous warm-prefix index written from the measured
+`prompt_progress` reuse and read at admission — is the only path that can price
+cross-session warmth, and path (a) is closed by the backend surface rather than
+by effort. Ship it with its two prerequisites:
+
+| follow-up | role | state |
+|---|---|---|
+| `LP-0MWRWBPFV00339XP` — *Price cross-session prompt-cache warmth at admission from the measured reuse of a matching prefix* | the recommended path | filed, blocked |
+| `LP-0MWRWBJPP001Q5JX` — *Prefill calibration window is fed the predicted cache ratio* | blocking prerequisite (path (c)) | filed, open |
+| `LP-0MWL0VHOY0065EI8` — *Warm 99 %-cached prompt priced near cold rate* | conditional prerequisite: the coded coefficient that the credit multiplies | pre-existing, open |
+
+Expected effect, stated against this document's own baseline: the audited
+population's own-ETA p50 falls from **29.7 s** to the coded-term floor of
+**≈25.6 s** from the credit alone, and to **< 1 s** with LP-0MWL0VHOY0065EI8;
+the matched `prefill_eta_accuracy` p50 over those pairs falls from **10,764 %**
+to below **1,000 %**; and the audit set stops being refused behind a single
+occupant (59.4 s → < 2 s projected wait against a 30 s budget). None of these
+figures is a behaviour change in this item: it is an investigation, and the
+pricing ships under the items above, each with its own restart.
+
 ## Non-goals
 
 * `force_full_prompt` / delta-routing behaviour.
