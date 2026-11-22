@@ -3,8 +3,11 @@
 **Work item:** LP-0MVWC0FAT0018PMW — *Coordinate restart-free 24 h measurement
 windows across concurrent verification items*
 **Kind:** process / record (no code change, no scheduling knob)
-**Last refreshed:** 2026-11-02T11:05Z (populated from the live Worklog, **not**
-the stale 2026-10-31 list in the originating item)
+**Last refreshed:** 2026-11-22T12:00Z — restart rows for 2026-11-15/16/18/19 and the
+post-fix `slots_stale` window row added by LP-0MWLZ68SF0052E7Z. The rest of the
+calendar is still the 2026-11-02 snapshot (populated from the live Worklog, **not**
+the stale 2026-10-31 list in the originating item); a full re-population is not
+this item's scope.
 
 This file is the single coordination record for restart-free measurement
 windows. It exists because every one of the open verification items below needs
@@ -100,7 +103,11 @@ run **without** `--reason`; the rest name their deploy:
 | 2026-11-01T13:17:50 | 1315877 | release-lag fix deploy (LP-0MVUVHBZH007INL1) |
 | 2026-11-01T21:26:41 | 1487007 | manual, no reason |
 | 2026-11-02T10:38:10 | 3684928 | LP-0MVZ2EPI3006Y0WN deploy of `9f3b9c06` (starvation fix) — `--reason` omitted, so manual/unknown |
-| **2026-11-02T10:39:25** | **3698721** | **current anchor** — LP-0MVWBXDZA00494HK live verification (slices 2-3, unloaded-model `/slots` skip) |
+| **2026-11-02T10:39:25** | **3698721** | **anchor of the 2026-11-02 refresh** — LP-0MVWBXDZA00494HK live verification (slices 2-3, unloaded-model `/slots` skip) |
+| 2026-11-15T01:06:51 | 3122239 | manual, no reason (recovered from the retained segment) |
+| 2026-11-16T15:20:49 | 3720326 | `reason=LP-0MW7V14DN007F127: group-2 validation restart (cold-regime ETA + deadline token capacity)` — the re-arm #6 anchor in § 3.4 |
+| **2026-11-18T10:24:29** | **1789326** | **anchor of the post-fix `slots_stale` window** (§ 3.4) — `reason=LP-0MVVCO1N7004TNGY: deploy F3 shared /slots snapshot (156f3cd3d) + F4 age-derived slots_stale schema 8 (1aeca7059) + F5 residual attribution (d8ce36dc9)` |
+| 2026-11-19T19:36:07 | 2765810 | manual, no reason — 9 h 11 m **after** that window closed, so it did not void it |
 
 ---
 
@@ -120,7 +127,7 @@ coordination record.
 | **LP-0MVP7HX2S008IU57** | router-responder `GET /slots … 500 == 0` after the child-port discovery fix | `f58e8964` + `189864fc` (LP-0MVP7525P008RXMF, deployed 2026-10-26T21:01:42Z) | `2026-10-27T12:00Z → 2026-10-28T12:00Z` — **expired** | Superseded in practice by the `/health`-fix measurement (LP-0MVVLKPBM007F6U6, RED); needs an explicit disposition, not a fresh 24 h window |
 | **LP-0MVVLQMG1000843Q** | writer-side sidecar pairing, ≥ 24 h post-deploy | `5c0f80f9` (LP-0MVVI8TEU006KTOZ, 2026-10-31T06:18:04Z) — **in the loaded anchor build** | `deploy + 24 h`; current anchor `2026-11-02T10:39:25Z → 2026-11-03T10:39:25Z` | Assignee hold (`Map`); fix is deployed, so a window is available once the hold is released |
 | **LP-0MVU8003X0018WT8** | router-responder `GET /slots … 400 == 0` after the `?model=` fixes | LP-0MVU7ZZTH005FSFL slices (merged; record loaded build at anchor) | `earliest 2026-11-01T23:56Z` (based on the 2026-10-31T23:56 restart) — **superseded** | **Re-arm** to the current anchor (`→ 2026-11-03T10:39:25Z`) |
-| **LP-0MVVCO1N7004TNGY** | `slots_stale` over 24 h (target < 5 %; measured 29.59 %) | baseline `f58e8964`; the read-path fix under test is not yet landed | one 24 h re-measure after the fix is deployed | In progress; **not yet armable** — no fix build to anchor on |
+| **LP-0MVVCO1N7004TNGY** | `slots_stale` over 24 h (target < 5 %; measured 29.59 %) | F3 `156f3cd3d` + F4 `1aeca7059` + F5 `d8ce36dc9`, deployed by the 2026-11-18T10:24:29Z restart | `2026-11-18T10:25:00Z → 2026-11-19T10:25:00Z` — **measured** (see § 3.4) | **Done**: `slots_stale` **4.88 %** (608/12,450) at the 300 s ceiling; tightened 2 s reading 31.60 %. Outcome recorded by LP-0MWLZ68SF0052E7Z |
 | **LP-0MVVXGMRN007NCJP** | re-measure the 24 h `slots_stale` window; record AC2 disposition | fix under LP-0MVVCO1N7004TNGY | `≥ 24 h` after that fix is deployed | **Blocked** on the parent fix |
 | **LP-0MVZ2EPI3006Y0WN** | restart the proxy onto the starvation fix, then let ≥ 24 h elapse | `9f3b9c06` (LP-0MVW8S8DH008E4W4, 2026-11-02T09:12:09Z) — **deployed** by the 2026-11-02T10:38:10 restart | window anchored at the current restart: `2026-11-02T10:39:25Z → 2026-11-03T10:39:25Z` | **Deploy done**; verification carried by **LP-0MVZ4R2B20027XK3** (run-not-before 2026-11-03T10:39:24Z) |
 | **LP-0MVZ4R2B20027XK3** | verify the ≥ 24 h restart-free window for the starvation fix | the build loaded at the 2026-11-02T10:39:24Z anchor (`9f3b9c06` present) | `2026-11-02T10:39:25Z → 2026-11-03T10:39:25Z` (run instant = window end) | Open; do **not** restart the proxy before 2026-11-03T10:39:24Z |
@@ -137,6 +144,7 @@ coordination record.
 | Item | Window (UTC) | Anchor / loaded build | Outcome |
 |---|---|---|---|
 | **LP-0MVN44XB0009M33K** (re-arm #6, AC4 resident-prefix) | `2026-11-16T15:21:00Z → 2026-11-17T15:21:00Z` — 24.0 h, 100 % covered, five log segments | restart `2026-11-16T15:20:47Z` pid 3720326 (`reason=LP-0MW7V14DN007F127: group-2 validation restart`); loaded build `79f53ac1` | **PASS** (both AC6 gates): scheduling-attributed cancellations 22 → **0**, `residency_measured_decisions` 0 → **252**. Qualifier: 14:24:42Z–15:21Z had the local route closed by an orphaned prefill marker (`LP-0MWKWGLRT003AUG4`). Record: `slot-thrashing-investigation/findings.md` § *2026-11-17 Addendum (re-arm #6)* |
+| **LP-0MWLZ68SF0052E7Z** (F6 AC2, `slots_stale`) | `2026-11-18T10:25:00Z → 2026-11-19T10:25:00Z` — 24.0 h, **100 % covered**, no gaps, six log segments | restart `2026-11-18T10:24:26Z` pid 1789326 (`reason=LP-0MVVCO1N7004TNGY: deploy F3+F4+F5`); loaded build `d8ce36dc9` (schema 8); 0 in-window startup markers | **MET** on the delivered definition: `slots_stale` **4.88 %** (608/12,450) < 5 % — 51 over-age (300 s ceiling) + 557 undatable. Tightened reading recorded alongside: age > 2 s on **31.60 %** of datable polls (p90 35.14 s, max 424.20 s; 81.3 % of those prefill-bound). `saturated`-without-live-work 11, all attributed. Record: `docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md` |
 
 **Lesson recorded by that run:** anchor the window at the **first whole minute
 after** the restart. Pinning the raw restart instant (`15:20:47`) leaves the

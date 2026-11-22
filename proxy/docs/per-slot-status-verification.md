@@ -1022,3 +1022,32 @@ age inherits the backend's blocking time. Against the delivered ≈300 s ceiling
 `slots_stale` would read **0 %** on this window (max age 235.9 s); against a 2 s budget it reads
 17.8 %. The freshness budget, not the derivation, decides the verdict; that trade-off belongs to
 the producer (parent AC2 second branch).
+
+### Measured outcome — post-fix 24 h window (LP-0MWLZ68SF0052E7Z)
+
+First 24 h window measured **after** F3/F4/F5 were live (schema 8):
+`2026-11-18T10:25:00Z → 2026-11-19T10:25:00Z`, restart-free (0 in-window startup
+markers), 100 % log coverage, loaded build `d8ce36dc9`.
+
+| Reading | Value |
+|---|---|
+| Status polls | 12,450 |
+| `slots_stale` at the delivered 300 s ceiling | **608 = 4.88 %** (target < 5 %: met) |
+| — over the ceiling | 51 (0.41 %; `detail_cache`) |
+| — no datable snapshot (counted stale by contract) | 557 (4.47 %; `counts_cache`, `slots_snapshot_source=none`) |
+| Snapshot age, datable polls | p50 **0.73 s** · p90 **35.14 s** · p99 **187.73 s** · max **424.20 s** |
+| Tightened reading, age > 2 s (plan Q3 candidate) | **31.60 %** of datable polls · 30.18 % of all polls — of which 81.3 % `capacity_hint=prefill_bound` |
+| `slots_upstream_calls = 0` | 11,492 / 12,450 polls (92.3 %) |
+| `saturated` without live local work | 11 (0.09 %), 11/11 attributed; zero stale-and-saturated violations |
+
+Read the pass with the definition in mind: 91.6 % of the residual is an
+**undatable** snapshot rather than an old one, and the `< 5 %` verdict holds at
+the 300 s ceiling — at a 2 s ceiling the same polls read 31.6 %. The ceiling,
+not the derivation, decides the verdict; the choice between "keep 300 s and
+label the metric *unusably old*" and "tighten toward 2 s and accept ~32 %" is
+an open, non-blocking producer question on the parent (LP-0MVVCO1N7004TNGY).
+
+Reproduce with `scripts/capacity_signal_verification.py` (as-configured) and
+`scripts/slots_snapshot_age_distribution.py` (tightened + age distribution);
+full record: [`docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md`](../../docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md).
+
