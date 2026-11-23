@@ -1012,6 +1012,25 @@ async def get_llama_local_status(request: Request):
         if isinstance(detail_provenance, dict)
         else 0
     )
+    # Read-path facts needed both by the derivation below and by the AC3 guard
+    # that follows it: what each phase recorded (a failure sets ``reason``) and
+    # whether this poll was served a payload at all.
+    _counts_out = counts_outcome if isinstance(counts_outcome, dict) else {}
+    _detail_out = detail_outcome if isinstance(detail_outcome, dict) else {}
+    _counts_prov = counts_provenance if isinstance(counts_provenance, dict) else {}
+    _detail_prov = detail_provenance if isinstance(detail_provenance, dict) else {}
+    _read_failed = bool(_counts_out.get("reason") or _detail_out.get("reason"))
+    _served_a_payload = (
+        bool(slots)
+        or counts_stale
+        or detail_stale
+        or model_absent
+        # A cache hit serves a dated payload even when that payload is a
+        # failure (``failure_backoff``) or an unexpired older result
+        # (``ttl_cache``): the age is real, so it is not a missing snapshot.
+        or _counts_prov.get("source") in ("ttl_cache", "failure_backoff")
+        or _detail_prov.get("source") in ("ttl_cache", "failure_backoff")
+    )
     if detail_stale or counts_stale:
         # Served the last-known snapshot (graceful degradation): label it a
         # snapshot, not a cache hit, and age it from the snapshot's own fetch
@@ -1045,14 +1064,34 @@ async def get_llama_local_status(request: Request):
             )
         )
     else:
-        # No upstream fetch this poll: label the cache path that served it.
-        for _prov in (
-            counts_provenance if isinstance(counts_provenance, dict) else {},
-            detail_provenance if isinstance(detail_provenance, dict) else {},
+        # No upstream fetch this poll: label the path that served the payload.
+        for _prov, _out in (
+            (_counts_prov, _counts_out),
+            (_detail_prov, _detail_out),
         ):
             _src = _prov.get("source")
             if _src in ("failure_backoff", "ttl_cache"):
                 slots_snapshot_source = _src
+                slots_snapshot_age_seconds = _snapshot_age_seconds(
+                    _prov.get("fetched_at")
+                )
+                break
+            # LP-0MWSD6CEE0068T19 (parent LP-0MWRXFO0I005UBVM): this poll did
+            # not fetch, but it JOINED a shared fetch that landed a payload —
+            # ``source="upstream"`` with ``upstream_calls=0`` and the *leader's*
+            # landing stamp. Its payload is that fetch's payload, so its age is
+            # that stamp's age: leader and joiner publish one age for one
+            # payload, and the age is never re-derived from this poll's own
+            # receive time, so a fossil cannot be re-stamped fresh. A shared
+            # fetch that landed a *failure* recorded a ``reason``: it served
+            # nothing, so it stays unlabelled (``none`` / ``None``) for the AC3
+            # guard below.
+            if (
+                _src == "upstream"
+                and _prov.get("fetched_at") is not None
+                and not _out.get("reason")
+            ):
+                slots_snapshot_source = "upstream"
                 slots_snapshot_age_seconds = _snapshot_age_seconds(
                     _prov.get("fetched_at")
                 )
@@ -1066,22 +1105,6 @@ async def get_llama_local_status(request: Request):
     # stamp as an age would make an empty surface look datable, and the
     # age-derived ``slots_stale`` would then call a poll with no evidence
     # fresh. Leaving the age ``None`` reports it as a missing snapshot instead.
-    _counts_out = counts_outcome if isinstance(counts_outcome, dict) else {}
-    _detail_out = detail_outcome if isinstance(detail_outcome, dict) else {}
-    _counts_prov = counts_provenance if isinstance(counts_provenance, dict) else {}
-    _detail_prov = detail_provenance if isinstance(detail_provenance, dict) else {}
-    _read_failed = bool(_counts_out.get("reason") or _detail_out.get("reason"))
-    _served_a_payload = (
-        bool(slots)
-        or counts_stale
-        or detail_stale
-        or model_absent
-        # A cache hit serves a dated payload even when that payload is a
-        # failure (``failure_backoff``) or an unexpired older result
-        # (``ttl_cache``): the age is real, so it is not a missing snapshot.
-        or _counts_prov.get("source") in ("ttl_cache", "failure_backoff")
-        or _detail_prov.get("source") in ("ttl_cache", "failure_backoff")
-    )
     if _read_failed and not _served_a_payload:
         slots_snapshot_age_seconds = None
 
