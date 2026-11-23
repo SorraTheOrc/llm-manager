@@ -178,7 +178,7 @@ renamed by those bumps.
 
 ```json
 {
-  "status_schema_version": 5,
+  "status_schema_version": 8,
   "total_slots": 2,
   "available_slots": 0,
   "contention_queue_depth": 3,          // existing, elsewhere in the payload
@@ -187,6 +187,9 @@ renamed by those bumps.
   "prefill_budget_seconds": 120.0,
   "queue_eta_seconds": 240.0,
   "slots_stale": false,
+  "slots_stale_reason": null,
+  "slots_snapshot_age_seconds": 0.42,
+  "slots_snapshot_source": "snapshot",
   "slots_detail_stale": false,
   "slot_counts_stale": false,
   "local_in_flight_requests": 1,
@@ -461,6 +464,15 @@ measured the read path rather than freshness. The published definition is now:
 > that produced the served payload on a monotonic clock and is never reset by
 > serving the cache again.
 
+Read it as an **unusably-old-or-undatable bound, never as a freshness claim**:
+the operator-facing statement of the same contract — the staleness vocabulary,
+the `slots_stale_reason` table, the ceiling and the fail-closed rules — is
+[`docs/local-slots-observability.md`](../../docs/local-slots-observability.md);
+this page carries the measurement and derivation detail. Freshness is the
+snapshot-age distribution in
+[Measured outcome](#measured-outcome--post-fix-24-h-window-lp-0mwlz68sf0052e7z),
+not this flag.
+
 Consequences a consumer must know:
 
 - **No new knob, no renamed field.** The ceiling is the one delivered by
@@ -660,12 +672,16 @@ What the numbers say about this contract:
    dispatch-lifecycle issue (deadline vs. upstream cancellation), not a
    capacity-signal one — the reconciliation rules do not apply to a genuine
    fresh snapshot.
-3. **`slots_stale` is a polling-path metric, not a capacity-truthfulness
-   metric.** Its semantics are unchanged by the fix, and the rate tracks the
-   `/slots` round-trip: the handler budgets are 2.0 s for the counts query and
-   `STATUS_QUERY_TIMEOUT` (1.0 s) for the detail query, while router-serialised
+3. **`slots_stale` was a polling-path metric, not a capacity-truthfulness
+   metric.** Its age-derived redefinition came later (schema 8 — see
+   [`slots_stale` measures snapshot age](#slots_stale-measures-snapshot-age-lp-0mvvxgm54009toxd)),
+   and at the time of this window the rate tracked the `/slots` round-trip: the
+   handler then budgeted 2.0 s for the counts query and `STATUS_QUERY_TIMEOUT`
+   (1.0 s) for the detail query — the serialised counts/detail split that the
+   delivered read path (see [Read path delivered](#read-path-delivered-lp-0mvvxgltm008roj9))
+   replaces with one shared, at-most-one-request fetch — while router-serialised
    polls took p50 3,029 ms (detail-cache-served) against 3 ms for a fresh poll.
-   The per-hour rate follows GPU load (44.3 % at 03:00, 96.0 % at 02:00), which
+   The per-hour rate followed GPU load (44.3 % at 03:00, 96.0 % at 02:00), which
    a truthfulness defect would not. The < 5 % target can only be judged on a
    build that contains `f58e8964`; measured here it stays at the pre-fix level
    (79.5 %) by construction.
@@ -982,12 +998,14 @@ seconds.
 
 ### Conclusion
 
-The dominant contributor to > 2 s refreshes is the **child `/slots` handler blocking behind
+The dominant contributor to > 2 s refreshes was the **child `/slots` handler blocking behind
 llama-server's generation loop**: while a prompt is being prefilled the endpoint returns in seconds
-to tens of seconds (idle/decode cost is 1–18 ms). Proxy-side serialisation is an **amplifier, not
-the cause**: the handler issues counts and detail as two sequential bounded queries, so 28 % of
-stale polls pay that blocking cost twice, and the 2 s + 1 s budgets guarantee the poll is reported
-stale long before the backend answers.
+to tens of seconds (idle/decode cost is 1–18 ms). Proxy-side serialisation was an **amplifier, not
+the cause**: at the time of this profile the handler issued counts and detail as two sequential
+bounded queries, so 28 % of stale polls paid that blocking cost twice and the 2 s + 1 s budgets
+guaranteed the poll was reported stale long before the backend answered. Neither shape is current:
+the delivered read path below coalesces both phases onto **one** bounded fetch (per-poll fan-out is
+0 or 1 by construction and the detail phase costs ~0 ms).
 
 ### Read path delivered (LP-0MVVXGLTM008ROJ9)
 
@@ -1020,8 +1038,9 @@ one shared snapshot removes the double fetch and keeps poll latency inside budge
 make the data fresher than the last **completed** fetch — so a `slots_stale` defined by snapshot
 age inherits the backend's blocking time. Against the delivered ≈300 s ceiling an age-derived
 `slots_stale` would read **0 %** on this window (max age 235.9 s); against a 2 s budget it reads
-17.8 %. The freshness budget, not the derivation, decides the verdict; that trade-off belongs to
-the producer (parent AC2 second branch).
+17.8 %. The freshness budget, not the derivation, decides the verdict; that trade-off belonged to
+the producer (parent AC2 second branch) and was **decided on 2026-11-22** — option 3, two-tier
+(LP-0MWRXH13L000UXSA): see [Measured outcome](#measured-outcome--post-fix-24-h-window-lp-0mwlz68sf0052e7z).
 
 ### Measured outcome — post-fix 24 h window (LP-0MWLZ68SF0052E7Z)
 
@@ -1032,7 +1051,7 @@ markers), 100 % log coverage, loaded build `d8ce36dc9`.
 | Reading | Value |
 |---|---|
 | Status polls | 12,450 |
-| `slots_stale` at the delivered 300 s ceiling | **608 = 4.88 %** (target < 5 %: met) |
+| `slots_stale` at the delivered 300 s ceiling (an **unusably-old-or-undatable bound**, not a freshness claim) | **608 = 4.88 %** (target < 5 %: met) |
 | — over the ceiling | 51 (0.41 %; `detail_cache`) |
 | — no datable snapshot (counted stale by contract) | 557 (4.47 %; `counts_cache`, `slots_snapshot_source=none`) |
 | Snapshot age, datable polls | p50 **0.73 s** · p90 **35.14 s** · p99 **187.73 s** · max **424.20 s** |
@@ -1040,14 +1059,48 @@ markers), 100 % log coverage, loaded build `d8ce36dc9`.
 | `slots_upstream_calls = 0` | 11,492 / 12,450 polls (92.3 %) |
 | `saturated` without live local work | 11 (0.09 %), 11/11 attributed; zero stale-and-saturated violations |
 
-Read the pass with the definition in mind: 91.6 % of the residual is an
-**undatable** snapshot rather than an old one, and the `< 5 %` verdict holds at
-the 300 s ceiling — at a 2 s ceiling the same polls read 31.6 %. The ceiling,
-not the derivation, decides the verdict; the choice between "keep 300 s and
-label the metric *unusably old*" and "tighten toward 2 s and accept ~32 %" is
-an open, non-blocking producer question on the parent (LP-0MVVCO1N7004TNGY).
+Read the pass with the **two-tier framing** in mind (producer decision
+2026-11-22, option 3 — LP-0MWRXH13L000UXSA):
 
-Reproduce with `scripts/capacity_signal_verification.py` (as-configured) and
-`scripts/slots_snapshot_age_distribution.py` (tightened + age distribution);
-full record: [`docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md`](../../docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md).
+| Statement | Value | How to read it |
+|---|---|---|
+| `slots_stale` — age > 300 s ceiling, undatable ⇒ stale | **4.88 %** (608 / 12,450) | an **unusably-old-or-undatable bound** — never a freshness claim |
+| Snapshot-age distribution (freshness, **reported not targeted**) | p50 **0.73 s** · p90 **35.14 s** · p99 **187.73 s** · max **424.20 s** | **the number to watch** — **31.60 %** of datable polls above 2 s, **4.47 %** of polls undatable |
+| Hard 2 s freshness SLO | **none today** | not introduced by this decision |
+
+91.6 % of the residual is an **undatable** snapshot rather than an old one, so
+the `< 5 %` verdict holds at the 300 s ceiling. At a 2 s ceiling the same polls
+read 31.6 %, but 81.3 % of those carry `capacity_hint=prefill_bound` — that
+figure is a statement about backend load, not about the read path — and
+tightening today would start life *failing* at 31.6 % with nothing gained.
+
+**Revisit trigger** (recorded so the question cannot drift): set a freshness SLO
+from the post-fix distribution only when **both** hold — (i) undatable polls
+below **0.5 %** over a 24 h window (LP-0MWRXFO0I005UBVM closed), and (ii) the
+nightly age series (LP-0MWRXGPO3004GXD7) has **≥ 14 days** of data. A threshold
+that moves must ship the relabelling test (LP-0MWRXH13L000UXSA AC3), and every
+pre/post figure is labelled by the definition that produced it. Until then,
+quote `slots_stale` only with its definition and watch the distribution above
+as the freshness number.
+
+Reproduce (both commands were run against the archived window; the artifacts
+live in `~/proxy-usage-reports/slots-stale-postfix/`):
+
+```bash
+# as-configured reading — slots_stale at the delivered 300 s ceiling
+python3 scripts/capacity_signal_verification.py \
+  --since '2026-11-18 10:25:00' --until '2026-11-19 10:25:00' --window-closed \
+  --label slots-stale-postfix --limit 250 --json \
+  --write-artifacts ~/proxy-usage-reports/slots-stale-postfix
+
+# tightened (> 2 s / > 5 s / > 300 s) reading and the snapshot-age distribution
+python3 scripts/slots_snapshot_age_distribution.py \
+  --since '2026-11-18 10:25:00' --until '2026-11-19 10:25:00' \
+  --threshold-seconds 2 --threshold-seconds 5 --threshold-seconds 300 --json \
+  > ~/proxy-usage-reports/slots-stale-postfix/age_distribution.json
+```
+
+Full record: [`docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md`](../../docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md)
+(+ `.json`); the staleness contract, reason vocabulary and ceiling are stated
+for operators in [`docs/local-slots-observability.md`](../../docs/local-slots-observability.md).
 

@@ -11,6 +11,18 @@ Reported alongside it, as the AC requires: the **tightened 2 s reading is
 31.60 %** of datable polls, so the pass is a property of the 300 s ceiling, not
 of snapshots being fresh (§ 5).
 
+> **Decision note (2026-11-22) — the § 5 / § 8 "open question" is decided.**
+> The producer took **option 3 (two-tier)** in LP-0MWRXH13L000UXSA: `slots_stale`
+> stays at the delivered 300 s ceiling and is described as an
+> **unusably-old-or-undatable bound**, never as a freshness claim; freshness is
+> the snapshot-age distribution in § 5, **reported not targeted**; and no hard
+> 2 s SLO is introduced today. Revisit trigger: set a freshness SLO only when
+> undatable polls fall below 0.5 % of a 24 h window (LP-0MWRXFO0I005UBVM closed)
+> **and** the nightly age series (LP-0MWRXGPO3004GXD7) has ≥ 14 days of data; a
+> threshold that moves ships the relabelling test (AC3 of that decision). The
+> applied text lives in
+> [`proxy/docs/per-slot-status-verification.md`](../../proxy/docs/per-slot-status-verification.md#measured-outcome--post-fix-24-h-window-lp-0mwlz68sf0052e7z) (F7, LP-0MVVXGN2C004O28B).
+
 ---
 
 ## 1. Window and restart integrity (AC1)
@@ -168,10 +180,12 @@ prefill-blocked backend regime rather than measuring freshness inside it.
 
 At the tightened 2 s ceiling the same window would read **31.6 % stale — a
 miss of the 5 % target by a factor of 6.3**. The verdict is decided by the
-ceiling, not by the derivation. This is recorded as a **non-blocking OPEN
-QUESTION on the parent** (LP-0MVVCO1N7004TNGY): keep the 300 s ceiling (and
-label the metric "unusably old", not "fresh"), or tighten toward the plan's 2 s
-value and accept a ~32 % reading. This item does not change the ceiling.
+ceiling, not by the derivation. This was raised as a **non-blocking OPEN
+QUESTION on the parent** (LP-0MVVCO1N7004TNGY) and was **decided on 2026-11-22**
+(LP-0MWRXH13L000UXSA, option 3, two-tier) — see the decision note at the top:
+keep the 300 s ceiling as an *unusably-old-or-undatable* bound, report this
+distribution as the freshness number to watch, and introduce no 2 s SLO today.
+This item does not change the ceiling.
 
 ## 6. Pre/post comparison (AC4)
 
@@ -233,5 +247,5 @@ are now dominated by an *undatable* snapshot (557) rather than a slow refresh
 | AC2 command, bounds, deployed build, artifact dir recorded on F6 | **met** (§ 2, recorded on LP-0MVVXGMRN007NCJP) |
 | AC3 as-configured verdict **and** tightened 2 s reading with age distribution | **met** — 4.88 % vs 31.60 % (§§ 3, 5) |
 | AC4 pre/post table with the definition change labelled on the parent | **met** (§ 6, recorded on LP-0MVVCO1N7004TNGY) |
-| AC5 `< 5 %` → say why and what the metric still does and does not capture | **met** (§ 7); the 2 s ceiling choice is raised as a non-blocking OPEN QUESTION on the parent |
+| AC5 `< 5 %` → say why and what the metric still does and does not capture | **met** (§ 7); the 2 s ceiling choice was raised as a non-blocking OPEN QUESTION on the parent and is now **decided** — option 3, two-tier (2026-11-22, LP-0MWRXH13L000UXSA) |
 | AC6 `proxy/docs/per-slot-status-verification.md` updated with the outcome | **met** |
