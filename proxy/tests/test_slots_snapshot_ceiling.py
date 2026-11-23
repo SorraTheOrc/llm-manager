@@ -445,3 +445,52 @@ class TestEffectiveCeilingIsPublished:
         assert payload["slots_max_snapshot_age_seconds"] == (
             obs.local_slots_max_snapshot_age_seconds(config={})
         )
+
+
+class TestOverCeilingGuardUnchanged:
+    """AC3 (LP-0MWSD6BS1007LA9L): the withhold path the fix must not change.
+
+    The join-stamp fix (LP-0MWSD6CEE0068T19) must not make an over-ceiling
+    snapshot look fresh: its true age stays published and above the ceiling,
+    the slot list and availability stay withheld, the reason is
+    ``snapshot_too_old``, and the next fresh poll recovers with no restart.
+    """
+
+    @pytest.mark.asyncio
+    async def test_over_ceiling_withholds_then_recovers_without_restart(self):
+        client = _ScriptedClient(ok=False)
+        config = {"local_slots_max_snapshot_age_seconds": 300}
+        stale, record = await _get_status(
+            client,
+            server_config=config,
+            fossil=FOSSIL,
+            age_seconds=29_825.67,
+        )
+
+        # The fossil's true age is still published — never re-stamped fresh.
+        assert stale["slots_snapshot_age_seconds"] > stale[
+            "slots_max_snapshot_age_seconds"
+        ]
+        assert record is not None, "no status_request line was logged"
+        assert record.slots_snapshot_age_seconds > stale[
+            "slots_max_snapshot_age_seconds"
+        ]
+
+        # Availability is withheld from the over-age snapshot
+        # (LP-0MW1VVKPF001ZAV5).
+        assert stale["slots"] == []
+        assert stale["available_slots"] == 0
+        assert stale["total_slots"] == 0
+        assert stale["slots_stale"] is True
+        assert stale["slots_stale_reason"] == "snapshot_too_old"
+
+        # Recovery needs no restart: the next successful poll restores a fresh
+        # surface.
+        client.ok = True
+        obs.reset_slots_poll_cache()
+        fresh, _ = await _get_status(client, server_config=config)
+
+        assert fresh["slots_stale"] is False
+        assert fresh["slots_stale_reason"] is None
+        assert [s["slot_id"] for s in fresh["slots"]] == [0, 1]
+        assert fresh["available_slots"] == 2

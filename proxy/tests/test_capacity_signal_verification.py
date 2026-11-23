@@ -326,6 +326,26 @@ def test_slots_stale_from_age_needs_both_fields(csv):
     ) is None
 
 
+def test_slots_stale_from_age_pins_the_guard_contract(csv):
+    """Guard slice (LP-0MWSD6BS1007LA9L): the F4 contract must not drift.
+
+    Two boundaries are load-bearing while the join-stamp fix lands:
+
+    * ``age=None`` with a usable ceiling stays **stale** — an undatable
+      snapshot proves nothing, so it must never be counted fresh; and
+    * ``age == ceiling`` stays **fresh** — the ceiling is the last acceptable
+      age, not the first unacceptable one.
+
+    A fix that re-stamps a fossil fresh or shifts the boundary would break the
+    agreement between the proxy's published ``slots_stale`` and this
+    derivation.
+    """
+    assert csv.slots_stale_from_age(_age_pair(None, 300.0)) is True
+    assert csv.slots_stale_from_age(_age_pair(300.0, 300.0)) is False
+    # The immediately adjacent over-ceiling age is stale.
+    assert csv.slots_stale_from_age(_age_pair(300.1, 300.0)) is True
+
+
 def test_saturated_without_live_work_uses_inflight_then_flag_fallback(
     csv, tmp_path
 ):

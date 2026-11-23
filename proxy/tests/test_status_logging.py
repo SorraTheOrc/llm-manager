@@ -945,3 +945,46 @@ async def test_phase_timings_reconcile_on_the_failure_path():
         assert rec.slots_counts_ms is not None
         total = rec.status_query_ms + rec.slots_counts_ms
         assert total <= rec.latency_ms
+
+
+# ---------------------------------------------------------------------------
+# No-payload guard (LP-0MWSD6BS1007LA9L, guards LP-0MVVXGM54009TOXD)
+#
+# The join-stamp fix (LP-0MWSD6CEE0068T19) must not make a poll that genuinely
+# served nothing look datable. A read that failed and had no fresh payload, no
+# cache and no definitive model-absent answer produced no snapshot at all, so
+# its age must stay ``None`` and the age-derived ``slots_stale`` must stay
+# ``true`` — the poll must never borrow an age from its own attempt/receive
+# time (that would re-stamp a missing snapshot fresh).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_payload_poll_publishes_no_age_and_stays_stale():
+    """A failed read that served nothing stays undatable and stale.
+
+    The backend is held for a measurable delay and then fails, so the poll
+    *does* hold an attempt stamp: if the guard derived an age from the poll's
+    own receive/attempt time it would publish a small non-``None`` number.
+    ``None`` therefore proves the age came from no served payload, not from
+    when the poll ran.
+    """
+    backend = _SlotsBackend([(500, None)], delay=0.05)
+
+    async with _status_poll(backend=backend) as (payload, rec, b):
+        # The poll really attempted a fetch (and waited for it), so an
+        # attempt/receive stamp existed to be (wrongly) reused.
+        assert b.calls, "the fixture must exercise a real upstream attempt"
+        assert rec.slots_counts_ms >= 40, (
+            "the attempt must take measurable time so a re-stamped age would "
+            "be visibly non-None; got slots_counts_ms="
+            f"{rec.slots_counts_ms}"
+        )
+
+        # Nothing was served, so there is no snapshot to date.
+        assert payload["slots"] == []
+        assert payload["slots_snapshot_age_seconds"] is None
+        assert rec.slots_snapshot_age_seconds is None
+
+        # No datable snapshot is stale by the F4 contract, never fresh.
+        assert payload["slots_stale"] is True
