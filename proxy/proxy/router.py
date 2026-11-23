@@ -3277,10 +3277,49 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                 # joined heuristically from ``routing_check`` lines. Both values are
                                                 # already computed above in this function; appending them keeps
                                                 # every existing log consumer (and regex) byte-compatible.
+                                                #
+                                                # LP-0MWRWBJPP001Q5JX (path (c) of
+                                                # docs/dev/prompt-cache-tuning.md): feed the
+                                                # priced calibration window from the dispatch's
+                                                # MEASURED prompt_progress reuse when one exists,
+                                                # so a cross-session cache hit is recorded as a
+                                                # hit instead of a whole-prompt cold prefill.
+                                                # Falls back to the routing prediction
+                                                # byte-for-byte whenever no usable measurement
+                                                # exists, and never raises on the stream path.
+                                                # The resolved ratio/basis are also logged on the
+                                                # dispatch_first_byte_ms line so the window's
+                                                # composition is attributable.
+                                                _window_measured = None
+                                                _window_ratio = _cached_ratio
+                                                _window_ratio_basis = "predicted"
+                                                try:
+                                                    from proxy.prefill_eta import (
+                                                        resolve_window_ratio,
+                                                    )
+
+                                                    _window_measured = (
+                                                        _measured_prefill.get_measured_prefill(
+                                                            model_name, session_id
+                                                        )
+                                                    )
+                                                    _window_ratio, _window_ratio_basis = (
+                                                        resolve_window_ratio(
+                                                            _cached_ratio,
+                                                            _window_measured.measured_cached_ratio
+                                                            if _window_measured is not None
+                                                            else None,
+                                                        )
+                                                    )
+                                                except Exception:
+                                                    _window_measured = None
+                                                    _window_ratio = _cached_ratio
+                                                    _window_ratio_basis = "predicted"
                                                 srv.logger.info(
                                                     "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f "
                                                     "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s "
-                                                    "priority=%s estimated_tokens=%d%s",
+                                                    "priority=%s estimated_tokens=%d "
+                                                    "window_cached_ratio=%.4f window_ratio_basis=%s%s",
                                                     _first_byte_total_ms,
                                                     _first_byte_service_ms,
                                                     _cache_state,
@@ -3290,6 +3329,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     model_name or "unknown",
                                                     _priority or "unknown",
                                                     int(_estimated_tokens or 0),
+                                                    _window_ratio,
+                                                    _window_ratio_basis,
                                                     turn_field(),
                                                 )
                                                 # Feed the prefill-ETA calibration window
@@ -3327,9 +3368,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     record_dispatch_sample(
                                                         model_name,
                                                         _estimated_tokens,
-                                                        _cached_ratio,
+                                                        _window_ratio,
                                                         _first_byte_service_ms,
                                                         contended=_is_contended,
+                                                        ratio_basis=_window_ratio_basis,
                                                     )
                                                     # Q410 AC1 / Q2(option a):
                                                     # feed the genuinely-cold
@@ -3348,22 +3390,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     # observed) simply records
                                                     # nothing.
                                                     try:
-                                                        from proxy.measured_prefill import (
-                                                            get_measured_prefill,
-                                                        )
                                                         from proxy.prefill_eta import (
                                                             record_cold_measured_sample,
                                                         )
 
-                                                        _cold_measured = get_measured_prefill(
-                                                            model_name, session_id
-                                                        )
-                                                        if _cold_measured is not None:
+                                                        if _window_measured is not None:
                                                             record_cold_measured_sample(
                                                                 model_name,
                                                                 _estimated_tokens,
-                                                                _cold_measured.measured_cached_ratio,
-                                                                _cold_measured.processed,
+                                                                _window_measured.measured_cached_ratio,
+                                                                _window_measured.processed,
                                                                 _first_byte_service_ms,
                                                             )
                                                     except Exception:

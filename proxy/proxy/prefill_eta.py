@@ -76,7 +76,13 @@ record keeps today's behaviour byte-for-byte.
 Calibration is data-driven: every local dispatch records a sample
 ``(coded_tokens, new_tokens, dispatch_to_first_byte_ms)`` from the existing
 ``dispatch_first_byte_ms`` log line (service time, i.e. excluding the queue
-wait), keyed by ``(model, context bucket)``, in a bounded rolling window. A
+wait), keyed by ``(model, context bucket)``, in a bounded rolling window. The
+sample's cache ratio is the dispatch's **measured** ``prompt_progress`` reuse
+when one exists and the routing prediction only when none does
+(LP-0MWRWBJPP001Q5JX): a cross-session prompt-cache hit is therefore recorded
+as a hit, not as a whole-prompt cold prefill that drags the fitted cold rate
+down. The sample's basis (``measured`` / ``predicted``) is logged so the
+window's composition is attributable. A
 two-coefficient least-squares fit produces the per-bucket coefficients. When
 a bucket has too few samples the guard is **inert** — it admits, i.e. today's
 queueing behaviour is unchanged — so the guard can never reject on a guess.
@@ -403,6 +409,15 @@ class DeadlineCapacity:
 # ---------------------------------------------------------------------------
 # Rolling calibration window (module scope = one proxy process)
 # ---------------------------------------------------------------------------
+
+#: Basis of the cache ratio a priced-window sample was recorded with
+#: (LP-0MWRWBJPP001Q5JX). ``measured`` means the dispatch's MEASURED
+#: ``prompt_progress`` reuse (``measured_prefill.MeasuredPrefill``);
+#: ``predicted`` means no usable measurement existed and the routing prediction
+#: was kept. Recorded per sample so the window's composition is attributable.
+WINDOW_RATIO_BASIS_MEASURED = "measured"
+WINDOW_RATIO_BASIS_PREDICTED = "predicted"
+VALID_WINDOW_RATIO_BASES = (WINDOW_RATIO_BASIS_MEASURED, WINDOW_RATIO_BASIS_PREDICTED)
 
 #: ``(model, bucket) -> deque[(coded_tokens, new_tokens, service_ms)]``
 _samples: dict[tuple[str, int], deque] = {}
@@ -763,12 +778,51 @@ above the client's own deadline loses the race it exists to win. A zero
 # Sample recording + calibration
 # ---------------------------------------------------------------------------
 
+def resolve_window_ratio(
+    predicted_ratio: float | None,
+    measured_ratio: float | None,
+) -> tuple[float, str]:
+    """Choose the cache ratio a priced-window sample is recorded with.
+
+    LP-0MWRWBJPP001Q5JX (path (c) of the prompt-cache assessment in
+    ``docs/dev/prompt-cache-tuning.md``): the priced window must be fitted from
+    the reuse llama-server actually observed, not from the routing prediction.
+    The prediction is per-``(model, session)`` and defaults to ``0.0`` for a
+    session with no entry, so a cross-session prompt-cache hit entered the
+    window as ``(coded=0, new=<whole prompt>, ms≈130)`` — a phantom-cold
+    sample that halved the fitted cold-prefill rate.
+
+    Returns ``(ratio, basis)``. When a finite *measured_ratio* exists the
+    measured ratio and ``"measured"`` are returned; otherwise the *predicted*
+    ratio and ``"predicted"`` — byte-for-byte the pre-change behaviour for an
+    unmeasured dispatch (fail-open). Never raises; malformed inputs fall back
+    to the prediction.
+    """
+    try:
+        predicted = float(predicted_ratio)
+    except (TypeError, ValueError):
+        predicted = 0.0
+    if not math.isfinite(predicted):
+        predicted = 0.0
+    predicted = min(1.0, max(0.0, predicted))
+    if measured_ratio is None:
+        return predicted, WINDOW_RATIO_BASIS_PREDICTED
+    try:
+        measured = float(measured_ratio)
+    except (TypeError, ValueError):
+        return predicted, WINDOW_RATIO_BASIS_PREDICTED
+    if not math.isfinite(measured):
+        return predicted, WINDOW_RATIO_BASIS_PREDICTED
+    return min(1.0, max(0.0, measured)), WINDOW_RATIO_BASIS_MEASURED
+
+
 def record_dispatch_sample(
     model: str | None,
     prompt_tokens: int,
     cached_ratio: float,
     service_ms: float,
     contended: bool = False,
+    ratio_basis: str = WINDOW_RATIO_BASIS_PREDICTED,
 ) -> None:
     """Record one observed local prefill (rolling calibration window).
 
@@ -782,6 +836,11 @@ def record_dispatch_sample(
     Contended samples are stored in their own per-``(model, bucket)`` window so
     a contended admission can be priced from the co-residency distribution
     instead of the solitary-dominated mixed window (measured 2-4x optimistic).
+
+    *ratio_basis* (LP-0MWRWBJPP001Q5JX) records whether *cached_ratio* is the
+    dispatch's **measured** cache reuse or the routing **prediction**, so the
+    window's composition is attributable (``prefill_calibration_sample`` log
+    line). Callers resolve it with :func:`resolve_window_ratio`.
 
     Never raises: a metric path must not break a stream. Invalid inputs
     (missing model, non-positive tokens/time, non-finite values) are ignored.
@@ -803,6 +862,9 @@ def record_dispatch_sample(
         if not math.isfinite(ratio):
             ratio = 0.0
         ratio = min(1.0, max(0.0, ratio))
+        basis = str(ratio_basis or "").strip().lower()
+        if basis not in VALID_WINDOW_RATIO_BASES:
+            basis = WINDOW_RATIO_BASIS_PREDICTED
         coded = int(tokens * ratio)
         new = max(0, tokens - coded)
         bucket = bucket_for(tokens)
@@ -812,6 +874,25 @@ def record_dispatch_sample(
             window = deque(maxlen=WINDOW_SAMPLES)
             window_map[(model_key, bucket)] = window
         window.append((coded, new, ms))
+        # Attribution (LP-0MWRWBJPP001Q5JX AC1): which ratio this sample was
+        # recorded with, so the window's composition is auditable. Debug level
+        # — the production attribution is the router's per-dispatch
+        # ``dispatch_first_byte_ms`` line (``window_ratio_basis=``), and this
+        # line makes the same fact available to tests and operators who enable
+        # debug logging.
+        logger.debug(
+            "prefill_calibration_sample model=%s bucket=%d tokens=%d coded=%d "
+            "new=%d cached_ratio=%.4f ratio_basis=%s contended=%s service_ms=%.1f",
+            model_key,
+            bucket,
+            tokens,
+            coded,
+            new,
+            ratio,
+            basis,
+            "true" if contended else "false",
+            ms,
+        )
         _last_prompt_tokens[model_key] = tokens
         history = _recent_prompt_tokens.get(model_key)
         if history is None:

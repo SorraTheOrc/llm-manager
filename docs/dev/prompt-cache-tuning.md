@@ -921,6 +921,16 @@ session_id)`). A cross-session hit therefore enters the window as
 **Cost added to the admission path: zero.** The measurement is already in scope;
 this is a change of argument, not a new call.
 
+**Shipped (LP-0MWRWBJPP001Q5JX).** The window now records the dispatch's
+**measured** reuse (`measured_prefill.get_measured_prefill(...).measured_cached_ratio`)
+when one exists and the routing prediction only when none does, resolved by
+`prefill_eta.resolve_window_ratio`. Each sample's basis (`measured` / `predicted`)
+is logged on the `dispatch_first_byte_ms` line (`window_ratio_basis=`) so the
+window's composition is attributable. This changes only the sample
+**composition** of the calibration window — no admission price is touched by
+this item, and the cross-session blind spot above is unchanged: an unmeasured
+(possibly warm) prompt is still priced from the routing prediction.
+
 **Evidence that this matters.** 2026-11-22 partial window (00:00 → 13:10 UTC): of
 the 1,317 measured dispatches ≥ 3,000 estimated tokens, **42.3 %** were priced at
 ≥ 2× their measured new tokens (Σ priced 4,884,984 vs Σ measured 3,384,634 new
@@ -993,7 +1003,7 @@ the snapshot).
    blocking prerequisite of the recommended path.
 
 **Verdict: viable with conditions** — a strict calibration-fidelity fix, and the
-prerequisite of (b). Filed as LP-0MWRWBJPP001Q5JX.
+prerequisite of (b). Implemented as LP-0MWRWBJPP001Q5JX.
 
 ### Recommendation
 
@@ -1005,7 +1015,7 @@ by effort. Ship it with its two prerequisites:
 | follow-up | role | state |
 |---|---|---|
 | `LP-0MWRWBPFV00339XP` — *Price cross-session prompt-cache warmth at admission from the measured reuse of a matching prefix* | the recommended path | filed, blocked |
-| `LP-0MWRWBJPP001Q5JX` — *Prefill calibration window is fed the predicted cache ratio* | blocking prerequisite (path (c)) | filed, open |
+| `LP-0MWRWBJPP001Q5JX` — *Prefill calibration window is fed the predicted cache ratio* | blocking prerequisite (path (c)) | implemented |
 | `LP-0MWL0VHOY0065EI8` — *Warm 99 %-cached prompt priced near cold rate* | conditional prerequisite: the coded coefficient that the credit multiplies | pre-existing, open |
 
 Expected effect, stated against this document's own baseline: the audited
