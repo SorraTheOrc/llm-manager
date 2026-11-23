@@ -758,3 +758,223 @@ def test_derive_slots_from_payload_is_the_single_source_of_counts():
     assert obs.derive_slots_from_payload("not-a-list") is None
     assert obs.derive_slots_from_payload([1, 2]) is None
     assert obs.derive_slots_from_payload([]) == (0, 0, ())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Joining poll publishes the fetch stamp (LP-0MWSD6B5F003P9CN / LP-0MWRXFO0I005UBVM)
+#
+# A status poll that JOINS another poll's in-flight shared ``/slots`` fetch is
+# served the leader's real payload, yet it publishes
+# ``slots_snapshot_age_seconds=None`` / ``slots_snapshot_source="none"``. The
+# age is derived in ``proxy/proxy/handlers.py`` as a three-way branch:
+#
+#   1. ``detail_stale or counts_stale``   → ``snapshot``  (cache stamps)
+#   2. ``elif slots_upstream_calls:``      → ``upstream``  (own fetch stamp)
+#   3. ``else:``                           → only ``failure_backoff`` / ``ttl_cache``
+#
+# A joiner satisfies none of them: ``_read_slots_snapshot`` starts no fetch
+# (``created=False`` ⇒ ``upstream_calls=0``) but its provenance *does* carry
+# ``source="upstream"`` and the landing ``fetched_at`` of the fetch that
+# produced the payload it was served. Branch 2 therefore does not fire and
+# branch 3 ignores ``source="upstream"``, so the published age stays ``None``
+# — and the age-derived ``slots_stale`` contract calls a seconds-old payload
+# stale (the measured 557 of 608 stale polls).
+#
+# Written red-first: this test is a STRICT xfail, so the suite stays green
+# while the defect stands and the fix (LP-0MWSD6CEE0068T19) forces the marker's
+# removal — a passing xfail is a failure.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _GatedBackend:
+    """Raw ``/slots`` fetch stub that holds the ONE shared fetch until released.
+
+    ``started`` fires when the leader's upstream fetch begins, ``release`` lets
+    it land, and ``calls`` records every upstream attempt so the test can prove
+    the joiner caused none.
+    """
+
+    def __init__(self, payload=None):
+        self.payload = payload if payload is not None else list(_SLOTS_PAYLOAD)
+        self.calls: list[str] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, url: str, timeout: float, client=None):
+        self.calls.append(url)
+        self.started.set()
+        await self.release.wait()
+        return 200, self.payload
+
+
+def _status_records_by_client_port(records: list[logging.LogRecord]) -> dict:
+    """Index this test's ``status_request`` records by the caller's port."""
+    return {
+        rec.client_port: rec
+        for rec in records
+        if rec.getMessage() == "status_request"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LP-0MWSD6B5F003P9CN: a poll that joins an in-flight /slots fetch is "
+        "served a dated payload but publishes slots_snapshot_age_seconds=None / "
+        "slots_snapshot_source=none (handlers.py derives the age only from "
+        "counts_stale/detail_stale, slots_upstream_calls, or a cache allow-list); "
+        "remove this marker when the fix (LP-0MWSD6CEE0068T19) lands."
+    ),
+)
+async def test_joining_poll_publishes_the_fetch_stamp(monkeypatch):
+    """A joiner is served a dated payload and must publish its provenance.
+
+    Two REAL ``/llama/local/status`` polls run concurrently against the
+    production read path (only the raw upstream fetch and the status query are
+    stubbed). The leader's fetch is held open until the second poll has joined
+    the same shared task, so the second poll is provably a follower — not a TTL
+    cache hit and not a pending-timeout degradation.
+    """
+    from unittest.mock import MagicMock
+    from unittest.mock import patch as _patch
+
+    from proxy.server import app
+
+    from proxy import server
+
+    backend = _GatedBackend()
+
+    async def fake_query():
+        return {"llama_server_running": True}
+
+    # Observe the coalescer's entry point: ``created=False`` means this poll
+    # joined an in-flight fetch instead of starting one.
+    real_shared_task = obs._shared_slots_snapshot_task
+    joined = asyncio.Event()
+
+    def _observing_shared_task(url, timeout, client):
+        task, created = real_shared_task(url, timeout, client)
+        if not created:
+            joined.set()
+        return task, created
+
+    monkeypatch.setattr(obs, "_shared_slots_snapshot_task", _observing_shared_task)
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    collector = _Collect()
+    collector.setLevel(logging.INFO)
+    log = logging.getLogger("llama-proxy")
+    prev_level = log.level
+    log.setLevel(logging.INFO)
+    log.addHandler(collector)
+
+    # Distinct client ports let each published status line be attributed to the
+    # leader or the joiner request deterministically.
+    leader_transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1111))
+    joiner_transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 2222))
+
+    leader_resp = joiner_resp = None
+    try:
+        with (
+            _patch("proxy.server.query_llama_status", side_effect=fake_query),
+            _patch.object(obs, "_do_slots_fetch", backend),
+            _patch.multiple(
+                server,
+                current_model="test-model",
+                model_switch_refcount=0,
+                model_switch_lock=_FakeLock(),
+                background_loads={},
+                local_dispatch_records={},
+                local_dispatch_records_lock=_FakeLock(),
+                _http_client=MagicMock(),
+                config={"server": {"llama_server_port": 8080}},
+            ),
+        ):
+            async with (
+                httpx.AsyncClient(
+                    transport=leader_transport, base_url="http://test"
+                ) as leader_client,
+                httpx.AsyncClient(
+                    transport=joiner_transport, base_url="http://test"
+                ) as joiner_client,
+            ):
+                leader_task = asyncio.create_task(
+                    leader_client.get("/llama/local/status")
+                )
+                # The leader is inside its upstream fetch ...
+                await asyncio.wait_for(backend.started.wait(), timeout=2.0)
+                joiner_task = asyncio.create_task(
+                    joiner_client.get("/llama/local/status")
+                )
+                try:
+                    # ... and the second poll has attached to the SAME task.
+                    await asyncio.wait_for(joined.wait(), timeout=2.0)
+                finally:
+                    # Never leave the held fetch (or either request) pending,
+                    # even when an assertion above fails.
+                    backend.release.set()
+                leader_resp, joiner_resp = await asyncio.gather(
+                    leader_task, joiner_task
+                )
+    finally:
+        log.removeHandler(collector)
+        log.setLevel(prev_level)
+        await obs.acancel_slots_snapshot_tasks()
+
+    assert leader_resp is not None and joiner_resp is not None
+    assert leader_resp.status_code == 200 and joiner_resp.status_code == 200
+    # AC4: the joiner caused no upstream call and the leader performed exactly
+    # one — this is a real join, not a cache hit and not a timeout.
+    assert len(backend.calls) == 1, (
+        "the two polls must share exactly ONE upstream /slots fetch, got "
+        f"{len(backend.calls)}: {backend.calls}"
+    )
+    assert all("/slots" in url for url in backend.calls)
+
+    by_port = _status_records_by_client_port(records)
+    assert 1111 in by_port and 2222 in by_port, (
+        f"expected one status_request line per poll, got ports {sorted(by_port)}"
+    )
+    leader_rec = by_port[1111]
+    joiner_rec = by_port[2222]
+
+    # AC4: the leader's own fetch is attributed to it ...
+    assert leader_rec.slots_upstream_calls == 1
+    # ... and the joiner is served that fetch's payload, without a fetch of its
+    # own, after waiting on it (both phases are fresh, unlike a timeout).
+    assert joiner_rec.slots_upstream_calls == 0, (
+        "a joining poll must publish slots_upstream_calls=0; it performed no "
+        f"upstream call (got {joiner_rec.slots_upstream_calls})"
+    )
+    assert joiner_rec.slots_counts_ms >= 0
+    leader_payload = leader_resp.json()
+    joiner_payload = joiner_resp.json()
+    assert joiner_payload["slots"] == leader_payload["slots"], (
+        "the joiner must be served the leader's own payload, got "
+        f"{joiner_payload['slots']!r} vs {leader_payload['slots']!r}"
+    )
+    assert joiner_payload["available_slots"] == leader_payload["available_slots"]
+    assert joiner_payload["total_slots"] == leader_payload["total_slots"]
+
+    # AC2/AC3: a payload WAS served, so its age must be published and its
+    # source must name the serving path — never ``none``. (Strict xfail: this
+    # is the assertion the fix must make pass.)
+    assert joiner_rec.slots_snapshot_age_seconds is not None, (
+        "a joining poll was served a real /slots payload but published no "
+        "snapshot age, so the age-derived slots_stale calls it stale"
+    )
+    assert joiner_rec.slots_snapshot_age_seconds == pytest.approx(0.0, abs=2.0)
+    assert joiner_rec.slots_snapshot_source != "none", (
+        "a joining poll's snapshot source must name the serving path, got "
+        f"{joiner_rec.slots_snapshot_source!r}"
+    )
+    assert joiner_rec.slots_snapshot_source in {"upstream", "ttl_cache", "snapshot"}
+    assert joiner_payload["slots_stale"] is False, (
+        "a seconds-old shared payload must not be reported stale"
+    )
