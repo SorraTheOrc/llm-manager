@@ -3,11 +3,13 @@
 **Work item:** LP-0MVWC0FAT0018PMW — *Coordinate restart-free 24 h measurement
 windows across concurrent verification items*
 **Kind:** process / record (no code change, no scheduling knob)
-**Last refreshed:** 2026-11-22T12:00Z — restart rows for 2026-11-15/16/18/19 and the
-post-fix `slots_stale` window row added by LP-0MWLZ68SF0052E7Z. The rest of the
-calendar is still the 2026-11-02 snapshot (populated from the live Worklog, **not**
-the stale 2026-10-31 list in the originating item); a full re-population is not
-this item's scope.
+**Last refreshed:** 2026-11-25T11:15Z — **§ 2 fully refreshed** to the live
+2026-11-25T11:07:33Z anchor (pid 545169) by LP-0MWW0VZUU002E4MN, with the outgoing
+2026-11-22 anchor moved into the restart history and the § 3.1 rows for the items
+that anchor serves. Earlier refresh: 2026-11-22T12:00Z (restart rows for
+2026-11-15/16/18/19 plus the post-fix `slots_stale` window row from
+LP-0MWLZ68SF0052E7Z). Rows below § 3.1 that still quote 2026-11-02/11-06 anchors
+are historical records, not live windows.
 
 This file is the single coordination record for restart-free measurement
 windows. It exists because every one of the open verification items below needs
@@ -69,13 +71,34 @@ Two consequences drive everything else in this file:
 
 | Fact | Value |
 |---|---|
-| Running proxy | pid **3698721**, `ps -o lstart` **2026-11-02T10:39:24Z** (log line `2026-11-02 10:39:25`) |
-| Restart attribution | `reason=LP-0MVWBXDZA00494HK live verification: deploy slices 2-3 (unloaded-model /slots skip)` |
-| Loaded build | the tree at the anchor, which contains `9f3b9c06` (starvation fix) and `19d3c927` — record `git log -1` at run time; the checkout tip moves **without** a restart |
-| Checkout tip at refresh | `1976307e` (origin/dev; docs-only over `19d3c927`) — not necessarily the loaded code |
-| Earliest a fresh 24 h window can close | **2026-11-03T10:39:24Z** (anchor + 24 h) |
-| Restart-free so far | ≈ 25 m at 2026-11-02T11:05Z |
-| Window owner for this anchor | **LP-0MVZ4R2B20027XK3** (run-not-before 2026-11-03T10:39:24Z) |
+| Running proxy | pid **545169**, `ps -o lstart` **2026-11-25T11:07:33Z**; `Logging initialised … pid=545169` at `2026-11-25 11:07:36,580` |
+| Restart attribution | `source=manual actor=unknown reason=LP-0MWRXFO0I005UBVM / LP-0MWSD6CEE0068T19: deploy joiner /slots snapshot age fix (aa6115bcc) batched with LP-0MWRWBJPP001Q5JX (5ef9b5ebb) - open 24 h restart-free window` (`--reason` sets the reason text; `source=` stays `manual` for an operator-run restart) |
+| Loaded build | checkout tip at launch = **`5ef9b5ebb`**, containing `aa6115bcc` (LP-0MWSD6CEE0068T19 / LP-0MWRXFO0I005UBVM — joiner `/slots` snapshot age) **and** `5ef9b5ebb` (LP-0MWRWBJPP001Q5JX — prefill calibration measured basis). The other four commits over the outgoing build `8d494d878` are docs/tests only (`573ef8c13`, `feab623a8`, `f4fcd47d5`, `ceef54f29`) |
+| llama-server | **preserved** by the restart ("unchanged local backend config") — the warm KV / prompt cache survived, so this anchor is not a cold-cache window |
+| Checkout tip at refresh | `5ef9b5ebb` (origin/dev) — identical to the loaded build, so another restart right now would load nothing new |
+| Window start | **2026-11-25T11:08:00Z** (first whole minute after the restart; the restart line sits outside the window) |
+| Earliest a fresh 24 h window can close | **2026-11-26T11:08:00Z** (window start + 24 h) |
+| Restart-free so far | counted from 2026-11-25T11:08:00Z; the previous anchor (pid 3779655) had run 2 d 21 h |
+| Window owner for this anchor | **LP-0MWSD6D24002J0K7** (child of LP-0MWRXFO0I005UBVM; `startOn` = run-not-before `2026-11-26T11:08:00Z`) and **LP-0MWRWBJPP001Q5JX** (same window — one window, many measurements) |
+
+> **This was a two-change batched restart, and the attribution says so.** The
+> deploy loaded **two** behaviour changes at once: `aa6115bcc`
+> (LP-0MWSD6CEE0068T19 / LP-0MWRXFO0I005UBVM) and `5ef9b5ebb`
+> (LP-0MWRWBJPP001Q5JX). Both are named in the `reason=` line, so each item's
+> measurement stays attributable. The remaining commits in the delta are
+> docs/tests only and change no proxy behaviour.
+
+> **Do not restart the proxy before 2026-11-26T11:08:00Z.** A restart inside
+> this window re-anchors it and the partial window never yields a PASS (§ 1).
+> If a deploy cannot wait, record the re-anchor explicitly and re-arm the
+> affected items to `last restart + 24 h` (§ 4.6).
+
+> **Available for reuse — producer decision pending.** The gating fix for
+> **LP-0MWBZVU04007OII2** (group-3 validation, `01d89a19e` slot-before-admission)
+> is already an ancestor of this loaded build, so this anchor could serve as its
+> single attributed group-3 restart. It is **not** claimed for that item here:
+> the `reason=` line above does not name it, so adopting it requires an explicit
+> producer decision recorded on that item and a row added below.
 
 > **Why the loaded build ≠ the checkout tip matters.** The proxy runs from a
 > shared checkout whose `HEAD` moves when agents commit; the running process
@@ -108,10 +131,12 @@ run **without** `--reason`; the rest name their deploy:
 | 2026-11-16T15:20:49 | 3720326 | `reason=LP-0MW7V14DN007F127: group-2 validation restart (cold-regime ETA + deadline token capacity)` — the re-arm #6 anchor in § 3.4 |
 | **2026-11-18T10:24:29** | **1789326** | **anchor of the post-fix `slots_stale` window** (§ 3.4) — `reason=LP-0MVVCO1N7004TNGY: deploy F3 shared /slots snapshot (156f3cd3d) + F4 age-derived slots_stale schema 8 (1aeca7059) + F5 residual attribution (d8ce36dc9)` |
 | 2026-11-19T19:36:07 | 2765810 | manual, no reason — 9 h 11 m **after** that window closed, so it did not void it |
+| 2026-11-22T13:47:45 | 3779655 | manual, no reason — loaded build `8d494d878`. Its own 24 h window `2026-11-22T13:47Z → 2026-11-23T13:47Z` **closed before** the next restart and is owned by **LP-0MWRR3ZUV008ADVB**; that item must measure before log retention prunes the segments (≈ 2026-11-29) |
+| **2026-11-25T11:07:33** | **545169** | **anchor of the 2026-11-25 refresh (§ 2)** — `reason=LP-0MWRXFO0I005UBVM / LP-0MWSD6CEE0068T19: … batched with LP-0MWRWBJPP001Q5JX …`; llama-server preserved; loaded build `5ef9b5ebb` |
 
 ---
 
-## 3. The calendar — open measurement items (live snapshot 2026-11-02T11:05Z)
+## 3. The calendar — open measurement items (live snapshot 2026-11-25T11:15Z)
 
 ### 3.1 Items that require a restart-free ≥ 24 h window
 
@@ -125,7 +150,11 @@ coordination record.
 |---|---|---|---|---|
 | **LP-0MVN44XB0009M33K** | 24 h AC4 resident-prefix admission (scheduling-attributed `prefill_deadline` drop ≥ 90 %) | loaded build at the 2026-11-16T15:20:47Z anchor = `79f53ac1` (`LP-0MW8EAT60003Z28H`) | **measured** — re-arm #6 `2026-11-16T15:21:00Z → 2026-11-17T15:21:00Z` (see § 3.4) | **Done**: PASS — 0 scheduling-attributed of 1 deadline event (22 → 0); see `slot-thrashing-investigation/findings.md`. Open qualifier: the tail-of-window orphaned-marker wedge (`LP-0MWKWGLRT003AUG4`) |
 | **LP-0MVP7HX2S008IU57** | router-responder `GET /slots … 500 == 0` after the child-port discovery fix | `f58e8964` + `189864fc` (LP-0MVP7525P008RXMF, deployed 2026-10-26T21:01:42Z) | `2026-10-27T12:00Z → 2026-10-28T12:00Z` — **expired** | Superseded in practice by the `/health`-fix measurement (LP-0MVVLKPBM007F6U6, RED); needs an explicit disposition, not a fresh 24 h window |
-| **LP-0MVVLQMG1000843Q** | writer-side sidecar pairing, ≥ 24 h post-deploy | `5c0f80f9` (LP-0MVVI8TEU006KTOZ, 2026-10-31T06:18:04Z) — **in the loaded anchor build** | `deploy + 24 h`; current anchor `2026-11-02T10:39:25Z → 2026-11-03T10:39:25Z` | Assignee hold (`Map`); fix is deployed, so a window is available once the hold is released |
+| **LP-0MVVLQMG1000843Q** | writer-side sidecar pairing, ≥ 24 h post-deploy | `5c0f80f9` (LP-0MVVI8TEU006KTOZ, 2026-10-31T06:18:04Z) — in **every** build since 2026-11-02 | from the current anchor: **`2026-11-25T11:08:00Z → 2026-11-26T11:08:00Z`** | Open. The pre-restart anchor (pid 3779655, 2 d 21 h old) was eligible but that opportunity is spent by the 2026-11-25 restart, so the earliest valid window is now `2026-11-26T11:08:00Z` |
+| **LP-0MWSD6D24002J0K7** | re-measure the undatable share of `slots_stale` (target < 0.5 %) after the joiner-age fix | `aa6115bcc` (LP-0MWSD6CEE0068T19) **and** `5ef9b5ebb` (LP-0MWRWBJPP001Q5JX) — both in the 2026-11-25T11:07:33Z anchor build | **`2026-11-25T11:08:00Z → 2026-11-26T11:08:00Z`**; `startOn` = `2026-11-26T11:08:00Z` | **Armed.** Parent AC4/AC5; measure after the window closes. Before: 4.47 % undatable (557/12,450) |
+| **LP-0MWRWBJPP001Q5JX** | post-deploy measurement of the measured-basis prefill calibration | `5ef9b5ebb` — in the 2026-11-25T11:07:33Z anchor build | shares the `2026-11-25T11:08:00Z → 2026-11-26T11:08:00Z` window | **No separate window** (one window, many measurements); recorded here so the batched restart is attributable to both items |
+| **LP-0MWRR3ZUV008ADVB** | 24 h before/after + regression band after the measured-basis ETA fix | `af0e39273` — in the **outgoing** anchor build `8d494d878` (pid 3779655) | `2026-11-22T13:47Z → 2026-11-23T13:47Z` — **closed**, restart-free, and bounded by the later 2026-11-25 restart | Open: analyse the closed window before log retention (≈ 2026-11-29); no new window needed |
+| **LP-0MWBZVU04007OII2** | group-3 validation: one attributed restart + ≥ 24 h restart-free window | `01d89a19e` — already in the 2026-11-25 anchor build | **may reuse** `2026-11-25T11:08:00Z → 2026-11-26T11:08:00Z` | **Producer decision pending** — the anchor's `reason=` line does not name this item; adopt it explicitly here or take a later restart |
 | **LP-0MVU8003X0018WT8** | router-responder `GET /slots … 400 == 0` after the `?model=` fixes | LP-0MVU7ZZTH005FSFL slices (merged; record loaded build at anchor) | `earliest 2026-11-01T23:56Z` (based on the 2026-10-31T23:56 restart) — **superseded** | **Re-arm** to the current anchor (`→ 2026-11-03T10:39:25Z`) |
 | **LP-0MVVCO1N7004TNGY** | `slots_stale` over 24 h (target < 5 %; measured 29.59 %) | F3 `156f3cd3d` + F4 `1aeca7059` + F5 `d8ce36dc9`, deployed by the 2026-11-18T10:24:29Z restart | `2026-11-18T10:25:00Z → 2026-11-19T10:25:00Z` — **measured** (see § 3.4) | **Done**: `slots_stale` **4.88 %** (608/12,450) at the 300 s ceiling; tightened 2 s reading 31.60 %. Outcome recorded by LP-0MWLZ68SF0052E7Z |
 | **LP-0MVVXGMRN007NCJP** | re-measure the 24 h `slots_stale` window; record AC2 disposition | fix under LP-0MVVCO1N7004TNGY | `≥ 24 h` after that fix is deployed | **Blocked** on the parent fix |
@@ -181,10 +210,12 @@ subsequent restart occurred.
 1. **Read this calendar before any deploy that restarts the proxy.** The
    dispatcher / operator checks which windows are open and which fixes are
    already loaded.
-2. **Batch.** Collect every pending fix that needs a restart (today:
-   `9f3b9c06` for LP-0MVZ2EPI3006Y0WN / LP-0MVW8S8OZ00449YR, plus any other
-   merged-but-not-loaded fix), deploy them in **one** restart, and then open
-   **one** shared window from that anchor. Do not restart once per item.
+2. **Batch.** Collect every pending fix that needs a restart (as of
+   2026-11-25T11:15Z: **nothing is merged-but-not-loaded** — the checkout tip
+   `5ef9b5ebb` equals the anchor's loaded build, so a restart now would load no
+   code; the 2026-11-25 deploy batched `aa6115bcc` and `5ef9b5ebb` in one
+   restart), deploy them in **one** restart, and then open **one** shared window
+   from that anchor. Do not restart once per item.
 3. **Never deploy inside an open window.** A deploy that must land mid-window is
    either deferred to the window's end, or it explicitly re-anchors and
    invalidates the named windows below — recorded as such, never silently.
