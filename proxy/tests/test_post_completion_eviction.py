@@ -60,8 +60,9 @@ What this file pins
   same harness driving a dispatch that is served *and* completed on the local
   endpoint produces no eviction today, so the assertion above is not vacuous.
 * ``test_genuinely_stalled_dispatch_is_still_evicted`` — inverse control: a
-  dispatch that never completes is still reclaimed by the watchdog with
-  ``reason=no_progress_watchdog``, so the fix cannot pass by silencing the
+  dispatch that never completes is still reclaimed by the watchdog with the
+  distinct ``reason=prefill_stalled`` (LP-0MWKQJHSM000CI6W; formerly the
+  umbrella ``no_progress_watchdog``), so the fix cannot pass by silencing the
   watchdog for real stalls.
 
 Harness idioms are taken from ``test_abandoned_local_dispatch.py`` (injected
@@ -446,7 +447,9 @@ async def test_genuinely_stalled_dispatch_is_still_evicted(clock, caplog):
 
     after_acceptance = _eviction_lines(caplog, "local_eviction_after_acceptance")
     assert len(after_acceptance) == 1, after_acceptance
-    assert "reason=no_progress_watchdog" in after_acceptance[0]
+    # LP-0MWKQJHSM000CI6W: the stalled dispatch now reports the distinct reason
+    # (no progress for the watchdog timeout, no ETA, inside the hard ceiling).
+    assert "reason=prefill_stalled" in after_acceptance[0]
     assert f"session={SESSION}" in after_acceptance[0]
-    assert _after_acceptance_by_reason() == {"no_progress_watchdog": 1}
+    assert _after_acceptance_by_reason() == {"prefill_stalled": 1}
     assert (LOCAL_ENDPOINT, SESSION) not in srv.local_dispatch_records

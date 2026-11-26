@@ -118,6 +118,28 @@ DEFAULT_LOG_GLOB = "proxy.log*"
 REASON_PREFILL_DEADLINE = "prefill_deadline"
 REASON_MEASURED_CACHE_DEFICIT = "measured_cache_deficit"
 
+#: The distinct prefill-watchdog release reasons introduced by
+#: LP-0MWKQJHSM000CI6W. Before that change the post-acceptance eviction line
+#: carried only the umbrella ``no_progress_watchdog`` label even when the sweep
+#: had computed one of these, so the per-reason split could be met by
+#: relabelling. They are ordinary reasons to :func:`reason_split` (which groups
+#: by whatever value the line carries), and are named here so a consumer can
+#: tell an early abort from a genuine wedge without hard-coding strings.
+REASON_PREFILL_ETA_EXCEEDED = "prefill_eta_exceeded"
+REASON_PREFILL_STALLED = "prefill_stalled"
+REASON_PREFILL_MAX_EXCEEDED = "prefill_max_exceeded"
+
+#: The umbrella the watchdog falls back to when no distinct reason applies.
+REASON_NO_PROGRESS_WATCHDOG = "no_progress_watchdog"
+
+#: Every distinct watchdog release reason (used by the reconciliation test).
+WATCHDOG_RELEASE_REASONS: tuple[str, ...] = (
+    REASON_PREFILL_ETA_EXCEEDED,
+    REASON_PREFILL_STALLED,
+    REASON_PREFILL_MAX_EXCEEDED,
+    REASON_NO_PROGRESS_WATCHDOG,
+)
+
 #: The parent AC4 classifier (LP-0MVOAQDB4002D56G): agent audit runs use session
 #: ids prefixed ``audit-``; every other session — including an unattributed one
 #: — is user traffic. Mirrors ``reporting.AUDIT_SESSION_PREFIX`` so the two

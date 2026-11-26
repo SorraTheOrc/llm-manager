@@ -27,6 +27,11 @@ from proxy import admission_events
 AFTER_ACCEPTANCE_REASONS = (
     "prefill_deadline",
     "no_progress_watchdog",
+    # LP-0MWKQJHSM000CI6W: the watchdog reports the distinct reason the sweep
+    # computed rather than the umbrella label.
+    "prefill_eta_exceeded",
+    "prefill_stalled",
+    "prefill_max_exceeded",
     "idle_timeout",
     "orphan_cleanup",
     "lease_evicted",
@@ -108,6 +113,11 @@ def test_each_reason_emits_exactly_one_error_event(reason, caplog):
         "elapsed_s=",
         "slot_id=1",
         "llama_task_id=unknown",
+        # LP-0MWKQJHSM000CI6W: release-context evidence is always appended so
+        # the V1 window can classify every eviction.
+        "task_started=no",
+        "progress_observed=no",
+        "queue_wait_s=unknown",
     ):
         assert field in message, f"missing evidence field {field!r} in {message!r}"
 

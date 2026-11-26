@@ -421,8 +421,14 @@ def test_eviction_line_is_append_only(caplog):
         "llama_task_id",
         "endpoint",
     ]
-    # Everything the association adds comes after the pre-existing keys.
-    assert keys[9:] == ["llama_task_id_reason"]
+    # Everything the association adds comes after the pre-existing keys; the
+    # LP-0MWKQJHSM000CI6W release-context evidence is appended last.
+    assert keys[9:] == [
+        "llama_task_id_reason",
+        "task_started",
+        "progress_observed",
+        "queue_wait_s",
+    ]
 
 
 # ---------------------------------------------------------------------------

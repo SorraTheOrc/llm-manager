@@ -3839,6 +3839,9 @@ async def _increment_local_active_queries(
                                 session_key,
                                 admission_evidence=admission_evidence,
                             ),
+                            # LP-0MWKQJHSM000CI6W: the measured contention-queue
+                            # wait is release-context evidence for the V1 window.
+                            "queue_wait_s": _queue_wait_seconds_from_request(request),
                         }
                     _pin_dispatch_slot(
                         srv, record_key, session_key, backend
@@ -4691,6 +4694,26 @@ def _record_local_eviction(
     return plan is not None
 
 
+def _queue_wait_seconds_from_request(request) -> float | None:
+    """Return the contention-queue wait stamped on *request*, if any.
+
+    LP-0MWKQJHSM000CI6W: the eviction line reports how much queue wait
+    preceded the dispatch (the V1 window buckets it), so the record stores the
+    measured value at admission. A request that never queued (or a call site
+    without a request object) carries ``None`` — rendered as ``unknown``, never
+    guessed as ``0``.
+    """
+    if request is None:
+        return None
+    try:
+        value = getattr(request, "_contention_queue_wait_seconds", None)
+        if value is None:
+            return None
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _dispatch_evidence(
     body_json: dict | None,
     model_name: str | None,
@@ -5145,6 +5168,9 @@ async def _try_acquire_local_dispatch(
                             session_key,
                             admission_evidence=admission_evidence,
                         ),
+                        # LP-0MWKQJHSM000CI6W: the measured contention-queue
+                        # wait is release-context evidence for the V1 window.
+                        "queue_wait_s": _queue_wait_seconds_from_request(request),
                     }
                 if _credit_taken:
                     srv.local_active_queries += 1
@@ -7248,7 +7274,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     verify_candidates: list[tuple[str, dict]] = []
     # LP-0MUGQHPJ50046LV8: deferred watchdog-released records (stream_cm, slot
     # freeing, preflight tracking) — processed after releasing the lock.
-    deferred_watchdog: list[tuple[str, str, str | None, object]] = []
+    deferred_watchdog: list[
+        tuple[str, str, str | None, object, dict, str]
+    ] = []
 
     # Phase 1 (under lock): collect expired records. Inactive records are
     # freed immediately; expired ACTIVE records are deferred to phase 3 so
@@ -7388,6 +7416,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                             endpoint_from_record,
                             stream_cm,
                             released_record,
+                            _watchdog_reason,
                         )
                     )
                     continue
@@ -7644,6 +7673,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             endpoint_from_record,
             stream_cm,
             released_record,
+            watchdog_reason,
         ) in deferred_watchdog:
             try:
                 # Close the upstream httpx stream to cancel the in-flight
@@ -7669,10 +7699,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             )
             # LP-0MVN4LCED00661MX AC1 (``no_progress_watchdog``): the watchdog
             # released an accepted dispatch that never produced a first byte.
+            # LP-0MWKQJHSM000CI6W AC1: report the distinct reason the sweep
+            # computed (``prefill_eta_exceeded`` / ``prefill_stalled`` /
+            # ``prefill_max_exceeded``) rather than the umbrella label, so the
+            # eviction line reconciles with the preceding ``lease_released``
+            # line and a relabelling cannot be mistaken for a fix.
             _emit_eviction_after_acceptance(
                 srv,
                 session_key,
-                "no_progress_watchdog",
+                watchdog_reason,
                 released_record,
                 endpoint=endpoint_from_record,
             )
