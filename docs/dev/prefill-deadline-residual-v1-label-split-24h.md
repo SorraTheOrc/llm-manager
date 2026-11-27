@@ -56,6 +56,29 @@ The one figure that did not improve is attributability: 82.65 % of the window's
 aborts carry `slot_id=unknown`, so the stronger never-started diagnostic is
 available for only 9 events.
 
+### 0.1 The pass/fail line the producer set on 2026-11-25
+
+The 2026-11-25 hand-off on this item replaced the `b2` counted-pair criterion
+with the **reason-agnostic user-class stall-weighted rate** over *all*
+post-acceptance abort reasons, and made the `b2` pair and the occupancy/capacity
+attribution **diagnostics only**.
+
+| Gate | Threshold | This window | Verdict |
+|---|---|---|---|
+| All-reasons **user-class** Σ`elapsed_s`/h | **≤ 6.06 s/h** (≥ 90 % below the group-1 60.572 s/h) | **88.567 s/h** (2 125.6 s over 24.0 h) | **NOT met** — 14.6× the threshold |
+| Event base / noise guard | ≥ 10 user-class aborts across all reasons | **51** | met, no extension needed |
+| Escalation trigger | first window above 30.29 s/h (half the group-1 baseline) → report as a finding instead of re-measuring | **88.567 s/h > 30.29 s/h** | **escalated** — no confirming window is armed; the finding is this report |
+| `b2` pair (diagnostic) | — | `prefill_deadline` user 0 + `measured_cache_deficit` user 3 = **3 events, 0.125/h** | diagnostic: the counted pair is rare, and that is *not* the pass line |
+| `prefill_deadline` attribution (diagnostic) | occupancy < 25 %, capacity < 50 % | 2 events: **occupancy 2, capacity 0, predicted-warmth 0** | diagnostic |
+
+So the honest headline for the downstream verdict (**LP-0MVRMOV8K0007NFO** /
+**LP-0MVO8H7VQ003B12I**) is: **the reason-agnostic criterion is not met, and it is
+not a near miss** — 88.567 s/h against a 6.06 s/h gate. Because that is above
+the 30.29 s/h escalation trigger, the producer's rule says to report it as a
+finding rather than re-measure. The finding is: the class is dominated by a
+**15.3 s-median early cut** (`prefill_eta_exceeded`, 83 events, 2 956.0 s), not
+by the deadline-shaped stall the `b2` pair was built around.
+
 ## 1. Window certification (AC1, AC2)
 
 The anchor is the **restart that loaded the fix**, not a commit date. Per the
@@ -102,16 +125,21 @@ the implementation worktree:
 python3 proxy/scripts/analyse_prefill_deadline_residual.py \
   --start "2026-11-26 10:18:00" --end "2026-11-27 10:18:00" \
   --deadline-seconds 180 \
+  --llama-log "/var/log/llama-proxy/llama-server*.log" \
   --json --output docs/dev/prefill-deadline-residual-v1-label-split-24h.json
 ```
 
-`--llama-log` is deliberately **not** passed: the release→cancel joiner needs a
-`llama-server` log covering *exactly* the window, and this window's llama-server
-log is not a clean window boundary (the backend has been up since 2026-11-22, so
-its rotated segments do not align with a 2026-11-26 10:18 boundary). The
-abandoned-prefill block therefore reports `basis = legacy_rate_estimate` and
-`measured_available = false`. Nothing in AC3 depends on it: every classification
-figure in §3 is derived from the proxy log alone.
+This is the command form the 2026-11-25 hand-off mandates. The joiner is
+enabled and reports `abandoned_prefill_windows.basis = measured_stop`,
+`measured_available = true`, `seconds_basis_tok_s = 141.48` — but also
+**`abandoned_prefill_windows.coverage.verdict = mismatch`** (98 releases against
+7 350 backend task segments), because the `llama-server` backend has been up
+since 2026-11-22 13:47 and its log stream is not aligned to a 2026-11-26 10:18
+window boundary. Every figure in §0.1 and §3 is derived from **proxy log only**
+(the stall cost's `source_fields` are `reason`/`session`/`elapsed_s` and the
+classification reads the eviction line), so the coverage mismatch moves nothing
+that is used for pass/fail; it is recorded so nobody reads the abandoned-prefill
+rows as window-certified.
 
 The admission denominators (AC4) were produced by:
 
@@ -285,6 +313,12 @@ reduced the class; it claims the class is now diagnosable, and the diagnosis
 
 ## 5. What this window changes for the rest of the chain
 
+- **The downstream verdict has its answer and it is negative.** The
+  reason-agnostic user stall-weighted rate is **88.567 s/h against a 6.06 s/h
+  gate**, which is also above the 30.29 s/h escalation trigger. Per the
+  2026-11-25 producer decision, LP-0MVRMOV8K0007NFO and LP-0MVO8H7VQ003B12I must
+  record the criterion as **not met** and carry this as a finding, not arm a
+  confirming window.
 - **The never-started fix (LP-0MWM0CR18001SB1U) now has its target defined from
   this window, not group-2:** 9 evidenced never-started events (all user,
   `prefill_eta_exceeded` 7 / `measured_cache_deficit` 2) plus 81 unattributable
