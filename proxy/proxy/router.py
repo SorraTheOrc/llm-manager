@@ -34,6 +34,45 @@ def _srv():
     return _m
 
 
+def _note_dispatch_outcome(
+    request,
+    session_id,
+    kind,
+    *,
+    endpoint=None,
+    prompt_fp=None,
+):
+    """Emit one ``local_dispatch_outcome`` line (LP-0MWM0CPQN009SHJR).
+
+    ``kind`` is ``"accepted"`` / ``"refused"`` / ``"remote"``; it is
+    resolved to the canonical outcome vocabulary in
+    :mod:`proxy.retry_outcome`. The line records that this client's dispatch
+    was admitted locally, refused locally, or served remotely, so an earlier
+    abort of the same session/prompt can be joined to what followed.
+    Measurement-only — wrapped so it can never raise into a dispatch path and
+    never changes an admission decision, abort policy or threshold (AC4).
+    """
+    try:
+        from proxy import retry_outcome as _retry_outcome
+
+        outcome = {
+            "accepted": _retry_outcome.OUTCOME_LOCAL_ACCEPTED,
+            "refused": _retry_outcome.OUTCOME_LOCAL_REFUSED,
+            "remote": _retry_outcome.OUTCOME_REMOTE,
+        }.get(kind, kind)
+        if prompt_fp is None:
+            prompt_fp = _retry_outcome.request_prompt_fingerprint(request)
+        _retry_outcome.record_dispatch_outcome(
+            _srv(),
+            session_id,
+            prompt_fp,
+            outcome,
+            endpoint=endpoint,
+        )
+    except Exception:
+        pass
+
+
 def _log_local_stream_client_disconnect(srv, session_id, model_name):
     """Log a terminal ``Stream finished: reason=client_disconnect`` line.
 
@@ -1278,6 +1317,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     # which prompt failed.
     _client_prompt_fingerprint = _prefill_thrash_fingerprint(body_json)
 
+    # LP-0MWM0CPQN009SHJR: the stable prompt identity for the retry-outcome
+    # join, captured from the client's ORIGINAL body before ``_handle_session``
+    # rewrites ``messages`` to a delta. Stamped on the request so the dispatch
+    # record, the eviction line and every ``local_dispatch_outcome`` line carry
+    # one value; measurement-only and never raises.
+    _prompt_fp = None
+    try:
+        from proxy import retry_outcome as _retry_outcome
+
+        _prompt_fp = _retry_outcome.stamp_prompt_fingerprint(request, body_json)
+    except Exception:
+        _prompt_fp = None
+
     # Session handling – incremental prompt ingestion
     session_result = await _handle_session(
         srv, body_json, server_config, request.headers
@@ -1586,6 +1638,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
         # No remote providers or remote attempts failed — reject due to concurrency
         _record_backend_signal("concurrency_rejects")
+        # LP-0MWM0CPQN009SHJR: record the refusal as the caller's next-dispatch
+        # outcome so an earlier abort of this session can be joined to it.
+        _note_dispatch_outcome(request, session_id, "refused", endpoint=endpoint)
         srv.logger.warning(
             "concurrency_reject active=%s max=%s path=%s",
             cur_active,
@@ -1636,6 +1691,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         )
     )
     if _local_gate_refused:
+        # LP-0MWM0CPQN009SHJR: the gate refused local for this request.
+        _note_dispatch_outcome(request, session_id, "refused", endpoint=endpoint)
         try:
             record_http_error(
                 "v1/chat/completions", "5xx", _local_gate_reason
@@ -1689,6 +1746,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             request=request,
         )
         if not acquired:
+            # LP-0MWM0CPQN009SHJR: the local lease/occupancy gate refused this
+            # dispatch (cold start or no slots) — the caller was not admitted
+            # locally on this attempt. Recorded as a next-dispatch outcome so
+            # an earlier abort of this session can be joined to it (AC1/AC2).
+            _note_dispatch_outcome(
+                request, session_id, "refused", endpoint=endpoint
+            )
             _cold = cold_start.is_cold(server_config)
             # AC2/AC3 (LP-0MW0KZTWC004HXQ5): a refusal must be diagnosable from
             # the log alone. The evidence snapshot names every input the gate
@@ -1801,6 +1865,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
     )
     if slot_response is not None:
+        # LP-0MWM0CPQN009SHJR: the slot-availability probe refused the dispatch.
+        _note_dispatch_outcome(request, session_id, "refused", endpoint=endpoint)
         return slot_response
 
     # Mark active query
@@ -1858,6 +1924,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         request._local_dispatch_started_at = _dispatch_start
     except Exception:
         pass
+    # LP-0MWM0CPQN009SHJR: the dispatch is admitted locally — record it as the
+    # caller's next-dispatch outcome. This fires for explicit and anonymous
+    # sessions alike (both record-create paths are above). An abort of THIS
+    # dispatch is logged separately by the eviction sink; an in-request retry
+    # re-enters here and emits its own line, which is exactly the "next
+    # attempt" the join needs.
+    _note_dispatch_outcome(request, session_id, "accepted", endpoint=endpoint, prompt_fp=_prompt_fp)
 
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)

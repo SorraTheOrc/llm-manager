@@ -3838,6 +3838,9 @@ async def _increment_local_active_queries(
                                 model_name,
                                 session_key,
                                 admission_evidence=admission_evidence,
+                                # LP-0MWM0CPQN009SHJR: the retry-join key from
+                                # the client's original body.
+                                prompt_fp=_dispatch_prompt_fp(request, body_json),
                             ),
                             # LP-0MWKQJHSM000CI6W: the measured contention-queue
                             # wait is release-context evidence for the V1 window.
@@ -4714,12 +4717,36 @@ def _queue_wait_seconds_from_request(request) -> float | None:
         return None
 
 
+def _dispatch_prompt_fp(request, body_json: dict | None) -> str | None:
+    """The stable prompt identity for a dispatch record (LP-0MWM0CPQN009SHJR).
+
+    Prefers the fingerprint stamped on the request at the earliest body parse
+    (before session-delta rewriting mutates ``messages``), so the record, the
+    eviction line and the ``local_dispatch_outcome`` lines all agree on one
+    join key; falls back to recomputing from *body_json* for a caller that
+    never stamped it. Never raises.
+    """
+    try:
+        stamped = getattr(request, "_prompt_fp", None) if request is not None else None
+    except Exception:
+        stamped = None
+    if stamped:
+        return stamped
+    try:
+        from proxy.retry_outcome import prompt_fingerprint
+
+        return prompt_fingerprint(body_json)
+    except Exception:
+        return None
+
+
 def _dispatch_evidence(
     body_json: dict | None,
     model_name: str | None,
     session_key: str | None,
     *,
     admission_evidence: dict | None = None,
+    prompt_fp: str | None = None,
 ) -> dict:
     """Accepted-dispatch evidence for the post-acceptance eviction event.
 
@@ -4766,6 +4793,12 @@ def _dispatch_evidence(
         "slot_id": None,
         "llama_task_id": None,
         "first_byte_seen": False,
+        # LP-0MWM0CPQN009SHJR: the stable prompt identity, computed from the
+        # client's ORIGINAL body (before session-delta rewriting) and threaded
+        # here by the caller. It is recorded even when no admission snapshot
+        # exists, so the abort line always carries a join key (rendered
+        # ``unknown`` when absent) and a pre-change record stays parseable.
+        "prompt_fp": prompt_fp,
     }
     if not isinstance(admission_evidence, dict):
         return evidence
@@ -5167,6 +5200,9 @@ async def _try_acquire_local_dispatch(
                             model_name,
                             session_key,
                             admission_evidence=admission_evidence,
+                            # LP-0MWM0CPQN009SHJR: the retry-join key from the
+                            # client's original body.
+                            prompt_fp=_dispatch_prompt_fp(request, body_json),
                         ),
                         # LP-0MWKQJHSM000CI6W: the measured contention-queue
                         # wait is release-context evidence for the V1 window.

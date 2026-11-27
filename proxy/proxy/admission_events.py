@@ -318,6 +318,15 @@ def _release_context_fields(
       liveness-only lease extension is deliberately not counted as progress.
     - ``queue_wait_s``: the contention-queue wait stamped on the record at
       admission, ``unknown`` when the record carries none.
+
+    LP-0MWM0CPQN009SHJR adds two **correlation** fields for the retry-outcome
+    join (append-only, so no pre-existing key moves):
+
+    - ``prompt_fp``: the stable prompt identity the dispatch record carried from
+      admission (:func:`proxy.retry_outcome.prompt_fingerprint`), so the abort
+      can be joined to the caller's next dispatch of the same prompt;
+    - ``turn``: the per-request correlation id stamped on the record, extra
+      provenance for the join (``unknown`` when the record carries none).
     """
     record = record or {}
     task_started = "yes" if llama_task_id is not None else "no"
@@ -332,10 +341,16 @@ def _release_context_fields(
         queue_wait_value = max(0.0, float(record.get("queue_wait_s")))
     except (TypeError, ValueError):
         queue_wait_value = None
+    turn_value = record.get("turn")
     return {
         "task_started": task_started,
         "progress_observed": "yes" if progress_observed else "no",
         "queue_wait_s": queue_wait_value,
+        # LP-0MWM0CPQN009SHJR: the retry-outcome correlation key. A pre-change
+        # record carries no prompt fingerprint; it renders ``unknown`` rather
+        # than a fabricated value, so an unjoinable abort is visibly so.
+        "prompt_fp": record.get("prompt_fp") or "unknown",
+        "turn": turn_value if turn_value else "unknown",
     }
 
 

@@ -69,6 +69,16 @@ the dispatch monitor; see ``proxy/proxy/admission_events.py``)::
         local_in_flight_requests=N local_owner_session_id=S ...
     Stream finished: reason=R tokens=A/B/C session=S provider=local ...
 
+    # LP-0MWM0CPQN009SHJR retry-outcome join (emission: proxy/retry_outcome.py):
+    #
+    local_dispatch_outcome session=S prompt_fp=F outcome=O endpoint=E [turn=T]
+    dispatch_first_byte_ms=... session=S ... [turn=T]     # local first byte
+    ttft_seconds=F session=S provider=O model=M [turn=T]   # remote first byte
+
+    The eviction line additionally carries ``prompt_fp=F`` and ``turn=T``
+    (appended after the release-context fields), the correlation key the join
+    matches on.
+
 Usage::
 
     python3 proxy/scripts/analyse_prefill_deadline_residual.py \\
@@ -184,6 +194,78 @@ RELEASE_CONTEXT_NOTE = (
     "three fields and is reported as ``unknown``, never inferred."
 )
 
+#: Retry-outcome vocabulary (LP-0MWM0CPQN009SHJR). ``none`` means the analyser
+#: observed no next dispatch of the session inside the window — it is a join
+#: result, never an emitted outcome (the proxy only emits ``local_accepted`` /
+#: ``local_refused`` / ``remote`` on ``local_dispatch_outcome`` lines).
+RETRY_OUTCOME_LOCAL_ACCEPTED = "local_accepted"
+RETRY_OUTCOME_LOCAL_REFUSED = "local_refused"
+RETRY_OUTCOME_REMOTE = "remote"
+RETRY_OUTCOME_NONE = "none"
+
+#: When one client turn emits several outcome lines (a refusal that then
+#: escalates remotely), the turn's terminal outcome is the first name present,
+#: in this order — remote wins over an admitted local dispatch, which wins
+#: over a bare refusal.
+RETRY_OUTCOME_PRECEDENCE: tuple[str, ...] = (
+    RETRY_OUTCOME_REMOTE,
+    RETRY_OUTCOME_LOCAL_ACCEPTED,
+    RETRY_OUTCOME_LOCAL_REFUSED,
+)
+
+RETRY_JOIN_OUTCOME_VOCABULARY: tuple[str, ...] = (
+    RETRY_OUTCOME_LOCAL_ACCEPTED,
+    RETRY_OUTCOME_LOCAL_REFUSED,
+    RETRY_OUTCOME_REMOTE,
+    RETRY_OUTCOME_NONE,
+)
+
+#: The ``retry_join`` block's published latency percentiles (AC3).
+RETRY_JOIN_PERCENTILES = (50, 95)
+
+#: The eviction/outcome/first-byte fields the retry join reads, so a reader can
+#: see that the block consumes no pre-existing key (AC4: the diff is logging
+#: plus analysis).
+RETRY_JOIN_SOURCE_FIELDS: tuple[str, ...] = (
+    "session",
+    "prompt_fp",
+    "outcome",
+    "turn",
+    "ts",
+    "elapsed_s",
+)
+
+#: The "same prompt" tolerance: identical ``prompt_fp`` values (SHA-256 of the
+#: request's ``messages`` list), so sampling parameters never change it.
+RETRY_JOIN_TOLERANCE = (
+    "Two dispatches carry the 'same prompt' when their ``prompt_fp`` values "
+    "are equal. The fingerprint is the SHA-256 of the request's ``messages`` "
+    "list (canonical JSON), so sampling/generation parameters are ignored and "
+    "only a changed message list (new turn content) changes it."
+)
+
+#: Coverage caveat for every retry-join figure (AC6).
+RETRY_JOIN_CAVEAT = (
+    "The join is log-only and cross-turn: an abort is matched to the next "
+    "dispatch of the same session (by timestamp), and a single turn's several "
+    "outcome lines are collapsed to one terminal outcome (precedence: "
+    "remote > local_accepted > local_refused). It cannot correlate across a "
+    "client restart that changes the session id, nor across sessions; a retry "
+    "that lands after the window close is reported as never-completed, not as "
+    "escaped. A first-byte latency is measured only when the retry produced a "
+    "local or remote first byte inside the window."
+)
+
+RETRY_JOIN_NOTE = (
+    "Retry-outcome join (LP-0MWM0CPQN009SHJR): what the caller of each "
+    "post-acceptance abort experienced next — the next dispatch outcome of the "
+    "same session (local accepted / local refused / remote / none), the time "
+    "from the abort to first byte on a completed retry, and whether the retry "
+    "carried the same prompt. Per abort reason this reports the share retried, "
+    "median/p95 extra latency to first byte, and the share that never completed "
+    "in the window, so a 15 s abort that lands a remote retry immediately reads "
+    "differently from one that leaves the request unanswered."
+)
 #: The parent AC4 classifier (LP-0MVOAQDB4002D56G): agent audit runs use session
 #: ids prefixed ``audit-``; every other session — including an unattributed one
 #: — is user traffic. Mirrors ``reporting.AUDIT_SESSION_PREFIX`` so the two
@@ -378,6 +460,11 @@ class EvictionEvent:
     progress_observed: bool | None = None
     #: Measured contention-queue wait stamped at admission (``None`` = unknown).
     queue_wait_s: float | None = None
+    #: LP-0MWM0CPQN009SHJR: the retry-join correlation key — the stable prompt
+    #: identity recorded on the eviction line (``None`` on a pre-change line).
+    prompt_fp: str | None = None
+    #: The per-request correlation id stamped on the record, when present.
+    turn: str | None = None
 
     @property
     def dispatch_start(self) -> datetime:
@@ -388,6 +475,39 @@ class EvictionEvent:
         if self.estimated_tokens <= 0:
             return 0.0
         return max(0.0, 1.0 - (self.new_tokens / self.estimated_tokens))
+
+
+@dataclass(frozen=True)
+class DispatchOutcome:
+    """One ``local_dispatch_outcome`` line (LP-0MWM0CPQN009SHJR).
+
+    The proxy emits one of these for a local admission (``local_accepted``), a
+    local refusal (``local_refused``) and a remote serve (``remote``). A single
+    client turn can emit several as the provider chain moves; the join collapses
+    them with :data:`RETRY_OUTCOME_PRECEDENCE`.
+    """
+
+    ts: datetime
+    session: str
+    outcome: str
+    prompt_fp: str | None = None
+    turn: str | None = None
+
+
+@dataclass(frozen=True)
+class FirstByte:
+    """A first byte for a session, local (``dispatch_first_byte_ms``) or
+    remote (``ttft_seconds``).
+
+    ``provider`` is ``"local"`` or the remote ``provider=`` token; ``turn`` is
+    the per-request id both lines already carry, used to pair the first byte
+    with its outcome line.
+    """
+
+    ts: datetime
+    session: str
+    provider: str
+    turn: str | None = None
 
 
 @dataclass(frozen=True)
@@ -539,6 +659,9 @@ class WindowLog:
     progress_signatures: list[ProgressSignature] = field(default_factory=list)
     local_completions: list[tuple[datetime, str]] = field(default_factory=list)
     status_polls: list[StatusPoll] = field(default_factory=list)
+    #: LP-0MWM0CPQN009SHJR: the retry-outcome join's raw material.
+    dispatch_outcomes: list[DispatchOutcome] = field(default_factory=list)
+    first_bytes: list[FirstByte] = field(default_factory=list)
     lines_in_window: int = 0
     duplicate_lines_dropped: int = 0
     files_read: int = 0
@@ -615,6 +738,18 @@ def _maybe_queue_wait(value: str | None) -> float | None:
     return _float(value)
 
 
+def _maybe_str(value: str | None) -> str | None:
+    """Keep a string field, mapping ``unknown``/absent to ``None``.
+
+    LP-0MWM0CPQN009SHJR: a pre-change eviction line carries neither
+    ``prompt_fp`` nor ``turn``; absence must stay ``None`` (unattributable),
+    never a fabricated empty string, so the join can report it as unknown.
+    """
+    if value is None or value == "unknown" or value == "":
+        return None
+    return value
+
+
 def read_log_lines(paths, failures: list[str] | None = None) -> list[str]:
     """Read every line of *paths*, transparently decompressing ``.gz`` files.
 
@@ -680,6 +815,9 @@ def _parse_line(log: WindowLog, ts: datetime, line: str) -> None:
                 task_started=_tri_state(fields.get("task_started")),
                 progress_observed=_tri_state(fields.get("progress_observed")),
                 queue_wait_s=_maybe_queue_wait(fields.get("queue_wait_s")),
+                # LP-0MWM0CPQN009SHJR: the retry-join correlation key.
+                prompt_fp=_maybe_str(fields.get("prompt_fp")),
+                turn=_maybe_str(fields.get("turn")),
             )
         )
         return
@@ -742,6 +880,52 @@ def _parse_line(log: WindowLog, ts: datetime, line: str) -> None:
                 ),
             )
         )
+        return
+    # LP-0MWM0CPQN009SHJR: the retry-outcome join's two raw streams. The proxy
+    # emits one ``local_dispatch_outcome`` line per local admission/refusal or
+    # remote serve; the first byte on a retry is the pre-existing
+    # ``dispatch_first_byte_ms`` (local) or ``ttft_seconds`` (remote) line.
+    if "local_dispatch_outcome " in line:
+        fields = parse_fields(line)
+        session = fields.get("session")
+        outcome = fields.get("outcome")
+        if session and outcome:
+            log.dispatch_outcomes.append(
+                DispatchOutcome(
+                    ts=ts,
+                    session=session,
+                    outcome=outcome,
+                    prompt_fp=_maybe_str(fields.get("prompt_fp")),
+                    turn=_maybe_str(fields.get("turn")),
+                )
+            )
+        return
+    if "dispatch_first_byte_ms=" in line:
+        fields = parse_fields(line)
+        session = fields.get("session")
+        if session:
+            log.first_bytes.append(
+                FirstByte(
+                    ts=ts,
+                    session=session,
+                    provider="local",
+                    turn=_maybe_str(fields.get("turn")),
+                )
+            )
+        return
+    if "ttft_seconds=" in line:
+        fields = parse_fields(line)
+        session = fields.get("session")
+        if session:
+            log.first_bytes.append(
+                FirstByte(
+                    ts=ts,
+                    session=session,
+                    provider=fields.get("provider") or "remote",
+                    turn=_maybe_str(fields.get("turn")),
+                )
+            )
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1106,6 +1290,172 @@ def release_context_split(evictions, hours: float) -> dict:
         "task_started_no_by_slot": task_started_no_by_slot,
         "priced_as_new_compute": priced,
         "note": RELEASE_CONTEXT_NOTE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Retry-outcome join (LP-0MWM0CPQN009SHJR)
+# ---------------------------------------------------------------------------
+
+
+def _terminal_outcome(group: list[DispatchOutcome]) -> str:
+    """The terminal outcome of one retry turn, by :data:`RETRY_OUTCOME_PRECEDENCE`.
+
+    A provider chain can emit several ``local_dispatch_outcome`` lines for one
+    client request (a local refusal that then escalates remotely, or two local
+    admits across an in-request retry); the turn's terminal outcome is the
+    first name present in precedence order.
+    """
+    present = {item.outcome for item in group}
+    for name in RETRY_OUTCOME_PRECEDENCE:
+        if name in present:
+            return name
+    return group[-1].outcome if group else RETRY_OUTCOME_NONE
+
+
+def _join_abort_row(
+    event: EvictionEvent,
+    outcomes_after: list[DispatchOutcome],
+    first_bytes_after: list[FirstByte],
+) -> dict:
+    """One abort's join row: outcome, same-prompt, latency, completion.
+
+    *outcomes_after* is the session's ``local_dispatch_outcome`` lines strictly
+    after the abort (earliest first); *first_bytes_after* the session's first
+    bytes strictly after the abort. ``none`` is reported when no next dispatch
+    was observed; a first-byte latency is only meaningful for a completed
+    retry. Absent correlation keys render ``None`` (never a guessed value).
+    """
+    row: dict = {
+        "ts": event.ts.isoformat(sep=" ", timespec="seconds"),
+        "session": event.session,
+        "reason": event.reason,
+        "elapsed_s": round(float(event.elapsed_s), 3),
+        "prompt_fp": event.prompt_fp,
+        "turn": event.turn,
+    }
+    if not outcomes_after:
+        row["outcome"] = RETRY_OUTCOME_NONE
+        row["retried"] = False
+        row["same_prompt"] = None
+        row["abort_to_first_byte_s"] = None
+        row["completed"] = False
+        row["retry_turn"] = None
+        row["retry_prompt_fp"] = None
+        return row
+
+    first = outcomes_after[0]
+    turn = first.turn if first.turn else None
+    # Collapse a single turn's several outcome lines (the chain can move local
+    # refusal -> remote in one request) to its terminal outcome.
+    group = [
+        item for item in outcomes_after if turn is None or item.turn == turn
+    ]
+    outcome = _terminal_outcome(group)
+    retry_fp = first.prompt_fp
+    same_prompt = None
+    if event.prompt_fp and retry_fp:
+        same_prompt = event.prompt_fp == retry_fp
+
+    # The retry's first byte: the earliest same-session first-byte line whose
+    # turn matches the retry (or simply the earliest after the retry's outcome
+    # line when no turn was bound). ``dispatch_first_byte_ms`` for local,
+    # ``ttft_seconds`` for remote.
+    fb = None
+    if turn is not None:
+        for candidate in first_bytes_after:
+            if candidate.turn == turn and candidate.ts >= first.ts:
+                fb = candidate
+                break
+    if fb is None:
+        for candidate in first_bytes_after:
+            if candidate.ts >= first.ts:
+                fb = candidate
+                break
+    row["retried"] = outcome != RETRY_OUTCOME_NONE
+    row["outcome"] = outcome
+    row["same_prompt"] = same_prompt
+    row["completed"] = fb is not None
+    row["abort_to_first_byte_s"] = (
+        round((fb.ts - event.ts).total_seconds(), 3) if fb is not None else None
+    )
+    row["retry_turn"] = first.turn
+    row["retry_prompt_fp"] = first.prompt_fp
+    row["first_byte_provider"] = fb.provider if fb is not None else None
+    return row
+
+
+def _retry_stats(rows: list[dict]) -> dict:
+    """One aggregate row: aborts, retried share, outcome split, latency."""
+    total = len(rows)
+    outcome = Counter(row["outcome"] for row in rows)
+    retried = sum(1 for row in rows if row["retried"])
+    completed = sum(1 for row in rows if row["completed"])
+    same = sum(1 for row in rows if row["same_prompt"] is True)
+    same_unknown = sum(1 for row in rows if row["same_prompt"] is None)
+    latencies = [
+        float(row["abort_to_first_byte_s"])
+        for row in rows
+        if row["completed"] and row["abort_to_first_byte_s"] is not None
+    ]
+    return {
+        "aborts": total,
+        "retried": {"count": retried, "share": _share(retried, total)},
+        "outcome": {
+            name: outcome.get(name, 0) for name in RETRY_JOIN_OUTCOME_VOCABULARY
+        },
+        "same_prompt": {
+            "count": same,
+            "share_of_retried": _share(same, retried) if retried else 0.0,
+            "unknown": same_unknown,
+        },
+        "abort_to_first_byte_s": _percentiles(latencies, RETRY_JOIN_PERCENTILES),
+        "completed": {"count": completed, "share": _share(completed, total)},
+        "never_completed": {
+            "count": total - completed,
+            "share": _share(total - completed, total),
+        },
+    }
+
+
+def retry_join(log: WindowLog, hours: float) -> dict:
+    """Join every post-acceptance abort to the caller's next dispatch (AC1-AC3).
+
+    Per abort the row reports the next dispatch outcome of the same session
+    (``local_accepted`` / ``local_refused`` / ``remote`` / ``none``), whether
+    that retry carried the same prompt (``prompt_fp`` equality), and the time
+    from the abort to the retry's first byte (measured only when the retry
+    completed inside the window). Aggregates are published per abort reason
+    (share retried, median/p95 extra latency to first byte, share that never
+    completed in the window) beside the overall row. Log-only: nothing here
+    reads or changes proxy configuration (AC4).
+    """
+    outcomes = sorted(log.dispatch_outcomes, key=lambda o: (o.ts, o.session))
+    first_bytes = sorted(log.first_bytes, key=lambda f: (f.ts, f.session))
+    rows: list[dict] = []
+    for event in sorted(log.evictions, key=lambda e: (e.ts, e.session)):
+        outcomes_after = [
+            o for o in outcomes if o.session == event.session and o.ts > event.ts
+        ]
+        first_after = [
+            f for f in first_bytes if f.session == event.session and f.ts > event.ts
+        ]
+        rows.append(_join_abort_row(event, outcomes_after, first_after))
+
+    by_reason: dict[str, dict] = {}
+    for reason, group in _group_by(rows, lambda r: r["reason"]).items():
+        by_reason[str(reason)] = _retry_stats(group)
+    return {
+        "hours": round(hours, 3),
+        "aborts": len(rows),
+        "source_fields": list(RETRY_JOIN_SOURCE_FIELDS),
+        "outcome_vocabulary": list(RETRY_JOIN_OUTCOME_VOCABULARY),
+        "tolerance": RETRY_JOIN_TOLERANCE,
+        "caveat": RETRY_JOIN_CAVEAT,
+        "total": _retry_stats(rows),
+        "by_reason": by_reason,
+        "note": RETRY_JOIN_NOTE,
+        "rows": rows,
     }
 
 
@@ -2172,6 +2522,10 @@ def build_report(
         # AC3 (LP-0MWM0CP4B001088M): classify every post-acceptance abort by
         # the emitted reason plus the release context the label split added.
         "release_context_split": release_context_split(log.evictions, hours),
+        # AC1-AC3 (LP-0MWM0CPQN009SHJR): join each post-acceptance abort to the
+        # caller's next dispatch, so a fast successful retry is distinguished
+        # from a request left unanswered.
+        "retry_join": retry_join(log, hours),
         # AC1/AC2 (LP-0MW7V30AZ007JB5Z): the stall-weighted rate and stall
         # shape beside the per-event rate above. ``deadline_seconds`` is echoed
         # so the ``>= deadline - 1 s`` bucket is always relative to a stated
@@ -2368,6 +2722,32 @@ def _text_summary(report: dict) -> str:
             f"({never['share']:.1%}); {context['events_without_release_context']} "
             "line(s) without release context (pre-split)"
         )
+    retry = report.get("retry_join")
+    if retry and retry.get("aborts"):
+        total = retry["total"]
+        lat = total["abort_to_first_byte_s"]
+        lines.append(
+            f"Retry outcome: {total['retried']['count']}/{retry['aborts']} "
+            f"aborts retried ({total['retried']['share']:.1%}); outcome "
+            + ", ".join(
+                f"{name}={count}" for name, count in total["outcome"].items()
+            )
+            + f"; {total['never_completed']['count']} never completed "
+            f"({total['never_completed']['share']:.1%}); abort→first-byte "
+            f"p50={lat['p50']} p95={lat['p95']} s (n={lat['count']})"
+        )
+        for reason, row in sorted(retry["by_reason"].items()):
+            rlat = row["abort_to_first_byte_s"]
+            outcome = ", ".join(
+                f"{name}={count}" for name, count in row["outcome"].items() if count
+            )
+            lines.append(
+                f"  {reason}: retried {row['retried']['count']}/{row['aborts']} "
+                f"({row['retried']['share']:.1%}) [{outcome or 'none'}]; "
+                f"never completed {row['never_completed']['count']} "
+                f"({row['never_completed']['share']:.1%}); abort→first-byte "
+                f"p50={rlat['p50']} p95={rlat['p95']} s (n={rlat['count']})"
+            )
     basis = report.get("seconds_basis")
     if basis is not None:
         if basis["tok_s"] is None:
