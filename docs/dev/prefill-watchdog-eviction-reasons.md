@@ -78,6 +78,22 @@ its per-reason split and attribution without a schema change. The named
 constants are `REASON_PREFILL_ETA_EXCEEDED`, `REASON_PREFILL_STALLED`,
 `REASON_PREFILL_MAX_EXCEEDED` and `REASON_NO_PROGRESS_WATCHDOG`.
 
+The analyser also publishes `release_context_split` (LP-0MWM0CP4B001088M AC3):
+counts and Σ `elapsed_s` per hour by emitted reason, `task_started`,
+`progress_observed` and queue-wait bucket, plus the never-started share keyed on
+`llama_task_id_reason=task_id_not_started` — the same field the group-2 baseline
+counted, so the two windows stay comparable. Two readings it makes structural:
+
+- a line that predates the split (no release-context fields) lands in `unknown`
+on every dimension — absence is never inferred as `task_started=no`;
+- `task_started=no` is split by whether the slot was resolvable at all. Only a
+**known** slot with no backend task carries `task_id_not_started`; a dispatch
+whose slot is `unknown` is *not attributable*, which is weaker evidence than a
+task that never started. The V1 window
+(`docs/dev/prefill-deadline-residual-v1-label-split-24h.md`) found 9 attributable
+never-started events against 81 unattributable ones, so the two must not be
+collapsed.
+
 ## Rollback
 
 The change is label-only. Rolling back is reverting the commit; there is **no

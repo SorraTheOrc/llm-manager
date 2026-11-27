@@ -140,6 +140,50 @@ WATCHDOG_RELEASE_REASONS: tuple[str, ...] = (
     REASON_NO_PROGRESS_WATCHDOG,
 )
 
+#: The ``llama_task_id_reason`` that means the cached ``/slots`` snapshot named a
+#: task for the dispatch's slot and it was not the session's (LP-0MW959RRO008AAH9).
+#: This is the field the group-2 baseline counted (20 of 184 evictions), so the
+#: never-started share stays comparable across the split (LP-0MWM0CP4B001088M
+#: AC3).
+TASK_ID_REASON_NOT_STARTED = "task_id_not_started"
+
+#: The eviction fields the release-context classification reads. The last three
+#: were added by LP-0MWKQJHSM000CI6W and are simply absent on a pre-split line;
+#: every other key pre-dates both changes, so this surface adds no log field.
+RELEASE_CONTEXT_SOURCE_FIELDS = (
+    "reason",
+    "session",
+    "slot_id",
+    "llama_task_id_reason",
+    "task_started",
+    "progress_observed",
+    "queue_wait_s",
+    "elapsed_s",
+)
+
+#: Queue-wait buckets, in reporting order (seconds of measured contention-queue
+#: wait before admission). ``unknown`` is a first-class value, never ``0``.
+QUEUE_WAIT_BUCKET_LABELS: tuple[str, ...] = (
+    "zero",
+    "(0, 1]",
+    "(1, 5]",
+    "(5, 30]",
+    "> 30",
+    "unknown",
+)
+
+RELEASE_CONTEXT_NOTE = (
+    "Release-context classification of the post-acceptance evictions: counts "
+    "and Σ elapsed_s / h by emitted reason, by ``task_started``, by "
+    "``progress_observed`` and by queue-wait bucket. ``task_started=no`` is "
+    "further split by whether the slot was resolvable at all, because a "
+    "dispatch whose slot is unknown is *not attributable* — that is not the "
+    "same evidence as a known slot with no backend task, and only the latter "
+    "is ``llama_task_id_reason=task_id_not_started`` (the field the group-2 "
+    "baseline counted). A line logged before the split carries none of the "
+    "three fields and is reported as ``unknown``, never inferred."
+)
+
 #: The parent AC4 classifier (LP-0MVOAQDB4002D56G): agent audit runs use session
 #: ids prefixed ``audit-``; every other session — including an unattributed one
 #: — is user traffic. Mirrors ``reporting.AUDIT_SESSION_PREFIX`` so the two
@@ -326,6 +370,14 @@ class EvictionEvent:
     endpoint: str
     llama_task_id: int | None = None
     slot_id: int | None = None
+    #: ``llama_task_id_reason`` when a known slot could not be attributed.
+    task_id_reason: str | None = None
+    #: ``task_started``/``progress_observed`` are tri-state: ``None`` means the
+    #: line predates the split (LP-0MWKQJHSM000CI6W), which is **not** ``no``.
+    task_started: bool | None = None
+    progress_observed: bool | None = None
+    #: Measured contention-queue wait stamped at admission (``None`` = unknown).
+    queue_wait_s: float | None = None
 
     @property
     def dispatch_start(self) -> datetime:
@@ -540,6 +592,29 @@ def _float(value: str | None) -> float | None:
     return number if number == number else None
 
 
+def _tri_state(value: str | None) -> bool | None:
+    """Parse a ``yes``/``no`` log field, keeping absence as ``None``.
+
+    LP-0MWKQJHSM000CI6W added ``task_started`` and ``progress_observed`` to the
+    eviction line; a window logged before it carries neither. Mapping absence to
+    ``False`` would report every pre-split abort as "task not started", so the
+    distinction is preserved deliberately.
+    """
+    if value is None:
+        return None
+    token = str(value).strip().lower()
+    if token == "yes":
+        return True
+    if token == "no":
+        return False
+    return None
+
+
+def _maybe_queue_wait(value: str | None) -> float | None:
+    """Parse ``queue_wait_s``; ``unknown``/absent stays ``None`` (never 0)."""
+    return _float(value)
+
+
 def read_log_lines(paths, failures: list[str] | None = None) -> list[str]:
     """Read every line of *paths*, transparently decompressing ``.gz`` files.
 
@@ -601,6 +676,10 @@ def _parse_line(log: WindowLog, ts: datetime, line: str) -> None:
                 endpoint=fields.get("endpoint") or "unknown",
                 llama_task_id=_maybe_int(fields.get("llama_task_id")),
                 slot_id=_maybe_int(fields.get("slot_id")),
+                task_id_reason=fields.get("llama_task_id_reason"),
+                task_started=_tri_state(fields.get("task_started")),
+                progress_observed=_tri_state(fields.get("progress_observed")),
+                queue_wait_s=_maybe_queue_wait(fields.get("queue_wait_s")),
             )
         )
         return
@@ -866,6 +945,167 @@ def stall_cost(
         "total": total,
         "by_reason": by_reason,
         "note": STALL_COST_NOTE,
+    }
+
+
+def _release_label(value: bool | None) -> str:
+    """Render a tri-state release-context flag as ``yes``/``no``/``unknown``."""
+    if value is None:
+        return "unknown"
+    return "yes" if value else "no"
+
+
+def _queue_wait_bucket(seconds: float | None) -> str:
+    """Bucket a measured queue wait; ``None`` (unmeasured) is ``unknown``."""
+    if seconds is None:
+        return "unknown"
+    value = float(seconds)
+    if value <= 0:
+        return "zero"
+    if value <= 1:
+        return "(0, 1]"
+    if value <= 5:
+        return "(1, 5]"
+    if value <= 30:
+        return "(5, 30]"
+    return "> 30"
+
+
+def _release_aggregate(events, hours: float, population: int) -> dict:
+    """One release-context row: events, share, session split, Σ stall."""
+    group = list(events)
+    user = sum(1 for effect in group if session_class(effect.session) == "user")
+    seconds = round(sum(float(effect.elapsed_s) for effect in group), 3)
+    return {
+        "events": len(group),
+        "share": _share(len(group), population),
+        "user": user,
+        "audit": len(group) - user,
+        "stall_seconds": seconds,
+        "stall_seconds_per_hour": round(seconds / hours, 3) if hours else 0.0,
+    }
+
+
+def _task_id_reason_counts(events) -> dict:
+    counts = Counter(
+        effect.task_id_reason for effect in events if effect.task_id_reason
+    )
+    return dict(sorted(counts.items()))
+
+
+def release_context_split(evictions, hours: float) -> dict:
+    """Classify a window's evictions by release context (V1 AC3).
+
+    LP-0MWM0CP4B001088M AC3: once the umbrella ``no_progress_watchdog`` label
+    was split (LP-0MWKQJHSM000CI6W), a window must classify every
+    post-acceptance abort by the emitted reason, ``task_started``,
+    ``progress_observed`` and the queue-wait bucket, and must make the
+    never-started share explicit and comparable with the group-2 baseline
+    (20/184 ``llama_task_id_reason=task_id_not_started``).
+
+    Two honesty rules are structural rather than advisory:
+
+    - a pre-split line carries none of the three fields and lands in the
+      ``unknown`` row of every dimension (absence is never inferred as ``no``);
+    - ``task_started=no`` is published together with a split by whether the
+      slot was resolvable, because only a *known* slot with no backend task
+      carries ``task_id_not_started`` — a dispatch whose slot is unknown is not
+      attributable, which is weaker evidence than a task that never started.
+    """
+    events = list(evictions)
+    population = len(events)
+    with_context = [effect for effect in events if effect.task_started is not None]
+
+    by_reason: dict[str, dict] = {}
+    for reason, group in sorted(_group_by(events, lambda e: e.reason).items()):
+        row = _release_aggregate(group, hours, population)
+        row["never_started"] = sum(
+            1
+            for effect in group
+            if effect.task_id_reason == TASK_ID_REASON_NOT_STARTED
+        )
+        by_reason[str(reason)] = row
+
+    by_task_started = {
+        label: _release_aggregate(
+            [e for e in events if _release_label(e.task_started) == label],
+            hours,
+            population,
+        )
+        for label in ("yes", "no", "unknown")
+    }
+    by_progress_observed = {
+        label: _release_aggregate(
+            [e for e in events if _release_label(e.progress_observed) == label],
+            hours,
+            population,
+        )
+        for label in ("yes", "no", "unknown")
+    }
+    by_queue_wait_bucket = {
+        label: _release_aggregate(
+            [e for e in events if _queue_wait_bucket(e.queue_wait_s) == label],
+            hours,
+            population,
+        )
+        for label in QUEUE_WAIT_BUCKET_LABELS
+    }
+
+    not_started_reason = [
+        effect
+        for effect in events
+        if effect.task_id_reason == TASK_ID_REASON_NOT_STARTED
+    ]
+    never_started = _release_aggregate(not_started_reason, hours, population)
+    never_started["basis"] = f"llama_task_id_reason={TASK_ID_REASON_NOT_STARTED}"
+    never_started["by_task_id_reason"] = _task_id_reason_counts(not_started_reason)
+    never_started["by_reason"] = dict(
+        sorted(
+            Counter(effect.reason for effect in not_started_reason).items()
+        )
+    )
+
+    task_started_no = [effect for effect in events if effect.task_started is False]
+    by_slot = {
+        "slot_known": [effect for effect in task_started_no if effect.slot_id is not None],
+        "slot_unknown": [effect for effect in task_started_no if effect.slot_id is None],
+    }
+    task_started_no_by_slot: dict[str, dict] = {}
+    for label, group in by_slot.items():
+        row = _release_aggregate(group, hours, population)
+        row["by_task_id_reason"] = _task_id_reason_counts(group)
+        task_started_no_by_slot[label] = row
+
+    priced_as_new = [
+        effect
+        for effect in events
+        if effect.estimated_tokens > 0
+        and effect.new_tokens >= effect.estimated_tokens
+    ]
+    priced = _release_aggregate(priced_as_new, hours, population)
+
+    total_seconds = round(
+        sum(float(effect.elapsed_s) for effect in events), 3
+    )
+    return {
+        "hours": round(hours, 3),
+        "events": population,
+        "events_with_release_context": len(with_context),
+        "events_without_release_context": population - len(with_context),
+        "stall_seconds": total_seconds,
+        "stall_seconds_per_hour": (
+            round(total_seconds / hours, 3) if hours else 0.0
+        ),
+        "source_fields": list(RELEASE_CONTEXT_SOURCE_FIELDS),
+        "queue_wait_buckets": list(QUEUE_WAIT_BUCKET_LABELS),
+        "by_reason": by_reason,
+        "by_task_started": by_task_started,
+        "by_progress_observed": by_progress_observed,
+        "by_queue_wait_bucket": by_queue_wait_bucket,
+        "never_started": never_started,
+        "task_started_no_by_slot": task_started_no_by_slot,
+        "priced_as_new_compute": priced,
+        "note": RELEASE_CONTEXT_NOTE,
     }
 
 
@@ -1929,6 +2169,9 @@ def build_report(
             "per_hour": round(len(log.evictions) / hours, 3) if hours else None,
         },
         "reason_split": reason_split(log.evictions, hours),
+        # AC3 (LP-0MWM0CP4B001088M): classify every post-acceptance abort by
+        # the emitted reason plus the release context the label split added.
+        "release_context_split": release_context_split(log.evictions, hours),
         # AC1/AC2 (LP-0MW7V30AZ007JB5Z): the stall-weighted rate and stall
         # shape beside the per-event rate above. ``deadline_seconds`` is echoed
         # so the ``>= deadline - 1 s`` bucket is always relative to a stated
@@ -2113,6 +2356,18 @@ def _text_summary(report: dict) -> str:
                 f"{user['buckets']['at_or_near_deadline']['count']} at/near the "
                 f"{cost['deadline_seconds']:g} s deadline"
             )
+    context = report.get("release_context_split")
+    if context:
+        started = context["by_task_started"]
+        never = context["never_started"]
+        lines.append(
+            "Release context: task_started yes="
+            f"{started['yes']['events']} no={started['no']['events']} "
+            f"unknown={started['unknown']['events']}; never-started "
+            f"(task_id_not_started) {never['events']} "
+            f"({never['share']:.1%}); {context['events_without_release_context']} "
+            "line(s) without release context (pre-split)"
+        )
     basis = report.get("seconds_basis")
     if basis is not None:
         if basis["tok_s"] is None:
