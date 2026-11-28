@@ -32,9 +32,12 @@ Reuse from a sibling test module (``proxy/tests`` is on ``sys.path`` via
 
     from test_slots_busy_engine_policy import BusySlotsStub, call_local_status
 
-The two proxy poll budgets the stub must exceed to reproduce the defect are
-:data:`COUNTS_BUDGET_SECONDS` (2.0 s, hard-coded in the status handler) and
-:data:`DEFAULT_DETAIL_BUDGET_SECONDS` (1.0 s, ``STATUS_QUERY_TIMEOUT``).
+The status poll's ``/slots`` budget is ``STATUS_QUERY_TIMEOUT``
+(:data:`DEFAULT_DETAIL_BUDGET_SECONDS`, 1.0 s): since LP-0MVVXGLTM008ROJ9 one
+bounded shared fetch serves both the counts pair and the per-slot detail, so a
+stub slower than that budget reproduces the busy-engine degradation with a
+single upstream attempt (the legacy 2.0 s counts budget,
+:data:`COUNTS_BUDGET_SECONDS`, is kept as a stub-delay margin).
 """
 
 import asyncio
@@ -50,7 +53,12 @@ import pytest
 # Documented proxy poll budgets. The stub latency must exceed BOTH to
 # reproduce the measured busy-engine degradation.
 COUNTS_BUDGET_SECONDS = 2.0
-"""Counts-phase ``/slots`` budget, hard-coded in ``get_llama_local_status``."""
+"""Legacy counts-phase ``/slots`` budget (pre-LP-0MVVXGLTM008ROJ9).
+
+The status path now performs ONE bounded fetch per poll at
+``STATUS_QUERY_TIMEOUT``; tests keep this constant only as a stub-delay margin
+that is comfortably above the real budget.
+"""
 
 DEFAULT_DETAIL_BUDGET_SECONDS = 1.0
 """Detail-phase ``/slots`` budget (``STATUS_QUERY_TIMEOUT`` default)."""
@@ -316,16 +324,31 @@ class TestBusyEngineBaseline:
             "a timed-out detail phase with a cached detail list must report "
             "slots_detail_stale=true"
         )
-        assert payload["slots_stale"] is True, (
-            "slots_stale is the union of both fallbacks; a degraded poll must "
-            "never read fresh"
+        # The per-phase flags above are the degradation evidence. ``slots_stale``
+        # is age-derived (LP-0MVVXGM54009TOXD): the served snapshot is 2 s old,
+        # inside the freshness ceiling, so serving a cache entry is NOT
+        # staleness — that conflation is exactly what the derivation change
+        # removes.
+        assert payload["slots_stale"] is False, (
+            "a cache-served snapshot inside the freshness ceiling is not stale"
         )
-        # Both phases actually hit the (too-slow) upstream, and both exceeded
-        # the budget they were given.
-        assert len(stub.budget_exceeding_calls()) >= 2, (
-            "both the counts and the detail phase must have exceeded their "
-            f"budgets; observed calls: {stub.calls}"
+        assert payload["slots_snapshot_age_seconds"] is not None
+        assert payload["slots_snapshot_age_seconds"] <= payload[
+            "slots_max_snapshot_age_seconds"
+        ]
+        # LP-0MVVXGLTM008ROJ9: exactly ONE bounded upstream fetch serves both
+        # phases (the detail phase reuses the counts phase's shared snapshot),
+        # so the busy-engine degradation costs one attempt at the
+        # STATUS_QUERY_TIMEOUT budget — not two serialised attempts.
+        assert len(stub.calls) == 1, (
+            "the counts and detail phases must share one upstream fetch; "
+            f"observed calls: {stub.calls}"
         )
+        assert stub.calls[0]["timeout"] == DEFAULT_DETAIL_BUDGET_SECONDS, (
+            "the shared fetch must be bounded by STATUS_QUERY_TIMEOUT; "
+            f"observed budgets: {[c['timeout'] for c in stub.calls]}"
+        )
+        assert len(stub.budget_exceeding_calls()) == 1
 
     @pytest.mark.asyncio
     async def test_degraded_poll_returns_well_formed_payload_within_budget(self):
@@ -396,7 +419,13 @@ class TestBusyEngineHttp500:
         stub = BusySlotsStub(delay=0.0, status=500)
         payload, _ = await call_local_status(stub=stub)
 
-        assert payload["slots_stale"] is True
+        # Age-derived ``slots_stale`` (LP-0MVVXGM54009TOXD): the seeded snapshot
+        # is inside the ceiling, so the surface is fresh even though both
+        # phases were served from cache. The degradation is still disclosed by
+        # ``slot_counts_stale`` / ``slots_detail_stale``.
+        assert payload["slots_stale"] is False
+        assert payload["slot_counts_stale"] is True
+        assert payload["slots_detail_stale"] is True
         # Last-known pool size survives the failure; availability is withheld
         # because a stale list cannot prove capacity.
         assert payload["total_slots"] == _DEFAULT_SEED_COUNTS[1]
@@ -415,7 +444,7 @@ class TestHarnessReuse:
 
     @pytest.mark.asyncio
     async def test_detail_budget_override_is_applied(self):
-        """``detail_timeout`` is threaded into the detail phase's fetch."""
+        """``detail_timeout`` is threaded into the shared ``/slots`` fetch."""
         stub = BusySlotsStub(delay=COUNTS_BUDGET_SECONDS + 0.5)
         _, _ = await call_local_status(stub=stub, detail_timeout=0.25)
 
@@ -459,7 +488,7 @@ class TestDetailPhaseFailureReason:
         assert after > before, "a detail-phase HTTP 500 must increment http_500"
         # AC1: the graceful-degradation contract is unchanged.
         assert payload["slots_detail_stale"] is True
-        assert payload["slots_stale"] is True
+        assert payload["slots_stale"] is False  # age-derived: cache ≠ stale
         assert len(payload["slots"]) == len(_DEFAULT_SEED_SLOTS)
         # AC3: provenance names the served snapshot and its age.
         assert payload["slots_snapshot_source"] == "snapshot"
@@ -482,7 +511,7 @@ class TestDetailPhaseFailureReason:
         assert after_500 == before_500, "a timeout must NOT be labelled http_500"
         # Same graceful-degradation payload shape as the 500 case.
         assert payload["slots_detail_stale"] is True
-        assert payload["slots_stale"] is True
+        assert payload["slots_stale"] is False  # age-derived: cache ≠ stale
         assert payload["slots_snapshot_source"] == "snapshot"
 
     @pytest.mark.asyncio

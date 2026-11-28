@@ -32,6 +32,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -315,17 +316,61 @@ def _wait_for_startup_logs(directory: Path, expected: int, timeout: float = 15.0
         time.sleep(0.05)
 
 
-def _wait_for_log_content(path: Path, timeout: float = 15.0) -> str:
-    """The detached child writes asynchronously; wait until it has said something."""
+def _wait_for_log_content(
+    path: Path, expected: str = "FAKE_UVICORN", timeout: float = 15.0
+) -> str:
+    """Wait until the detached child's log ends with a complete ``expected`` line.
+
+    LP-0MWJK9ZJF00667UE: the child writes its banner lines (``Using config:``,
+    ``=== Starting proxy server ===``) before it reaches the uvicorn exec, so
+    "the file is non-empty" is not a completion signal. On a loaded host the
+    caller could read that mid-startup content and race the child (the later
+    "first run untouched" comparison then fails as the child appends more).
+    Wait for the marker as the last newline-terminated line instead.
+    """
     deadline = time.monotonic() + timeout
     while True:
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             text = ""
-        if text or time.monotonic() > deadline:
+        lines = [line for line in text.splitlines() if line]
+        if lines and text.endswith("\n") and expected in lines[-1]:
+            return text
+        if time.monotonic() > deadline:
             return text
         time.sleep(0.05)
+
+
+def test_wait_for_log_content_waits_for_the_complete_marker_line(tmp_path):
+    """LP-0MWJK9ZJF00667UE: a mid-startup log is not a finished child.
+
+    Regression: this helper used to return as soon as the file was non-empty.
+    The detached child writes its banner lines (``Using config:``,
+    ``=== Starting proxy server ===``) before it execs uvicorn, so on a loaded
+    host the test read that partial log and failed. The helper must wait until
+    the child's own marker line is complete.
+    """
+    log = tmp_path / "proxy-startup-partial.log"
+    log.write_text(
+        "Warning: reap-stale-proxy.sh not found\n"
+        "=== Starting proxy server ===\n",
+        encoding="utf-8",
+    )
+
+    def append_marker() -> None:
+        time.sleep(0.15)
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("FAKE_UVICORN -m uvicorn proxy.server:app --port 1234\n")
+
+    writer = threading.Thread(target=append_marker)
+    writer.start()
+    try:
+        content = _wait_for_log_content(log)
+    finally:
+        writer.join()
+
+    assert content.splitlines()[-1].startswith("FAKE_UVICORN"), content
 
 
 def test_default_startup_log_is_per_invocation_and_never_overwritten(tmp_path):
@@ -355,7 +400,9 @@ def test_default_startup_log_is_per_invocation_and_never_overwritten(tmp_path):
     assert link.resolve() == first_log.resolve()
 
     original = _wait_for_log_content(first_log)
-    assert "FAKE_UVICORN" in original, f"per-invocation log stayed empty: {first_log}"
+    assert "FAKE_UVICORN" in original, (
+        f"the per-invocation log never received the child's output: {first_log}"
+    )
 
     second = _run(sandbox, "--port", str(_free_port()))
     assert second.returncode == 0, second.stderr

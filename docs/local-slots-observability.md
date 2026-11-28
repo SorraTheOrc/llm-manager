@@ -46,9 +46,19 @@ When the served snapshot's age exceeds the ceiling:
 - `slots_stale` is `true`;
 - `slots_stale_reason` is `snapshot_too_old`.
 
-Below the ceiling nothing changes: the snapshot is still served with its true
-age in `slots_snapshot_age_seconds`, `slots_snapshot_source="snapshot"`, and
-the transport-level reason (`query_timeout` / `query_error`).
+Below the ceiling the snapshot is still served with its true age in
+`slots_snapshot_age_seconds` and `slots_snapshot_source="snapshot"`. Since
+LP-0MVVXGM54009TOXD that poll reports `slots_stale: false` with
+`slots_stale_reason: null`: a cache-served snapshot inside the ceiling is
+**not stale by this bound**, and the cache path is disclosed by
+`slot_counts_stale` / `slots_detail_stale` instead. The bound is an
+*unusably-old-or-undatable* safety line, **not** a freshness claim — freshness
+is the reported snapshot-age distribution (p50/p90/p99/max, plus the > 2 s and
+undatable shares) in
+[per-slot-status-verification.md § Measured outcome](../proxy/docs/per-slot-status-verification.md#measured-outcome--post-fix-24-h-window-lp-0mwlz68sf0052e7z);
+no hard freshness SLO exists today (producer decision 2026-11-22,
+LP-0MWRXH13L000UXSA). `slots_stale` is the age-derived observable —
+see [per-slot-status-verification.md](../proxy/docs/per-slot-status-verification.md#slots_stale-measures-snapshot-age-lp-0mvvxgm54009toxd).
 
 An **unset** fetch stamp is treated as an unknown age, not an infinitely old
 one, so an un-initialised cache never trips the ceiling.

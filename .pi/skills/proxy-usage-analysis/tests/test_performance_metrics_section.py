@@ -363,15 +363,18 @@ class TestCrossEraNote:
 class TestPrefillEtaAccuracyDirection:
     @pytest.mark.parametrize(
         ("error", "expected"),
-        [(0.0, 100.0), (40.0, 60.0), (100.0, 0.0), (140.0, 0.0)],
+        # The raw median absolute relative error is recorded as-is, lower is
+        # better (LP-0MWJOUZG9008Q4RG): no 100 - error conversion and no clamp,
+        # so an error above 100 % is reported above 100 %.
+        [(0.0, 0.0), (40.0, 40.0), (92.3, 92.3), (100.0, 100.0), (140.0, 140.0)],
     )
-    def test_the_recorded_actual_is_accuracy_not_the_error(
+    def test_the_recorded_actual_is_the_raw_error_not_an_accuracy(
         self, tmp_path, monkeypatch, error, expected
     ):
         # The aggregation helper reports a median absolute *relative error*
-        # (lower is better) while the registry declares the metric
-        # higher-is-better; recording the error would invert best-3 retention,
-        # so the scorecard records 100 - error (clamped at 0).
+        # (lower is better) and the registry declares the metric
+        # lower-is-better, so the scorecard records the error as-is rather
+        # than a 100 - error accuracy figure.
         monkeypatch.setattr(
             aggregation,
             "performance_metric_inputs",
@@ -386,7 +389,7 @@ class TestPrefillEtaAccuracyDirection:
             measurement["value"]
             for measurement in _measurements(state, "prefill_eta_accuracy")
         ] == [expected]
-        assert _cells(report, "Prefill ETA accuracy")[ACTUAL] == (
+        assert _cells(report, "Prefill ETA error")[ACTUAL] == (
             f"{expected:.1f} %"
         )
 
@@ -397,11 +400,14 @@ class TestPrefillEtaAccuracyDirection:
 
 
 class TestToleranceColumn:
-    def test_every_row_renders_the_default_ten_percent_band(self):
+    def test_every_row_renders_its_own_band(self):
         report = _report()
 
         for metric in pm.METRIC_REGISTRY:
-            assert _cells(report, metric.label)[TOLERANCE] == "±10 %", metric.id
+            # ``fallback_rate`` opts into a deliberate zero band
+            # (LP-0MWJOUY4E002FNHP); every other metric keeps the 10 % default.
+            expected = "±0 %" if metric.id == "fallback_rate" else "±10 %"
+            assert _cells(report, metric.label)[TOLERANCE] == expected, metric.id
 
     def test_the_header_names_target_tolerance_actual_and_result(self):
         section = _report().split(SUMMARY_HEADING, 1)[1].split("\n## ", 1)[0]
@@ -435,38 +441,114 @@ class TestToleranceColumn:
         assert _cells(report, "Decode speed")[TOLERANCE] == "±10 %"
 
     def test_the_verdict_uses_the_band_not_an_exact_comparison(self, tmp_path):
-        # fallback_rate is lower-is-better: three seeded 30.5 % windows give a
-        # 30.5 % target whose band edge is 33.55 %. This window's 33.3 % is
-        # worse than the target yet inside the band, so it must read Met. A
-        # 30.0 % seed makes the edge 33.0 %, which the same actual misses.
+        # contention_denials_per_hour is lower-is-better and keeps its ±10 %
+        # band (unlike fallback_rate, whose committed band is zero): the
+        # fixture window's 1.0 denials/h is worse than a 0.95 target yet inside
+        # its 1.045 band edge, so it reads Met. A 0.90 seed makes the edge 0.99,
+        # which the same actual misses.
         inside = tmp_path / "inside.yaml"
         _seed(
             inside,
-            "fallback_rate",
+            "contention_denials_per_hour",
             [
-                ("2026-07-01", 30.5, FINGERPRINT),
-                ("2026-07-02", 30.5, FINGERPRINT),
-                ("2026-07-03", 30.5, FINGERPRINT),
+                ("2026-07-01", 0.95, FINGERPRINT),
+                ("2026-07-02", 0.95, FINGERPRINT),
+                ("2026-07-03", 0.95, FINGERPRINT),
             ],
         )
         outside = tmp_path / "outside.yaml"
         _seed(
             outside,
-            "fallback_rate",
+            "contention_denials_per_hour",
             [
-                ("2026-07-01", 30.0, FINGERPRINT),
-                ("2026-07-02", 30.0, FINGERPRINT),
-                ("2026-07-03", 30.0, FINGERPRINT),
+                ("2026-07-01", 0.90, FINGERPRINT),
+                ("2026-07-02", 0.90, FINGERPRINT),
+                ("2026-07-03", 0.90, FINGERPRINT),
             ],
         )
 
-        inside_cells = _cells(_report(metrics_state=inside), "Fallback rate")
-        outside_cells = _cells(_report(metrics_state=outside), "Fallback rate")
+        inside_cells = _cells(_report(metrics_state=inside), "Contention denials per hour")
+        outside_cells = _cells(
+            _report(metrics_state=outside), "Contention denials per hour"
+        )
 
-        assert inside_cells[ACTUAL] == "33.3 % of requests"
+        assert inside_cells[ACTUAL] == "1.00 denials/h"
         assert inside_cells[RESULT] == "Met", (
-            "33.3 % is worse than the 30.5 % target but inside its ±10 % band"
+            "1.00 denials/h is worse than the 0.95 target but inside its ±10 % band"
         )
         assert outside_cells[RESULT] == "Unmet", (
-            "33.3 % is outside the 30.0 % target's ±10 % band"
+            "1.00 denials/h is outside the 0.90 target's ±10 % band"
         )
+
+
+# ---------------------------------------------------------------------------
+# Strict Fallback-rate scorecard row (LP-0MWJOUTOV000G701)
+# ---------------------------------------------------------------------------
+#
+# The producer approved a strict verdict for the lower-is-better Fallback-rate
+# metric only: `Met` if and only if the window's actual is at or below the
+# target (`actual <= target`), no +tolerance band above the target (parent
+# LP-0MWEOGIUK006B1DD Q1 answer (a)). The strictness is what the scorecard
+# derives through the per-metric tolerance machinery — the committed defaults'
+# ``tolerance_pct`` read by ``performance_metrics.tolerance_for`` — so this
+# row's Result changes band for ``fallback_rate`` while every other row keeps
+# its band.
+#
+# These pin the rendered side of the rule; the engine boundary and the `--json`
+# parity are pinned in ``test_performance_metrics.py`` and
+# ``test_performance_metrics_report.py``.
+
+
+class TestStrictFallbackRateRow:
+    """Rendered scorecard row for the lower-is-better Fallback-rate metric.
+
+    The fixture window's fallback rate is 33.3 % (see ``MEASURABLE``): a
+    seeded target below it exercises the above-target boundary, one above it
+    exercises the at/below-target side. The above-target row read `Met`
+    against the then-current ±10 % band — the red-first case, pinned as
+    ``xfail(strict=True)`` until this child narrowed the band; it is now
+    unmarked and green.
+    """
+
+    def test_row_reads_unmet_when_actual_is_above_the_target_inside_the_former_band(
+        self, tmp_path
+    ):
+        # Three 30.9 % windows give a 30.9 % target whose former ±10 % band
+        # edge is 33.99 %: the window's 33.3 % sits above the target yet inside
+        # the old band, so the row must read Unmet under the strict rule.
+        state_path = tmp_path / STATE_FILENAME
+        _seed(
+            state_path,
+            "fallback_rate",
+            [
+                ("2026-07-01", 30.9, FINGERPRINT),
+                ("2026-07-02", 30.9, FINGERPRINT),
+                ("2026-07-03", 30.9, FINGERPRINT),
+            ],
+        )
+
+        cells = _cells(_report(metrics_state=state_path), "Fallback rate")
+
+        assert cells[ACTUAL] == "33.3 % of requests"
+        assert cells[RESULT] == "Unmet", (
+            "33.3 % is above the 30.9 % target; only actual <= target is Met"
+        )
+
+    def test_row_reads_met_when_actual_is_below_the_target(self, tmp_path):
+        # Three windows averaging 42.0 % with the window's 33.3 % below it:
+        # Met under the band and under the strict rule.
+        state_path = tmp_path / STATE_FILENAME
+        _seed(
+            state_path,
+            "fallback_rate",
+            [
+                ("2026-07-01", 40.0, FINGERPRINT),
+                ("2026-07-02", 42.0, FINGERPRINT),
+                ("2026-07-03", 44.0, FINGERPRINT),
+            ],
+        )
+
+        cells = _cells(_report(metrics_state=state_path), "Fallback rate")
+
+        assert cells[ACTUAL] == "33.3 % of requests"
+        assert cells[RESULT] == "Met"

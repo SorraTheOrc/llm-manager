@@ -75,6 +75,9 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import aggregation  # noqa: E402
+
+from tests import fixtures  # noqa: E402
 from tests.fixtures import (  # noqa: E402
     ARCHIVED_REPORT_ERA_A,
     ARCHIVED_REPORT_ERA_B,
@@ -114,7 +117,7 @@ TEN_METRICS = {
     "context_pressure": LOWER,
     "prompt_cache_hit_ratio": HIGHER,
     "contention_denials_per_hour": LOWER,
-    "prefill_eta_accuracy": HIGHER,
+    "prefill_eta_accuracy": LOWER,
 }
 
 FP = "slots=2,ctx=131072"
@@ -390,6 +393,292 @@ def test_a_zero_target_has_a_zero_width_band():
     assert pm.derive_verdict(0.1, measurements, LOWER) == "Unmet"
 
 
+# --- Strict Fallback-rate rule (LP-0MWJOUTOV000G701) ------------------------
+#
+# The producer approved a strict verdict for the lower-is-better Fallback-rate
+# metric only: `Met` if and only if the window's actual is at or below the
+# target (`actual <= target`), no +tolerance band above the target, while every
+# other metric keeps its band (parent LP-0MWEOGIUK006B1DD Q1 answer (a)). The
+# strictness is expressed through the same per-metric tolerance machinery the
+# scorecard uses — the committed defaults' ``tolerance_pct`` read by
+# :func:`tolerance_for` and handed to :func:`derive_verdict` by
+# ``reporting._scorecard_rows`` — not a new comparison surface, so the
+# scorecard and the ``--json`` block cannot diverge.
+#
+# Red-first: the above-target assertion was written against the then-current
+# ±10 % band and pinned its expected pass as ``xfail(strict=True)`` naming the
+# implementation child (LP-0MWJOUY4E002FNHP). That child narrows
+# ``fallback_rate.tolerance_pct`` to a committed zero band, so the assertion is
+# now unmarked and green; the at/below-target and per-metric-band assertions
+# pin the sides of the boundary that must not move either way.
+
+#: The decision example from the parent item: a 64.9 % target whose former
+#: ±10 % band edge is 71.39 % with the window's 66.3 % inside that band.
+FALLBACK_TARGET = 64.9
+FALLBACK_TARGET_MEASUREMENTS = [
+    measurement(FALLBACK_TARGET, "2026-09-01"),
+    measurement(FALLBACK_TARGET, "2026-09-02"),
+    measurement(FALLBACK_TARGET, "2026-09-03"),
+]
+
+
+def test_fallback_rate_is_unmet_above_the_target_inside_the_former_band():
+    """The boundary the current ±10 % band gets wrong: 66.3 % against a
+    64.9 % target is below the 71.39 % band edge, so the lax rule reads `Met`;
+    the approved strict rule (at or below the target) reads `Unmet`."""
+    assert (
+        pm.derive_verdict(
+            66.3,
+            FALLBACK_TARGET_MEASUREMENTS,
+            LOWER,
+            tolerance_pct=pm.tolerance_for("fallback_rate"),
+        )
+        == "Unmet"
+    )
+
+
+def test_fallback_rate_is_met_when_the_actual_equals_the_target():
+    """Boundary equality stays `Met` under the band and under the strict rule.
+
+    Compared against the value the engine itself derives, re-summing the best
+    three in a test constant would make the verdict a float-associativity
+    problem rather than an equality-semantics one.
+    """
+    target = pm.target_from(FALLBACK_TARGET_MEASUREMENTS, LOWER)
+
+    assert (
+        pm.derive_verdict(
+            target,
+            FALLBACK_TARGET_MEASUREMENTS,
+            LOWER,
+            tolerance_pct=pm.tolerance_for("fallback_rate"),
+        )
+        == "Met"
+    )
+
+
+def test_fallback_rate_is_met_when_the_actual_is_below_the_target():
+    assert (
+        pm.derive_verdict(
+            FALLBACK_TARGET - 5.0,
+            FALLBACK_TARGET_MEASUREMENTS,
+            LOWER,
+            tolerance_pct=pm.tolerance_for("fallback_rate"),
+        )
+        == "Met"
+    )
+
+
+LOWER_IS_BETTER_IDS = [
+    metric.id
+    for metric in pm.METRIC_REGISTRY
+    if metric.direction == LOWER and metric.id != "fallback_rate"
+]
+
+
+@pytest.mark.parametrize("metric_id", LOWER_IS_BETTER_IDS)
+def test_every_other_lower_is_better_metric_keeps_its_tolerance_band(metric_id):
+    """The strictness is per-metric: 5 % above the target still reads `Met`
+    for every other lower-is-better metric under its own committed band."""
+    target = pm.target_from(LOWER_MEASUREMENTS, LOWER)
+
+    assert (
+        pm.derive_verdict(
+            target * 1.05,
+            LOWER_MEASUREMENTS,
+            LOWER,
+            tolerance_pct=pm.tolerance_for(metric_id),
+        )
+        == "Met"
+    )
+
+
+# --- Prefill-ETA raw error metric (LP-0MWJOUV5P007R799 / LP-0MWJOUZG9008Q4RG) --
+#
+# Parent LP-0MWEOGIUK006B1DD Q3 answer (a): the producer approved reporting the
+# median absolute relative **error** for `prefill_eta_accuracy` directly and
+# registering the metric lower-is-better, so a smaller error is better. The
+# aggregation helper already returns that error (p50 ≈ 1041 % on recent
+# windows); the implementation child (LP-0MWJOUZG9008Q4RG) removed the
+# `max(0, 100 − error)` conversion and flipped the registry entry to lower-is-
+# better, so best-3 retention keeps the best (smallest-error) windows.
+#
+# ``TEN_METRICS`` above records the approved definition: this metric is
+# lower-is-better, and ``test_registry_direction_matches_the_parent_definition``
+# follows it. The aggregation helpers treat a smaller value as better.
+
+#: Median absolute relative errors of the matched prefill-ETA pairs: lower is
+#: better, so the three best measurements are the three smallest errors. Their
+#: windows are deliberately not the three most recent, so retention cannot pass
+#: by keeping the newest three.
+PREFILL_ERROR_MEASUREMENTS = [
+    measurement(1041.0, "2026-11-10"),
+    measurement(980.0, "2026-11-11"),
+    measurement(1200.0, "2026-11-12"),
+    measurement(1010.0, "2026-11-13"),
+    measurement(1100.0, "2026-11-14"),
+]
+PREFILL_ERROR_BEST_THREE = [(980.0, "2026-11-11"), (1010.0, "2026-11-13"), (1041.0, "2026-11-10")]
+PREFILL_ERROR_TARGET = (980.0 + 1010.0 + 1041.0) / 3
+
+
+def prefill_direction() -> str:
+    """The direction the registry itself declares for the prefill metric."""
+    return registry_entry("prefill_eta_accuracy").direction
+
+
+def test_prefill_eta_accuracy_is_registered_lower_is_better():
+    """The reported figure is an error, so a smaller value must be better."""
+    assert prefill_direction() == LOWER
+
+
+def test_prefill_eta_best_three_keeps_the_smallest_errors():
+    """A lower-is-better entry retains the three smallest errors (the best
+    windows); a higher-is-better entry would retain the three largest, which is
+    the inversion the redefinition removes."""
+    retained = pm.retained(PREFILL_ERROR_MEASUREMENTS, prefill_direction())
+
+    assert [(entry["value"], entry["date"]) for entry in retained] == PREFILL_ERROR_BEST_THREE
+
+
+def test_prefill_eta_target_is_the_mean_of_the_three_smallest_errors():
+    assert pm.target_from(PREFILL_ERROR_MEASUREMENTS, prefill_direction()) == pytest.approx(
+        PREFILL_ERROR_TARGET
+    )
+
+
+def test_a_smaller_error_than_the_target_reads_met():
+    """Under the redefinition the best window is the one whose error is
+    smallest; judged higher-is-better a better-than-target error reads
+    `Unmet`, which is the misleading verdict this pins against."""
+    target = pm.target_from(PREFILL_ERROR_MEASUREMENTS, LOWER)
+
+    assert (
+        pm.derive_verdict(
+            target - 100.0,
+            PREFILL_ERROR_MEASUREMENTS,
+            prefill_direction(),
+            tolerance_pct=pm.tolerance_for("prefill_eta_accuracy"),
+        )
+        == "Met"
+    )
+
+
+def test_a_larger_error_than_the_target_reads_unmet():
+    target = pm.target_from(PREFILL_ERROR_MEASUREMENTS, LOWER)
+
+    assert (
+        pm.derive_verdict(
+            target * 2.0,
+            PREFILL_ERROR_MEASUREMENTS,
+            prefill_direction(),
+            tolerance_pct=pm.tolerance_for("prefill_eta_accuracy"),
+        )
+        == "Unmet"
+    )
+
+
+# --- Context-size pressure at 80 % of the per-slot context (LP-0MWJOUUG6003WO79)
+#
+# Parent LP-0MWEOGIUK006B1DD Q2 answer (a): the scorecard's Context-size
+# pressure is the share of sessions at or above **80 % of the effective
+# per-slot context**, the ratio the report's own "Context sizes approaching
+# per-slot limits" recommendation already uses
+# (``recommendations.CONTEXT_PRESSURE_RATIO = 0.80``). The previous
+# implementation sampled only *served local requests* against **100 %** of the
+# per-slot limit, and the large-context bypass routes oversized requests away,
+# so the row was structurally 0.0 % every window.
+#
+# Implemented by LP-0MWJOUYUL0005H95, which lowers
+# ``CONTEXT_PRESSURE_THRESHOLD_RATIO`` to 0.80 and samples each session's peak
+# context. The no-pressure and n/a assertions hold under both definitions and
+# pin the sides that must not move either way (the fix must never fabricate
+# pressure, nor a fabricated 0).
+#
+# The fixture windows (``tests.fixtures.context_pressure_window``) describe a
+# 1 000-token profile across 2 slots, so the per-slot context is 500 tokens
+# and the 80 % threshold is 400. Their request-level prompt samples sit at
+# half each session's peak — every one below 400 — so a 0.0 % reading can only
+# come from measuring the wrong population (the served requests).
+
+
+def test_context_pressure_counts_sessions_at_80_percent_of_per_slot_context():
+    """Two of four sessions peak at or above the 400-token threshold: one at
+    480 (96 %) and one at exactly 400 (80 %, which is "at or above"), while
+    399 (79.8 %) and 120 are not pressured — so the share is 50.0 %.
+
+    The exact percentage is pinned because the defect is not "a bit low" but
+    structurally zero: under the current request-level, 100 %-of-per-slot
+    definition every sample here is below its limit and the row reads 0.0 %.
+    """
+    summary = fixtures.context_pressure_window(
+        [
+            fixtures.context_pressure_session("pressured", 480),
+            fixtures.context_pressure_session("at-the-threshold", 400),
+            fixtures.context_pressure_session("comfortable", 399),
+            fixtures.context_pressure_session("light", 120),
+        ]
+    )
+
+    stats = aggregation.context_pressure(
+        summary, fixtures.context_pressure_config()
+    )
+
+    assert stats is not None
+    assert stats.at_or_above == 2
+    assert stats.share_pct == 50.0
+
+
+def test_context_pressure_reports_zero_when_no_session_reaches_80_percent():
+    """No session peaks at or above 80 % of its per-slot context, so the row
+    reads 0.0 % — real pressure must not be fabricated."""
+    summary = fixtures.context_pressure_window(
+        [
+            fixtures.context_pressure_session("comfortable", 399),
+            fixtures.context_pressure_session("light", 120),
+        ]
+    )
+
+    stats = aggregation.context_pressure(
+        summary, fixtures.context_pressure_config()
+    )
+
+    assert stats is not None
+    assert stats.at_or_above == 0
+    assert stats.share_pct == 0.0
+
+
+def test_context_pressure_uses_each_sessions_own_per_slot_context():
+    """The threshold follows each session's own profile rather than one
+    analysis-time context: session ``fast`` (1 000 tokens over 2 slots, 500 per
+    slot) at 400 is at 80 %, while ``cheap`` (2 000 tokens over 2 slots, 1 000
+    per slot) at 400 is only at 40 % — so the shared peak counts once."""
+    summary = fixtures.context_pressure_window(
+        [
+            fixtures.context_pressure_session("fast", 400, ctx_size=1000),
+            fixtures.context_pressure_session("cheap", 400, ctx_size=2000),
+        ]
+    )
+
+    stats = aggregation.context_pressure(summary)
+
+    assert stats is not None
+    assert stats.at_or_above == 1
+    assert stats.share_pct == 50.0
+
+
+def test_context_pressure_is_not_available_without_a_resolvable_limit():
+    """A session with no resolvable slot geometry yields ``n/a`` (``None``),
+    never a fabricated ``0`` — the same rule the parent item's other metrics
+    keep (LP-0MWEOGIUK006B1DD constraints)."""
+    summary = fixtures.context_pressure_window(
+        [fixtures.context_pressure_session("unresolvable", 490, slots=None)]
+    )
+
+    assert aggregation.context_pressure(summary) is None
+    assert aggregation.performance_metric_inputs(summary)["context_pressure"] is None
+
+
 # --- Per-metric tolerance override -----------------------------------------
 
 
@@ -416,11 +705,30 @@ def test_an_invalid_tolerance_falls_back_to_the_default(value):
     )
 
 
-def test_the_committed_defaults_carry_a_ten_percent_tolerance_per_metric():
+def test_an_explicit_zero_tolerance_is_kept_as_a_strict_band():
+    """A falsy ``0`` is a deliberate zero-width band, not an absent value
+    (LP-0MWJOUY4E002FNHP): the normaliser must not restore the 10 % default."""
+    defaults = {"metrics": {"decode_speed": {"tolerance_pct": 0}}}
+
+    assert pm.tolerance_for("decode_speed", defaults) == pytest.approx(0.0)
+
+
+def test_the_committed_fallback_rate_band_is_the_strict_zero_band():
+    """The shipped defaults express the strict Fallback-rate verdict through
+    the ordinary per-metric band, so no bespoke comparison surface exists."""
+    assert pm.tolerance_for("fallback_rate") == pytest.approx(0.0)
+
+
+def test_the_committed_defaults_carry_the_strict_fallback_band_and_the_ten_percent_default():
+    """``fallback_rate`` deliberately opts out of the 10 % band
+    (LP-0MWJOUY4E002FNHP); every other metric keeps it."""
     defaults = pm.load_defaults()
 
     for metric in pm.METRIC_REGISTRY:
-        assert pm.tolerance_for(metric.id, defaults) == pytest.approx(10.0), metric.id
+        expected = 0.0 if metric.id == "fallback_rate" else 10.0
+        assert pm.tolerance_for(metric.id, defaults) == pytest.approx(
+            expected
+        ), metric.id
 
 
 def test_an_explicit_tolerance_widens_the_band_the_verdict_uses():

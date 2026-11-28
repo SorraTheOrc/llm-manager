@@ -59,6 +59,18 @@ CAPACITY_FLOOR = 0.5
 COMPOSITE_REASONS = ("prefill_deadline", "measured_cache_deficit")
 #: Attribution classes, in reporting order.
 ATTRIBUTION_CLASSES = ("predicted-warmth", "capacity", "occupancy")
+
+#: The stall-cost percentiles published per reason (LP-0MW7V30AZ007JB5Z AC2).
+STALL_PERCENTILES = (50, 90, 95, 99)
+#: Boundary below which an abort is a fast detour, not a stall (AC2 ``< 1 s``).
+SUB_SECOND_STALL_S = 1.0
+#: Boundary of the "short stall" class (AC2 ``< 5 s``).
+SHORT_STALL_S = 5.0
+#: Slack under the deadline that still counts as a full-deadline wait (AC2).
+NEAR_DEADLINE_SLACK_S = 1.0
+#: Fallback deadline when the analyser payload predates the ``deadline_seconds``
+#: field: the shipped ``local_prefill_deadline_seconds`` at the time of writing.
+DEFAULT_PREFILL_DEADLINE_S = 180.0
 #: Env override for the analyser path (tests, non-source installs).
 ANALYSER_ENV = "PROXY_USAGE_WASTED_COMPUTE_ANALYSER"
 ANALYSER_RELATIVE = Path("proxy") / "scripts" / "analyse_prefill_deadline_residual.py"
@@ -85,6 +97,108 @@ class ReasonRow:
             "audit": self.audit,
             "per_hour": self.per_hour,
             "user_per_hour": self.user_per_hour,
+        }
+
+
+@dataclass(frozen=True)
+class StallRow:
+    """Stall cost for one eviction reason, split by session class (AC1/AC2).
+
+    ``stall_seconds_per_hour`` is ``Σ elapsed_s / window_hours`` — the figure
+    that can reward making aborts faster, which an event rate cannot.
+    """
+
+    reason: str
+    events: int
+    user_events: int
+    audit_events: int
+    total_stall_seconds: float
+    total_stall_seconds_per_hour: float | None
+    user_stall_seconds: float
+    user_stall_seconds_per_hour: float | None
+    audit_stall_seconds: float
+    audit_stall_seconds_per_hour: float | None
+    user_percentiles: dict
+    total_percentiles: dict
+    user_buckets: dict
+
+    @property
+    def user_median_stall_seconds(self) -> float | None:
+        return self.user_percentiles.get("p50")
+
+    def to_json(self) -> dict:
+        return {
+            "reason": self.reason,
+            "events": self.events,
+            "user_events": self.user_events,
+            "audit_events": self.audit_events,
+            "total_stall_seconds": self.total_stall_seconds,
+            "total_stall_seconds_per_hour": self.total_stall_seconds_per_hour,
+            "user_stall_seconds": self.user_stall_seconds,
+            "user_stall_seconds_per_hour": self.user_stall_seconds_per_hour,
+            "audit_stall_seconds": self.audit_stall_seconds,
+            "audit_stall_seconds_per_hour": self.audit_stall_seconds_per_hour,
+            "user_percentiles": dict(self.user_percentiles),
+            "total_percentiles": dict(self.total_percentiles),
+            "user_buckets": dict(self.user_buckets),
+        }
+
+
+@dataclass(frozen=True)
+class StallCost:
+    """The window's stall-weighted cost, with the (b2) composite (AC1/AC2).
+
+    ``composite_user_*`` merges the two reasons the producer counts together
+    (:data:`COMPOSITE_REASONS`) for non-``audit`` sessions, so the report can
+    show the same population the per-event (b2) rate scores — priced in
+    seconds of user waiting instead of events.
+    """
+
+    hours: float | None
+    deadline_seconds: float
+    total_events: int
+    total_stall_seconds: float
+    stall_seconds_per_hour: float | None
+    composite_user_events: int
+    composite_user_stall_seconds: float
+    composite_user_stall_seconds_per_hour: float | None
+    composite_user_percentiles: dict
+    composite_user_buckets: dict
+    deadline_user_percentiles: dict
+    deadline_user_buckets: dict
+    rows: tuple[StallRow, ...] = ()
+
+    @property
+    def deadline_row(self) -> StallRow | None:
+        for row in self.rows:
+            if row.reason == "prefill_deadline":
+                return row
+        return None
+
+    @property
+    def deficit_row(self) -> StallRow | None:
+        for row in self.rows:
+            if row.reason == "measured_cache_deficit":
+                return row
+        return None
+
+    def to_json(self) -> dict:
+        return {
+            "hours": self.hours,
+            "deadline_seconds": self.deadline_seconds,
+            "total_events": self.total_events,
+            "total_stall_seconds": self.total_stall_seconds,
+            "stall_seconds_per_hour": self.stall_seconds_per_hour,
+            "composite_user_events": self.composite_user_events,
+            "composite_user_stall_seconds": self.composite_user_stall_seconds,
+            "composite_user_stall_seconds_per_hour": (
+                self.composite_user_stall_seconds_per_hour
+            ),
+            "composite_user_percentiles": dict(self.composite_user_percentiles),
+            "composite_user_buckets": dict(self.composite_user_buckets),
+            "deadline_user_percentiles": dict(self.deadline_user_percentiles),
+            "deadline_user_buckets": dict(self.deadline_user_buckets),
+            "reasons": [row.to_json() for row in self.rows],
         }
 
 
@@ -129,6 +243,10 @@ class WastedCompute:
     restart_free: bool = True
     verdict: str = "unknown"
     caveats: tuple[str, ...] = ()
+    #: Stall-weighted cost of the same window (LP-0MW7V30AZ007JB5Z): what the
+    #: event rate above cannot price. ``None`` when the analyser payload has no
+    #: ``stall_cost`` block (a payload from before this surface existed).
+    stall_cost: StallCost | None = None
 
     # -- derived presentation helpers -------------------------------------
 
@@ -189,6 +307,9 @@ class WastedCompute:
             "restart_free": self.restart_free,
             "verdict": self.verdict,
             "caveats": list(self.caveats),
+            "stall_cost": (
+                self.stall_cost.to_json() if self.stall_cost is not None else None
+            ),
         }
 
 
@@ -462,7 +583,152 @@ def normalise(
         restart_free=restart_free,
         verdict=verdict,
         caveats=tuple(caveats),
+        stall_cost=normalise_stall_cost(
+            dataset.get("stall_cost"), hours=hours
+        ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Stall-weighted cost (LP-0MW7V30AZ007JB5Z)
+# ---------------------------------------------------------------------------
+
+
+def _percentiles(values, points=STALL_PERCENTILES) -> dict:
+    """Percentile block over *values* (same linear interpolation as elsewhere).
+
+    Deliberately identical to ``analyse_prefill_deadline_residual._percentiles``
+    and ``reporting._percentile`` so the composite computed here cannot
+    disagree with the per-reason figures the analyser published (a test pins
+    that agreement).
+    """
+    numbers = sorted(float(v) for v in values if v is not None)
+    if not numbers:
+        return {"count": 0, **{f"p{p}": None for p in points}, "min": None,
+                "max": None, "mean": None}
+    result: dict = {"count": len(numbers)}
+    for point in points:
+        rank = (len(numbers) - 1) * (point / 100.0)
+        low = int(rank)
+        high = min(low + 1, len(numbers) - 1)
+        value = numbers[low] + (numbers[high] - numbers[low]) * (rank - low)
+        result[f"p{point}"] = round(value, 3)
+    result["min"] = round(numbers[0], 3)
+    result["max"] = round(numbers[-1], 3)
+    result["mean"] = round(sum(numbers) / len(numbers), 3)
+    return result
+
+
+def _stall_buckets(values, deadline_seconds: float) -> dict:
+    """The ``< 1 s`` / ``< 5 s`` / ``>= deadline - 1 s`` split (AC2)."""
+    threshold = round(float(deadline_seconds) - NEAR_DEADLINE_SLACK_S, 3)
+    numbers = [float(v) for v in values]
+    total = len(numbers)
+
+    def _bucket(count: int) -> dict:
+        return {"count": count, "share": round(count / total, 4) if total else 0.0}
+
+    near = _bucket(sum(1 for v in numbers if v >= threshold))
+    near["threshold_s"] = threshold
+    return {
+        "under_1s": _bucket(sum(1 for v in numbers if v < SUB_SECOND_STALL_S)),
+        "under_5s": _bucket(sum(1 for v in numbers if v < SHORT_STALL_S)),
+        "at_or_near_deadline": near,
+    }
+
+
+def _values_of(row: dict | None) -> list[float]:
+    """The raw per-class elapsed seconds the analyser published for a reason."""
+    if not row:
+        return []
+    values = row.get("values")
+    if not isinstance(values, list):
+        return []
+    return [float(value) for value in values if _opt_float(value) is not None]
+
+
+def normalise_stall_cost(block, *, hours: float | None) -> StallCost | None:
+    """Turn the analyser's ``stall_cost`` payload into a :class:`StallCost`.
+
+    Pure, and tolerant of an older payload: a dataset without ``stall_cost``
+    yields ``None`` (the report then omits the stall rows instead of printing
+    zeros it did not measure).
+    """
+    if not isinstance(block, dict) or not block:
+        return None
+    by_reason = block.get("by_reason") or {}
+    if not isinstance(by_reason, dict):
+        return None
+    deadline_seconds = _opt_float(block.get("deadline_seconds"))
+    if deadline_seconds is None:
+        deadline_seconds = DEFAULT_PREFILL_DEADLINE_S
+    window_hours = _opt_float(block.get("hours")) or hours
+
+    rows: list[StallRow] = []
+    composite_values: list[float] = []
+    for reason, payload in by_reason.items():
+        if not isinstance(payload, dict):
+            continue
+        classes = payload.get("by_session_class") or {}
+        user = classes.get("user") or {}
+        audit = classes.get("audit") or {}
+        rows.append(
+            StallRow(
+                reason=str(reason),
+                events=int(payload.get("events") or 0),
+                user_events=int(user.get("events") or 0),
+                audit_events=int(audit.get("events") or 0),
+                total_stall_seconds=_float_or_zero(payload.get("stall_seconds")),
+                total_stall_seconds_per_hour=_opt_float(
+                    payload.get("stall_seconds_per_hour")
+                ),
+                user_stall_seconds=_float_or_zero(user.get("stall_seconds")),
+                user_stall_seconds_per_hour=_opt_float(
+                    user.get("stall_seconds_per_hour")
+                ),
+                audit_stall_seconds=_float_or_zero(audit.get("stall_seconds")),
+                audit_stall_seconds_per_hour=_opt_float(
+                    audit.get("stall_seconds_per_hour")
+                ),
+                user_percentiles=dict(user.get("percentiles") or {}),
+                total_percentiles=dict(payload.get("percentiles") or {}),
+                user_buckets=dict(user.get("buckets") or {}),
+            )
+        )
+        if reason in COMPOSITE_REASONS:
+            composite_values.extend(_values_of(user))
+    rows.sort(key=lambda row: (-row.total_stall_seconds, row.reason))
+
+    total = block.get("total") or {}
+    deadline_row = next(
+        (row for row in rows if row.reason == "prefill_deadline"), None
+    )
+    return StallCost(
+        hours=window_hours,
+        deadline_seconds=deadline_seconds,
+        total_events=int(total.get("events") or 0),
+        total_stall_seconds=_float_or_zero(total.get("stall_seconds")),
+        stall_seconds_per_hour=_opt_float(total.get("stall_seconds_per_hour")),
+        composite_user_events=len(composite_values),
+        composite_user_stall_seconds=round(sum(composite_values), 3),
+        composite_user_stall_seconds_per_hour=(
+            round(sum(composite_values) / window_hours, 3) if window_hours else None
+        ),
+        composite_user_percentiles=_percentiles(composite_values),
+        composite_user_buckets=_stall_buckets(composite_values, deadline_seconds),
+        deadline_user_percentiles=(
+            dict(deadline_row.user_percentiles) if deadline_row else {}
+        ),
+        deadline_user_buckets=(
+            dict(deadline_row.user_buckets) if deadline_row else {}
+        ),
+        rows=tuple(rows),
+    )
+
+
+def _float_or_zero(value) -> float:
+    number = _opt_float(value)
+    return round(number, 3) if number is not None else 0.0
 
 
 def _verdict(

@@ -141,17 +141,29 @@ class TestLastKnownFallbackBehaviour:
 
     @pytest.mark.asyncio
     async def test_status_uses_last_known_when_direct_fails(self):
-        """get_llama_local_status serves the cached total with
-        slots_stale=true when direct _query_slots fails. Since
-        LP-0MW1VDZIX0011D8M a stale list asserts no availability: the summary
-        publishes ``available_slots: 0`` with ``availability_unknown: true``
-        instead of the cached ``2`` (which over-dispatched behind a fossil)."""
+        """get_llama_local_status serves the cached total when _query_slots fails.
+
+        The cache use is disclosed by ``slot_counts_stale``; the age-derived
+        ``slots_stale`` (LP-0MVVXGM54009TOXD) stays false for a fresh cached
+        snapshot. Since LP-0MW1VDZIX0011D8M a cache-served list asserts no
+        availability: the summary publishes ``available_slots: 0`` with
+        ``availability_unknown: true`` instead of the cached ``2`` (which
+        over-dispatched behind a fossil)."""
+        # Establish a last-known cache entry (available=2, total=3) that is
+        # seconds old: within the freshness ceiling, so the age-derived
+        # ``slots_stale`` (LP-0MVVXGM54009TOXD) is false — serving the cache is
+        # disclosed by ``slot_counts_stale``, not conflated with staleness.
+        import time as _time
+
         import proxy.observability as obs
         import proxy.server as server
         from proxy.handlers import get_llama_local_status
-        # Establish a fresh last-known cache entry (available=2, total=3)
-        obs._record_last_slot_counts(2, 3)
-        assert obs.last_known_slot_counts() == (2, 3)
+
+        with patch(
+            "proxy.observability._last_slot_counts_cache",
+            (2, 3, _time.monotonic() - 2.0),
+        ):
+            assert obs.last_known_slot_counts() == (2, 3)
 
         def fail_counts(*a, **kw):
             async def _fail(*a, **kw):
@@ -182,18 +194,26 @@ class TestLastKnownFallbackBehaviour:
                     return []
                 with patch("proxy.observability._query_slots", side_effect=fake_query_slots):
                     with patch("proxy.observability._query_slots_detail", side_effect=fake_query_detail):
-                        req = MagicMock()
-                        req.headers = {}
-                        req.client = MagicMock(host="127.0.0.1", port=54321)
-                        j = await get_llama_local_status(req)
+                        with patch(
+                            "proxy.observability._last_slot_counts_cache",
+                            (2, 3, _time.monotonic() - 2.0),
+                        ):
+                            req = MagicMock()
+                            req.headers = {}
+                            req.client = MagicMock(host="127.0.0.1", port=54321)
+                            j = await get_llama_local_status(req)
                         assert j["total_slots"] == 3
                         assert j["available_slots"] == 0
                         assert j["availability_unknown"] is True
-                        assert j["slots_stale"] is True
+                        assert j["slot_counts_stale"] is True
+                        # Age-derived: a seconds-old cache is not stale.
+                        assert j["slots_stale"] is False
 
     @pytest.mark.asyncio
     async def test_status_not_stale_on_direct_success(self):
         """Direct success → real counts, slots_stale=false (no fallback needed)."""
+        import time as _time
+
         import proxy.server as server
         from proxy.handlers import get_llama_local_status
         # No prior cache needed — direct succeeds
@@ -209,6 +229,16 @@ class TestLastKnownFallbackBehaviour:
                 ):
                     if isinstance(status_out, dict):
                         status_out.update({"status": 200, "reason": None})
+                    if isinstance(provenance_out, dict):
+                        # Faithful to the real helper: the fetch stamp the
+                        # age-derived ``slots_stale`` reads.
+                        provenance_out.update(
+                            {
+                                "source": "upstream",
+                                "fetched_at": _time.monotonic(),
+                                "upstream_calls": 1,
+                            }
+                        )
                     return (1, 3)
                 async def fake_query_detail(
                     port, timeout=2.0, model=None, _client=None, provenance_out=None, status_out=None,
@@ -234,10 +264,15 @@ class TestNoRegressionInSlotAccuracy:
         import inspect
 
         import proxy.observability as obs
+        # Schema guard: these keys are the contract with the routing /
+        # contention logic (LP-0MSUO5Z0K007HBSS).
+        # LP-0MVVXGLTM008ROJ9: the per-slot schema is derived once, by
+        # ``derive_slots_from_payload`` — guard the contract where it lives so
+        # the check cannot pass on a docstring alone.
+        derivation = inspect.getsource(obs.derive_slots_from_payload)
+        assert "is_processing" in derivation
+        assert "n_decoded" in derivation
         for name in ("_query_slots_detail", "_query_slots_progress"):
             src = inspect.getsource(getattr(obs, name))
-            # Schema guard: these keys are the contract with the routing /
-            # contention logic (LP-0MSUO5Z0K007HBSS).
             assert "is_processing" in src
-        assert "n_decoded" in inspect.getsource(obs._query_slots_detail)
         assert "n_past" in inspect.getsource(obs._query_slots_progress)

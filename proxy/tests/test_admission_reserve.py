@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MWJSK4SU003JE7A
+# smell: naming
+# severity: medium
+# description: Variable `_BUILDER_KWARGS` in function should be lowercase
+# -->
 """Atomic local-admission reservations + explicit fallback intent
 (LP-0MVIKPCSG002B0NL).
 
@@ -1320,6 +1326,85 @@ def test_capacity_verdict_vocabulary_and_module_boundary():
     )
 
 
+def test_capacity_verdict_prices_the_deadline_token_capacity():
+    """LP-0MW957RB3000ER79 (decision form): a decision that refused on the
+    deadline token capacity classifies ``too_large`` from its own evidence.
+
+    The capacity is a request-property bound, so it must survive even a coarse
+    fallback reason recorded on the request later (LP-0MWFN1DIL002TTSP AC2):
+    the pin predicate and the refusal path rebuild the verdict, and a capacity
+    refusal can never be downgraded to ``deferrable`` by a reason override.
+    """
+    decision = _admission_decision(
+        reason=prefill_eta.REASON_DEADLINE_CAPACITY,
+        deadline_capacity_tokens=19230,
+        deadline_capacity_calibrated=True,
+        capacity_priced_tokens=38460,
+    )
+
+    # The verdict from the decision alone — the guard's own shape.
+    verdict = admission_reserve.local_capacity_verdict(decision)
+    assert verdict.verdict == admission_reserve.CAPACITY_TOO_LARGE
+    assert verdict.reason == prefill_eta.REASON_DEADLINE_CAPACITY
+
+    # AC2: a coarse fallback reason (``local_admission_guard``) was stamped on
+    # the request after the guard refused; the capacity evidence must win —
+    # the reason param names the *exit*, not a property of the prompt.
+    masked = admission_reserve.local_capacity_verdict(
+        decision, reason="local_admission_guard"
+    )
+    assert masked.verdict == admission_reserve.CAPACITY_TOO_LARGE
+
+
+def test_capacity_verdict_deadline_capacity_raw_form():
+    """LP-0MW957RB3000ER79 (raw form): the refusal builder prices the
+    capacity before the shared helper reads the full decision, so
+    ``local_capacity_verdict`` accepts the evidence as raw inputs and
+    classifies it like the decision form — the single implementation serves
+    both callers (LP-0MWFN1DIL002TTSP AC2)."""
+    too_large = admission_reserve.local_capacity_verdict(
+        deadline_capacity_tokens=19230,
+        capacity_priced_tokens=38460,
+        deadline_capacity_calibrated=True,
+    )
+    assert too_large.verdict == admission_reserve.CAPACITY_TOO_LARGE
+
+    # Exactly-at-capacity is admitted (the comparison is ``>``).
+    boundary = admission_reserve.local_capacity_verdict(
+        deadline_capacity_tokens=19230,
+        capacity_priced_tokens=19230,
+        deadline_capacity_calibrated=True,
+    )
+    assert boundary.verdict == admission_reserve.CAPACITY_DEFERRABLE
+
+    # AC5 fail-open: an uncalibrated capacity never refuses, even when the
+    # priced count exceeds the (default-rate) capacity.
+    uncalibrated = admission_reserve.local_capacity_verdict(
+        deadline_capacity_tokens=19230,
+        capacity_priced_tokens=38460,
+        deadline_capacity_calibrated=False,
+    )
+    assert uncalibrated.verdict == admission_reserve.CAPACITY_DEFERRABLE
+
+
+def test_capacity_verdict_deadline_capacity_bound_disabled():
+    """A deadline disabled (``deadline_capacity_tokens`` ``None`` / ``0``) is
+    not a bound: the raw form stays deferrable fail-open."""
+    no_deadline = admission_reserve.local_capacity_verdict(
+        deadline_capacity_tokens=None,
+        capacity_priced_tokens=38460,
+        deadline_capacity_calibrated=True,
+    )
+    assert no_deadline.verdict == admission_reserve.CAPACITY_DEFERRABLE
+
+    zero_deadline = admission_reserve.local_capacity_verdict(
+        deadline_capacity_tokens=0,
+        capacity_priced_tokens=38460,
+        deadline_capacity_calibrated=True,
+    )
+    assert zero_deadline.verdict == admission_reserve.CAPACITY_DEFERRABLE
+
+
 # ---------------------------------------------------------------------------
 # Single-implementation contract: one verdict call per refusal
 # (LP-0MVSMROLM005RO71, child of LP-0MVSMI7JK002FKUF — parent AC1)
@@ -1380,14 +1465,24 @@ def _refusal_builder_calls(spy: _CapacityVerdictSpy) -> list[dict]:
 
     The builder's consultation is distinguishable structurally: it passes the
     refusal evidence by keyword (``reason`` / ``new_tokens`` /
-    ``budget_tokens``), while the pin predicate passes the routing evidence
-    positionally (the guard decision) or as a sub-set of the same keywords.
+    ``budget_tokens``, plus the deadline-capacity pair — LP-0MW957RB3000ER79),
+    while the pin predicate passes the routing evidence positionally (the
+    guard decision) or as a sub-set of the same keywords.
     """
+    _BUILDER_KWARGS = frozenset(
+        {
+            "reason",
+            "new_tokens",
+            "budget_tokens",
+            "deadline_capacity_tokens",
+            "capacity_priced_tokens",
+            "deadline_capacity_calibrated",
+        }
+    )
     return [
         call
         for call in spy.calls
-        if call["args"] == ()
-        and set(call["kwargs"]) == {"reason", "new_tokens", "budget_tokens"}
+        if call["args"] == () and set(call["kwargs"]) == _BUILDER_KWARGS
     ]
 
 

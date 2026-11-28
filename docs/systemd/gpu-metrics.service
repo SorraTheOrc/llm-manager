@@ -14,7 +14,7 @@ rocm-exporter publishes no release artefacts ([rocm-exporter.service](rocm-expor
 Reading sysfs needs no root, no ROCm userspace and no extra daemon — the loop
 costs one `cat` per attribute every 10 s.
 
-Two things this unit is **not**:
+Three things this unit is **not**:
 
 - It is not a utilisation signal. `gpu_busy_percent` is **not sampled at all**
   (retired 2026-11-07, LP-0MW5K8ZDZ007YSIX): on this Strix Halo APU the driver
@@ -26,6 +26,12 @@ Two things this unit is **not**:
   [monitoring/gpu_compute_rules.yaml](../../monitoring/gpu_compute_rules.yaml).
   The decision and its evidence are recorded under
   [Decision: `gpu_busy_percent` is retired](#decision-gpu_busy_percent-is-retired).
+- It is not a `gpu_metrics` activity publisher either. The
+  `amd_gpu_metrics_v3_0` blob's `average_gfx_activity` was the last candidate
+  for a direct percentage, and it measured as the same saturated counter as
+  `gpu_busy_percent` under a second name. The negative verdict, its numbers and
+  its re-measure recipe are recorded under
+  [Decision: no `gpu_metrics` activity series is published](#decision-no-gpu_metrics-activity-series-is-published).
 - It is not the workload signal either. Slot occupancy — how many llama-server
   slots exist, how many are processing a task, the per-slot 0/1 state, the
   in-flight task count and a last-successful-sample heartbeat — is published by
@@ -103,6 +109,146 @@ in `FORBIDDEN_RULE_SERIES`, and the documented sampler script below is now
 scanned by the same guard, so re-adding the attribute to the sampler fails
 `proxy/tests/test_monitoring_deployment.py` instead of silently republishing a
 counter nobody reads.
+
+## Decision: no `gpu_metrics` activity series is published
+
+**Status:** negative verdict, recorded 2026-11-18 (LP-0MVZEW7R1004GLJN). The
+sampler is **unchanged** by this decision: it still emits only the three memory
+series in the table above. No `gpu_metrics` activity series is published, and no
+new daemon, port or scrape job is added.
+
+The record is citable: `tests/fixtures/gpu_metrics_verdict_capture_2026-11-18.csv`
+is the raw 181-sample capture, its `.meta.json` sidecar carries the probe
+command, capture window, kernel and SHA-256, and
+`tests/test_gpu_metrics_verdict_record.py` recomputes the statistics from that
+capture and fails if this document stops quoting them.
+
+### What the blob is: the pinned v3.0 decode layout
+
+`/sys/class/drm/card0/device/gpu_metrics` is a 264-byte, world-readable binary
+record — the interface `amdgpu_top` reads — and it needs no root, no ROCm
+userspace and no `amd-smi`. It is `struct gpu_metrics_v3_0` from
+`drivers/gpu/drm/amd/include/kgd_pp_interface.h`, inside `#pragma pack(4)`;
+the same structure is vendored verbatim in `libdrm_amdgpu_sys` 0.8.16
+(`wrapper/wrapper_gpu_metrics.h`). The offsets are pinned as a literal table in
+`scripts/lib/gpu_metrics_decoder.py`, because no installed `linux-headers`
+package on this host ships the structure.
+
+Header (`<HBB`, 4 bytes):
+
+| Header field | Value | Meaning |
+|---|---|---|
+| `structure_size` | 264 | total record size the kernel reports |
+| `format_revision` | 3 | `gpu_metrics_v3_0` |
+| `content_revision` | 0 | member semantics |
+
+The members occupy a 260-byte field region; the kernel reports 264 bytes, so
+the record ends in 4 bytes of tail padding (`ffffffff` on the captured blob),
+with three 2-byte interior `pack(4)` alignment gaps at offsets 102, 118 and
+226. The decoder accepts exactly 264 bytes and requires all three header
+values above, so a kernel or firmware layout change fails loudly instead of
+misparsing. The fields the verdict reads (offsets from the start of the
+record):
+
+| Member | Offset (bytes) | Count | Unit | Meaning |
+|---|---|---|---|---|
+| `average_gfx_activity` | 42 | 1 | % | GFX busy percentage — the candidate |
+| `average_vcn_activity` | 44 | 1 | % | VCN busy percentage |
+| `average_ipu_activity` | 46 | 8 | % | per-IPU-column busy percentage |
+| `average_core_c0_activity` | 62 | 16 | % | per-core C0 residency (CPU) |
+| `average_dram_reads` | 94 | 1 | MB/s | DRAM read bandwidth |
+| `average_socket_power` | 112 | 1 | mW | package power (PPT/STAPM) |
+| `average_gfx_power` | 124 | 1 | mW | GFX-domain power |
+| `average_gfxclk_frequency` | 174 | 1 | MHz | GFX clock |
+| `time_filter_alphavalue` | 256 | 1 | us | SMU filter time constant |
+
+### The measured verdict (2026-11-18, kernel 7.0.0-38)
+
+Capture: `python3 scripts/gpu_metrics_probe.py --duration 180 --interval 1
+--verdict` on **2026-11-18 20:58:36 → 21:01:36 UTC**, kernel
+**7.0.0-38-generic**, **181 samples** at 1 s: **54 idle** (package power
+below 60 W), **5 middle**, **122 compute** (at or above 90 W). Package power
+moved between 42.1 W and 119.0 W across the capture, so both bands are present
+and the verdict is not one-sided.
+
+| Statistic | `average_gfx_activity` | `gpu_busy_percent` | Bar | Result |
+|---|---|---|---|---|
+| idle-band mean (< 60 W) | 100.00 % (n = 54) | 100.00 % (n = 54) | — | — |
+| compute-band mean (>= 90 W) | 99.98 % (n = 122) | 99.98 % (n = 122) | — | — |
+| separation (compute - idle) | -0.02 pp | -0.02 pp | >= 30 pp | fail |
+| Pearson r against package power | -0.068 | -0.068 | >= 0.6 | fail |
+| idle-band false-busy share (>= 90 % while < 60 W) | 100.0 % | 100.0 % | <= 10 % | fail |
+
+Decision: **`fail` on all three elements of the bar**, with a **100 %
+idle-band false-busy** share against the <= 10 % limit. The field only ever
+read 98, 99 and 100 across the whole capture, and its value was **identical to
+`gpu_busy_percent` on all 181 samples**. `average_gfx_activity` is therefore
+not an independent SMU measurement: it is the same two-state GFX-busy counter
+the sampler retired on 2026-11-07, under a second name, so it reports "GFX
+domain powered" rather than "GFX busy" and saturates across exactly the band
+that mattered.
+
+This reproduces the 2026-10-29 intake capture (120 samples at 100 % from 42 W
+to 123 W, LP-0MVSQT7YC0045HFW) on the current kernel, so the negative verdict
+rests on more than one capture and more than one day. **The path is closed:
+do not re-investigate `gpu_metrics` activity fields without a fresh capture
+from the recipe below.**
+
+Two `average_core_c0_activity` columns did clear the bar:
+`average_core_c0_activity[5]` (idle 18.94 %, compute 97.23 %, 78.29 pp,
+r 0.945) and `average_core_c0_activity[7]` (13.65 % to 98.17 %, 84.52 pp,
+r 0.965). They are **per-core CPU C0 residency** — how busy the CPU cores
+were, not what the GPU was doing — so neither is a GPU utilisation input nor
+published, and the guard in `proxy/tests/test_monitoring_deployment.py` keeps
+`average_gfx_activity` out of every rule. Nothing else in the blob passed:
+`average_vcn_activity` and the eight `average_ipu_activity` columns read 0
+throughout (no variance, no separation), and the remaining members are power,
+clock, temperature and bandwidth values that duplicate the hwmon sensors
+node_exporter already scrapes.
+
+### Re-measuring the `gpu_metrics` verdict
+
+Re-run this when a kernel, firmware or driver change could have altered the
+blob — and only then, or when a new layout must be pinned. If the decoder
+starts failing closed, re-derive the layout table above from the kernel header
+first: the offsets are pinned in `scripts/lib/gpu_metrics_decoder.py` and are
+not shipped in this host's `linux-headers` package.
+
+```bash
+# Per-field statistics and the pass/fail decision on stderr; CSV samples on stdout.
+python3 scripts/gpu_metrics_probe.py --duration 180 --interval 1 --verdict
+
+# Machine-readable capture, for a replacement record.
+python3 scripts/gpu_metrics_probe.py --duration 180 --interval 1 --json --verdict \
+  > /tmp/gpu_metrics-verdict-$(date +%F).json
+```
+
+The defaults are `--duration` 1800 s (30 min) and `--interval` 1 s; a short
+run is enough on this host because both bands occur within minutes. The
+capture must hold **both bands** — idle band (< 60 W) and compute band
+(>= 90 W) — or the engine reports `insufficient_data` and the numbers are not
+evidence. The bar, all three elements: separation >= 30 pp, Pearson r >= 0.6
+against package power, and idle false-busy <= 10 %.
+
+**If a field passes**, adopt it in one change: add the series and its meaning
+to the Metric names table above and to the sampler, remove the field from
+`FORBIDDEN_RULE_SERIES`, and extend
+`tests/test_gpu_metrics_textfile_series.py` (it fails when the documented and
+emitted series sets diverge). **If it fails**, update the capture fixture, its
+sidecar and this section together: `tests/test_gpu_metrics_verdict_record.py`
+recomputes the statistics from the capture and fails when any of the three
+drifts.
+
+Values are SMU **time-filtered** (`time_filter_alphavalue` reads 1 000 000)
+with an **undocumented** window, so no claim finer than the sample interval is
+supported; quote the capture, never a single sample as an instantaneous
+reading.
+
+**Resolution floor.** Had a field passed, its series would have been sampled
+every **10 s** by this unit and scraped every **15 s** by Prometheus. Those are
+the resolution floor: the `gpu_metrics` values are SMU time-filtered with an
+undocumented window, so no claim finer than the sample interval is supportable,
+and publishing the series would not have changed that.
 
 ## The sampler script
 
@@ -231,6 +377,13 @@ curl -s --get http://127.0.0.1:9090/api/v1/query \
 # Cross-check against the driver's own numbers
 cat /sys/class/drm/card0/device/mem_info_gtt_used
 rocm-smi --showmeminfo vram
+
+# The gpu_metrics verdict still holds: the blob decodes and its activity field
+# still saturates (a failing field is the expected, recorded outcome)
+python3 scripts/gpu_metrics_probe.py --duration 60 --interval 1 --verdict
+# expected: status ok, average_gfx_activity FAIL on all three bar elements;
+#           the full re-measure recipe is under "Re-measuring the
+#           `gpu_metrics` verdict"
 ```
 
 ## Troubleshooting

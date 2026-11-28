@@ -842,6 +842,18 @@ async def proxy_to_remote(
     if not isinstance(body_json, dict):
         body_json = {}
 
+    # LP-0MWM0CPQN009SHJR: capture the stable prompt identity from the client's
+    # original body (before responses/sanitise translation mutates ``messages``)
+    # so the remote outcome line carries the same join key the eviction line
+    # will. Measurement-only; never raises.
+    _prompt_fp = None
+    try:
+        from proxy import retry_outcome as _retry_outcome
+
+        _prompt_fp = _retry_outcome.stamp_prompt_fingerprint(request, body_json)
+    except Exception:
+        _prompt_fp = None
+
     if responses_mode:
         # Keep the chat-format tool-call repair (it runs on the inbound chat
         # messages), then translate the whole body to the Responses API shape.
@@ -893,6 +905,22 @@ async def proxy_to_remote(
         or request.headers.get("x-client-request-id")
         or None
     )
+
+    # LP-0MWM0CPQN009SHJR: the request is dispatched remotely — record the
+    # next-dispatch outcome so an earlier local abort of this session/prompt can
+    # be joined to what the caller actually got. Measurement-only (AC4).
+    try:
+        from proxy import retry_outcome as _retry_outcome
+
+        _retry_outcome.record_dispatch_outcome(
+            _srv(),
+            _remote_session_id,
+            _prompt_fp,
+            _retry_outcome.OUTCOME_REMOTE,
+            endpoint=endpoint or None,
+        )
+    except Exception:
+        pass
 
     # Schedule fire-and-forget recording of client→proxy and proxy→provider requests
     if _remote_session_id:

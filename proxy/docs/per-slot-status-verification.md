@@ -51,14 +51,19 @@ Now:
   instead of 0/0, bounded by `SLOT_COUNTS_STALE_AFTER_SECONDS` (default
   3600s; env-configurable) so a genuinely-unavailable llama-server
   eventually fail-closes rather than serving stale capacity forever.
-- The payload and `status_request` log gain a `slots_stale` boolean that is
-  `true` whenever the served slot data (counts or per-slot detail) came from
-  the cache (vs a fresh query), so a future silent failure is observable.
+- The payload and `status_request` log gain a `slots_stale` boolean. Since
+  LP-0MVVXGM54009TOXD it reports the **freshness of the snapshot the poll was
+  served from** (see ["`slots_stale` measures snapshot age"](#slots_stale-measures-snapshot-age-lp-0mvvxgm54009toxd)),
+  not cache use: a cache-served snapshot inside the freshness ceiling is
+  fresh, and the per-source `slot_counts_stale` / `slots_detail_stale` flags
+  disclose the cache path.
 - Per-slot detail degrades the same way (LP-0MUFSVXID0039ZAQ): when the
   fresh `_query_slots_detail()` call fails or returns an empty list, the
   handler serves `_last_slot_details_cache` instead of `slots: []`, preserving
   herdr per-slot identity; an empty cache still yields a well-formed empty
-  array. A cached-detail response sets `slots_stale: true`.
+  array. A cached-detail response sets `slots_detail_stale: true` (and
+  `slots_stale: true` only once the served snapshot is past the freshness
+  ceiling).
 - Every failed query increments `llama_slots_query_failures_total{reason=...}`
   (Prometheus counter), alerting via `monitoring/slots_query_alerts.yaml`
   when the failure rate is sustained.
@@ -95,7 +100,7 @@ Now:
   copy** for enrichment, so log-derived fields can never poison the fallback
   cache. Both the periodic broadcast loop and the SSE `status_events()` path
   use it.
-- A status response served from the cache (`slots_stale: true`) therefore
+- A status response served from the cache (`slots_detail_stale: true`) therefore
   reports only genuine `/slots` values — never a log-derived `n_decoded`
   greater than the live value (AC5).
 - With a fresh log the override still works exactly as before (AC4), so the
@@ -159,17 +164,21 @@ discriminator and can annotate a draining slot from an **endpoint-wide**
 registry entry when the release could not resolve a slot identity
 (LP-0MVUVHB1V006HA5I / LP-0MVUVHAQP001IRKK). That is an additive widening of
 *which* abandonments are annotatable — no field is removed or reinterpreted, so
-the abandonment change kept `status_schema_version` at `4`. The payload version
-is now `5` (`LP-0MVWFKIKJ005XHAY` added the read-only `local_route_available` /
-`local_route_reason` / `local_route_cooldown_remaining_s` fields, see
-[routing.md](routing.md#the-published-route-fields-status_schema_version-5));
-every field described below is unchanged by that bump.
+the abandonment change kept `status_schema_version` at `4`. v5
+(`LP-0MVWFKIKJ005XHAY`) added the read-only `local_route_available` /
+`local_route_reason` / `local_route_cooldown_remaining_s` fields (see
+[routing.md](routing.md#the-published-route-fields-status_schema_version-5)),
+v6 added the enumerated `slots_stale_reason`, v7 derived `available_slots` from
+`slots[]` plus `availability_unknown`, and v8
+([`slots_stale` measures snapshot age](#slots_stale-measures-snapshot-age-lp-0mvvxgm54009toxd))
+redefined `slots_stale` as age-derived. No field described below is removed or
+renamed by those bumps.
 
 ## Payload (new fields)
 
 ```json
 {
-  "status_schema_version": 5,
+  "status_schema_version": 8,
   "total_slots": 2,
   "available_slots": 0,
   "contention_queue_depth": 3,          // existing, elsewhere in the payload
@@ -178,6 +187,9 @@ every field described below is unchanged by that bump.
   "prefill_budget_seconds": 120.0,
   "queue_eta_seconds": 240.0,
   "slots_stale": false,
+  "slots_stale_reason": null,
+  "slots_snapshot_age_seconds": 0.42,
+  "slots_snapshot_source": "snapshot",
   "slots_detail_stale": false,
   "slot_counts_stale": false,
   "local_in_flight_requests": 1,
@@ -435,11 +447,70 @@ busy snapshot served for hours while the GPU was idle, and the leaked
 `local_active_queries` counter kept `local_active_query` true. Both are now
 truthful.
 
+## `slots_stale` measures snapshot age (LP-0MVVXGM54009TOXD)
+
+`slots_stale` **changed meaning** in `status_schema_version: 8`. It used to be
+the union "counts **or** per-slot detail came from the last-known cache". Once
+the status path serves a warm shared `/slots` snapshot by design
+(LP-0MVVXGLTM008ROJ9) that condition is true for almost every poll, so it
+measured the read path rather than freshness. The published definition is now:
+
+> `slots_stale` is `true` **iff** the age of the snapshot the poll was served
+> from (`slots_snapshot_age_seconds`) exceeds the delivered ceiling
+> `slots_max_snapshot_age_seconds` (`local_slots_max_snapshot_age_seconds` /
+> `LOCAL_SLOTS_MAX_SNAPSHOT_AGE_SECONDS`), and `true` whenever the poll cannot
+> date a snapshot at all (nothing served, or a failed read that served no
+> cache). `age == ceiling` is still fresh; the age is stamped from the fetch
+> that produced the served payload on a monotonic clock and is never reset by
+> serving the cache again.
+
+Read it as an **unusably-old-or-undatable bound, never as a freshness claim**:
+the operator-facing statement of the same contract — the staleness vocabulary,
+the `slots_stale_reason` table, the ceiling and the fail-closed rules — is
+[`docs/local-slots-observability.md`](../../docs/local-slots-observability.md);
+this page carries the measurement and derivation detail. Freshness is the
+snapshot-age distribution in
+[Measured outcome](#measured-outcome--post-fix-24-h-window-lp-0mwlz68sf0052e7z),
+not this flag.
+
+Consequences a consumer must know:
+
+- **No new knob, no renamed field.** The ceiling is the one delivered by
+  LP-0MW1VVKPF001ZAV5; `slots_snapshot_age_seconds`, `slots_snapshot_source`,
+  `slot_counts_stale` and `slots_detail_stale` keep their names and meanings.
+- **`slots_stale_reason` never contradicts the flag.** The enumerated reason
+  (LP-0MW1VVIPG008896N) is `null` whenever `slots_stale` is `false` — a fresh
+  snapshot inside the ceiling publishes `slots_stale: false` **and**
+  `slots_stale_reason: null` even when a phase served a cache entry. The
+  vocabulary and precedence are unchanged (`snapshot_too_old` dominates), and
+  the forced `true` for `router_model_missing` is retained: the proxy holds no
+  live evidence at all in that state.
+- **A cache-served phase is not staleness.** Use `slot_counts_stale` /
+  `slots_detail_stale` to see *which* phase fell back to the last-known cache.
+  `capacity_hint` reconciliation still keys on `slots_detail_stale` only
+  (LP-0MVKSXR4P001V0CM), so the hint can never claim `saturated` from stale
+  detail while `local_in_flight_requests == 0`.
+- **A definitive "model not loaded" answer is fresh.** llama-server's HTTP
+  400/404 (or a resolver skip) is a live answer, not a missing snapshot: the
+  payload reports the configured pool and does not set `slots_stale`.
+- **Rates before and after the change are not comparable.** The field name is
+  unchanged but its meaning tightened, so judge any `slots_stale` target on
+  post-change windows only. `scripts/capacity_signal_verification.py`
+  re-derives the flag from the published age/ceiling pair when a line carries
+  them and falls back to the line's own flag for pre-F1 windows, so historical
+  windows stay readable; its `slots_stale_derivation` block reports which
+  definition produced each verdict and how many polls disagree.
+
+Pinned by `test_slots_stale_follows_snapshot_age` (the `<`/`==`/`>`/missing
+table), `TestSnapshotAgeIsMonotonic` (a frozen backend's age grows and crosses
+the ceiling) and the `/health` mirror (`slots_surface_status` reports `unknown`,
+never `stale`, when the backend is unreachable).
+
 ## Freshness honesty (AC7)
 
-`slots_stale` semantics are unchanged (counts **or** per-slot detail came from
-the last-known cache); the per-source flags `slot_counts_stale` and
-`slots_detail_stale` tell the two apart. When the served slot detail is stale,
+The per-source flags `slot_counts_stale` and `slots_detail_stale` disclose
+which phase was served from the last-known cache; `slots_stale` is the
+age-derived observable above. When the served slot detail is stale,
 **both per-slot and top-level ETA fields are `null`** — a dispatcher never acts
 on a stale wait estimate. `prefill_budget_seconds` is a configuration constant
 (not poll-derived) and stays truthful.
@@ -601,12 +672,16 @@ What the numbers say about this contract:
    dispatch-lifecycle issue (deadline vs. upstream cancellation), not a
    capacity-signal one — the reconciliation rules do not apply to a genuine
    fresh snapshot.
-3. **`slots_stale` is a polling-path metric, not a capacity-truthfulness
-   metric.** Its semantics are unchanged by the fix, and the rate tracks the
-   `/slots` round-trip: the handler budgets are 2.0 s for the counts query and
-   `STATUS_QUERY_TIMEOUT` (1.0 s) for the detail query, while router-serialised
+3. **`slots_stale` was a polling-path metric, not a capacity-truthfulness
+   metric.** Its age-derived redefinition came later (schema 8 — see
+   [`slots_stale` measures snapshot age](#slots_stale-measures-snapshot-age-lp-0mvvxgm54009toxd)),
+   and at the time of this window the rate tracked the `/slots` round-trip: the
+   handler then budgeted 2.0 s for the counts query and `STATUS_QUERY_TIMEOUT`
+   (1.0 s) for the detail query — the serialised counts/detail split that the
+   delivered read path (see [Read path delivered](#read-path-delivered-lp-0mvvxgltm008roj9))
+   replaces with one shared, at-most-one-request fetch — while router-serialised
    polls took p50 3,029 ms (detail-cache-served) against 3 ms for a fresh poll.
-   The per-hour rate follows GPU load (44.3 % at 03:00, 96.0 % at 02:00), which
+   The per-hour rate followed GPU load (44.3 % at 03:00, 96.0 % at 02:00), which
    a truthfulness defect would not. The < 5 % target can only be judged on a
    build that contains `f58e8964`; measured here it stays at the pre-fix level
    (79.5 %) by construction.
@@ -806,9 +881,12 @@ change:
      `discovered-from:LP-0MVUTYHG7001S6BM`.
 2. **`latency_ms=3355` with `slots_detail_stale=false` (06:57:36).**
    **Not reproduced as a distinct defect.** `latency_ms` is the whole poll, not
-   the `/slots` detail budget: the handler issues up to three sequential bounded
-   queries (`query_llama_status` 1 s, counts 2 s, detail 1 s → 4 s envelope), so
-   3,355 ms is inside the envelope. That second also produced three concurrent
+   the `/slots` detail budget: the handler issued up to three sequential bounded
+   queries (`query_llama_status` 1 s, counts 2 s, detail 1 s → 4 s envelope) at
+   the time of the window, so 3,355 ms is inside that envelope. (Since
+   LP-0MVVXGLTM008ROJ9 the counts and detail phases share one snapshot and one
+   bounded fetch, so the `/slots` envelope is a single `STATUS_QUERY_TIMEOUT`
+   budget; see [the shared-snapshot read path](#read-path-delivered-lp-0mvvxgltm008roj9).) That second also produced three concurrent
    polls (3,355 / 856 / 26 ms) — the leader fetched and the two followers reused
    the single-flight payload — and `slots_detail_stale=false` truthfully says the
    detail query returned 200 within its own budget.
@@ -818,4 +896,238 @@ contains the endpoint-wide annotation) is a separate operational run; the
 history above is the baseline it is read against, with the widened
 `_ABANDON_REASONS` set noted as a discontinuity.
 
+## Residual attribution tiers and the stale-snapshot invariant (LP-0MVVXGMGB004DUGR)
+
+The 24 h run of 2026-10-29 left 5 of its 70 residual polls unattributable. The
+measurement tool now explains that class instead of leaving a bare empty
+`cause`. Three tiers are joined per poll, in precedence order:
+
+| Tier | Evidence | Reported as |
+|---|---|---|
+| primary | nearest preceding abandonment/restart within `--attribution-lookback-seconds` (600 s) — **unchanged** | `cause` / `confidence: primary` |
+| corroborated | a local dispatch record's lifetime (`Stream started: provider=local` → the next `Stream finished`/`lease_released` for the session) inside, or within `--live-work-window-seconds` (10 s) of, the poll | `cause: live_work_attribution_lag` / `confidence: corroborated` |
+| extended | nearest preceding abandonment/restart within `--attribution-extended-lookback-seconds` (3600 s) but outside the primary lookback | `extended_cause` / `extended_evidence_timestamp` / `extended_seconds_since_evidence`, `confidence: extended` |
+
+`lease_renewed` is deliberately **not** evidence on its own: it is a retention
+heartbeat that also fires for an idle retained lease, and a retained lease is
+not work. Only the primary and corroborated tiers move `attributed_polls` /
+`by_cause`, so a window measured before this change stays comparable with the
+same window measured after it. Every per-poll row (and CSV column) now carries
+`reason` and `confidence`; a poll no tier explains is reported `unexplained`,
+with its timestamp in `unexplained_timestamps` and a stated verdict note —
+never silently dropped.
+
+**Fresh-window evidence** (`2026-11-16 15:21` → `2026-11-17 22:00`, covered, 
+31,334 polls): 23 residual polls, **23 attributed / 0 unattributed / 0
+unexplained** — 19 `session_evicted`, 2 `measured_cache_deficit`, 1
+`proxy_restart`, 1 `live_work_attribution_lag`. The corroborated poll is the one
+the primary tier could not explain: `2026-11-16 17:32:11`, 575 ms after its own
+local dispatch's `Stream finished`, while llama-server still reported the slot
+processing and `local_in_flight_requests` had already dropped to 0. Artifacts:
+`~/proxy-usage-reports/2026-11-17_f5-residual-attribution/`.
+
+The 2026-10-29 window itself cannot be re-attributed from the log: retention
+now starts at `2026-11-10 00:00:23`, and the tool reports `outside_retention`
+for that window. Its five previously-unattributable polls are classified from
+the artifact columns instead: three (`01:47:19`, `18:41:05`, `18:44:22`) are
+fresh-detail polls with no live work — the dispatch-lifetime class corroborated
+live above — and two (`05:15:12`, latency 2.7 s / 2.3 s) carried
+`available_slots=1` beside `saturated`, which is either the documented
+leased-slot pairing or a counts-stale divergence; that artifact predates the
+`slot_counts_stale` column, so the two cannot be told apart from it. The
+per-poll table is in `~/proxy-usage-reports/2026-11-17_f5-residual-attribution/SUMMARY.md`.
+
+The same harness also checks the stale-snapshot invariant from the log:
+`stale_saturated_without_live_work` counts polls whose
+`slots_snapshot_age_seconds` exceeds their own published
+`slots_max_snapshot_age_seconds` (or whose snapshot cannot be dated) and that
+still report `capacity_hint=saturated` with `local_in_flight_requests=0`. The
+verdict fails on any such poll. Measured on the fresh window above: 31,334
+judgeable polls, 0 over-age, 2 undatable, **0 violations**.
+
+
+## Read-path cost attribution and the child-port probe (LP-0MVVXGI490089OX5)
+
+Two tools together separate "the handler ran out of budget" from "the backend was slow". They are
+deliberately different measurements, because the handler's per-phase timings are **clamped by the
+handler's own budgets** and therefore cannot show how slow a `/slots` fetch actually was:
+
+- `scripts/capacity_signal_verification.py` reports `per_phase_read_path` — p50/p90/p99 for
+  `status_query_ms`, `slots_counts_ms` and `slots_detail_ms`, split stale vs fresh, with the
+  per-poll upstream fan-out (`slots_upstream_calls`) and the served `slots_snapshot_source`.
+- `scripts/probe_child_slots.py` times `GET /slots?model=…` **directly against the resolved
+  llama-server child port** (never through the proxy), pairs every sample with the child's
+  `is_processing` flags so "the GPU was busy" is recorded per sample, and reads the proxy's last
+  `status_request` line before and after so the two costs are compared at the same moment.
+
+```bash
+# closed-window profile
+python3 scripts/capacity_signal_verification.py \
+  --since '2026-11-16 15:20:47' --until '2026-11-17 15:20:47' --window-closed \
+  --label post-f1-24h --json --write-artifacts ~/proxy-usage-reports/post-f1-24h
+
+# ≥ 10 timed child-port /slots calls while a slot is processing
+python3 scripts/probe_child_slots.py --model Qwen3 --samples 12 --interval 0.15 --timeout 35 \
+  --write-artifact ~/proxy-usage-reports/post-f1-24h/ac2-child-port-probe --json
+```
+
+### Measured — restart-free closed window, 2026-11-16 15:20:47 → 2026-11-17 15:20:47
+
+29,053 status polls (coverage complete, no gaps); `slots_stale` 5,239 (**18.03 %** — the target is
+< 5 %), all of them served from the last known snapshot (`slots_snapshot_source=snapshot`).
+
+| phase | stale p50 / p90 / p99 (ms) | fresh p50 / p90 / p99 (ms) |
+|---|---|---|
+| `status_query_ms` | 4 / 6 / 21 | 4 / 6 / 29 |
+| `slots_counts_ms` | **1647 / 4002 / 5388** | 0 / 1 / 2963 |
+| `slots_detail_ms` | **1015 / 2029 / 3043** | 0 / 0 / 0 |
+
+Per-poll fan-out: stale `0:992 · 1:2780 · **2:1467** (28 %)`; fresh `0:23067 · 1:747`.
+Snapshot age of the served payload: p50 0.55 s, p90 14.5 s, p99 61.8 s, max 235.9 s; **17.80 %**
+of polls were served a snapshot older than 2 s (4.44 % older than 30 s, 1.09 % older than 60 s,
+0 % older than 300 s).
+
+### Measured — live child-port probe, 2026-11-17 18:35:30 (12 samples, all while a slot processed)
+
+`p50 17.8 ms`, **`p95 32 096 ms`**, min 13.4 ms, max 32 096 ms; **3 of 12 samples exceeded the
+1 s `STATUS_QUERY_TIMEOUT`** (per-sample: 32 096 · 4 614 · 12 556 · 18.4 · 17.8 · 18.3 · 18.5 ·
+17.3 · 14.4 · 14.4 · 13.4 · 14.4 ms). The proxy's own phases at that moment were
+`status_query_ms=4`, `slots_counts_ms=1148`, `slots_detail_ms=1016`, `slots_upstream_calls=1` — the
+handler clamped at its budgets while the single upstream fetch it was waiting on took tens of
+seconds.
+
+### Conclusion
+
+The dominant contributor to > 2 s refreshes was the **child `/slots` handler blocking behind
+llama-server's generation loop**: while a prompt is being prefilled the endpoint returns in seconds
+to tens of seconds (idle/decode cost is 1–18 ms). Proxy-side serialisation was an **amplifier, not
+the cause**: at the time of this profile the handler issued counts and detail as two sequential
+bounded queries, so 28 % of stale polls paid that blocking cost twice and the 2 s + 1 s budgets
+guaranteed the poll was reported stale long before the backend answered. Neither shape is current:
+the delivered read path below coalesces both phases onto **one** bounded fetch (per-poll fan-out is
+0 or 1 by construction and the detail phase costs ~0 ms).
+
+### Read path delivered (LP-0MVVXGLTM008ROJ9)
+
+The status poll now serves **one shared snapshot** per request:
+
+- `_query_slots()` and `_query_slots_detail()` are grouped by
+  `observability.slots_read_scope()`; the first read fetches (at most one
+  bounded upstream request), and both the counts pair and the per-slot detail
+  are derived from that one payload by `derive_slots_from_payload()`. The
+  summary therefore cannot contradict its own `slots[]` — including the
+  previously inconsistent default for a slot that omits `is_processing`.
+- A snapshot within the coalescer's freshness window
+  (`SLOTS_POLL_TTL_SECONDS`, default 1 s) is reused with **zero** upstream
+  calls; otherwise the poll joins the URL's one shared fetch task.
+- The fetch is bounded by `STATUS_QUERY_TIMEOUT`. If it outlives the poll's
+  budget the poll degrades to the last-known snapshot and the fetch **keeps
+  running**, landing in the coalesced cache for later polls — a slow backend no
+  longer extends the poll, and concurrent polls never promote a second fetch.
+- The per-phase fields keep their names and meanings: `slots_counts_ms` now
+  carries the shared fetch, `slots_detail_ms` is the shared-snapshot read
+  (≈0), and `slots_upstream_calls` is 0 or 1 by construction.
+
+To re-measure the backend cost after this change, run
+`scripts/probe_child_slots.py` while a slot is processing and compare it with
+the same-moment `slots_counts_ms` / `slots_detail_ms` (the probe bypasses the
+proxy; the handler's phases are clamped by their budgets).
+
+Consequences recorded for the follow-up items (LP-0MVVXGLTM008ROJ9, LP-0MVVXGM54009TOXD): serving
+one shared snapshot removes the double fetch and keeps poll latency inside budget, but it cannot
+make the data fresher than the last **completed** fetch — so a `slots_stale` defined by snapshot
+age inherits the backend's blocking time. Against the delivered ≈300 s ceiling an age-derived
+`slots_stale` would read **0 %** on this window (max age 235.9 s); against a 2 s budget it reads
+17.8 %. The freshness budget, not the derivation, decides the verdict; that trade-off belonged to
+the producer (parent AC2 second branch) and was **decided on 2026-11-22** — option 3, two-tier
+(LP-0MWRXH13L000UXSA): see [Measured outcome](#measured-outcome--post-fix-24-h-window-lp-0mwlz68sf0052e7z).
+
+### Measured outcome — post-fix 24 h window (LP-0MWLZ68SF0052E7Z)
+
+First 24 h window measured **after** F3/F4/F5 were live (schema 8):
+`2026-11-18T10:25:00Z → 2026-11-19T10:25:00Z`, restart-free (0 in-window startup
+markers), 100 % log coverage, loaded build `d8ce36dc9`.
+
+| Reading | Value |
+|---|---|
+| Status polls | 12,450 |
+| `slots_stale` at the delivered 300 s ceiling (an **unusably-old-or-undatable bound**, not a freshness claim) | **608 = 4.88 %** (target < 5 %: met) |
+| — over the ceiling | 51 (0.41 %; `detail_cache`) |
+| — no datable snapshot (counted stale by contract) | 557 (4.47 %; `counts_cache`, `slots_snapshot_source=none`) |
+| Snapshot age, datable polls | p50 **0.73 s** · p90 **35.14 s** · p99 **187.73 s** · max **424.20 s** |
+| Tightened reading, age > 2 s (plan Q3 candidate) | **31.60 %** of datable polls · 30.18 % of all polls — of which 81.3 % `capacity_hint=prefill_bound` |
+| `slots_upstream_calls = 0` | 11,492 / 12,450 polls (92.3 %) |
+| `saturated` without live local work | 11 (0.09 %), 11/11 attributed; zero stale-and-saturated violations |
+
+Read the pass with the **two-tier framing** in mind (producer decision
+2026-11-22, option 3 — LP-0MWRXH13L000UXSA):
+
+| Statement | Value | How to read it |
+|---|---|---|
+| `slots_stale` — age > 300 s ceiling, undatable ⇒ stale | **4.88 %** (608 / 12,450) | an **unusably-old-or-undatable bound** — never a freshness claim |
+| Snapshot-age distribution (freshness, **reported not targeted**) | p50 **0.73 s** · p90 **35.14 s** · p99 **187.73 s** · max **424.20 s** | **the number to watch** — **31.60 %** of datable polls above 2 s, **4.47 %** of polls undatable |
+| Hard 2 s freshness SLO | **none today** | not introduced by this decision |
+
+91.6 % of the residual is an **undatable** snapshot rather than an old one, so
+the `< 5 %` verdict holds at the 300 s ceiling. At a 2 s ceiling the same polls
+read 31.6 %, but 81.3 % of those carry `capacity_hint=prefill_bound` — that
+figure is a statement about backend load, not about the read path — and
+tightening today would start life *failing* at 31.6 % with nothing gained.
+
+**Revisit trigger** (recorded so the question cannot drift): set a freshness SLO
+from the post-fix distribution only when **both** hold — (i) undatable polls
+below **0.5 %** over a 24 h window (LP-0MWRXFO0I005UBVM closed), and (ii) the
+nightly age series (LP-0MWRXGPO3004GXD7) has **≥ 14 days** of data. **Clause (i)
+is satisfied as of the 2026-11-26→27 re-measurement (0.0368 %); clause (ii) is
+not assessed here**, so no threshold moves until the producer rules on it. A threshold
+that moves must ship the relabelling test (LP-0MWRXH13L000UXSA AC3), and every
+pre/post figure is labelled by the definition that produced it. Until then,
+quote `slots_stale` only with its definition and watch the distribution above
+as the freshness number.
+
+Reproduce (both commands were run against the archived window; the artifacts
+live in `~/proxy-usage-reports/slots-stale-postfix/`):
+
+```bash
+# as-configured reading — slots_stale at the delivered 300 s ceiling
+python3 scripts/capacity_signal_verification.py \
+  --since '2026-11-18 10:25:00' --until '2026-11-19 10:25:00' --window-closed \
+  --label slots-stale-postfix --limit 250 --json \
+  --write-artifacts ~/proxy-usage-reports/slots-stale-postfix
+
+# tightened (> 2 s / > 5 s / > 300 s) reading and the snapshot-age distribution
+python3 scripts/slots_snapshot_age_distribution.py \
+  --since '2026-11-18 10:25:00' --until '2026-11-19 10:25:00' \
+  --threshold-seconds 2 --threshold-seconds 5 --threshold-seconds 300 --json \
+  > ~/proxy-usage-reports/slots-stale-postfix/age_distribution.json
+```
+
+Full record: [`docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md`](../../docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md)
+(+ `.json`); the staleness contract, reason vocabulary and ceiling are stated
+for operators in [`docs/local-slots-observability.md`](../../docs/local-slots-observability.md).
+
+#### Re-measured after the joiner-age fix (LP-0MWSD6D24002J0K7)
+
+Second 24 h window, `2026-11-26T10:18:00Z → 2026-11-27T10:18:00Z`, restart-free
+(0 in-window startup markers), 100 % log coverage, loaded build `989358278`
+(carries `aa6115bcc` and `5ef9b5ebb`). The **counts-cache provenance gap is
+gone**: the undatable share fell to a handful of refresh timeouts.
+
+| Reading | 2026-11-18 → 19 | 2026-11-26 → 27 |
+|---|---|---|
+| Status polls | 12,450 | **16,296** |
+| `slots_stale` at the 300 s ceiling | 4.88 % (608) | **0.0368 % (6)** |
+| — over the ceiling | 51 (`detail_cache`) | **0** |
+| — no datable snapshot | 557 (4.47 %, `counts_cache`) | **6 (0.0368 %, `slots_snapshot_source=none`, refresh timeout)** |
+| Snapshot age, datable polls | p50 0.73 s · p90 35.14 s · max 424.20 s | p50 **0.74 s** · p90 **38.51 s** · max **295.44 s** |
+| Tightened reading, age > 2 s | 31.60 % of datable | **34.49 %** of datable (82.1 % `prefill_bound`) |
+| `saturated` without live local work | 11, 11/11 attributed | **4, 4/4 attributed** |
+
+Agreement check: `slots_stale` **6 == over-age 0 + undatable 6**, and
+`slots_snapshot_age_distribution.py` independently reports the same 6.
+Full record:
+[`docs/dev/slots-stale-postfix-window-2026-11-26-to-27.md`](../../docs/dev/slots-stale-postfix-window-2026-11-26-to-27.md)
+(+ `.json`). The freshness distribution is **unchanged in shape** (the
+prefill-bound tail still dominates), so the two-tier framing below still stands:
+this fix removed the *undatable* class, not the backend-driven staleness.
 

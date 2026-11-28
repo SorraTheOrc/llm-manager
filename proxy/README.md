@@ -2225,7 +2225,7 @@ Response:
 | `local_abandoned_slots`   | `int`         | Slots annotated `abandoned` — dispatches the proxy gave up on that llama-server has not released yet (LP-0MVRMI5HK00558TB). The count is **endpoint-wide aware**: an abandonment recorded without a resolvable slot identity (or whose recorded id no longer matches the draining slot) is stored as one endpoint-wide registry entry and still counts once here, so no abandonment the proxy gave up on is invisible (LP-0MVUVHB1V006HA5I, LP-0MVUVHAQP001IRKK). |
 | `slots[].abandoned`      | `bool`        | `true` when the proxy gave up on the dispatch occupying this slot and llama-server has not released it yet; always paired with `abandonment_reason` (`prefill_deadline`, `session_evicted`, `no_progress_watchdog`, `client_disconnect`, `orphan_cleanup`, `measured_cache_deficit`), `abandoned_session_id` and `abandoned_at_seconds_ago` so a ghost is never a bare boolean (LP-0MVRMI5HK00558TB). |
 | `slots[].abandoned_scope` | `string \| null` | Which registry entry produced a slot's `abandoned` annotation: `"slot"` (the slot's own recorded identity matched), `"endpoint"` (an endpoint-wide entry applied to a processing slot that no lease **and** no live dispatch record owns — i.e. a draining ghost), or `null` when the slot is not abandoned. Additive within `status_schema_version` 4 (LP-0MVUVHB1V006HA5I). |
-| `status_schema_version`   | `int`         | Payload schema version (currently `7`; every bump has been additive — `4` carried the abandonment fields in this table, `5` added the `local_route_*` fields, and `6`/`7` came with the `available_slots` derivation-from-`slots[]` change that also added `availability_unknown`, so no field is removed or reinterpreted). |
+| `status_schema_version`   | `int`         | Payload schema version (currently `8`; every bump has been additive — `4` carried the abandonment fields in this table, `5` added the `local_route_*` fields, `6`/`7` came with the `available_slots` derivation-from-`slots[]` change that also added `availability_unknown`, and `8` redefined `slots_stale` as age-derived against `slots_max_snapshot_age_seconds`, so no field is removed or reinterpreted). |
 
 **Performance:**
 
@@ -2522,9 +2522,19 @@ matching lease returns `200 OK` (no-op). This is useful for automated
 workflows that want to clean up after completing a task without knowing
 whether the lease is still active.
 
-**Important:** This endpoint only releases the dispatch lease record from
-`local_dispatch_records`. It does **not** release the scheduler slot (job
-ownership), which is managed separately via disconnect detection or timeout.
+The release also pops the session's `local_prefill_in_flight` marker, even when
+no dispatch record matches, so it is the **manual fallback** for a local route
+wedged by an orphaned prefill marker (LP-0MWKWGLRT003AUG4). Recovery is
+normally automatic: the 10 s dispatch-cleanup sweep reclaims a marker with no
+backing dispatch record and logs `prefill_marker_reclaimed session=<id>
+reason=orphaned`, with no proxy restart required. Prefer the sweep; use this
+endpoint when the route needs reopening immediately (the 2026-11-17 incident
+was cleared this way after 505 denial lines).
+
+**Important:** This endpoint releases the dispatch lease record from
+`local_dispatch_records` and pops the session's `local_prefill_in_flight`
+marker. It does **not** release the scheduler slot (job ownership), which is
+managed separately via disconnect detection or timeout.
 
 #### Dispatch Lease
 

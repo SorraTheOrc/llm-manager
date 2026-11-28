@@ -522,3 +522,238 @@ Qwen3 chat-model polling path that still hits the router port (live `ss`
 shows persistent proxy→:8080 connections), matching the same busy-child /
 unloaded-model mechanism documented above. Target signal remains
 `router:500 == 0`.
+
+## Post-fix 24 h window verification (LP-0MVP7HX2S008IU57, 2026-11-16 → 2026-11-17) — router 500s **zero**, fallback axis RED
+
+**Work item:** LP-0MVP7HX2S008IU57 (verifies the LP-0MVP7525P008RXMF child-port
+discovery fix)
+**Window:** 2026-11-16T15:20:47Z → 2026-11-17T15:20:47Z (anchored to the
+group-2 proxy restart `pid 3720326`, `lstart` 2026-11-16T15:20:47Z; measured
+2026-11-17T18:20:11Z, 2 h 59 m after the window closed; raw counts in
+[`router-slots-500-window-2026-11-16-to-17.json`](router-slots-500-window-2026-11-16-to-17.json))
+
+### TL;DR — AC1 met (router 500s **0**), AC4 unmet (one boot-time Qwen3 fallback)
+
+- **Router-responder `GET /slots ... 500` = 0** across a 42 h 20 m superset
+  (109,330 `/slots` events, 15 h 20 m before the window and 2 h 56 m after it)
+  that contains every in-window access. The residual floor measured in the
+  2026-11-01 → 11-02 window (752 router 500s in a 31.9 h superset, ≈ 16/day
+  in-window) **has not recurred**: 0 router 500s on every measured content day
+  from 2026-11-07 except a single line on 2026-11-13.
+- **One chat-model fallback occurred**, at window start **+4.4 s**
+  (`model=Qwen3`, `source=log_signal`) — the anchor restart's own boot
+  transient, before child-port discovery had resolved. Counter delta **1**,
+  warning lines **1**, and **0** for the remaining 23 h 59 m 56 s. AC4's
+  chat-model zero-tolerance rule therefore fails ⇒ **verdict RED** by the
+  documented rule, attributed to boot rather than to the busy-child / unloaded
+  model mechanisms. Filed as **LP-0MWL0R0UT004G9XE**.
+- `slots_stale` share **18.03 %** of all `status_request` polls — the lowest
+  measured post-fix figure (31.4 % in 2026-10-27 → 28, 42.7 % in 2026-11-01 →
+  02, pre-fix baseline 64.4 %).
+
+### Method and window file sets
+
+Access lines in `llama-server*.log` carry no timestamps, so the window is
+scoped by file: the daily `copytruncate` copy whose name is the rotation date
+and whose content is the **previous** UTC day, plus the live file. The union
+is a 42 h 20 m **superset** of the 24 h window (15 h 20 m of pre-window and
+2 h 56 m of post-window traffic), so zero router 500s across it proves zero
+inside the window.
+
+Every access line in both files belongs to the same model child,
+**container pid 44409** — the persistent host-first `llama-server` (host pid
+3122336, started 2026-11-15T01:06:52Z, *before* the window). One generation
+served the whole superset; because it predates the window, the pid does not
+bound the file set in time (unlike the 2026-10-27 window, where the child
+restarted with the window anchor).
+
+| File | Content range (UTC) | router 200 | router 400 | router 500 | child 200 | child 400/500 |
+|---|---|---|---|---|---|---|
+| `llama-server.log-2026-11-17` | 11-16 00:00 → 11-17 00:00 | 1 | 1,070 | **0** | 60,893 | 0 |
+| `llama-server.log` (live) | 11-17 00:00 → 18:20 | 0 | 310 | **0** | 47,056 | 0 |
+| **superset total** | 11-16 00:00 → 11-17 18:20 | **1** | **1,380** | **0** | **107,949** | **0** |
+
+Router-responder traffic is **1.26 %** of all `/slots` events (1,381 of
+109,330) — every slot query except the boot poll and the 400s is served
+directly by the child port.
+
+`proxy.log` is timestamped and self-rotates every 6 h, so each candidate's own
+first/last line timestamps were derived and the files that tile the window
+kept (`proxy.log.2026-11-16_152045` ends at 15:20:45, before the window; the
+live `proxy.log` starts at 15:21:01, after the window end):
+
+| File | First line (UTC) | Last line (UTC) | In-window lines | `status_request` polls | `slots_stale=True` | fallback WARNs |
+|---|---|---|---|---|---|---|
+| `proxy.log.2026-11-16_15` | 11-16 15:20:48.866 | 11-16 21:20:47.400 | 155,471 | 13,695 | 2,532 | 1 |
+| `proxy.log-2026-11-17_00` | 11-16 21:20:48.857 | 11-17 00:00:03.557 | 62,202 | 7,507 | 941 | 0 |
+| `proxy.log.2026-11-16_21` | 11-17 00:00:05.674 | 11-17 03:20:46.648 | 28,776 | 1,771 | 489 | 0 |
+| `proxy.log.2026-11-17_03` | 11-17 03:20:48.056 | 11-17 09:20:46.252 | 45,875 | 2,529 | 506 | 0 |
+| `proxy.log.2026-11-17_09` | 11-17 09:20:52.805 | 11-17 15:20:51.185 (clipped at 15:20:47) | 71,009 | 3,551 | 771 | 0 |
+| **totals** | 11-16 15:20:48 → 11-17 15:20:47 | | **363,333** | **29,053** | **5,239** | **1** |
+
+### Router vs child responder split — `scripts/slots_500_triage.py` output verbatim (AC2)
+
+```text
+$ python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy --llama-file llama-server.log-2026-11-17 --json
+  "classification": {
+    "responder_status": {
+      "44409:200": 60893,
+      "router:200": 1,
+      "router:400": 1070
+    },
+    "proximate_causes": {},
+    "stats": {
+      "slots_total": 61964,
+      "slots_200": 60894,
+      "slots_400": 1070,
+      "slots_500": 0,
+      "cancel_events": 400,
+      "model_400_events": 8,
+      "proxying_events": 5391,
+      "prefill_events": 4975,
+      "checkpoint_events": 5918,
+      "near_proxy_500s": 0,
+      "near_cancel_500s": 0,
+      "near_prefill_500s": 0,
+      "near_checkpoint_500s": 0
+    }
+  }
+
+$ python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy --llama-file llama-server.log --json
+  "classification": {
+    "responder_status": {
+      "44409:200": 47056,
+      "router:400": 310
+    },
+    "proximate_causes": {},
+    "stats": {
+      "slots_total": 47366,
+      "slots_200": 47056,
+      "slots_400": 310,
+      "slots_500": 0,
+      "cancel_events": 271,
+      "model_400_events": 4,
+      "proxying_events": 3975,
+      "prefill_events": 3684,
+      "checkpoint_events": 4444,
+      "near_proxy_500s": 0,
+      "near_cancel_500s": 0,
+      "near_prefill_500s": 0,
+      "near_checkpoint_500s": 0
+    }
+  }
+```
+
+(`--json` output truncated to the `classification` block; the full documents
+are `per_file_slots` / `correlation` / `fix_options` as for every run of this
+CLI. The live file grew between the two capture instants — 18:20:11Z is the
+single measurement instant for both blocks above.)
+
+Daily router-500 trend, same measurement over the daily `copytruncate` copies
+(labelled by **content** day — the copy named by its rotation date holds the
+previous UTC day; 2026-11-11 is a partial copy, 2,434 child 200s):
+
+| Content day | 11-07 | 11-08 | 11-09 | 11-10 | 11-11* | 11-12 | 11-13 | 11-14 | 11-15 | 11-16 | 11-17 (to 18:20) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| router 500s | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | **0** |
+| router 400s | 193 | 496 | 343 | 611 | 31 | 439 | 515 | 93 | 264 | 1,070 | 310 |
+
+Reading: the residual floor from the 2026-11-01 → 11-02 window
+(`~16/day in-window`, 752 in the superset) is **absent**: every measured day
+from 2026-11-07 shows 0 router 500s except a single line on 2026-11-13,
+consistent with the remediation closed as LP-0MVYZ8Z16004QIRG on 2026-11-04.
+The target signal `router:500 == 0` now holds over a full 24 h window.
+
+### Restart integrity (AC6)
+
+- Window proxy `pid 3720326`, `lstart` **2026-11-16T15:20:47Z**, still running
+  at measurement (`etime` 1-02:58:55) ⇒ **no pid change, no restart inside the
+  window**.
+- Exactly **one** `Starting LLama Proxy Server` line in the window
+  (15:20:49.786) — the anchor process's own boot line, 2.8 s after its
+  `lstart`; 0 in the other four `proxy.log` files.
+- A single model-child generation (`pid 44409`) serves every `/slots` line in
+  both `llama-server` files.
+- Because the serving process **started at the window start**, its monotonic
+  counters *are* the window counters: no post-window restart destroyed the
+  counter delta this time (unlike the 2026-10-27 → 28 and 2026-11-01 → 02
+  windows).
+
+### Fallback signals (AC4)
+
+```text
+# HELP llama_slots_child_port_fallbacks_total Proxy /slots queries falling back to the router port because no model child port could be discovered, by reason
+# TYPE llama_slots_child_port_fallbacks_total counter
+llama_slots_child_port_fallbacks_total{reason="no_child_port_router_mode"} 1.0
+llama_slots_query_failures_total{reason="timeout"} 12210.0
+```
+
+| Signal | Window value | Verdict |
+|---|---|---|
+| `llama_slots_child_port_fallbacks_total{reason="no_child_port_router_mode"}` delta | **1** | chat-model zero-tolerance **fails** |
+| `slots_child_port_unavailable` WARNING lines | **1** (`model=Qwen3`, 15:20:51.411Z) | — |
+| chat-model (`Qwen3`) fallbacks, steady state (15:20:52 → 15:20:47 next day) | **0** | clean |
+| embed-model (`mxbai-embed`) fallbacks | **0** | non-blocking, none |
+
+The single fallback is the **first poll of the boot that anchors the window**:
+
+```text
+2026-11-16 15:20:51,406 - INFO - Started TTS server (PID: 3721608)
+2026-11-16 15:20:51,408 - INFO - Slot occupancy sampler started (interval 10.0s)
+2026-11-16 15:20:51,411 - WARNING - slots_child_port_unavailable: no model child port discovered for model=Qwen3 (source=log_signal); falling back to router port 8080 — every proxy-initiated /slots poll will traverse t...
+2026-11-16 15:20:51,435 - WARNING - llama-server --version returned 127
+2026-11-16 15:20:51,560 - INFO - Adopted running llama-server (model=router parallel=1 router_mode=True); preserving warm prompt cache
+```
+
+The same restart-correlated transient appeared in the 2026-11-01 → 02 window
+(3 × `model=Qwen3`, each within 3 s of a restart). It is a boot-ordering
+issue, not the busy-child / unloaded-model mechanism the fix targets, and it
+makes a zero-tolerance fallback check unsatisfiable on any restart-anchored
+window. Filed as **LP-0MWL0R0UT004G9XE**; the `gpt120` unloaded-model confound
+(LP-0MVVCY3HQ0009F0K) did **not** fire this window (4 `gpt120` requests, 0
+fallback warnings).
+
+### `slots_stale` share (AC3)
+
+| Figure | Window value | Comparison |
+|---|---|---|
+| **Primary:** all `status_request` polls | **5,239 / 29,053 = 18.03 %** | 31.4 % (10-27 → 28), 42.7 % (11-01 → 02), **64.4 %** pre-fix baseline (2026-10-26) |
+| Secondary: active-prefill subset (`active_query=true` or `local_active_query=true`) | **5,018 / 16,197 = 30.98 %** (the subset is 55.75 % of all polls) | — |
+
+### Baseline and reproducibility (AC5)
+
+- **Baseline available this window**: the serving process started exactly at
+  the window start, so its counters were 0 at *t0* by construction — the
+  counter delta needs no reconstruction (the previous window's missed-snapshot
+  limitation does not apply).
+- No `llama-server.log` line-count baseline was captured; the file-set
+  argument is the over-count direction instead — a 42 h 20 m superset (15 h
+  20 m before the window, 2 h 56 m after it) with 0 router 500s.
+- Commands used: the two `slots_500_triage.py` invocations above; the
+  `proxy.log` derivation loop (`awk` first/last timestamp per candidate) plus
+  a window-clipping tally over the five kept files; `ps -o pid,lstart,etime`
+  and a single `/metrics` scrape per site.
+
+### Residual router 400s — observation only
+
+1,380 router-responder `/slots ... 400` in the superset (1.26 % of slot
+events) — the `?model=` / model-resolution class, not this item's AC. The
+dedicated 24 h 400 == 0 verification is **LP-0MVU8003X0018WT8** (same window);
+these counts are recorded here for it.
+
+### Limitations
+
+- `llama-server` access lines are timestamp-free ⇒ the window is scoped by
+  file and proven by the over-count direction: the 42 h 20 m superset (15 h
+  20 m pre-window, 2 h 56 m post-window) reports 0 router 500s, and both
+  overhangs carry none.
+- The persistent host-first `llama-server` (container pid 44409 / host pid
+  3122336) predates the window, so its lines cannot be time-bounded by pid as
+  in the 2026-10-27 window.
+- The fallback counter delta **includes the window's first 4.4 s** (the anchor
+  restart's boot transient) because process lifetime == window.
+- `proxy.log` window end is clipped at 15:20:47 inside
+  `proxy.log.2026-11-17_09`, whose last line is 15:20:51.
+- `llama_slots_query_failures_total{reason="timeout"} 12,210` is a
+  process-lifetime value (window + overhang) and is reported as an observation
+  only.

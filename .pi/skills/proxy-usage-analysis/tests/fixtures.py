@@ -959,7 +959,7 @@ E2E_LINES = [
 # These two markers bracket a restart (real log formats from /var/log/llama-proxy):
 #   - ``Mode-switch restart spawned:`` (mode.py, immediately before the kill)
 #   - ``restart_services: router-mode restart complete (N slots)`` (lifecycle.py)
-from datetime import datetime  # noqa: E402  (kept beside its fixtures below)
+from datetime import datetime, timedelta  # noqa: E402  (kept beside its fixtures below)
 
 RESTART_SCRIPT = "/home/rgardler/projects/llm/proxy/scripts/start-proxy.sh --restart"
 
@@ -1443,3 +1443,107 @@ prefills are 20 slot-seconds but only 10 s of wall clock.
 Percentages are of the combined measured phase slot-time (prefill +
 decode) and always sum to 100.0%.
 """
+
+
+# --- Context-pressure windows (LP-0MWJOUUG6003WO79) -------------------------
+#
+# A *real* pressured session peaks at or above 80 % of its effective per-slot
+# context — the ratio the report's own "Context sizes approaching per-slot
+# limits" recommendation already uses (``recommendations.CONTEXT_PRESSURE_RATIO
+# = 0.80``). These builders model a 1 000-token profile across 2 slots, so
+# every session's per-slot context is 500 tokens and the pressure threshold is
+# 400 tokens. The peak context is never lowered to fake pressure: the fixtures
+# describe sessions that genuinely reach it.
+
+CONTEXT_PRESSURE_LOCAL_MODEL_CTX = 1000
+CONTEXT_PRESSURE_SLOTS = 2
+CONTEXT_PRESSURE_PER_SLOT_TOKENS = (
+    CONTEXT_PRESSURE_LOCAL_MODEL_CTX // CONTEXT_PRESSURE_SLOTS
+)
+CONTEXT_PRESSURE_THRESHOLD_TOKENS = 400  # 80 % of the 500-token per-slot limit
+
+_CONTEXT_PRESSURE_WINDOW_START = datetime(2026, 8, 2, 14, 0, 0)
+
+
+def context_pressure_config() -> dict:
+    """The analysis config that fixes the pressure window's per-slot context."""
+    return {"local_model_ctx_size": CONTEXT_PRESSURE_LOCAL_MODEL_CTX}
+
+
+def context_pressure_session(
+    session_id: str,
+    peak_tokens: int,
+    *,
+    slots: int | None = CONTEXT_PRESSURE_SLOTS,
+    ctx_size: int | None = None,
+) -> dict:
+    """One session whose peak context reached *peak_tokens* tokens.
+
+    ``ctx_size`` overrides the profile context the per-slot limit is derived
+    from; ``slots=None`` makes that limit unresolvable, so the session can be
+    neither counted as pressured nor used as a measured sample.
+    """
+    return {
+        "session_id": session_id,
+        "start": _CONTEXT_PRESSURE_WINDOW_START,
+        "end": _CONTEXT_PRESSURE_WINDOW_START + timedelta(minutes=5),
+        "duration_seconds": 300.0,
+        "messages": 1,
+        "local_requests": 1,
+        "remote_requests": 0,
+        "start_context_size": peak_tokens,
+        "avg_context_size": float(peak_tokens),
+        "max_context_size": peak_tokens,
+        "avg_response_size": 50.0,
+        "max_response_size": 60,
+        "initial_provider": "local",
+        "initial_model": "Qwen3",
+        "remote_provider": None,
+        "remote_model": None,
+        "remote_move_time": None,
+        "fallback_reason": None,
+        "bucket": "fast",
+        "slots": slots,
+        "dispatch_denied": 0,
+        "routing_skips": 0,
+        "ctx_size": ctx_size,
+    }
+
+
+def context_pressure_window(
+    sessions: list[dict],
+    *,
+    local_prompt_samples: list[tuple[str | None, int]] | None = None,
+) -> object:
+    """An ``aggregation.AnalysisResult`` window holding *sessions*.
+
+    By default each session contributes one *request-level* prompt sample at
+    half its peak — deliberately below the 80 % threshold — so a non-zero
+    share can only come from the per-session peak population the metric's
+    ``source`` / ``calculation`` copy names. Pass ``local_prompt_samples=[]``
+    for a window with no request-level samples at all.
+    """
+    import aggregation
+
+    summary = aggregation.AnalysisResult(
+        window_start=_CONTEXT_PRESSURE_WINDOW_START,
+        window_end=_CONTEXT_PRESSURE_WINDOW_START + timedelta(hours=1),
+        sessions={},
+        fallback_events=[],
+        routing_skip_events=[],
+        dispatch_denied_count=0,
+        unattributed_events=0,
+        lines_skipped=0,
+        total_lines=0,
+    )
+    for spec in sessions:
+        session = aggregation.SessionStats(**spec)
+        summary.sessions[session.session_id] = session
+    if local_prompt_samples is None:
+        local_prompt_samples = [
+            (spec["session_id"], spec["max_context_size"] // 2)
+            for spec in sessions
+            if spec["max_context_size"]
+        ]
+    summary.local_prompt_samples = list(local_prompt_samples)
+    return summary

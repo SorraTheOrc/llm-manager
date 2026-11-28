@@ -67,8 +67,13 @@ def _reset_slots_poll_cache():
     import proxy.observability as obs
 
     obs.reset_slots_poll_cache()
+    # LP-0MVVXGLTM008ROJ9: in-flight shared /slots fetches are shared tasks; a
+    # task left behind by one test must not be joined by the next (and a
+    # closed event loop must never be awaited).
+    obs.reset_slots_snapshot_state()
     yield
     obs.reset_slots_poll_cache()
+    obs.reset_slots_snapshot_state()
 
 
 @pytest.fixture(autouse=True)

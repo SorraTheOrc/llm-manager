@@ -1255,7 +1255,7 @@ session's own** dispatch record:
 
 | Gate | Where | Own record |
 | --- | --- | --- |
-| routing concurrency (`cur_local >= max_local` → `local_concurrency_limit`) | `_proxy_with_fallback_cycle` → `_local_concurrency_info` | **idle lease excluded** |
+| routing concurrency (`cur_local >= max_local` → `local_concurrency_limit`) | `_proxy_with_fallback_cycle` → `_local_concurrency_info` | **own record with no streaming dispatch token excluded** (idle lease, or finished-but-not-yet-released) |
 | dispatch lease (`_try_acquire_local_dispatch`) | lease choke point | same-session re-acquisition permitted (`own_has_lease`) |
 
 Before this, the routing gate counted *every* active-or-unexpired record —
@@ -1275,12 +1275,101 @@ local→remote for no capacity reason, one of them pushed remote on four
 consecutive turns 4.5–26.2 s after its own local turn.
 
 **The rule.** `_get_local_concurrency_info(..., session_id=…)` excludes the
-requesting session's own record **only while it is an idle lease**
-(`active: false`). A record that is still `active` is genuine in-flight work, so
-a second concurrent request from the same session is gated exactly as before.
+requesting session's own record whenever it holds **no streaming dispatch
+token** (the `_is_own_record_non_occupancy` predicate, also exported under the
+historical alias `_is_own_idle_lease`). That one predicate covers both shapes
+that must not gate the returning session:
+
+- an **idle lease** — `active: false`, the slot a finished turn keeps reserved
+  for its owner during the no-preemption cooldown (LP-0MW0VH2LB008JSKQ);
+- **finished-but-not-yet-released** — `active: true` with an empty
+  `streaming_dispatch_tokens` set: the response has reached its terminal chunk
+  but request teardown has not yet released the dispatch credit
+  (LP-0MWNHBG7D002NH5S). A sequential client's next turn lands in this window
+  (measured ~145 ms after the stream ends, against ~1.41 s of teardown latency)
+  and was previously refused with `local_concurrency_limit`.
+
+**Genuine in-flight work still counts.** A record that holds **at least one**
+streaming dispatch token — a second concurrent request from the same session —
+is genuine in-flight work and keeps occupying its slot, so that request is gated
+exactly as before. The discriminator is the streaming set, deliberately not the `active`
+flag: clearing `active` at the terminal chunk would change the branch key in
+`_try_acquire_local_dispatch` and could lose an outstanding credit, so the
+marker sits beside it instead.
+
+The marker (`streaming_dispatch_tokens`) is a subset of the record's
+`dispatch_credits`, keyed on the **dispatch credit token**: a token enters the
+set when its dispatch takes its credit (`_try_acquire_local_dispatch` /
+`_increment_local_active_queries`), leaves it the moment the response reaches
+its terminal chunk (`_mark_local_dispatch_stream_finished`), and is pruned by
+`_claim_local_dispatch_credit` in the same critical section that releases the
+credit — so a released credit never leaves a stale streaming token behind. The
+marker never touches `active` or `dispatch_credits`, so exactly-once release is
+unchanged.
+
+**Which chunks count as terminal (LP-0MWOZFF7T001YA87).** Both of the local
+stream's terminal chunks mark, because both mean the client has its complete
+response:
+
+- the **upstream** `finish_reason` chunk or `[DONE]` marker, marked in the
+  streaming loop; and
+- the **synthesised** `finish_reason=error` + `[DONE]` pair the router emits
+  when the upstream stream fails (`ReadError`/`RemoteProtocolError`), marked in
+  the loop's exception handler.
+
+Without the second one the marker survived until request teardown, and teardown
+runs after the generator's `finally` slot save — measured **10–25 s** on that
+path (against ~1.41 s for a clean finish). A client retrying after a local
+stream error was therefore still counted as its own occupier and exiled with
+`local_concurrency_limit` for that whole window (17.13 h post-fix window,
+2026-11-19T19:37Z → 2026-11-20T12:45Z: 14 such fall-throughs, every one 10–25 s
+after a local `Local stream error (ReadError)`).
+
+**A client disconnect is still not "finished".** `GeneratorExit` /
+`CancelledError` take their own handlers and never mark, so a
+disconnected-but-credit-holding stream keeps counting until its credit is
+released — the conservative direction, because the slot may still be draining
+upstream work.
+
 `session_id=None` (anonymous callers, and the pool-description readers behind
 `/llama/local/status` and `/llama/local/reserve`) excludes nothing, so the
-engine-capacity view and the pure-legacy global-counter path are unchanged.
+engine-capacity view and the pure-legacy global-counter path are unchanged. A
+record that predates the marker (no `streaming_dispatch_tokens` key) keeps the
+pre-change rule keyed on `active` alone. Excluding the requester's own finished
+record removes a false refusal only; it does **not** add waiting, so `remote-ok`
+(the default preference) still never queues.
+
+### Re-measuring the impact (LP-0MWNHBI6A001V5DD)
+
+The raw `reason=local_concurrency_limit` count cannot confirm the fix, because
+the line is still emitted for genuine contention. The measurement therefore
+classifies each fall-through by **occupancy composition** from `proxy.log`:
+for every event it reconstructs the requesting session's own dispatch-record
+state (`local_preference_resolved outcome=local` → `Stream finished
+provider=local` → `lease_renewed` → `lease_released` / `local_eviction`) and
+counts the other sessions' present records at that instant.
+
+```bash
+python3 .pi/skills/proxy-usage-analysis/scripts/attribute_local_concurrency.py \
+    --log-dir /var/log/llama-proxy \
+    --start '2026-11-18 22:38:00' --until '2026-11-19 22:38:00' --json
+```
+
+It splits the events into four classes:
+
+| class | meaning | post-fix expectation |
+| --- | --- | --- |
+| `own_non_streaming_attributable` | own record present with **no** streaming dispatch token (idle lease or finished-but-not-released) and the others alone below the pool | ~0 — the fix excludes the own record |
+| `own_streaming_gated` | own record holds a streaming token (a genuinely concurrent same-session request) | unchanged |
+| `other_sessions_contention` | the other sessions' records already fill the pool | unchanged |
+| `unattributable` | neither the own nor the other records explain the refusal at the log timestamp (decision/log-line skew, the prefill cap, or a log gap) | unchanged |
+
+It reuses the method established on LP-0MW0VH2LB008JSKQ (own local turn
+finished inside the lease timeout → own-attributable), extended to the
+finished-but-not-released window this change fixes. Run it over a **≥24 h**
+window **after the fixed proxy code is running** (a restart is required — the
+measurement is of the live process, not the repository); the pre-fix baseline
+is reproduced by pointing the same command at a window before that restart.
 
 ## Dispatch-lease occupancy and the denial line (LP-0MW0KZTWC004HXQ5)
 
@@ -1312,6 +1401,89 @@ no-progress watchdog's concern, never the admission gate's — so it is left for
 the watchdog. Pruning also releases the freed session-slot assignment, so the
 slot registry cannot describe a slot the gate has already forgotten.
 
+#### The prefill cap is priced on live prefills (LP-0MWKWGLRT003AUG4)
+
+The prefill cap is priced with `_get_live_prefill_in_flight_count`, not the raw
+marker count. A `local_prefill_in_flight` entry is **evidence of a prefill only
+when an `active` dispatch record backs it** (a dispatch that is still running:
+prefill or generation); a marker with no live record is an orphan and counts as
+zero, and a marker whose record survives only as an inactive post-request lease
+does not count either. The raw `_get_prefill_in_flight_count` is retained for
+observability and back-compat, but it is not the quantity the gate — or the
+denial evidence below — prices. Serialisation is unchanged for a genuine
+prefill: a marker backed by an `active` record is still counted exactly as
+before, so `local_max_concurrent_prefills` keeps bounding concurrent prefills.
+
+#### Every record deletion pops its marker (LP-0MWL5KLN1003E990)
+
+A marker's lifetime is its dispatch record's lifetime. Every deletion path pops
+the session's marker in the same release: the admission-path prune, the
+explicit `POST /v1/leases/release`, the client-disconnect release, the
+end-of-request completion release, every branch of
+`_cleanup_stale_local_dispatch` (completed-record reaping, no-progress
+watchdog, idle timeout, orphan cleanup), and session invalidation
+(`session._invalidate_session_and_slot`). The prefill-deadline and
+measured-cache-deficit aborts already pop it inline in the shared
+`_release_unserved_dispatch` core. The marker set is therefore always a subset
+of the dispatch-record session ids: a record deletion cannot leave an orphan.
+Most paths share `router_helpers._pop_prefill_marker`, which is idempotent,
+fail-soft and synchronous, so the admission gate's prune path stays
+`await`-free.
+
+#### An orphaned marker is reclaimed within one cleanup tick (AC6)
+
+`_dispatch_cleanup_loop` (every 10 s) runs `_reclaim_orphaned_prefill_markers`
+immediately after `_cleanup_stale_local_dispatch`. One synchronous pass over
+both registries drops every marker whose session has **no** dispatch record and
+logs one line per reclaimed marker:
+
+```
+prefill_marker_reclaimed session=<id> reason=orphaned
+```
+
+A healthy tick logs nothing. The pass is deliberately more conservative than
+the pricing count: a marker backed by *any* record (an `active` dispatch or a
+retained inactive lease) is left alone, and deleting a record remains the
+per-path pop's job, so the sweep only ever discounts phantom markers and can
+never race a live prefill — the marker is written *after* its record is
+inserted, and the pass holds no `await`. Recovery needs **no proxy restart**
+and no configuration change, and is bounded by one tick (~10 s; the cleanup
+loop's documented end-to-end self-healing bound is ~20 s). One residual,
+bounded raw-count use remains outside the lease gate:
+`provider._local_slot_saturation` treats any marker as possible prefill
+saturation for the contention-queue wake decision, so an orphan can delay a
+queued wake until the tick (tracked as LP-0MWM8BQ5H008N3WF). It can never deny
+the direct dispatch path.
+
+#### Motivating measurement (2026-11-17)
+
+One orphaned marker (`01a1e9e4-90be-70d7-a899-aa39b5c753ca`) survived the
+prune at **14:24:42**: the record had been deleted (`records_total=0`,
+`owner=none`), the marker had not. From then until the manual release, every
+local dispatch was denied with
+
+```
+local_dispatch_denied ... records_total=0 ... prefill_in_flight=1
+  prefill_cap=1 llama_available_slots=2 llama_total_slots=2
+```
+
+while `/llama/local/status` on the same machine reported
+`local_prefills_in_flight=0 available_slots=2 local_route_available=true` —
+the gate priced a marker that no record backed. Since 14:24:42 the log held
+505 such denial lines and 413 `local_only_refused ... preference=local-preferred
+verdict=deferrable` refusals (among them 160 `cause=queue_depth_exceeded` and
+187 `cause=queue_wait_expired`), i.e. a hard outage for locally-pinned sessions
+while the GPU sat idle.
+
+The in-place mitigation was a targeted
+`POST /v1/leases/release {"session_id": "<leaked session>"}`: the release pops
+`local_prefill_in_flight[session_id]` even when no dispatch record matches
+(idempotent), and denial lines stopped immediately. That call remains the
+documented manual fallback (see [Lease Release](../README.md#lease-release)),
+but it is no longer the only recovery — the sweep above reclaims an orphan
+within one tick. Together these three changes are what let the
+`prefill_in_flight` evidence field mean "live prefill" again.
+
 ### The denial line carries its evidence (AC2)
 
 Every `local_dispatch_denied` line is followed on the SAME line by an
@@ -1329,6 +1501,14 @@ local_dispatch_denied session=… owner=… active=… cold_start=… <turn>
 (`None` when unavailable) so "no data" is never confused with "zero".
 `prefill_cap` is the *effective* cap (`local_max_concurrent_prefills`, clamped
 to the slot pool), which is what the prefill branch actually compares against.
+`prefill_in_flight` is the gate's **own live count** — the same
+`_get_live_prefill_in_flight_count` value the gate prices, produced by the same
+helper that publishes `local_prefills_in_flight` on `/llama/local/status` —
+never the raw marker count. The denial line therefore cannot contradict the
+status payload: an orphaned marker is invisible to both, and
+`prefill_in_flight>0` always means an `active` record really is prefilling.
+(The `records=` tail still lists the raw registry entries, so an operator can
+see the state the count was derived from.)
 The field vocabulary is published as `OCCUPANCY_EVIDENCE_FIELDS` so the log
 contract cannot drift from the code.
 
@@ -1417,13 +1597,17 @@ server:
   exactly as before when those caps are hit; the prefill-ETA admission guard
   refuses waits that cannot succeed rather than parking the request.
 - **No added delay for a lone request** — with nothing else prefilling the
-  gate is open (the in-flight count is 0).
+  gate is open (the live in-flight count is 0; an orphaned marker with no
+  `active` record is not counted — see
+  [Stale records never block](#stale-records-never-block-ac1)).
 - **Observability** — each local dispatch logs
   `prefill_gate_wait_ms=… saturation=… session=… model=… provider=…` (the time
   the request waited specifically for the prefill gate; `0.0` when it was not
   prefill-gated), and `/llama/local/status` publishes
-  `local_prefills_in_flight`, `local_max_concurrent_prefills` and
-  `prefill_gate_waiters` (the contention queue depth).
+  `local_prefills_in_flight` (the same liveness-filtered count the gate prices,
+  so the status payload and the `local_dispatch_denied` evidence cannot
+  disagree), `local_max_concurrent_prefills` and `prefill_gate_waiters` (the
+  contention queue depth).
 
 ## Residency-aware admission ladder (LP-0MVN1IQTF0037WTG)
 
@@ -2116,6 +2300,42 @@ either case, and the deadline + safety bounds still refuse anything that could
 not finish. The log line carries `budget_s` (the resolved queue budget) and
 `bound_s` (the bound actually enforced), so the two can never be confused.
 
+### What the ETA cannot see: the cross-session prompt cache (LP-0MWRQ6ZID000HZAZ)
+
+The formula above prices **per-session KV residency, not llama-server's
+cross-session prompt cache**. `cached_ratio` is a per-(model, session) ratio —
+the share of the prompt served from the slot's own KV — while llama-server's
+`--cache-ram` prompt cache (`40960` MiB in the shipped `models.ini`, see
+[docs/dev/prompt-cache-tuning.md](../../docs/dev/prompt-cache-tuning.md)) is
+shared *across* sessions. A dispatch logged with `cached_ratio=0.0` can
+therefore still be **warm** and fast to first byte: the cache is unpriced
+input, so the `coded_tokens` term under-counts what it actually saved.
+
+It has to be unpriced, because the warmth is unobservable at admission. There
+is no synchronous `/slots` probe on the admission hot path — `/slots` was
+measured held for more than 15 s during a prompt batch
+(LP-0MUXTW4MD003TVIC) — so `proxy/proxy/residency.py` serves a *cached*
+snapshot instead and the guard prices a prediction
+(`expected_cached_ratio`). Warmth becomes knowable only post hoc:
+`update_cached_ratio` writes turn N's usage from its own response and
+`record_measured_divergence` corrects turn N+1.
+
+Two consequences for anyone reading an ETA verdict or the report's
+`prefill_eta_accuracy`:
+
+- A refusal can be over-conservative for a prompt that is in fact warm from
+  another session's prefill — the guard cannot prove it, and admitting on an
+  unverified assumption is the failure mode the guard exists to prevent.
+- Part of the observed over-prediction (the 863 % median in the 2026-11-21
+  window) is **unobservable prompt-cache warmth, not calibration error**. Do
+  not retune the conservatism factor or the percentile knobs to chase it.
+
+This is a named limitation, **distinct from LP-0MWRQ6LSV009DVP4** — a
+*measured* resident prefix (`n_past_actual`) that is already available in the
+admission path but is not yet wired into the ETA. That one is a fixable defect;
+cross-session warmth is not observable at admission at all. The two causes must
+not be conflated when attributing an over-prediction.
+
 ### The ETA refusal is only taken when a remote can serve (LP-0MW0KZR7A003UFQK)
 
 The guard's refusal is a **capacity** judgement about the local engine, so it
@@ -2254,6 +2474,13 @@ each eviction to its admission evidence at the measured dispatch start
 | `inert_unlogged` — guard inert (uncalibrated bucket) and silent at the dispatch instant | 47 | 439,307 |
 | `priced_within_queue_budget` — admitted inside the 30 s queue budget (5.3–28.0 s) yet stalled the full deadline behind another session's prefill (occupancy priced 0) | 8 | 12,954 |
 | `idle_override` — admitted by the idle-capacity override, guard not consulted | 2 | 7,214 |
+
+This window predates the inert-admit logging (LP-0MVZF4SU10032OZH): inert
+decisions are now logged
+``decision=admit reason=inert_admit reason_inert=<reason>``, so a post-fix
+window splits the `inert_unlogged` class by inert reason (`inert_no_budget` /
+`inert_insufficient_samples` / `inert_policy_off`) instead of treating it as
+one observability defect.
 
 **Conclusions.** (1) The rung's own accepted trade is **26 / 24 h** — not
 126 / 24 h: the other 100 events came from admission paths the rung does not
@@ -4090,13 +4317,17 @@ cannot hold the pool:
    own session, and the record is addressed by
    `_dispatch_lease_key(endpoint, session_id)` — another session's open
    request can never refresh this record's `expires_at`/`last_progress_ts`.
-3. **Occupancy counts only live leases.** The admission gate's
+3. **Occupancy counts only live prefills.** The admission gate's
    `in_flight_prefills` (and therefore `busy_slots`) uses
    `_get_live_prefill_in_flight_count`, which counts an in-flight marker only
-   when a live (active/unexpired) dispatch record backs it. An orphan marker
-   left by a released/deleted record no longer reports
-   `busy_slots=1 … available_slots=0` for every other session (the incident's
-   52 admission-guard rejections in the hour).
+   when an **`active`** dispatch record backs it (a retained inactive lease
+   does not count). An orphan marker left by a released/deleted record no
+   longer reports `busy_slots=1 … available_slots=0` for every other session
+   (the incident's 52 admission-guard rejections in the hour). The invariant is
+   enforced at both ends: every record deletion pops its marker
+   (LP-0MWL5KLN1003E990), and the 10 s cleanup tick reclaims any marker that
+   still has no record (`prefill_marker_reclaimed`, LP-0MWL5KM8X00193B3) — see
+   [Stale records never block](#stale-records-never-block-ac1).
 
 Coverage: `proxy/tests/test_lease_truthfulness.py` (release on deadline,
 two-session extension isolation, orphan-marker occupancy, watchdog firing for

@@ -16,8 +16,8 @@ Validates that:
 
 Also enforces the `FORBIDDEN_RULE_SERIES` contract on **every** PromQL source —
 rule files (YAML) and the GPU utilisation CLI (Python, `QUERIES` mapping) — so a
-`gpu_busy_percent` query cannot be introduced in either place
-(LP-0MVT1NVAJ007KUGO).
+`gpu_busy_percent` query, or a saturated `gpu_metrics` activity field, cannot be
+introduced in either place (LP-0MVT1NVAJ007KUGO, LP-0MVZEW75H00741OS).
 """
 
 import ast
@@ -72,6 +72,19 @@ REQUIRED_RULE_FILES = {
 #   both read ~99 % and the counter inverts across 40-60 W / 90-100 W, i.e. it
 #   is not a utilisation signal (LP-0MS9GA6QL007XTBP, quantified in
 #   LP-0MVSQQO910077LYL and re-measured in LP-0MW5K7WKZ005VJXA).
+# - Saturated `gpu_metrics` activity fields: the `amd_gpu_metrics_v3_0` blob was
+#   the last candidate hardware signal and its verdict is negative. Capture
+#   **2026-11-18** on kernel 7.0.0-38 (61 samples at 1 s: 23 idle < 60 W, 25
+#   compute >= 90 W) read `average_gfx_activity` = 100 % in both bands — 0 pp
+#   separation, Pearson r undefined (zero variance) — giving a
+#   **100 % idle-band false-busy share** against a <= 10 % bar, reproducing the
+#   2026-10-29 intake capture (120 samples, 100 % across 42-123 W,
+#   LP-0MVSQT7YC0045HFW). On this APU the field reports "GFX domain powered",
+#   not "GFX busy", so it is no more a utilisation input than the counter
+#   above. Both the decoded field name and the series a sampler would publish
+#   are forbidden, so no rule, query or report can present it as utilisation
+#   even though nothing publishes it (the stance `rocm_vram_*` already takes;
+#   LP-0MVZEW75H00741OS).
 # llama_process_rss_bytes is deliberately NOT forbidden: LP-0MVO9F877008ZCP7
 # fixed the always-0 publication (llama-server runs in a podman container, so
 # the proxy now resolves RSS via the container process tree / cgroup
@@ -80,6 +93,8 @@ REQUIRED_RULE_FILES = {
 FORBIDDEN_RULE_SERIES = [
     "rocm_vram_",
     "gpu_busy_percent",
+    "average_gfx_activity",
+    "gpu_gfx_activity",
 ]
 
 
@@ -170,6 +185,19 @@ def _rule_expressions(path: Path) -> list[str]:
 # ``gpu_busy_percent`` query into the CLI would otherwise be a silent
 # utilisation regression that no rule-file check could see.
 CLI_QUERY_SOURCES = [PROJECT_ROOT / "scripts" / "gpu_utilisation.py"]
+
+#: The `gpu_metrics` probe CLI is a sysfs sampler, not a PromQL consumer, but the
+#: verdict it produces must never turn into a *query* input either: it is scanned
+#: permissively (having no query expression today is not a failure) so a
+#: ``QUERIES`` mapping added to it later is covered by the same contract
+#: (LP-0MVZEW75H00741OS).
+PROBE_QUERY_SOURCES = [PROJECT_ROOT / "scripts" / "gpu_metrics_probe.py"]
+
+#: The saturated activity field the negative `gpu_metrics` verdict names, and the
+#: series a textfile sampler would publish for it, so the guard can prove both
+#: spellings are rejected (LP-0MVZEW75H00741OS).
+SATURATED_ACTIVITY_FIELD = "average_gfx_activity"
+SATURATED_ACTIVITY_SERIES = "gpu_gfx_activity"
 
 #: Assignment/argument names whose string values are PromQL, by convention.
 _QUERY_NAME_SUFFIXES = ("QUERY", "QUERIES", "EXPR", "EXPRESSIONS")
@@ -272,6 +300,18 @@ def _consumer_guard_offenders(path: Path) -> list[str]:
         f"in a mapping named QUERIES/QUERY/EXPR/EXPRESSIONS, or pass them as a "
         f"query=/expr= argument."
     )
+    return _forbidden_series_offenders(expressions, source_label=path.name)
+
+
+def _optional_consumer_guard_offenders(path: Path) -> list[str]:
+    """Return forbidden-series offenders for a source that may hold no PromQL.
+
+    Unlike :func:`_consumer_guard_offenders`, a source with no query expression
+    is not a failure here: ``scripts/gpu_metrics_probe.py`` reads sysfs directly,
+    so "no PromQL" is its expected state. If it ever grows a ``QUERIES``
+    mapping, that mapping is scanned under the same contract.
+    """
+    expressions = _promql_expressions_in_python(path.read_text(), filename=str(path))
     return _forbidden_series_offenders(expressions, source_label=path.name)
 
 
@@ -954,8 +994,9 @@ class TestAlertRuleFiles:
             )
         assert not offenders, (
             "Rules reference series that are unpublished or meaningless on this "
-            "host (rocm_vram_* has no exporter, gpu_busy_percent is pinned at "
-            "100%):\n" + "\n".join(offenders)
+            "host (rocm_vram_* has no exporter, gpu_busy_percent and the "
+            "saturated gpu_metrics activity fields are not utilisation "
+            "signals):\n" + "\n".join(offenders)
         )
 
 
@@ -993,8 +1034,9 @@ class TestForbiddenSeriesGuard:
             )
         assert not offenders, (
             "The GPU utilisation CLI queries a series that is unpublished or "
-            "meaningless on this host (gpu_busy_percent saturates at ~20 W, "
-            "rocm_vram_* has no exporter):\n" + "\n".join(offenders)
+            "meaningless on this host (gpu_busy_percent saturates, the "
+            "gpu_metrics activity fields are saturated too, rocm_vram_* has no "
+            "exporter):\n" + "\n".join(offenders)
         )
 
     def test_guard_flags_a_forbidden_series_in_a_queries_mapping(self):
@@ -1104,6 +1146,121 @@ class TestForbiddenSeriesGuard:
         )
         assert len(offenders) == 1
         assert "gpu_busy_percent" in offenders[0]
+
+
+class TestSaturatedActivityFieldGuard:
+    """A saturated `gpu_metrics` activity field is not a utilisation input.
+
+    The `gpu_metrics` verdict is negative (capture 2026-11-18, kernel 7.0.0-38:
+    `average_gfx_activity` reads 100 % in both power bands, a 100 % idle-band
+    false-busy share), so the field joins `gpu_busy_percent` on the forbidden
+    list. These tests are non-vacuous: every consumer kind is shown to fail on a
+    violation, and the shipped rule files, the utilisation CLI and the probe CLI
+    are scanned for one (LP-0MVZEW75H00741OS AC1/AC3/AC4).
+    """
+
+    def _forbidden_comment(self) -> str:
+        """Return the comment block that justifies FORBIDDEN_RULE_SERIES."""
+        head, _, _ = Path(__file__).read_text().partition("FORBIDDEN_RULE_SERIES = [")
+        return "\n".join(
+            line for line in head.splitlines()[-60:] if line.lstrip().startswith("#")
+        )
+
+    def test_the_saturated_field_and_its_series_are_forbidden(self):
+        """AC1: both spellings join `gpu_busy_percent` on the list."""
+        assert SATURATED_ACTIVITY_FIELD in FORBIDDEN_RULE_SERIES
+        assert SATURATED_ACTIVITY_SERIES in FORBIDDEN_RULE_SERIES
+        assert "gpu_busy_percent" in FORBIDDEN_RULE_SERIES, (
+            "the counter's entry must survive: the activity field is an "
+            "addition, not a replacement"
+        )
+
+    def test_the_constant_cites_the_verdict_that_justifies_it(self):
+        """AC4: the evidence survives, so the entry is never re-litigated."""
+        comment = self._forbidden_comment()
+        for fact in (
+            "2026-11-18",  # capture date
+            "7.0.0-38",  # kernel the verdict was measured on
+            SATURATED_ACTIVITY_FIELD,  # the field the verdict names
+            "100 % idle-band false-busy",  # the share, against the bar
+            "<= 10 %",  # the bar it fails
+        ):
+            assert fact in comment, (
+                "the saturated-activity entry must cite the verdict that "
+                f"justifies it; missing {fact!r}"
+            )
+
+    def test_guard_flags_a_saturated_series_in_a_rule_expression(self):
+        """AC3, rule kind: a published-series selector is reported."""
+        expr = "avg_over_time(gpu_gfx_activity[2h])"
+
+        offenders = _forbidden_series_offenders([expr], source_label="synthetic")
+
+        assert offenders == [f"synthetic: {expr}"]
+
+    def test_guard_flags_the_decoded_field_in_a_queries_mapping(self):
+        """AC3, query kind: the raw decoded field name is reported too."""
+        source = (
+            "QUERIES = {\n"
+            '            "activity": "avg_over_time(average_gfx_activity[2h])",\n'
+            '            "computing": "avg_over_time(gpu:computing:bool[2h])",\n'
+            "        }\n"
+        )
+
+        offenders = _forbidden_series_offenders(
+            _promql_expressions_in_python(source), source_label="synthetic"
+        )
+
+        assert len(offenders) == 1, offenders
+        assert SATURATED_ACTIVITY_FIELD in offenders[0]
+
+    def test_guard_flags_a_query_added_to_the_probe(self):
+        """AC3, probe kind: the probe scan is forward coverage, not a no-op."""
+        source = (
+            PROBE_QUERY_SOURCES[0].read_text()
+            + "\nQUERIES = {\n"
+            '    "activity": "avg_over_time(gpu_gfx_activity[1h])",\n'
+            "}\n"
+        )
+
+        offenders = _forbidden_series_offenders(
+            _promql_expressions_in_python(source), source_label="gpu_metrics_probe.py"
+        )
+
+        assert len(offenders) == 1, offenders
+        assert SATURATED_ACTIVITY_SERIES in offenders[0]
+
+    def test_probe_cli_selects_no_forbidden_series(self):
+        """The probe reads sysfs; it must not become a query consumer."""
+        assert PROBE_QUERY_SOURCES
+        for path in PROBE_QUERY_SOURCES:
+            assert path.exists(), f"missing probe source: {path}"
+            assert _optional_consumer_guard_offenders(path) == [], (
+                "the gpu_metrics probe queries a series that cannot be used as a "
+                "utilisation input"
+            )
+
+    def test_shipped_rule_files_and_query_consumers_select_no_saturated_field(
+        self, prometheus_alert_rules
+    ):
+        """AC3 on the shipped sources: no real consumer uses the field."""
+        expressions: list[str] = []
+        for rule_file in prometheus_alert_rules:
+            expressions.extend(_rule_expressions(rule_file))
+        for path in CLI_QUERY_SOURCES:
+            if path.exists():
+                expressions.extend(
+                    _promql_expressions_in_python(path.read_text(), filename=str(path))
+                )
+
+        assert expressions, (
+            "the guard would be vacuous: no real rule or query expression found"
+        )
+        offenders = _forbidden_series_offenders(expressions, source_label="shipped")
+        assert not offenders, (
+            "a shipped rule or query selects a series that is not a utilisation "
+            "signal:\n" + "\n".join(offenders)
+        )
 
 
 class TestAttributableShareSingleProducer:

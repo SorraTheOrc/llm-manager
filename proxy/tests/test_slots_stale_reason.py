@@ -376,7 +376,7 @@ class TestPayload:
         payload = await _get_status(_Ok())
         assert payload["slots_stale"] is False
         assert payload["slots_stale_reason"] is None
-        assert payload["status_schema_version"] == 7
+        assert payload["status_schema_version"] == 8
 
     @pytest.mark.asyncio
     async def test_query_error_is_published(self):
@@ -401,14 +401,17 @@ class TestPayload:
     async def test_reason_published_even_with_no_cache_to_serve(self):
         """Diagnosability does not depend on there being a fossil to serve.
 
-        With no cached snapshot ``slots_stale`` stays false (nothing stale is
-        being *served* — the counts are simply 0/0 and consumers already see
-        no capacity), but the cause is still published so an operator is not
-        left guessing.
+        A failed read that served nothing (no fresh payload, no cache) is a
+        *missing snapshot* under the age-derived definition
+        (LP-0MVVXGM54009TOXD), so ``slots_stale`` is true and the enumerated
+        cause is published. Before the age-derived definition this poll
+        reported ``slots_stale=false`` while still publishing the reason — a
+        pair that could contradict itself.
         """
         payload = await _get_status(_FailingClient("error"))
-        assert payload["slots_stale"] is False
+        assert payload["slots_stale"] is True
         assert payload["slots_stale_reason"] == "query_error"
+        assert payload["slots_snapshot_age_seconds"] is None
 
     @pytest.mark.asyncio
     async def test_child_port_undiscovered_is_published(self):

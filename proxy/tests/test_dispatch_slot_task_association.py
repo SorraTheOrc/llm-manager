@@ -421,8 +421,18 @@ def test_eviction_line_is_append_only(caplog):
         "llama_task_id",
         "endpoint",
     ]
-    # Everything the association adds comes after the pre-existing keys.
-    assert keys[9:] == ["llama_task_id_reason"]
+    # Everything the association adds comes after the pre-existing keys; the
+    # LP-0MWKQJHSM000CI6W release-context evidence is appended last, and the
+    # LP-0MWM0CPQN009SHJR retry-join correlation fields after that (all
+    # append-only, so a deployed positional parser keeps its prefix).
+    assert keys[9:] == [
+        "llama_task_id_reason",
+        "task_started",
+        "progress_observed",
+        "queue_wait_s",
+        "prompt_fp",
+        "turn",
+    ]
 
 
 # ---------------------------------------------------------------------------

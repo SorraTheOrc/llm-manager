@@ -46,6 +46,7 @@ from dataclasses import dataclass
 import bucketing
 import engine_cross_check
 from aggregation import (
+    CONTEXT_PRESSURE_THRESHOLD_RATIO,
     FALLBACK_ATTRIBUTION_LEASE_DENIED,
     FALLBACK_ATTRIBUTION_UNATTRIBUTED,
     ROOT_CAUSE_OTHER,
@@ -95,7 +96,10 @@ REASON_SHARE = 0.20
 PROVIDER_CONTEXT_SHARE = 0.10
 FALLBACK_RATE_LOW = 0.10
 FALLBACK_RATE_HIGH = 0.30
-CONTEXT_PRESSURE_RATIO = 0.80
+#: Aliased to the scorecard metric's threshold (LP-0MWJOUYUL0005H95) so the
+#: recommendation and the reported ``context_pressure`` share can never
+#: disagree about what "pressure" means — one constant, two consumers.
+CONTEXT_PRESSURE_RATIO = CONTEXT_PRESSURE_THRESHOLD_RATIO
 CONTEXT_CRITICAL_RATIO = 0.95
 IMBALANCE_RATIO = 1.5
 IMBALANCE_MIN_SESSIONS = 3

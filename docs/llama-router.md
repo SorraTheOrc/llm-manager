@@ -679,6 +679,17 @@ so the deadline's first-byte wait does not bound them; the no-progress watchdog
 releases those, and `local_dispatch_max_prefill_seconds` (900 s) remains the
 lifetime ceiling.
 
+The watchdog reports the **distinct** reason it computed, not a single umbrella
+label: `prefill_eta_exceeded` (runaway prefill — elapsed past
+`eta_prefill_s * local_prefill_eta_factor`), `prefill_stalled` (no measured
+progress for the no-progress timeout — a genuine wedge), or
+`prefill_max_exceeded` (the hard ceiling). `no_progress_watchdog` is now only a
+fallback for a release no distinct reason attributes. The same value appears on
+the `lease_released` line and on the post-acceptance eviction line, which also
+appends `task_started`, `progress_observed` and `queue_wait_s` so a window can
+classify every pre-first-byte abort. Vocabulary, line contract and rollback:
+[docs/dev/prefill-watchdog-eviction-reasons.md](dev/prefill-watchdog-eviction-reasons.md).
+
 Live verification (2026-10-23, post-deploy): deadline → lease release 0 s,
 non-streaming stall → 189 s, zero `reason=local_lease_active` fallbacks in the
 post-fix window, and cooldown-throttled retries instead of the incident's 41

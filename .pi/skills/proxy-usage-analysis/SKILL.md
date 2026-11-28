@@ -192,7 +192,11 @@ The rules behind those numbers:
   produced each verdict. A metric whose own noise needs a wider or tighter
   band sets `tolerance_pct` in the committed defaults file (beside a one-line
   rationale for any value other than 10); an absent, non-numeric or negative
-  value falls back to the 10 % default and never fails the run. A **zero
+  value falls back to the 10 % default and never fails the run. An explicit
+  **`tolerance_pct: 0`** is not an absent value: it is a deliberate
+  zero-width, one-sided band, rendered `±0 %`, and the committed
+  `fallback_rate` default uses it so Fallback rate is `Met` only when the
+  window's actual is at or below its target. A **zero
   target** has a zero-width band — 10 % of zero is zero — so only an actual of
   zero is `Met` there; this is stated rather than replaced by an invented
   absolute epsilon.
@@ -201,6 +205,14 @@ The rules behind those numbers:
   best three span more than one era the section prints a **cross-era note**
   naming the metric and the eras, because such a target averages unlike
   configurations.
+- **Definition-change resets.** A metric whose *definition* changed has its
+  recorded history **reset**, with the change recorded in the state file's
+  `notes` block (`event: definition_change`), so a baseline or target is never
+  computed across two definitions; the row reads **Insufficient history**
+  until three post-change windows exist. `fallback_rate` history is retained
+  (only its verdict band moved). How to perform a reset, and the resets
+  already recorded: [REFERENCE.md § Definition-change history
+  resets](REFERENCE.md#definition-change-history-resets).
 
 `## Performance metric details` follows the table immediately: one `###`
 subsection per metric, headed by the metric id and label (for example
@@ -210,6 +222,21 @@ trade-offs of trying to improve it. The prose comes from the committed
 defaults file rather than the renderer, so a wording change is a defaults-file
 change; each subsection links to the data section reporting its figures
 instead of repeating those tables.
+
+### Metric semantics to read carefully (LP-0MWJOV2S7001CVS5)
+
+Three rows were redefined because their old values could not be read as
+signals. Each is now stated the way it is calculated:
+
+| Metric | Semantics |
+|---|---|
+| `fallback_rate` | **Strict verdict.** `Met` only when the window's fallback rate is **at or below** the target (`tolerance_pct: 0`, rendered `±0 %`); an over-target window is `Unmet`. No +tolerance band above the target (LP-0MWJOUY4E002FNHP). |
+| `context_pressure` | **At or above 80 % of the effective per-slot context** — share of sessions whose peak context (`max_context_size`) is ≥ 80 % of `local_model_ctx_size` / active slots, aligned with the **Context sizes approaching per-slot limits** recommendation. The retired measure sampled served per-request prompts against 100 %, which read a structural `0.0 %`. Sessions with no resolvable per-slot limit are excluded; `n/a` when nothing is measurable (LP-0MWJOUYUL0005H95). |
+| `prefill_eta_accuracy` | **Raw median absolute relative error**, as-is: `median(|predicted − observed| / observed × 100)` over matched guard-ETA → first-byte pairs, registered **lower-is-better** so the best three windows are the smallest errors. Errors above 100 % are reported above 100 % — there is no `100 − error` accuracy conversion and no clamp (LP-0MWJOUZG9008Q4RG). |
+
+Their recorded history in `performance_metrics_state.yaml` was reset for the
+two redefined measures, so the first post-change windows read `Insufficient
+history` rather than comparing against a pre-change baseline (LP-0MWJOV2S7001CVS5).
 
 Where the numbers live:
 
@@ -412,8 +439,11 @@ summary plus per-event rows):
 |---|---|---|
 | `rung_accepted` | `local_admission_guard decision=admit` priced inside the deadline-relative bound but above the queue budget — the free-gate rung's documented admitted-and-doomed trade | compare the rate against the documented accepted level (26 / 24 h, ~80k priced tokens, measured 2026-11-01→02); no fix unless the rate grows |
 | `priced_within_queue_budget` | admitted inside the 30 s queue budget yet no first byte — the slot was held by another session's prefill (occupancy priced ~0) | occupancy-observability defect — file a `discovered-from` bug (measured 8 / 24 h) |
-| `high_priority_inert` | `priority=high` was *genuinely* inert: a logged `no_budget` decision with every time bound disabled, so nothing was priced | **fixed** (LP-0MVZF3JZ9009LTN2; attribution corrected under LP-0MVZQUT3A0039MLY): `high` is now bounded by the deadline and safety budget like every other priority. An **unlogged** high-priority eviction is `inert_unlogged`; only a genuine logged `no_budget` line keeps this class, which must otherwise read 0 |
-| `inert_unlogged` | no guard line at the dispatch instant and no override — an inert decision that logged nothing (uncalibrated bucket, or `high` priority with no logged `no_budget` line) | observability defect — file a `discovered-from` bug (measured 47 / 24 h) |
+| `high_priority_inert` | **legacy** logged `reason=no_budget` (pre-fix shape) with every time bound disabled | only pre-fix log shapes land here; `must read 0` (LP-0MVZF3JZ9009LTN2) — a non-zero count is a regression. New inert lines class as `inert_no_budget` instead |
+| `inert_no_budget` | logged `reason=inert_admit reason_inert=no_budget` — the guard was consulted but every time bound was disabled, so nothing was priced | config-evident widening: a bound (deadline / safety budget) was deliberately disabled; re-enable one or accept the un-priced admission |
+| `inert_insufficient_samples` | logged `reason=inert_admit reason_inert=insufficient_samples` — an uncalibrated `(model, context-bucket)` window (below `local_admission_guard_min_samples`) admitted | **the self-reinforcing trap** (LP-0MVZF4SU10032OZH): evictions starve the bucket of *served* samples, so it never calibrates while its dispatches are all cancelled at the deadline. Fix the eviction class, not the calibration — re-measure the split over a 24 h window after the admission fix |
+| `inert_policy_off` | logged `reason=inert_admit reason_inert=policy_off` — the guard was disabled in config | config state is the evidence; turn `local_admission_guard_policy` on to get adjudication (and hence attribution) |
+| `inert_unlogged` | no admission evidence at all at the dispatch instant (log-rotation gap, a window that predates the inert-admit logging, or an inert admit whose `reason_inert=` could not be read) | re-run over a window after LP-0MVZF4SU10032OZH lands; the class should collapse near 0 — anything left is a genuine evidence gap |
 | `idle_override` / `economic_override` / `capacity_override` | a routing override admitted the dispatch without the guard | assess the override's own trade |
 | `priced_above_bound` | admitted although the priced wait exceeded the bound it was compared against | impossible by construction — treat as a guard bug |
 
@@ -442,9 +472,14 @@ corrected under LP-0MVZQUT3A0039MLY: an unlogged `priority=high` eviction is
 now `inert_unlogged` (it was previously mislabelled `high_priority_inert`),
 and `high_priority_inert` survives only for a genuine logged `no_budget`
 decision, so the "must read 0" rule is no longer diluted by uncalibrated high
-dispatches. LP-0MVZF4SU10032OZH (inert unlogged) and LP-0MVZF50MJ00654O1
-(occupancy priced at 0) remain open: those classes still appear until they
-land.
+dispatches. LP-0MVZF4SU10032OZH (inert unlogged) landed the inert-admit
+logging: an inert decision now emits the same `local_admission_guard` line
+with `decision=admit reason=inert_admit reason_inert=<no_budget |
+insufficient_samples | policy_off> enforced=false`, so the window's
+`inert_unlogged` split becomes attributable by inert reason (`inert_no_budget`
+/ `inert_insufficient_samples` / `inert_policy_off`) instead of collapsing
+into a single observability defect. LP-0MVZF50MJ00654O1 (occupancy priced
+at 0) remains open: that class still appears until it lands.
 
 **Reading the numbers.** `estimated_tokens` / `new_tokens` / `eta_prefill_s` are
 the **admission-time** values the routing decision priced and the dispatch

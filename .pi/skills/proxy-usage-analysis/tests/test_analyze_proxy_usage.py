@@ -9405,15 +9405,21 @@ class TestPerformanceMetricInputs:
 
     # -- context-size pressure --------------------------------------------
 
-    def test_context_pressure_share_at_or_above_the_per_slot_context(self):
-        res = self._summary([_session("s1", slots=2)])
-        res.local_prompt_samples = [("s1", 600), ("s1", 500), ("s1", 400)]
+    def test_context_pressure_share_of_sessions_at_80_percent_of_per_slot(self):
+        # Per-slot context = 1000 / 2 = 500 tokens, so the 80 % threshold is
+        # 400; the share counts each session's peak context once.
+        res = self._summary(
+            [
+                _session("pressured", slots=2, max_context=600),
+                _session("at-the-threshold", slots=2, max_context=400),
+                _session("comfortable", slots=2, max_context=399),
+            ]
+        )
         stats = aggregation.context_pressure(
             res, {"local_model_ctx_size": 1000}
         )
         assert stats is not None
         assert stats.metric_id == "context_pressure"
-        # per-slot context = 1000 / 2 = 500 tokens.
         assert stats.samples == 3
         assert stats.at_or_above == 2
         assert stats.share_pct == 66.7
@@ -9421,12 +9427,13 @@ class TestPerformanceMetricInputs:
         assert stats.unknown_threshold_samples == 0
 
     def test_context_pressure_uses_the_sessions_own_profile_context(self):
-        sessions = [_session("s1", slots=2)]
+        sessions = [_session("s1", slots=2, max_context=1000)]
         sessions[0]["ctx_size"] = 2000
         res = self._summary(sessions)
-        res.local_prompt_samples = [("s1", 999), ("s1", 1000)]
         stats = aggregation.context_pressure(res)
         assert stats is not None
+        # Per-slot context = 2000 / 2 = 1000, so the 1000-token peak is at 100 %.
+        assert stats.samples == 1
         assert stats.thresholds == (1000,)
         assert stats.at_or_above == 1
 
@@ -9437,16 +9444,22 @@ class TestPerformanceMetricInputs:
             ctx_sizes={"fast": 4096, "cheap": 8192},
             default_mode="fast",
         )
-        res = self._summary([_session("s1", slots=2, bucket="fast")])
-        res.local_prompt_samples = [("s1", 2048), ("s1", 1024)]
+        res = self._summary(
+            [_session("s1", slots=2, bucket="fast", max_context=2000)]
+        )
         stats = aggregation.context_pressure(res, None, mode_map)
         assert stats is not None
+        # Per-slot context = 4096 / 2 = 2048, so the 80 % threshold is 1638.4.
         assert stats.thresholds == (2048,)
         assert stats.at_or_above == 1
 
-    def test_context_pressure_excludes_samples_without_a_resolvable_limit(self):
-        res = self._summary([_session("s1", slots=2)])
-        res.local_prompt_samples = [("ghost", 9000), ("s1", 400)]
+    def test_context_pressure_excludes_sessions_without_a_resolvable_limit(self):
+        res = self._summary(
+            [
+                _session("s1", slots=2, max_context=399),
+                _session("ghost", slots=None, max_context=9000),
+            ]
+        )
         stats = aggregation.context_pressure(
             res, {"local_model_ctx_size": 1000}
         )
@@ -9455,9 +9468,17 @@ class TestPerformanceMetricInputs:
         assert stats.unknown_threshold_samples == 1
         assert stats.share_pct == 0.0
 
-    def test_context_pressure_none_without_local_requests(self):
-        res = self._summary([_session("s1", slots=2)])
-        assert aggregation.context_pressure(res, {"local_model_ctx_size": 1000}) is None
+    def test_context_pressure_none_without_a_measurable_session(self):
+        # A known peak with no resolvable per-slot limit is not a sample.
+        unresolvable = self._summary([_session("s1", slots=None)])
+        assert aggregation.context_pressure(
+            unresolvable, {"local_model_ctx_size": 1000}
+        ) is None
+        # A session with no peak context is not a sample either.
+        no_peak = self._summary([_session("s1", slots=2, max_context=None)])
+        assert aggregation.context_pressure(
+            no_peak, {"local_model_ctx_size": 1000}
+        ) is None
 
     # -- roll-up -----------------------------------------------------------
 

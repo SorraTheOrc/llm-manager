@@ -192,6 +192,13 @@ RE_LOCAL_ADMISSION_ENFORCED = re.compile(r"\benforced=(true|false)\b")
 RE_LOCAL_ADMISSION_ETA = re.compile(r"\beta_prefill_s=([\d.]+)")
 RE_LOCAL_ADMISSION_BUDGET = re.compile(r"\bbudget_s=([\d.]+)")
 RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
+#: The underlying inert reason on an inert admit (LP-0MVZF4SU10032OZH): the
+#: line is ``decision=admit reason=inert_admit reason_inert=<reason>``, so the
+#: report can tell a priced admit from an inert (non-adjudicating) one instead
+#: of inflating the priced-admit counter with every uncalibrated dispatch.
+RE_GUARD_REASON_INERT = re.compile(r"\breason_inert=([A-Za-z_]+)")
+#: The verdict token an inert admit carries (the guard abstained).
+INERT_ADMIT_REASON = "inert_admit"
 # Measured pool state on the guard record (LP-0MVGR2OXT0096OGK M1): the
 # busy/decode slot count, in-flight prefill count and free-slot flag at
 # decision time — the fields the denial-attribution verdict is derived from
@@ -220,6 +227,12 @@ RE_GUARD_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
 #: predate the field, never a fabricated value.
 RE_GUARD_OCCUPANT_HOLD = re.compile(r"\boccupant_hold_s=([\d.]+)")
 RE_GUARD_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
+#: The ETA pricing basis the guard priced the request with
+#: (LP-0MWRQ6LSV009DVP4 AC1): ``measured`` when a measured resident prefix
+#: priced ``new_tokens``, else ``predicted``. Additive — absent on pre-change
+#: lines, where it stays ``None`` so the report can report them as ``unknown``
+#: rather than silently re-labelling them.
+RE_GUARD_ETA_PRICING_BASIS = re.compile(r"\beta_pricing_basis=([A-Za-z_]+)")
 
 # Status-poll payload (LP-0MVGR2OXT0096OGK M3): ``status_request`` lines carry
 # the calibrated ``prefill_eta_seconds`` prediction and the truthful
@@ -764,6 +777,10 @@ class LogEvent:
     enforced: str | None = None
     eta_prefill_s: str | None = None
     budget_s: str | None = None
+    #: The underlying inert reason on an inert admit (LP-0MVZF4SU10032OZH):
+    #: ``no_budget`` / ``insufficient_samples`` / ``policy_off``. ``None`` on
+    #: a priced decision and on lines that predate the field.
+    reason_inert: str | None = None
     # Contended-pricing metadata on the same record (LP-0MVS8T6F4006DGG3): the
     # rate-calibration bucket the ETA was priced from and that bucket's sample
     # count, plus the occupancy term of the projection. ``new_tokens`` (a
@@ -772,6 +789,10 @@ class LogEvent:
     rate_bucket: str | None = None
     contended_samples: int | None = None
     eta_occupancy_s: str | None = None
+    #: ETA pricing basis on the guard record (LP-0MWRQ6LSV009DVP4 AC1):
+    #: ``measured`` when a measured resident prefix priced ``new_tokens``,
+    #: ``predicted`` otherwise. ``None`` on pre-change lines.
+    eta_pricing_basis: str | None = None
     #: The measured occupant hold taken into the occupancy term
     #: (LP-0MVV29YDQ00437N6). ``None`` on lines that predate the field.
     occupant_hold_s: str | None = None
@@ -1331,6 +1352,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             model=_first(RE_MODEL, msg),
             session=_session_from(msg),
             reason=_normalize_reason(_first(RE_LOCAL_ADMISSION_REASON, msg)),
+            reason_inert=_first(RE_GUARD_REASON_INERT, msg),
             decision=m2.group(1),
             enforced=_first(RE_LOCAL_ADMISSION_ENFORCED, msg),
             eta_prefill_s=_first(RE_LOCAL_ADMISSION_ETA, msg),
@@ -1343,6 +1365,9 @@ def parse_log_line(line: str) -> LogEvent | None:
             rate_bucket=_first(RE_GUARD_RATE_BUCKET, msg),
             contended_samples=_int(RE_GUARD_CONTENDED_SAMPLES, msg),
             eta_occupancy_s=_first(RE_GUARD_ETA_OCCUPANCY, msg),
+            # ETA pricing basis (LP-0MWRQ6LSV009DVP4 AC1/AC3): additive and
+            # absent on pre-change lines, where it stays ``None``.
+            eta_pricing_basis=_first(RE_GUARD_ETA_PRICING_BASIS, msg),
             # Measured blocker evidence (LP-0MVV29YDQ00437N6 AC5): additive and
             # absent on earlier lines, so a refusal can be attributed to the
             # measured occupant hold instead of inferred from the aggregate

@@ -2436,6 +2436,19 @@ server:
   local_admission_guard_policy: reject
   local_admission_guard_min_samples: 5
   local_admission_guard_window_samples: 200
+  # ETA pricing basis (LP-0MWRQ6LSV009DVP4 AC1/AC6). ``measured`` (default)
+  # prices the ETA's ``new_tokens`` from a MEASURED resident prefix when the
+  # admission path has one — the session's live ``context_tokens`` or its last
+  # measured dispatch — instead of the predicted cache ratio. A prompt whose KV
+  # prefix is already resident is then admitted on its real prefill work, not
+  # refused because last turn's prediction prized it as cold (measured
+  # 2026-11-21: predicted p50 34.95 s vs observed p50 3.44 s, an 863 % median
+  # error). A slot-owning session with no measured size (``session_slot``), and
+  # every unmeasured/absent/stale residency view, keep the predicted ratio — no
+  # measurement is inferred from absent data. ROLLBACK (parent AC6): set to
+  # ``predicted`` to restore the pre-change predicted-ratio pricing
+  # byte-for-byte at BOTH the guard and the stamped dispatch evidence.
+  local_eta_pricing_basis: measured
   # Prompt size used for the published estimate on /llama/local/status when
   # no dispatch has been observed yet for the current model. Aligned with the
   # cold-prefill admission budget below (LP-0MVN4LBEQ005QRVL) so the published

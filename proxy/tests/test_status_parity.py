@@ -257,10 +257,17 @@ class TestQuerySlots:
         assert available == 0
 
     @pytest.mark.asyncio
-    async def test_slots_default_is_processing_to_true(self):
-        from proxy.observability import _query_slots
+    async def test_slots_missing_is_processing_follows_the_shared_derivation(self):
+        """LP-0MVVXGLTM008ROJ9 AC3: one derivation decides the counts default.
 
-        # If is_processing is missing, it defaults to True
+        ``_query_slots`` used to treat a missing ``is_processing`` as busy
+        (default ``True``) while the per-slot detail treated it as idle, so a
+        poll's summary and its own ``slots[]`` could disagree. Both now come
+        from ``derive_slots_from_payload`` — the same default the served
+        ``slots[]`` carries — so the pair is consistent by construction.
+        """
+        from proxy.observability import _query_slots, derive_slots_from_payload
+
         slots_data = [
             {},
             {"is_processing": False},
@@ -268,7 +275,16 @@ class TestQuerySlots:
         client = MockAsyncClient([AsyncJsonResponse(200, slots_data)])
         available, total = await _query_slots(client, 8080)
         assert total == 2
-        assert available == 1
+        # Both slots are idle: the missing field is interpreted exactly as the
+        # served ``slots[]`` reports it (``is_processing: false``).
+        assert available == 2
+
+        # The detail derived from the SAME payload reports the same states and
+        # the same availability count (no second reading of the raw payload).
+        derived_available, derived_total, detail = derive_slots_from_payload(slots_data)
+        assert derived_total == total
+        assert derived_available == available
+        assert [slot["is_processing"] for slot in detail] == [False, False]
 
     @pytest.mark.asyncio
     async def test_returns_zeroes_on_non_list_response(self):
