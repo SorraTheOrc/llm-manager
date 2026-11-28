@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.31 (2026-11-28)
+### Features
+- slots_stale 29.59 % over a 24 h window — /slots refresh still misses its freshness budget under load (LP-0MVVCO1N7004TNGY)
+- [bug] Polls that join the coalesced /slots fetch publish no snapshot age — 557 of 608 stale polls (4.47 %) are stale by provenance gap, not age (LP-0MWRXFO0I005UBVM)
+### Bug Fixes
+- [bug] ETA prices per-session KV residency only — llama-server cross-session prompt-cache warmth is invisible, so warm prompts are priced cold (LP-0MWRQ6ZID000HZAZ)
+- [bug] Prefill calibration window is fed the predicted cache ratio — record the measured reuse the same dispatch carries (LP-0MWRWBJPP001Q5JX)
+- Usage report targets update (LP-0MWEOGIUK006B1DD)
+- Routing gate counts the requesting session's own still-active record: finished turn's next request is refused as local_concurrency_limit and exiled remote (LP-0MWMSQR3O002YNPW)
+- [bug] Pin-local capacity refusal keeps the pin and returns a retryable deferrable 429 (LP-0MWFN1DIL002TTSP)
+- Inert admission-guard decisions log nothing: ~47 prefill_deadline evictions per 24 h are un-attributable (LP-0MVZF4SU10032OZH)
+### Other
+- [chore] Register the 2026-11-26T10:17:48Z restart anchor and record the truncated 2026-11-25 window (LP-0MWXSPO0G001MSW4)
+- [chore] Register the 2026-11-25T11:07:33Z restart anchor and refresh the live anchor table (LP-0MWW0VZUU002E4MN)
+- Verify router:500 == 0 over 24 h after the child-port discovery fix — earliest run 2026-11-17T15:20:47Z (window 2026-11-16T15:20:47Z → 2026-11-17T15:20:47Z) (LP-0MVP7HX2S008IU57)
+- [run-not-before 2026-11-12T00:00:00Z] Group 2 validation: one proxy restart (after group 1), then measure the residual with the stall-weighted rate (LP-0MW7V14DN007F127)
+- Investigate /sys/class/drm/card0/device/gpu_metrics as a true GFX-activity signal on gfx1151 (LP-0MVSQT7YC0045HFW)
+- [test-failure] proxy::test_provider_fallback.py::test_cooldown_expiry — 10 ms wall-clock cooldown window flakes under load, blocking the dev-push gate (LP-0MWL58KAK003JZ41)
+- Finish gate red on concurrent main-checkout SKILL.md churn (LP-0MVZF4SU10032OZH session) (LP-0MWJUVZKY001Z442)
+- Finish gate red on concurrent main-checkout churn (LP-0MVVXGLTM008ROJ9 session) (LP-0MWL4O2Z1007KAG4)
+- Verify a fresh 24 h router /slots 400 == 0 window (AC4) — earliest 2026-11-19 10:24 UTC (24 h after the 2026-11-18 10:24 restart) (LP-0MVU8003X0018WT8)
+
 ## v0.1.30 (2026-11-16)
 ### Features
 - [impl] Cold-regime prefill-ETA calibration and an explicit deadline token capacity (LP-0MW7V2D13004ZO65)
