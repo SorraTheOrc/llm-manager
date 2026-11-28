@@ -240,20 +240,57 @@ def test_resolve_provider_skips_all_in_cooldown(sample_model_config):
     assert result is None
 
 
-def test_cooldown_expiry(sample_model_config):
-    """resolve_provider should return a provider after its cooldown expires."""
-    provider.mark_provider_unavailable("remote-primary", 0.01)  # very short cooldown
-    # First call should skip it
+def test_cooldown_expiry(sample_model_config, monkeypatch):
+    """resolve_provider should return a provider after its cooldown expires.
+
+    The cooldown clock is injected so expiry is driven explicitly rather than
+    raced against the wall clock. A real 10 ms cooldown plus ``time.sleep(0.02)``
+    flaked under load: a descheduled process could let the cooldown lapse before
+    the first assertion, so the "still in cooldown" branch was never exercised
+    (LP-0MWL58KAK003JZ41).
+    """
+    now = 1_000_000.0
+    monkeypatch.setattr(provider, "_cooldown_now", lambda: now)
+
+    provider.mark_provider_unavailable("remote-primary", 60.0)
+    assert provider._provider_unavailable_until["remote-primary"] == now + 60.0
+
+    # Inside the cooldown window the provider is skipped.
     result = provider.resolve_provider(sample_model_config)
     assert result["name"] == "remote-fallback"
 
-    # Wait for cooldown to expire
-    time.sleep(0.02)
-
-    # Now the first provider should be available again
+    # Exactly at the boundary the cooldown has elapsed (remaining == 0) and the
+    # primary is eligible again — no sleep, no wall-clock dependency.
+    now += 60.0
     result = provider.resolve_provider(sample_model_config)
     assert result is not None
     assert result["name"] == "remote-primary"
+
+    # Just past the boundary likewise expires the cooldown.
+    provider.mark_provider_unavailable("remote-primary", 60.0)
+    now += 60.001
+    result = provider.resolve_provider(sample_model_config)
+    assert result is not None
+    assert result["name"] == "remote-primary"
+
+
+def test_cooldown_clock_seam_controls_expiry(monkeypatch):
+    """The injected cooldown clock governs both the expiry write and the read.
+
+    Regression guard for the seam itself (LP-0MWL58KAK003JZ41 AC3): with no
+    seam, ``mark_provider_unavailable`` and ``_provider_cooldown_remaining``
+    each read ``time.time`` directly and expiry could only be driven by
+    sleeping. Freezing the clock proves both sides use the same source.
+    """
+    now = [2_000_000.0]
+    monkeypatch.setattr(provider, "_cooldown_now", lambda: now[0])
+
+    provider.mark_provider_unavailable("seam-provider", 10.0)
+    assert provider._provider_unavailable_until["seam-provider"] == 2_000_010.0
+
+    assert provider._is_provider_unavailable("seam-provider") is True
+    now[0] = 2_000_010.0  # exactly at the boundary -> expired
+    assert provider._is_provider_unavailable("seam-provider") is False
 
 
 def test_mark_provider_unavailable_stores_timestamp():

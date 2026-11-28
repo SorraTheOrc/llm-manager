@@ -1,0 +1,307 @@
+{
+  "bands": {
+    "20k-32k": {
+      "abandoned_share": 0.75,
+      "abandoned_share_by_trigger": {
+        "concurrency_limit": 1.0,
+        "local_lease_active": 0.0
+      },
+      "admission_verdicts": {
+        "admit": 159,
+        "reject": 302
+      },
+      "conversion_share": 0.3721,
+      "converted": 16,
+      "evictions": 2,
+      "queue_abandoned": 3,
+      "queue_abandoned_by_cause": {
+        "queue_wait_expired": 3
+      },
+      "queue_abandoned_by_trigger": {
+        "concurrency_limit": 3
+      },
+      "queue_dispatched": 1,
+      "queue_dispatched_by_trigger": {
+        "local_lease_active": 1
+      },
+      "queue_enqueued": 4,
+      "queue_enqueued_by_trigger": {
+        "concurrency_limit": 3,
+        "local_lease_active": 1
+      },
+      "queue_wait_seconds": 112.04,
+      "queued_waits": 4,
+      "rate_buckets": {
+        "cold": 159,
+        "solitary": 302
+      },
+      "reject_reasons": {
+        "prefill_budget_exceeded": 302
+      },
+      "sessions_admitted": 43,
+      "unconverted": 27
+    },
+    "32k-64k": {
+      "abandoned_share": 0.0,
+      "abandoned_share_by_trigger": {},
+      "admission_verdicts": {
+        "admit": 0,
+        "reject": 17364
+      },
+      "conversion_share": 0.0,
+      "converted": 0,
+      "evictions": 3,
+      "queue_abandoned": 0,
+      "queue_abandoned_by_cause": {},
+      "queue_abandoned_by_trigger": {},
+      "queue_dispatched": 0,
+      "queue_dispatched_by_trigger": {},
+      "queue_enqueued": 0,
+      "queue_enqueued_by_trigger": {},
+      "queue_wait_seconds": 0.0,
+      "queued_waits": 0,
+      "rate_buckets": {
+        "solitary": 17364
+      },
+      "reject_reasons": {
+        "prefill_budget_exceeded": 17364
+      },
+      "sessions_admitted": 0,
+      "unconverted": 0
+    },
+    "8k-20k": {
+      "abandoned_share": 0.75,
+      "abandoned_share_by_trigger": {
+        "concurrency_limit": 1.0,
+        "local_lease_active": 0.6667
+      },
+      "admission_verdicts": {
+        "admit": 366,
+        "reject": 239
+      },
+      "conversion_share": 0.9419,
+      "converted": 81,
+      "evictions": 6,
+      "queue_abandoned": 3,
+      "queue_abandoned_by_cause": {
+        "queue_wait_expired": 3
+      },
+      "queue_abandoned_by_trigger": {
+        "concurrency_limit": 1,
+        "local_lease_active": 2
+      },
+      "queue_dispatched": 1,
+      "queue_dispatched_by_trigger": {
+        "local_lease_active": 1
+      },
+      "queue_enqueued": 4,
+      "queue_enqueued_by_trigger": {
+        "concurrency_limit": 1,
+        "local_lease_active": 3
+      },
+      "queue_wait_seconds": 100.57,
+      "queued_waits": 4,
+      "rate_buckets": {
+        "cold": 101,
+        "contended": 439,
+        "solitary": 59,
+        "solitary_fallback": 6
+      },
+      "reject_reasons": {
+        "eta_exceeds_budget_direct": 89,
+        "prefill_eta_exceeds_deadline": 139,
+        "prefill_eta_exceeds_safety_budget": 11
+      },
+      "sessions_admitted": 86,
+      "unconverted": 5
+    },
+    "<8k": {
+      "abandoned_share": 1.0,
+      "abandoned_share_by_trigger": {
+        "concurrency_limit": 1.0,
+        "local_lease_active": 1.0
+      },
+      "admission_verdicts": {
+        "admit": 2284,
+        "reject": 390
+      },
+      "conversion_share": 0.9639,
+      "converted": 160,
+      "evictions": 86,
+      "queue_abandoned": 2,
+      "queue_abandoned_by_cause": {
+        "queue_wait_expired": 2
+      },
+      "queue_abandoned_by_trigger": {
+        "concurrency_limit": 1,
+        "local_lease_active": 1
+      },
+      "queue_dispatched": 0,
+      "queue_dispatched_by_trigger": {},
+      "queue_enqueued": 2,
+      "queue_enqueued_by_trigger": {
+        "concurrency_limit": 1,
+        "local_lease_active": 1
+      },
+      "queue_wait_seconds": 60.0,
+      "queued_waits": 2,
+      "rate_buckets": {
+        "cold": 89,
+        "contended": 360,
+        "solitary": 2218,
+        "solitary_fallback": 7
+      },
+      "reject_reasons": {
+        "eta_exceeds_budget": 2,
+        "eta_exceeds_budget_direct": 200,
+        "prefill_eta_exceeds_deadline": 168,
+        "prefill_eta_exceeds_safety_budget": 20
+      },
+      "sessions_admitted": 166,
+      "unconverted": 6
+    },
+    ">=64k": {
+      "abandoned_share": 0.0,
+      "abandoned_share_by_trigger": {},
+      "admission_verdicts": {
+        "admit": 0,
+        "reject": 890
+      },
+      "conversion_share": 0.0,
+      "converted": 0,
+      "evictions": 1,
+      "queue_abandoned": 0,
+      "queue_abandoned_by_cause": {},
+      "queue_abandoned_by_trigger": {},
+      "queue_dispatched": 0,
+      "queue_dispatched_by_trigger": {},
+      "queue_enqueued": 0,
+      "queue_enqueued_by_trigger": {},
+      "queue_wait_seconds": 0.0,
+      "queued_waits": 0,
+      "rate_buckets": {
+        "solitary": 890
+      },
+      "reject_reasons": {
+        "prefill_budget_exceeded": 890
+      },
+      "sessions_admitted": 0,
+      "unconverted": 0
+    }
+  },
+  "converted_sessions": 257,
+  "evictions": {
+    "by_reason": {
+      "idle_timeout": 2,
+      "lease_evicted": 3,
+      "measured_cache_deficit": 3,
+      "prefill_deadline": 2,
+      "prefill_eta_exceeded": 83,
+      "prefill_stalled": 5
+    },
+    "total": 98
+  },
+  "first_byte_without_admit": 0,
+  "log_dir": "/var/log/llama-proxy",
+  "log_files": [
+    "proxy.log-2026-11-27_00",
+    "proxy.log.2026-11-26_10",
+    "proxy.log.2026-11-26_16",
+    "proxy.log.2026-11-26_22",
+    "proxy.log.2026-11-27_04",
+    "proxy.log.2026-11-27_10"
+  ],
+  "log_files_scanned": [
+    "proxy.log",
+    "proxy.log-2026-11-21_00.gz",
+    "proxy.log-2026-11-22_00.gz",
+    "proxy.log-2026-11-23_00.gz",
+    "proxy.log-2026-11-24_00.gz",
+    "proxy.log-2026-11-25_00.gz",
+    "proxy.log-2026-11-26_00.gz",
+    "proxy.log-2026-11-27_00",
+    "proxy.log.2026-11-19_10.gz",
+    "proxy.log.2026-11-19_19.gz",
+    "proxy.log.2026-11-19_193602.gz",
+    "proxy.log.2026-11-20_01.gz",
+    "proxy.log.2026-11-20_13.gz",
+    "proxy.log.2026-11-20_132148.gz",
+    "proxy.log.2026-11-20_19.gz",
+    "proxy.log.2026-11-21_01.gz",
+    "proxy.log.2026-11-21_07.gz",
+    "proxy.log.2026-11-21_13.gz",
+    "proxy.log.2026-11-21_19.gz",
+    "proxy.log.2026-11-22_01.gz",
+    "proxy.log.2026-11-22_07.gz",
+    "proxy.log.2026-11-22_13.gz",
+    "proxy.log.2026-11-22_134741.gz",
+    "proxy.log.2026-11-22_19.gz",
+    "proxy.log.2026-11-23_01.gz",
+    "proxy.log.2026-11-23_07.gz",
+    "proxy.log.2026-11-23_13.gz",
+    "proxy.log.2026-11-23_19.gz",
+    "proxy.log.2026-11-24_01.gz",
+    "proxy.log.2026-11-24_07.gz",
+    "proxy.log.2026-11-24_13.gz",
+    "proxy.log.2026-11-24_19.gz",
+    "proxy.log.2026-11-25_01.gz",
+    "proxy.log.2026-11-25_11",
+    "proxy.log.2026-11-25_110731",
+    "proxy.log.2026-11-25_17",
+    "proxy.log.2026-11-25_23",
+    "proxy.log.2026-11-26_10",
+    "proxy.log.2026-11-26_101711",
+    "proxy.log.2026-11-26_101745",
+    "proxy.log.2026-11-26_16",
+    "proxy.log.2026-11-26_22",
+    "proxy.log.2026-11-27_04",
+    "proxy.log.2026-11-27_10"
+  ],
+  "queue_banding": {
+    "own_enqueue": 0,
+    "own_outcome": 10,
+    "session_chain": 0,
+    "unknown": 0
+  },
+  "queued_waits_enqueued": 10,
+  "queued_waits_enqueued_unbanded": 0,
+  "since": "2026-11-26 10:18:00",
+  "totals": {
+    "abandoned_share": 0.8,
+    "abandoned_share_by_trigger": {
+      "concurrency_limit": 1.0,
+      "local_lease_active": 0.6
+    },
+    "admission_verdicts": {
+      "admit": 2809,
+      "reject": 19185
+    },
+    "conversion_share": 0.8712,
+    "converted": 257,
+    "evictions": 98,
+    "queue_abandoned": 8,
+    "queue_abandoned_by_cause": {
+      "queue_wait_expired": 8
+    },
+    "queue_abandoned_by_trigger": {
+      "concurrency_limit": 5,
+      "local_lease_active": 3
+    },
+    "queue_dispatched": 2,
+    "queue_dispatched_by_trigger": {
+      "local_lease_active": 2
+    },
+    "queue_enqueued": 10,
+    "queue_enqueued_by_trigger": {
+      "concurrency_limit": 5,
+      "local_lease_active": 5
+    },
+    "queue_wait_seconds": 272.61,
+    "queued_waits": 10,
+    "rate_buckets": {},
+    "reject_reasons": {},
+    "sessions_admitted": 295,
+    "unconverted": 38
+  },
+  "until": "2026-11-27 10:18:00"
+}

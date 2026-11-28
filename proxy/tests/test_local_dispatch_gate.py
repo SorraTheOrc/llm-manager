@@ -2336,3 +2336,222 @@ async def test_prefill_guard_releases_on_stream_end_or_abort():
     # Prefill-only session that never generated: decrement is no-op / not negative.
     assert srv.local_generating_queries == 0
     assert "a" not in srv.local_prefill_in_flight
+
+
+# ---------------------------------------------------------------------------
+# Marker liveness in the prefill guard (LP-0MWKWGLRT003AUG4)
+#
+# Parent AC1 + AC5, test half. A ``local_prefill_in_flight`` marker is only
+# evidence of a prefill when a *live* dispatch record backs it
+# (``_get_live_prefill_in_flight_count``). The dispatch gate and the denial
+# evidence both price the live count (LP-0MWL5KL0J006ZVDG), so a single orphan
+# can no longer close the local route permanently — the 2026-11-17 incident
+# where a pruned record left ``prefill_in_flight=1`` behind and every later
+# dispatch was denied while ``llama_available_slots=2``.
+#
+# The defect rows ran ``xfail(strict=True)`` while the gate priced the raw
+# marker count; ``[impl] Gate prices the live prefill count``
+# (LP-0MWL5KL0J006ZVDG) removed the markers when it landed. The
+# conservative-guard rows run unmarked and must stay green: the liveness
+# filter drops *orphans only*, never a live prefill, so prefill serialisation
+# is preserved.
+# ---------------------------------------------------------------------------
+
+
+class _FrozenMonotonic:
+    """Freeze ``router_helpers.time.monotonic`` for a hermetic marker row.
+
+    Only ``monotonic`` is injected; every other ``time`` attribute falls
+    through to the real module, so the production code under test sees a
+    stable clock without patching the global ``time`` module (no sleeps).
+    """
+
+    def __init__(self, now: float = 10_000.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+def _live_dispatch_record(now: float) -> dict:
+    """An ``active`` (live) dispatch record bound to *now*."""
+    return {
+        "backend": "local",
+        "started_at": now,
+        "active": True,
+        "expires_at": now + 60,
+        "model_name": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_prefill_marker_liveness_orphan_marker_cannot_deny_dispatch(monkeypatch):
+    """LP-0MWKWGLRT003AUG4 AC1: an orphaned marker cannot deny a dispatch.
+
+    Phantom-marker state — one ``local_prefill_in_flight`` marker and an empty
+    ``local_dispatch_records``. The raw marker count is 1 (equal to the default
+    prefill cap), but the liveness-filtered count is 0, so a ``max_local=2``
+    pool has a free prefill slot and ``_try_acquire_local_dispatch`` must
+    return ``(True, ...)``. The gate prices the live count (LP-0MWL5KL0J006ZVDG),
+    so an orphan can no longer close the route permanently.
+    """
+    from proxy.router_helpers import (
+        _get_live_prefill_in_flight_count,
+        _get_prefill_in_flight_count,
+        _try_acquire_local_dispatch,
+    )
+
+    monkeypatch.setattr("proxy.router_helpers.time", _FrozenMonotonic())
+    srv = _make_dispatch_srv(
+        session_slot_pool_size=2,
+        prefill_in_flight={"sess-ghost": True},
+        dispatch_records={},
+    )
+    raw = _get_prefill_in_flight_count(srv)
+    live = _get_live_prefill_in_flight_count(srv)
+    assert (raw, live) == (1, 0), (
+        f"fixture: a marker with no record must read raw=1 live=0, got {raw}/{live}"
+    )
+
+    acquired, owner, active, _retry_after = await _try_acquire_local_dispatch(
+        srv, max_local=2, session_key="sess-new", backend="local",
+    )
+
+    assert acquired is True, (
+        "an orphaned prefill marker must not deny a dispatch: "
+        f"raw markers={raw}, live prefills={live}, acquired={acquired}, "
+        f"active={active}, owner={owner}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefill_marker_liveness_live_backed_marker_still_counts(monkeypatch):
+    """LP-0MWKWGLRT003AUG4 AC2: a live-backed marker still prices the cap.
+
+    Conservative guard — the same marker plus an ``active=True`` record. Raw
+    and live counts both equal 1 at the default cap of 1, so a second dispatch
+    is refused. The impl must leave this untouched: the liveness filter drops
+    orphaned markers only, preserving prefill serialisation exactly.
+    """
+    from proxy.router_helpers import (
+        _get_live_prefill_in_flight_count,
+        _get_prefill_in_flight_count,
+        _try_acquire_local_dispatch,
+    )
+
+    clock = _FrozenMonotonic()
+    monkeypatch.setattr("proxy.router_helpers.time", clock)
+    srv = _make_dispatch_srv(
+        session_slot_pool_size=2,
+        prefill_in_flight={"sess-live": True},
+        dispatch_records={"sess-live": _live_dispatch_record(clock.now)},
+    )
+    raw = _get_prefill_in_flight_count(srv)
+    live = _get_live_prefill_in_flight_count(srv)
+    assert (raw, live) == (1, 1), (
+        f"fixture: a live-backed marker must read raw=1 live=1, got {raw}/{live}"
+    )
+
+    acquired, owner, active, _retry_after = await _try_acquire_local_dispatch(
+        srv, max_local=2, session_key="sess-new", backend="local",
+    )
+
+    assert acquired is False, (
+        "a live-backed marker must still count against the prefill cap: "
+        f"raw={raw}, live={live}, acquired={acquired}, active={active}"
+    )
+    assert owner == "sess-live", (
+        f"denial should name the live prefill owner, got {owner!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefill_marker_liveness_helpers_agree_when_all_markers_live(monkeypatch):
+    """LP-0MWKWGLRT003AUG4 AC3: both helpers agree when every marker is live.
+
+    With every marker backed by an ``active`` record,
+    ``_get_live_prefill_in_flight_count`` must equal the raw
+    ``_get_prefill_in_flight_count``: the liveness filter is a subsetting
+    operation, so an all-live marker set is counted identically by both. Green
+    today and after the impl (which changes which count the gate *prices*, not
+    this equality).
+    """
+    from proxy.router_helpers import (
+        _get_live_prefill_in_flight_count,
+        _get_prefill_in_flight_count,
+    )
+
+    clock = _FrozenMonotonic()
+    monkeypatch.setattr("proxy.router_helpers.time", clock)
+    sessions = ("sess-a", "sess-b")
+    srv = _make_dispatch_srv(
+        session_slot_pool_size=3,
+        prefill_in_flight={s: True for s in sessions},
+        dispatch_records={s: _live_dispatch_record(clock.now) for s in sessions},
+    )
+
+    raw = _get_prefill_in_flight_count(srv)
+    live = _get_live_prefill_in_flight_count(srv)
+    assert (raw, live) == (2, 2), (
+        f"fixture: two live-backed markers must read raw=2 live=2, got {raw}/{live}"
+    )
+    assert live == raw, (
+        f"helpers must agree when all markers are live-backed: raw={raw} live={live}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefill_marker_liveness_evidence_reports_gate_priced_count(monkeypatch):
+    """LP-0MWKWGLRT003AUG4 AC4/AC5: the denial evidence reports the priced count.
+
+    Phantom-marker state with a free slot (``llama_available_slots=2``). The
+    evidence carries ``records_total=0`` with ``prefill_in_flight=0`` — the
+    liveness-filtered count (LP-0MWL5KL0J006ZVDG), equal both to
+    ``_get_live_prefill_in_flight_count`` and to what the gate prices, so a
+    self-contradicting denial line cannot be emitted.
+    """
+    from proxy.router_helpers import (
+        _get_live_prefill_in_flight_count,
+        _local_dispatch_occupancy_evidence,
+    )
+
+    monkeypatch.setattr("proxy.router_helpers.time", _FrozenMonotonic())
+    monkeypatch.setattr("proxy.observability.last_known_slot_counts", lambda: (2, 2))
+    srv = _make_dispatch_srv(
+        session_slot_pool_size=2,
+        prefill_in_flight={"sess-ghost": True},
+        dispatch_records={},
+    )
+    priced = _get_live_prefill_in_flight_count(srv)
+    assert priced == 0, (
+        f"fixture: a phantom marker must price 0 live prefills, got {priced}"
+    )
+
+    evidence = await _local_dispatch_occupancy_evidence(srv, max_local=2)
+
+    assert evidence["records_total"] == 0, (
+        f"fixture: no dispatch records expected, got {evidence['records_total']}"
+    )
+    assert evidence["llama_available_slots"] == 2, (
+        f"fixture: two free llama slots expected, got {evidence['llama_available_slots']}"
+    )
+    assert evidence["prefill_in_flight"] == priced, (
+        "the denial evidence must report the count the gate prices: "
+        f"records_total={evidence['records_total']}, "
+        f"prefill_in_flight={evidence['prefill_in_flight']}, priced={priced}, "
+        f"llama_available_slots={evidence['llama_available_slots']}"
+    )
+    assert not (
+        evidence["records_total"] == 0
+        and (evidence["prefill_in_flight"] or 0) > 0
+        and (evidence["llama_available_slots"] or 0) > 0
+    ), (
+        "a denial line must not report records_total=0 with prefill_in_flight>0 "
+        "while llama_available_slots>0: "
+        f"records_total={evidence['records_total']}, "
+        f"prefill_in_flight={evidence['prefill_in_flight']}, "
+        f"llama_available_slots={evidence['llama_available_slots']}"
+    )

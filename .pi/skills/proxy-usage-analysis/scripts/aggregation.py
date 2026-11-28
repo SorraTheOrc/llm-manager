@@ -490,6 +490,12 @@ def admission_breakdown(summary: AnalysisResult) -> dict:
     ``decision`` is neither ``admit`` nor ``reject`` are skipped so the splits
     always sum to the pre-existing ``local_admission_admit`` /
     ``local_admission_reject`` counters.
+
+    An **inert admit** (``reason_inert`` set, LP-0MVZF4SU10032OZH) is skipped
+    as well: the guard admitted without pricing the prompt, so it neither
+    belongs in a pricing-bucket split nor in the priced-admit counter those
+    splits sum to (it is reported separately as
+    ``local_admission_inert_admit``).
     """
     rate_buckets: dict[str, dict[str, int]] = {}
     bands: dict[str, AdmissionBandStats] = {}
@@ -498,6 +504,10 @@ def admission_breakdown(summary: AnalysisResult) -> dict:
     for event in getattr(summary, "local_admission_events", []) or []:
         decision = getattr(event, "decision", None)
         if decision not in ("admit", "reject"):
+            continue
+        if getattr(event, "reason_inert", None):
+            # Inert admit: nothing was priced, so it cannot inform a pricing
+            # bucket or a conversion rate for a priced admission.
             continue
         bucket = getattr(event, "rate_bucket", None) or UNKNOWN_RATE_BUCKET_LABEL
         verdicts = rate_buckets.setdefault(bucket, {"admit": 0, "reject": 0})
@@ -2850,10 +2860,17 @@ CACHE_STATE_COLD = "cold"
 #: or persistence failures, not a stream outcome.
 STREAM_ERROR_KINDS = ("stream_error", "stream_finish_error")
 
-#: Share of the effective per-slot context that counts as "pressure"
-#: (LP-0MW1BU9R5006C23N AC1): a request at or above the per-slot context
-#: cannot fit a slot at all.
-CONTEXT_PRESSURE_THRESHOLD_RATIO = 1.0
+#: Share of the effective per-slot context that counts as "pressure".
+#:
+#: Aligned with the context-size recommendation's
+#: ``recommendations.CONTEXT_PRESSURE_RATIO`` (LP-0MWJOUYUL0005H95): a session
+#: reaching 80 % of its own per-slot context is exactly the pressure the
+#: report's "Context sizes approaching per-slot limits" recommendation flags.
+#: The previous ``1.0`` threshold was structurally unreachable for *served*
+#: local requests, because the large-context bypass routes oversized requests
+#: away before they are served, so the scorecard row read ``0.0 %`` every
+#: window.
+CONTEXT_PRESSURE_THRESHOLD_RATIO = 0.80
 
 PROMPT_CACHE_METRIC_ID = "prompt_cache_hit_ratio"
 CONTEXT_PRESSURE_METRIC_ID = "context_pressure"
@@ -3163,11 +3180,11 @@ def prefill_eta_accuracy(summary: AnalysisResult) -> float | None:
     is inert for uncalibrated buckets and logs nothing in inactive observe
     mode), never ``0``.
 
-    Note for the scorecard: this is an *error*, so **lower is better**, while
+    Note for the scorecard: this figure is an *error*, so **lower is better**.
+    The scorecard records it as-is (LP-0MWJOUZG9008Q4RG):
     ``performance_metrics.METRIC_REGISTRY`` declares ``prefill_eta_accuracy``
-    as higher-is-better. A consumer recording this value as the metric actual
-    must invert it (e.g. ``100 − error``) or the direction-aware best-3
-    retention would keep the worst windows.
+    lower-is-better and its label/detail copy present the median absolute
+    relative error rather than an accuracy percentage.
     """
     errors = [abs(predicted - observed) / observed * 100.0
               for predicted, observed in prefill_eta_pairs(summary)
@@ -3175,6 +3192,64 @@ def prefill_eta_accuracy(summary: AnalysisResult) -> float | None:
     if not errors:
         return None
     return _percentile(sorted(errors), 50)
+
+
+def prefill_eta_accuracy_p90(summary: AnalysisResult) -> float | None:
+    """90th-percentile **absolute relative error** of the prefill ETA, in %.
+
+    Companion to :func:`prefill_eta_accuracy` (LP-0MWRQ6LSV009DVP4 AC4): the
+    same matched-pair error population and the module's shared percentile
+    convention, so the p90 tail the report quotes is derived exactly as the
+    p50 is. ``None`` when no dispatch pairs with a guard record — never ``0``.
+    """
+    errors = [abs(predicted - observed) / observed * 100.0
+              for predicted, observed in prefill_eta_pairs(summary)
+              if observed > 0.0]
+    if not errors:
+        return None
+    return _percentile(sorted(errors), 90)
+
+
+def prefill_eta_basis_share(summary: AnalysisResult) -> dict[str, object]:
+    """Measured-vs-predicted basis split of ETA-priced admissions.
+
+    LP-0MWRQ6LSV009DVP4 AC3: makes the share of ETA-priced admissions whose
+    ``new_tokens`` price was backed by a **measurement** visible, so the
+    2.3 %-measured baseline can be compared before and after the change
+    without ad-hoc log archaeology.
+
+    Counts every *admitted* guard record that carried a positive priced ETA
+    (``eta_prefill_s > 0``) and was not an enforced refusal — the population
+    ``prefill_eta_accuracy`` scores. ``unknown`` covers lines that predate the
+    ``eta_pricing_basis=`` field (never re-labelled ``predicted``).
+    ``measured_share_pct`` is ``measured / (measured + predicted)`` (the
+    lines we can classify); ``None`` when neither basis was observed, so an
+    empty window renders ``n/a`` rather than a fabricated ``0``.
+    """
+    counts = {"measured": 0, "predicted": 0, "unknown": 0}
+    for event in getattr(summary, "local_admission_events", []) or []:
+        eta = _float_or_none(getattr(event, "eta_prefill_s", None))
+        if eta is None or eta <= 0.0:
+            continue
+        if getattr(event, "enforced", None) == "true":
+            continue
+        basis = getattr(event, "eta_pricing_basis", None)
+        if basis not in counts:
+            basis = "unknown"
+        counts[basis] += 1
+    total = sum(counts.values())
+    classified = counts["measured"] + counts["predicted"]
+    return {
+        "measured": counts["measured"],
+        "predicted": counts["predicted"],
+        "unknown": counts["unknown"],
+        "total": total,
+        "measured_share_pct": (
+            round(counts["measured"] / classified * 100.0, 1)
+            if classified
+            else None
+        ),
+    }
 
 
 def per_slot_context_limit(
@@ -3205,13 +3280,14 @@ def per_slot_context_limit(
 
 @dataclass(frozen=True)
 class ContextPressureStats:
-    """Share of local requests at or above the effective per-slot context.
+    """Share of sessions at or above the effective per-slot context threshold.
 
     ``thresholds`` lists the distinct per-slot limits (rounded tokens) the
-    measured requests were compared against, so a mixed-mode window makes the
-    different eras visible. ``unknown_threshold_samples`` counts local requests
-    whose session (and therefore profile) could not be resolved: they are
-    excluded from the share rather than measured against a guessed limit.
+    measured sessions were compared against, so a mixed-mode window makes the
+    different eras visible. ``unknown_threshold_samples`` counts sessions whose
+    peak context is known but whose per-slot limit (and therefore profile)
+    could not be resolved: they are excluded from the share rather than
+    measured against a guessed limit.
     """
 
     metric_id: ClassVar[str] = CONTEXT_PRESSURE_METRIC_ID
@@ -3230,37 +3306,38 @@ def context_pressure(
     *,
     threshold_ratio: float = CONTEXT_PRESSURE_THRESHOLD_RATIO,
 ) -> ContextPressureStats | None:
-    """Share of local requests at or above the effective per-slot context.
+    """Share of sessions at or above the effective per-slot context threshold.
 
-    Each per-request prompt size retained in
-    ``AnalysisResult.local_prompt_samples`` is compared with **its own
-    session's** :func:`per_slot_context_limit` (scaled by *threshold_ratio*),
-    because the fast and cheap profiles pin different slot geometries. Returns
-    ``None`` when the window has no local request with a resolvable limit.
+    Each session's peak context (``SessionStats.max_context_size``) is compared
+    with **its own** :func:`per_slot_context_limit` (scaled by
+    *threshold_ratio*), because the fast and cheap profiles pin different slot
+    geometries. This is the population the report's "Context sizes approaching
+    per-slot limits" recommendation already measures
+    (``recommendations.CONTEXT_PRESSURE_RATIO``). The served requests' own
+    prompt sizes cannot show it: the large-context bypass routes oversized
+    requests away, so a served local request never reaches the per-slot ceiling.
 
-    Source note: ``performance_metrics.METRIC_REGISTRY`` describes this
-    metric's source as the ``routing_skip_local estimated_tokens=`` lines,
-    i.e. the routing decisions that were *skipped*. The measured input here is
-    the dispatched local requests' own prompt sizes, which is what "share of
-    local requests" means and is available for every serving window (a window
-    with no routing skips would otherwise report n/a). The skip-line evidence
-    remains the per-session ``context_at_fallback`` figure the report already
-    renders.
+    ``performance_metrics.METRIC_REGISTRY`` names this sampled input as the
+    per-session peak context against each session's effective per-slot
+    context (``local_model_ctx_size / active slots``), so the metric and its
+    copy describe the same population. Returns ``None`` when no session has a
+    resolvable limit ("n/a", never a fabricated ``0``).
     """
-    samples = getattr(summary, "local_prompt_samples", []) or []
     at_or_above = 0
     measured = 0
     unknown = 0
     thresholds: set[int] = set()
-    for session_id, tokens in samples:
-        session = summary.sessions.get(session_id) if session_id else None
+    for session in summary.sessions.values():
+        peak = _float_or_none(getattr(session, "max_context_size", None))
+        if peak is None:
+            continue
         limit = per_slot_context_limit(session, config, mode_map)
         if limit is None:
             unknown += 1
             continue
         measured += 1
         thresholds.add(round(limit))
-        if tokens >= limit * threshold_ratio:
+        if peak >= limit * threshold_ratio:
             at_or_above += 1
     if not measured:
         return None

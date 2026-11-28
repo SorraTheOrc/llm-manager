@@ -1,9 +1,4 @@
 
-# <!-- REFACTOR-LP-0MWIGY7V10086FB5
-# smell: formatting
-# severity: high
-# description: Module level import not at top of file
-# -->
 """Tests for the attributable GPU-activity share (:mod:`gpu_busy`).
 
 LP-0MWG7KQVZ008DBZM: the report's GPU-usage figure is the attributable
@@ -21,27 +16,22 @@ slot) produced only by ``scripts/gpu_utilisation.py``. These tests pin:
 from __future__ import annotations
 
 import json
-import sys
 from datetime import datetime
 from pathlib import Path
-
-import pytest
-
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS))
-# The producer lives at the repository root; make it importable for the
-# single-producer assertions.
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import aggregation
 import bucketing
 import gpu_busy
 import gpu_utilisation
 import log_parser
+import pytest
 import reporting
 
 from tests import fixtures
+
+# The producer lives at the repository root; make it importable for the
+# single-producer assertions.
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 #: The authored two-hour store bundle with its deliberate 10-minute hole.
 #: ``monitoring/tests/fixtures/window_with_gap.json`` is shared with the

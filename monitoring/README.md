@@ -630,6 +630,7 @@ AMD tooling offers nothing better on this host (measured 2026-10-28,
 | `amd-smi` | `N/A` for engine usage, socket power, clocks, thermals and energy (`amd-smi metric`, `amd-smi monitor`); VRAM only (`0.3 / 1.0 GB`), which misdescribes an APU that serves from GTT |
 | `rocm-smi` | power (the same `hwmon` `power1_average` node this stack scrapes) and `GPU use 100%` from `gpu_busy_percent` |
 | `amdtop` | Linux “GPU usage” is literally `/sys/class/drm/card0/device/gpu_busy_percent` (`linux.go:151`, commit `5e500c3`); power/temp from the same `hwmon` files; VRAM (not GTT). Windows uses ADLX, a Windows-only driver library |
+| `gpu_metrics` (`amdgpu_top`) | `/sys/class/drm/card0/device/gpu_metrics` (`amd_gpu_metrics_v3_0`) exposes `average_gfx_activity`: measured 2026-11-18, kernel 7.0.0-38-generic, 181 samples at 1 s (54 idle < 60 W, 122 compute ≥ 90 W, package power 42.1–119.0 W) — idle-band mean 100.00 %, compute-band mean 99.98 %, separation -0.02 pp, Pearson r -0.068, 100.0 % idle false-busy, and **identical to `gpu_busy_percent` on all 181 samples**, so it is the same two-state counter under a second name, not an independent measure. Fails the bar; nothing is published |
 
 So `amdtop` and `rocm-smi` display **the same counter** this stack used to
 sample (it is retired as a published series — see
@@ -697,12 +698,31 @@ be reproduced from the store. The conclusion is unchanged — the counter is not
 a utilisation signal, and `gpu:computing:bool` stays the derivation behind the
 attributable share — only the evidence is current (LP-0MW5K7WKZ005VJXA).
 
-**The falsifier.** `gpu_metrics` (`/sys/class/drm/card0/device/gpu_metrics`,
-the `amd_gpu_metrics_v3_0` blob `amdgpu_top` reads) is the only candidate that
-could replace power draw with a direct percentage. Its verdict belongs to
-LP-0MVSQT7YC0045HFW: if a graded field passes the discrimination bar recorded
-there, power becomes the corroborator and this power-derived measure is
-revisited *on that evidence*, never by re-argument (LP-0MVSQT7YC0045HFW).
+**The falsifier has been tested and it failed.** `gpu_metrics` was the only
+candidate that could have replaced power draw with a direct percentage, and the
+verdict is now recorded rather than pending: on the 2026-11-18 capture above,
+`average_gfx_activity` read 100.00 % in the idle band against 99.98 % in the
+compute band (separation -0.02 pp, Pearson r -0.068, 100.0 % idle-band
+false-busy) and was identical to `gpu_busy_percent` on every sample, so it is
+the same two-state counter under a second name. It fails all three elements of
+the bar and publishes nothing, so power stays the authoritative derivation. The
+full record — the pinned v3.0 decode layout, the band statistics and the
+re-measure recipe — is the
+[`gpu_metrics` decision record](../docs/systemd/gpu-metrics.service#decision-no-gpu_metrics-activity-series-is-published)
+in the sampler's deployment document (work items LP-0MVSQT7YC0045HFW and its
+children, LP-0MVZEW7R1004GLJN for the record itself). A fresh capture is the
+only thing that revisits the power-derived measure, never re-argument.
+
+**Re-measuring it** is a deliberate act, not an argument. After a kernel,
+firmware or driver change, run
+`python3 scripts/gpu_metrics_probe.py --duration 180 --interval 1 --verdict`
+and read the numbers only if the capture holds **both bands** — idle band
+(< 60 W) and compute band (>= 90 W) — otherwise the engine reports
+`insufficient_data` and the run is not evidence. A field must clear
+separation >= 30 pp, Pearson r >= 0.6 against package power and idle
+false-busy <= 10 %. The full recipe, its failure modes and what a passing
+field would require are in
+[docs/systemd/gpu-metrics.service](../docs/systemd/gpu-metrics.service#re-measuring-the-gpu_metrics-verdict).
 
 #### Re-measuring `gpu_busy_percent` discrimination
 
@@ -1336,5 +1356,7 @@ LP-0MW5K7WKZ005VJXA).
   the ~27-point divergence from the power figure.
 - LP-0MW5K90EQ001W0R1 — `gpu:computing_workload:bool` is the single reported
   GPU-activity figure: one producer, every other figure scoped by its name.
-- LP-0MVSQT7YC0045HFW — the `gpu_metrics` falsifier verdict; if a graded field
-  passes there, the power-derived measure is revisited on that evidence.
+- LP-0MVSQT7YC0045HFW — the `gpu_metrics` falsifier verdict: **negative**,
+  recorded 2026-11-18 (the activity field saturates and is identical to
+  `gpu_busy_percent`), so the power-derived measure stays authoritative until a
+  fresh capture says otherwise.

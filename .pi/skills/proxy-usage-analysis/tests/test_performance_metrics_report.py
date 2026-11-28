@@ -369,15 +369,22 @@ class TestSummaryTable:
         assert len(labels) == len(set(labels)) == 10
         assert [cells[0] for cells in _summary_rows(_report())] == labels
 
-    def test_every_row_renders_the_default_tolerance_band(self):
+    def test_every_row_renders_its_own_tolerance_band(self):
         # LP-0MWADHS83006QFQS AC3: the band that decided each verdict is
         # visible, so a reader can tell a within-tolerance miss from a
-        # regression.
+        # regression. ``fallback_rate`` deliberately declares a zero band
+        # (LP-0MWJOUY4E002FNHP); every other metric renders the 10 % default.
         rows = _summary_rows(_report())
 
         assert len(rows) == len(pm.METRIC_REGISTRY)
         for cells in rows:
-            assert cells[3] == "±10 %", cells[0]
+            metric_id = next(
+                metric.id
+                for metric in pm.METRIC_REGISTRY
+                if metric.label.strip() == cells[0]
+            )
+            expected = "±0 %" if metric_id == "fallback_rate" else "±10 %"
+            assert cells[3] == expected, f"{cells[0]}: {metric_id}"
 
     def test_metrics_without_three_measurements_report_insufficient_history(self):
         # The committed defaults file is a template: it carries no measurement
@@ -707,6 +714,144 @@ class TestEndToEndDefaultRuns:
 
 
 # ---------------------------------------------------------------------------
+# Strict Fallback-rate verdict on both surfaces (LP-0MWJOUTOV000G701)
+# ---------------------------------------------------------------------------
+#
+# The producer approved a strict verdict for the lower-is-better Fallback-rate
+# metric only: `Met` if and only if the window's actual is at or below the
+# target (`actual <= target`), no +tolerance band above the target (parent
+# LP-0MWEOGIUK006B1DD Q1 answer (a)). Both surfaces derive their verdict from
+# ``reporting._scorecard_rows`` (the single shared path), so they cannot
+# diverge; these tests pin the boundary on both at once.
+#
+# Red-first: the above-target case read `Met` on both surfaces against the
+# then-current ±10 % band and was pinned as ``xfail(strict=True)`` naming the
+# implementation child (LP-0MWJOUY4E002FNHP), which narrows
+# ``fallback_rate.tolerance_pct`` to a committed zero band; the case is now
+# unmarked and green.
+
+
+@needs_cli
+class TestStrictFallbackRateSurfaces:
+    """Scorecard row and ``--json`` entry report the same strict verdict.
+
+    The fixture window's fallback rate is 33.3 %: a seeded target below it
+    (30.9 %) puts the window inside the former ±10 % band (edge 33.99 %) yet
+    above the target; a seeded target above it (42.0 %) exercises the
+    at/below-target side.
+    """
+
+    @staticmethod
+    def _agree(entry: dict, cells: list[str]) -> None:
+        assert entry["actual"] == pytest.approx(33.3)
+        assert cells[4] == "33.3 % of requests", cells
+        assert cells[5] == entry["verdict"], (
+            "scorecard row and --json entry must report the same verdict"
+        )
+
+    def test_unmet_when_above_the_target_inside_the_former_band(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+        out_dir.mkdir()
+        state_path = out_dir / STATE_FILENAME
+        _seed_history(state_path, {"fallback_rate": [30.9, 30.9, 30.9]})
+
+        assert _run_cli(log_dir, out_dir, "--json") == 0
+        data = json.loads(capsys.readouterr().out)
+        entry = data["performance_metrics"]["fallback_rate"]
+        cells = _rows_by_metric_id((out_dir / "report.md").read_text())["fallback_rate"]
+
+        self._agree(entry, cells)
+        assert cells[5] == "Unmet", (
+            "33.3 % is above the 30.9 % target; only actual <= target is Met"
+        )
+        assert entry["verdict"] == "Unmet"
+
+    def test_met_when_at_or_below_the_target(self, tmp_path, capsys):
+        log_dir = _write_log_dir(tmp_path)
+        out_dir = tmp_path / "usage"
+        out_dir.mkdir()
+        state_path = out_dir / STATE_FILENAME
+        _seed_history(state_path, {"fallback_rate": [40.0, 42.0, 44.0]})
+
+        assert _run_cli(log_dir, out_dir, "--json") == 0
+        data = json.loads(capsys.readouterr().out)
+        entry = data["performance_metrics"]["fallback_rate"]
+        cells = _rows_by_metric_id((out_dir / "report.md").read_text())["fallback_rate"]
+
+        self._agree(entry, cells)
+        assert cells[5] == "Met"
+        assert entry["verdict"] == "Met"
+
+
+# ---------------------------------------------------------------------------
+# Prefill-ETA raw error actual (LP-0MWJOUV5P007R799)
+# ---------------------------------------------------------------------------
+#
+# Parent LP-0MWEOGIUK006B1DD Q3 answer (a): `prefill_eta_accuracy` reports the
+# median absolute relative **error** directly and is registered
+# lower-is-better. The aggregation helper already returns that error (p50
+# ≈ 1041 % on recent windows); the implementation child
+# (LP-0MWJOUZG9008Q4RG) removed the `max(0, 100 − error)` conversion from
+# ``reporting._performance_metric_actuals``, so every window now reads the
+# raw error (1041.0 rather than a clamped 0.0 %).
+#
+# The `n/a` assertion passes under both definitions and runs unmarked: it pins
+# the behaviour the redefinition must not change.
+
+
+def _prefill_actuals(monkeypatch, error: float) -> dict:
+    """The scorecard actuals with the aggregation reporting *error* only."""
+    monkeypatch.setattr(
+        aggregation,
+        "performance_metric_inputs",
+        lambda summary, config, mode_map: {"prefill_eta_accuracy": error},
+    )
+    return reporting._performance_metric_actuals(_probe_summary(), None, None)
+
+
+@pytest.mark.parametrize(
+    ("error", "former_accuracy"),
+    [
+        (1041.0, 0.0),  # the recent window: clamped (old) accuracy figure
+        (92.3, 7.7),  # the documented ≈8 % accuracy window
+    ],
+)
+def test_the_scorecard_actual_is_the_raw_error_with_no_accuracy_conversion(
+    monkeypatch, error, former_accuracy
+):
+    actuals = _prefill_actuals(monkeypatch, error)
+
+    assert actuals["prefill_eta_accuracy"] == pytest.approx(error)
+    assert actuals["prefill_eta_accuracy"] != pytest.approx(former_accuracy)
+
+
+def test_the_json_actual_is_the_same_raw_error_as_the_scorecard(monkeypatch):
+    """Both surfaces read ``_performance_metric_actuals``, so a conversion left
+    in one of them would make them disagree."""
+    actuals = _prefill_actuals(monkeypatch, 1041.0)
+    entry = reporting.performance_metrics_json(_probe_summary(), None, None)[
+        "prefill_eta_accuracy"
+    ]
+
+    assert entry["actual"] == pytest.approx(1041.0)
+    assert entry["actual"] == pytest.approx(actuals["prefill_eta_accuracy"])
+
+
+def test_no_matched_pairs_still_reports_not_available():
+    """The fixture window pairs no dispatch with a guard record: the metric is
+    `n/a` on both surfaces and is never recorded as a fabricated 0."""
+    summary = _probe_summary()
+    actuals = reporting._performance_metric_actuals(summary, None, None)
+    entry = reporting.performance_metrics_json(summary, None, None)["prefill_eta_accuracy"]
+
+    assert aggregation.prefill_eta_accuracy(summary) is None
+    assert actuals["prefill_eta_accuracy"] is None
+    assert entry["actual"] is None
+    assert entry["verdict"] == "Insufficient history"
+
+
+# ---------------------------------------------------------------------------
 # --json contract
 # ---------------------------------------------------------------------------
 
@@ -790,7 +935,11 @@ class TestJsonBlock:
             assert {"baseline", "target", "actual", "verdict"} <= set(entry), metric_id
             assert entry["verdict"] in VERDICTS, metric_id
             assert entry["actual"] is None or isinstance(entry["actual"], (int, float))
-            assert entry["tolerance_pct"] == pytest.approx(10.0), metric_id
+            # Each entry publishes the band its own verdict was judged against:
+            # the 10 % default except for the deliberately strict metric.
+            assert entry["tolerance_pct"] == pytest.approx(
+                pm.tolerance_for(metric_id)
+            ), metric_id
 
         by_label = {metric.label.strip(): metric.id for metric in pm.METRIC_REGISTRY}
         table = {by_label[cells[0]]: cells[5] for cells in _summary_rows((out_dir / "report.md").read_text())}
@@ -815,7 +964,14 @@ class TestJsonBlock:
 
         assert set(block) == {metric.id for metric in pm.METRIC_REGISTRY}
         for metric_id, entry in block.items():
-            assert entry["tolerance_pct"] == pytest.approx(10.0), metric_id
+            assert entry["tolerance_pct"] == pytest.approx(
+                pm.tolerance_for(metric_id)
+            ), metric_id
+            # ``fallback_rate`` opts into the strict zero band; every other
+            # metric keeps the 10 % default (LP-0MWJOUY4E002FNHP).
+            assert entry["tolerance_pct"] == pytest.approx(
+                0.0 if metric_id == "fallback_rate" else 10.0
+            ), metric_id
             # The pre-existing keys keep their meaning and type.
             assert {"baseline", "target", "actual", "verdict"} <= set(entry), metric_id
 

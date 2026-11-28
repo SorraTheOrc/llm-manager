@@ -3314,6 +3314,175 @@ def _dispatch_credit_tokens(record) -> list | None:
     return list(credits)
 
 
+def _dispatch_streaming_tokens(record) -> list | None:
+    """Return the record's tokens whose stream has not finished (or ``None``).
+
+    Parent LP-0MWMSQR3O002YNPW **AC1/AC2**, implementation child
+    LP-0MWNHBFN6000GH2J. ``streaming_dispatch_tokens`` is the subset of
+    ``dispatch_credits`` whose dispatch has *not* yet emitted its response's
+    terminal chunk. A token is added when the dispatch takes its credit
+    (:func:`_try_acquire_local_dispatch` /
+    :func:`_increment_local_active_queries`) and removed when the response's
+    terminal chunk is seen, so a reader can tell a finished-but-not-yet-
+    released turn from genuinely in-flight work without a timestamp heuristic.
+
+    The marker deliberately leaves ``active`` and ``dispatch_credits``
+    untouched: clearing ``active`` at the terminal chunk would flip the branch
+    key in :func:`_try_acquire_local_dispatch` (an ``active: true`` record
+    appends a credit, an inactive one is overwritten) and could lose an
+    outstanding credit while it is still held, breaking exactly-once release.
+
+    ``None`` means the record predates the marker (a legacy record, or a
+    hand-built record in a test): callers must keep the pre-change behaviour,
+    which is keyed on ``active`` alone.
+    """
+    if not isinstance(record, dict):
+        return None
+    streaming = record.get("streaming_dispatch_tokens")
+    if not isinstance(streaming, list):
+        return None
+    return list(streaming)
+
+
+def _prune_streaming_dispatch_tokens(record) -> None:
+    """Drop streaming tokens whose credit the record no longer holds.
+
+    AC2 invariant (LP-0MWNHBFN6000GH2J): ``streaming_dispatch_tokens`` is
+    always a subset of ``dispatch_credits``. Every credit claim prunes the
+    streaming set inside the *same* critical section, so a released credit can
+    never leave a streaming token behind — the teardown half of the lifecycle.
+    """
+    if not isinstance(record, dict):
+        return
+    streaming = record.get("streaming_dispatch_tokens")
+    if not isinstance(streaming, list):
+        return
+    credits = _dispatch_credit_tokens(record)
+    if credits is None:
+        # No credit list to be a subset of (legacy/hand-built record): leave
+        # the marker untouched rather than inventing a subset relation.
+        return
+    held = set(credits)
+    record["streaming_dispatch_tokens"] = [
+        token for token in streaming if token in held
+    ]
+
+
+def _add_streaming_dispatch_token(record, token) -> None:
+    """Mark *token*'s dispatch as streaming (it just took its credit)."""
+    if not isinstance(record, dict) or not isinstance(token, int):
+        return
+    streaming = record.get("streaming_dispatch_tokens")
+    if not isinstance(streaming, list):
+        streaming = []
+    if token not in streaming:
+        streaming = [*streaming, token]
+    record["streaming_dispatch_tokens"] = streaming
+    _prune_streaming_dispatch_tokens(record)
+
+
+def _mark_request_stream_finished(request) -> None:
+    """Set the per-request guard that prevents a double terminal-chunk mark."""
+    if request is None:
+        return
+    try:
+        request._local_dispatch_stream_finished = True
+    except Exception:
+        pass
+
+
+def _reset_request_stream_finished(request) -> None:
+    """Clear the per-request guard when this request takes a new dispatch."""
+    if request is None:
+        return
+    try:
+        request._local_dispatch_stream_finished = False
+    except Exception:
+        pass
+
+
+async def _mark_local_dispatch_stream_finished(
+    srv,
+    session_key: str | None,
+    endpoint: str | None = None,
+    request=None,
+) -> bool:
+    """Mark this dispatch's response stream finished (terminal chunk reached).
+
+    LP-0MWNHBFN6000GH2J **AC1**: the dispatch's existing credit token leaves the
+    record's ``streaming_dispatch_tokens`` set the moment its response reaches
+    the terminal chunk. The credit itself is untouched — ``active`` stays
+    ``True`` and the token stays in ``dispatch_credits`` until teardown claims
+    it — so exactly-once release is unchanged (AC3): this function never
+    releases a ``local_active_queries`` credit and never clears ``active``.
+
+    *request* carries the per-dispatch credit token
+    (LP-0MVYZEYZY003IQAH) and the per-request guard: once a request has marked
+    its stream finished, a repeated terminal-chunk detection (a second
+    ``finish_reason`` chunk, a synthetic ``[DONE]``) is a no-op, so the token
+    cannot be removed twice. When the same request later takes a *new* dispatch
+    the acquisition paths clear the guard again.
+
+    Best-effort (AC6): a missing registry, a legacy record without the marker,
+    an unidentifiable dispatch or any unexpected error is logged and leaves the
+    record counting — the conservative outcome, because a record that still
+    counts only costs the requester a slot for the remaining teardown window,
+    while a wrongly-marked record would let a concurrent dispatch past the gate.
+
+    Returns ``True`` only when this call actually removed a streaming token.
+    """
+    try:
+        if request is not None and getattr(
+            request, "_local_dispatch_stream_finished", False
+        ):
+            # The per-request guard: the terminal chunk was already marked.
+            return False
+        records = getattr(srv, "local_dispatch_records", None)
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        if records is None or lock is None:
+            return False
+        token = _dispatch_token_from_request(request)
+        key = _dispatch_lease_key(endpoint, session_key) if session_key else None
+        marked = False
+        async with lock:
+            record = records.get(key) if key is not None else None
+            if not isinstance(record, dict) and session_key is not None:
+                # Legacy string-key form (pre per-endpoint keys).
+                fallback = records.get(session_key)
+                if isinstance(fallback, dict):
+                    record = fallback
+            if not isinstance(record, dict):
+                return False
+            streaming = _dispatch_streaming_tokens(record)
+            if streaming is None:
+                # Legacy record with no marker: keep the ``active``-only shape.
+                return False
+            if token is None:
+                # Untracked caller (no dispatch identity): never guess which
+                # dispatch finished, so the record keeps counting.
+                return False
+            if token in streaming:
+                streaming.remove(token)
+                record["streaming_dispatch_tokens"] = streaming
+                _prune_streaming_dispatch_tokens(record)
+                marked = True
+        # Idempotent either way: a token that is already absent (a repeated
+        # detection, or a credit already released) also satisfies the request.
+        _mark_request_stream_finished(request)
+        return marked
+    except Exception as exc:
+        try:
+            srv.logger.warning(
+                "Failed to mark dispatch stream finished for session=%s: %s: %s",
+                session_key if session_key else "unknown",
+                type(exc).__name__,
+                exc,
+            )
+        except Exception:
+            pass
+        return False
+
+
 def _outstanding_dispatch_credits(srv) -> int:
     """Count the counter credits currently held by dispatch records.
 
@@ -3400,6 +3569,13 @@ async def _claim_local_dispatch_credit(
                         credits.pop(0)
                     srv.local_active_queries = max(0, srv.local_active_queries - 1)
                     record["dispatch_credits"] = credits
+                    # LP-0MWNHBFN6000GH2J AC2: the streaming marker is a subset
+                    # of the held credits, so the claimed credit's token leaves
+                    # the streaming set in this same critical section. A record
+                    # can never show a streaming token it no longer holds, and
+                    # a teardown of an already-finished dispatch is a no-op for
+                    # the marker.
+                    _prune_streaming_dispatch_tokens(record)
                     if credits:
                         # Another dispatch of the session is still in flight:
                         # keep the record active and hand the attribution to the
@@ -3613,6 +3789,10 @@ async def _increment_local_active_queries(
                             dispatch_token,
                         ]
                         existing["dispatch_token"] = dispatch_token
+                        # LP-0MWNHBFN6000GH2J AC1: this sibling's stream has not
+                        # reached its terminal chunk, so its token joins the
+                        # streaming set (and its own credit was appended above).
+                        _add_streaming_dispatch_token(existing, dispatch_token)
                         existing["expires_at"] = now + lease_timeout
                         existing["turn"] = get_turn_id() or ""
                     else:
@@ -3640,7 +3820,9 @@ async def _increment_local_active_queries(
                             # one), so an overwritten record's leftover credit is
                             # still releasable by the counter-vs-outstanding rule.
                             "dispatch_credits": [dispatch_token],
-                            # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
+                            # LP-0MWNHBFN6000GH2J AC1: the dispatch is streaming
+                            # until its response's terminal chunk is seen.
+                            "streaming_dispatch_tokens": [dispatch_token],
                             # A record that never makes progress is bounded by
                             # ``local_dispatch_no_progress_timeout_seconds`` from
                             # creation (no waiting on an unobservable signal).
@@ -3656,7 +3838,13 @@ async def _increment_local_active_queries(
                                 model_name,
                                 session_key,
                                 admission_evidence=admission_evidence,
+                                # LP-0MWM0CPQN009SHJR: the retry-join key from
+                                # the client's original body.
+                                prompt_fp=_dispatch_prompt_fp(request, body_json),
                             ),
+                            # LP-0MWKQJHSM000CI6W: the measured contention-queue
+                            # wait is release-context evidence for the V1 window.
+                            "queue_wait_s": _queue_wait_seconds_from_request(request),
                         }
                     _pin_dispatch_slot(
                         srv, record_key, session_key, backend
@@ -3671,6 +3859,9 @@ async def _increment_local_active_queries(
                     if request is not None:
                         try:
                             request._local_dispatch_token = dispatch_token
+                            # LP-0MWNHBFN6000GH2J: a newly acquired dispatch has
+                            # its own stream, so the terminal-chunk guard resets.
+                            _reset_request_stream_finished(request)
                         except Exception:
                             pass
         except Exception:
@@ -3744,11 +3935,20 @@ def _server_config_of(srv) -> dict:
 
 
 def _get_prefill_in_flight_count(srv) -> int:
-    """Return the number of sessions currently in prefill (dispatch→first-byte).
+    """Return the raw number of ``local_prefill_in_flight`` markers.
 
-    Prefill-aware guard (LP-0MTJET4I5009EHNX): caps concurrent prefills to
-    ``parallel`` (``session_slot_pool_size`` / ``max_local``) so the llama-
-    server internal queue does not saturate under generating-only occupancy.
+    This is the *unfiltered* marker count, including orphans left behind by a
+    deletion path that pruned the dispatch record without popping the marker
+    (LP-0MWKWGLRT003AUG4). It is kept exported for observability/back-compat
+    and for tests that pin the marker bookkeeping itself, but it is **not** the
+    quantity the dispatch gate prices: ``_try_acquire_local_dispatch`` and the
+    denial evidence use :func:`_get_live_prefill_in_flight_count`, so a marker
+    with no live dispatch record cannot deny a dispatch (LP-0MWL5KL0J006ZVDG).
+
+    Prefill-aware guard (LP-0MTJET4I5009EHNX): the live count caps concurrent
+    prefills to ``parallel`` (``session_slot_pool_size`` / ``max_local``) so the
+    llama-server internal queue does not saturate under generating-only
+    occupancy.
     """
     try:
         d = getattr(srv, "local_prefill_in_flight", None)
@@ -3792,6 +3992,89 @@ def _get_live_prefill_in_flight_count(srv) -> int:
         return max(0, sum(1 for s in markers if s in live_sessions))
     except Exception:
         return 0
+
+
+def _pop_prefill_marker(srv, session_id: str | None) -> bool:
+    """Pop *session_id*'s ``local_prefill_in_flight`` marker.
+
+    Invariant (LP-0MWKWGLRT003AUG4, LP-0MWL5KLN1003E990): **every dispatch-
+    record deletion pops the marker.** The marker set is process-wide and the
+    admission gate prices the prefill cap with it, so a marker that outlives
+    its dispatch record denies every local dispatch while the GPU sits idle —
+    the 2026-11-17 incident shape ``records_total=0 ... prefill_in_flight=1
+    ... llama_available_slots=2``. Every deletion path (stale-record prune,
+    explicit release, client disconnect, request completion, no-progress
+    watchdog, orphan sweep, session invalidation) routes its pop through this
+    one helper so the invariant has a single home.
+
+    Idempotent, session-keyed, fail-soft and synchronous: a single-key
+    ``dict.pop`` on the event loop is atomic, so no lock is taken and the
+    admission-gate prune path stays ``await``-free (AC5). Returns ``True``
+    when a marker was removed, ``False`` when there was nothing to remove —
+    a falsy/missing session, a missing registry attribute, or an unexpected
+    error, none of which may escape into a dispatch or invalidation path
+    (AC4).
+    """
+    if not session_id:
+        return False
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if markers is None:
+            return False
+        return markers.pop(session_id, None) is not None
+    except Exception:
+        return False
+
+
+def _reclaim_orphaned_prefill_markers(srv) -> list[str]:
+    """Drop every ``local_prefill_in_flight`` marker with no dispatch record.
+
+    LP-0MWKWGLRT003AUG4 AC6, LP-0MWL5KM8X00193B3: the bounded recovery for an
+    **already-orphaned** marker. Before this pass the only ways out of the
+    2026-11-17 wedge were a proxy restart or a hand-issued
+    ``POST /v1/leases/release``; a marker left by an older build (or by any
+    future leak that misses the per-deletion-path pop of
+    :func:`_pop_prefill_marker`) is now reclaimed by the regularly scheduled
+    cleanup tick, in process, with no operator action.
+
+    One synchronous pass over both registries: build the set of session ids
+    that still have a dispatch record, then drop every marker whose session is
+    absent from it. Cost is ``O(records + markers)`` — no new thread, timeout,
+    lock or configuration knob, and no blocking I/O, so it is safe inside the
+    async cleanup loop.
+
+    Conservative by construction: a marker backed by *any* record (``active``
+    or a retained inactive lease) is left alone. Deleting a record is the
+    per-path pops' job (:func:`_pop_prefill_marker`), so the sweep can only
+    discount phantom markers and can never race a live prefill — the marker is
+    written **after** its record is inserted
+    (``_try_acquire_local_dispatch``), and this pass holds no ``await``, so no
+    concurrent admission can be misclassified as orphaned.
+
+    Returns the reclaimed session ids, in registry order, for the cleanup
+    loop's ``prefill_marker_reclaimed`` log line and for tests. An empty list
+    means a healthy tick, which must log nothing at all. Never raises: the
+    cleanup loop must keep ticking on an observability gap.
+    """
+    reclaimed: list[str] = []
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if not markers:
+            return reclaimed
+        records = getattr(srv, "local_dispatch_records", None) or {}
+        backed_sessions: set[str] = set()
+        for key in list(records.keys()):
+            session_id = _dispatch_key_session_id(key)
+            if session_id is not None:
+                backed_sessions.add(session_id)
+        for session_id in list(markers.keys()):
+            if session_id in backed_sessions:
+                continue
+            if _pop_prefill_marker(srv, session_id):
+                reclaimed.append(session_id)
+    except Exception:
+        return reclaimed
+    return reclaimed
 
 
 def _live_prefill_remaining_seconds(
@@ -4414,12 +4697,56 @@ def _record_local_eviction(
     return plan is not None
 
 
+def _queue_wait_seconds_from_request(request) -> float | None:
+    """Return the contention-queue wait stamped on *request*, if any.
+
+    LP-0MWKQJHSM000CI6W: the eviction line reports how much queue wait
+    preceded the dispatch (the V1 window buckets it), so the record stores the
+    measured value at admission. A request that never queued (or a call site
+    without a request object) carries ``None`` — rendered as ``unknown``, never
+    guessed as ``0``.
+    """
+    if request is None:
+        return None
+    try:
+        value = getattr(request, "_contention_queue_wait_seconds", None)
+        if value is None:
+            return None
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _dispatch_prompt_fp(request, body_json: dict | None) -> str | None:
+    """The stable prompt identity for a dispatch record (LP-0MWM0CPQN009SHJR).
+
+    Prefers the fingerprint stamped on the request at the earliest body parse
+    (before session-delta rewriting mutates ``messages``), so the record, the
+    eviction line and the ``local_dispatch_outcome`` lines all agree on one
+    join key; falls back to recomputing from *body_json* for a caller that
+    never stamped it. Never raises.
+    """
+    try:
+        stamped = getattr(request, "_prompt_fp", None) if request is not None else None
+    except Exception:
+        stamped = None
+    if stamped:
+        return stamped
+    try:
+        from proxy.retry_outcome import prompt_fingerprint
+
+        return prompt_fingerprint(body_json)
+    except Exception:
+        return None
+
+
 def _dispatch_evidence(
     body_json: dict | None,
     model_name: str | None,
     session_key: str | None,
     *,
     admission_evidence: dict | None = None,
+    prompt_fp: str | None = None,
 ) -> dict:
     """Accepted-dispatch evidence for the post-acceptance eviction event.
 
@@ -4466,6 +4793,12 @@ def _dispatch_evidence(
         "slot_id": None,
         "llama_task_id": None,
         "first_byte_seen": False,
+        # LP-0MWM0CPQN009SHJR: the stable prompt identity, computed from the
+        # client's ORIGINAL body (before session-delta rewriting) and threaded
+        # here by the caller. It is recorded even when no admission snapshot
+        # exists, so the abort line always carries a join key (rendered
+        # ``unknown`` when absent) and a pre-change record stays parseable.
+        "prompt_fp": prompt_fp,
     }
     if not isinstance(admission_evidence, dict):
         return evidence
@@ -4709,7 +5042,16 @@ async def _try_acquire_local_dispatch(
                         if first_occupied_owner is None:
                             first_occupied_owner = _dispatch_key_session_id(existing_key)
                 _generating_count = _get_generating_only_count(srv)
-                _prefill_count = _get_prefill_in_flight_count(srv)
+                # LP-0MWL5KL0J006ZVDG: price the cap with the *live* prefill
+                # count. A ``local_prefill_in_flight`` marker with no backing
+                # dispatch record (an orphan left by a deletion path that did
+                # not pop it) is not a running prefill and must not deny a
+                # dispatch. A marker backed by an ``active`` record is still
+                # counted, so ``local_max_concurrent_prefills`` serialisation
+                # is preserved exactly. The raw count is kept exported for
+                # observability/back-compat (``_get_prefill_in_flight_count``),
+                # but it is not the priced quantity.
+                _prefill_count = _get_live_prefill_in_flight_count(srv)
                 has_generating_state = (
                     hasattr(srv, "local_generating_queries")
                     or hasattr(srv, "local_generating_sessions")
@@ -4799,6 +5141,9 @@ async def _try_acquire_local_dispatch(
                         _credit_taken = False
                         if _existing_credits is None:
                             own_record["dispatch_credits"] = [dispatch_token]
+                            own_record["streaming_dispatch_tokens"] = [
+                                dispatch_token
+                            ]
                     else:
                         dispatch_token = _new_dispatch_token()
                         _credit_taken = True
@@ -4807,6 +5152,10 @@ async def _try_acquire_local_dispatch(
                             dispatch_token,
                         ]
                         own_record["dispatch_token"] = dispatch_token
+                        # LP-0MWNHBFN6000GH2J AC1: an overlapping dispatch of
+                        # this session is streaming until its own terminal
+                        # chunk, so its token joins the record's streaming set.
+                        _add_streaming_dispatch_token(own_record, dispatch_token)
                     own_record["expires_at"] = now + lease_timeout
                     # LP-0MVYWLHNI000AQ7X AC1: a re-acquired record belongs to
                     # this turn now, so the clamp names the live turn.
@@ -4836,6 +5185,9 @@ async def _try_acquire_local_dispatch(
                         # credits this record holds, oldest first, so every
                         # dispatch's increment can be released exactly once.
                         "dispatch_credits": [dispatch_token],
+                        # LP-0MWNHBFN6000GH2J AC1: the dispatch is streaming
+                        # until its response's terminal chunk is seen.
+                        "streaming_dispatch_tokens": [dispatch_token],
                         # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                         "last_progress": 0,
                         "last_progress_ts": now,
@@ -4848,7 +5200,13 @@ async def _try_acquire_local_dispatch(
                             model_name,
                             session_key,
                             admission_evidence=admission_evidence,
+                            # LP-0MWM0CPQN009SHJR: the retry-join key from the
+                            # client's original body.
+                            prompt_fp=_dispatch_prompt_fp(request, body_json),
                         ),
+                        # LP-0MWKQJHSM000CI6W: the measured contention-queue
+                        # wait is release-context evidence for the V1 window.
+                        "queue_wait_s": _queue_wait_seconds_from_request(request),
                     }
                 if _credit_taken:
                     srv.local_active_queries += 1
@@ -4858,6 +5216,9 @@ async def _try_acquire_local_dispatch(
                 if request is not None:
                     try:
                         request._local_dispatch_token = dispatch_token
+                        # LP-0MWNHBFN6000GH2J: a re-acquired/new dispatch has
+                        # its own stream, so the terminal-chunk guard resets.
+                        _reset_request_stream_finished(request)
                     except Exception:
                         pass
                 # LP-0MVUVHAQP001IRKK: pin the slot identity on the record at
@@ -4915,6 +5276,11 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     Removes the dispatch record from ``local_dispatch_records`` under
     the existing lock. Returns ``True`` if a record was removed, or
     ``False`` if no matching record existed (idempotent no-op).
+
+    Invariant (LP-0MWL5KLN1003E990): **every dispatch-record deletion pops
+    the session's ``local_prefill_in_flight`` marker** via
+    :func:`_pop_prefill_marker`, so a release can never leave an orphan marker
+    that denies every later local dispatch.
 
     When *endpoint* is provided, only the per-endpoint record for that
     llama-server instance is released (LP-0MRPILSMW004T4H8); otherwise
@@ -5009,12 +5375,9 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     except Exception:
         raise
     # Free the slot registry entry
-    try:
-        _p = getattr(srv, "local_prefill_in_flight", None)
-        if _p is not None and session_id and session_id in _p:
-            _p.pop(session_id, None)
-    except Exception:
-        pass
+    # AC (LP-0MWL5KLN1003E990): every record deletion pops the marker — use the
+    # shared helper so this path cannot drift from the invariant.
+    _pop_prefill_marker(srv, session_id)
     if session_id:
         try:
             from proxy.session import _free_slot_assignment
@@ -6491,14 +6854,9 @@ def _release_client_disconnect_dispatch(
             endpoint=endpoint,
         )
 
-    marker_popped = False
-    try:
-        markers = getattr(srv, "local_prefill_in_flight", None)
-        if markers is not None and session_key in markers:
-            markers.pop(session_key, None)
-            marker_popped = True
-    except Exception:
-        marker_popped = False
+    # AC (LP-0MWL5KLN1003E990): every record deletion pops the marker — the
+    # shared helper reports whether a marker was actually present.
+    marker_popped = _pop_prefill_marker(srv, session_key)
 
     # AC1 (LP-0MVRMI5HK00558TB): resolve the slot identity **before** the
     # assignment is freed below (the released record's pinned ``slot_id`` first,
@@ -6574,6 +6932,11 @@ async def _release_completed_dispatch(
     request: Request | None = None,
 ) -> bool:
     """Release a local dispatch lease that outlived its completed request.
+
+    Invariant (LP-0MWL5KLN1003E990): **every dispatch-record deletion pops the
+    session's ``local_prefill_in_flight`` marker** via
+    :func:`_pop_prefill_marker`, so a completed request cannot leave an orphan
+    marker behind.
 
     Parent LP-0MVWEZCB0006WPBQ **AC8** — *no post-completion evictions*
     (LP-0MVWFKI8O001X694).
@@ -6693,13 +7056,9 @@ async def _release_completed_dispatch(
         return False
 
     # A completed request has no prefill in flight: a leftover marker counts
-    # against the pool's prefill cap until the sweep pops it.
-    try:
-        markers = getattr(srv, "local_prefill_in_flight", None)
-        if markers is not None:
-            markers.pop(session_key, None)
-    except Exception:
-        pass
+    # against the pool's prefill cap until the sweep pops it. AC
+    # (LP-0MWL5KLN1003E990): every record deletion pops the marker.
+    _pop_prefill_marker(srv, session_key)
 
     for record in released:
         endpoint = _endpoint_from_record(record)
@@ -6896,6 +7255,12 @@ def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
 async def _cleanup_stale_local_dispatch(srv) -> int:
     """Remove stale lease records from *local_dispatch_records*.
 
+    Invariant (LP-0MWL5KLN1003E990): **every dispatch-record deletion pops the
+    session's ``local_prefill_in_flight`` marker** via
+    :func:`_pop_prefill_marker`, so no sweep branch (completed reaping,
+    no-progress watchdog, idle timeout, orphan cleanup) can leave an orphan
+    marker behind.
+
     Three categories of stale records are cleaned:
 
     0a. **Completed records** (LP-0MVWFKI8O001X694, parent LP-0MVWEZCB0006WPBQ
@@ -6945,7 +7310,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     verify_candidates: list[tuple[str, dict]] = []
     # LP-0MUGQHPJ50046LV8: deferred watchdog-released records (stream_cm, slot
     # freeing, preflight tracking) — processed after releasing the lock.
-    deferred_watchdog: list[tuple[str, str, str | None, object]] = []
+    deferred_watchdog: list[
+        tuple[str, str, str | None, object, dict, str]
+    ] = []
 
     # Phase 1 (under lock): collect expired records. Inactive records are
     # freed immediately; expired ACTIVE records are deferred to phase 3 so
@@ -7001,12 +7368,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
-                    try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and session_key in _p:
-                            _p.pop(session_key, None)
-                    except Exception:
-                        pass
+                    # AC (LP-0MWL5KLN1003E990): every record deletion pops the
+                    # marker — the completed-record reaping included.
+                    _pop_prefill_marker(srv, session_key)
                     continue
 
                 # LP-0MUCEFB8E003YVFF: no-progress watchdog. Runs on every
@@ -7088,6 +7452,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                             endpoint_from_record,
                             stream_cm,
                             released_record,
+                            _watchdog_reason,
                         )
                     )
                     continue
@@ -7120,13 +7485,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
-                    try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and _dispatch_key_session_id(sid) in _p:
-                            _p.pop(_dispatch_key_session_id(sid), None)
-
-                    except Exception:
-                        pass
+                    # AC (LP-0MWL5KLN1003E990): every record deletion pops the
+                    # marker — the idle-timeout path included.
+                    _pop_prefill_marker(srv, _dispatch_key_session_id(sid))
                     # LP-0MVN4LCED00661MX AC1 (``idle_timeout``): classified by
                     # the record's ``first_byte_seen`` flag, NOT by this path —
                     # an inactive record that already served its response is
@@ -7252,12 +7613,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         record=record,
                     )
                     del srv.local_dispatch_records[sid]
-                    try:
-                        _p = getattr(srv, "local_prefill_in_flight", None)
-                        if _p is not None and _dispatch_key_session_id(sid) in _p:
-                            _p.pop(_dispatch_key_session_id(sid), None)
-                    except Exception:
-                        pass
+                    # AC (LP-0MWL5KLN1003E990): every record deletion pops the
+                    # marker — the orphan sweep included.
+                    _pop_prefill_marker(srv, _dispatch_key_session_id(sid))
                     removed += 1
                     # LP-0MVIQ0FJC000YLX0: cancel the upstream stream so the
                     # llama-server slot is actually freed. Without this the
@@ -7351,6 +7709,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             endpoint_from_record,
             stream_cm,
             released_record,
+            watchdog_reason,
         ) in deferred_watchdog:
             try:
                 # Close the upstream httpx stream to cancel the in-flight
@@ -7376,10 +7735,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             )
             # LP-0MVN4LCED00661MX AC1 (``no_progress_watchdog``): the watchdog
             # released an accepted dispatch that never produced a first byte.
+            # LP-0MWKQJHSM000CI6W AC1: report the distinct reason the sweep
+            # computed (``prefill_eta_exceeded`` / ``prefill_stalled`` /
+            # ``prefill_max_exceeded``) rather than the umbrella label, so the
+            # eviction line reconciles with the preceding ``lease_released``
+            # line and a relabelling cannot be mistaken for a fix.
             _emit_eviction_after_acceptance(
                 srv,
                 session_key,
-                "no_progress_watchdog",
+                watchdog_reason,
                 released_record,
                 endpoint=endpoint_from_record,
             )
@@ -7409,13 +7773,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 endpoint=endpoint_from_record,
                 reason="no_progress_watchdog",
             )
-            # Pop from preflight tracking.
-            try:
-                _p = getattr(srv, "local_prefill_in_flight", None)
-                if _p is not None and session_key in _p:
-                    _p.pop(session_key, None)
-            except Exception:
-                pass
+            # Pop from preflight tracking (AC LP-0MWL5KLN1003E990: every
+            # record deletion pops the marker).
+            _pop_prefill_marker(srv, session_key)
     # Removed stale leases frees slots — wake the cross-session contention
     # queue (LP-0MSORQVK50012Q4D AC2).
     if removed > 0:
@@ -7968,7 +8328,11 @@ def _prune_stale_dispatch_records(srv, now: float) -> list:
     watchdog's concern, never the admission gate's — so it is left alone.
 
     The freed session-slot assignment is released alongside the record so the
-    registry cannot describe a slot the gate has already forgotten.
+    registry cannot describe a slot the gate has already forgotten, and the
+    pruned record's ``local_prefill_in_flight`` marker is popped through
+    :func:`_pop_prefill_marker` — **every record deletion pops the marker**
+    (LP-0MWL5KLN1003E990), so an orphan can never deny local dispatches while
+    llama-server reports free slots.
 
     Returns the keys removed (for diagnostics/tests).
     """
@@ -7995,6 +8359,10 @@ def _prune_stale_dispatch_records(srv, now: float) -> list:
             _free_slot_assignment(_dispatch_key_session_id(existing_key))
         except Exception:
             pass
+        # AC (LP-0MWL5KLN1003E990): the pruned record's prefill marker is
+        # popped alongside the record and slot assignment, so no orphaned
+        # marker can survive the deletion and deny every later local dispatch.
+        _pop_prefill_marker(srv, _dispatch_key_session_id(existing_key))
     return removed
 
 
@@ -8014,6 +8382,12 @@ async def _local_dispatch_occupancy_evidence(srv, max_local: int | None = None) 
     ``max_local``, the generating-only and prefill-in-flight counts with the
     effective prefill cap, and llama-server's last known slot counts (which
     makes an AC3 divergence visible on the same line).
+
+    ``prefill_in_flight`` is the **liveness-filtered** count (the same count
+    the gate prices, LP-0MWL5KL0J006ZVDG), not the raw marker count: an orphaned
+    marker must never appear here as an in-flight prefill, or a denial line
+    could contradict itself (``records_total=0`` with ``prefill_in_flight>0``)
+    while llama-server reports free slots.
 
     Read-only: it takes ``local_dispatch_records_lock`` only to snapshot the
     registry, never mutates it, and never prunes (AC1's prune belongs to the
@@ -8073,7 +8447,13 @@ async def _local_dispatch_occupancy_evidence(srv, max_local: int | None = None) 
     except (TypeError, ValueError):
         evidence["active_counter"] = 0
     evidence["generating"] = _get_generating_only_count(srv)
-    evidence["prefill_in_flight"] = _get_prefill_in_flight_count(srv)
+    # LP-0MWL5KL0J006ZVDG: report the count the gate itself prices (the
+    # liveness-filtered count), so a ``local_dispatch_denied`` line can never
+    # carry ``records_total=0`` with ``prefill_in_flight>0`` while llama-server
+    # reports free slots. The field name and line shape are unchanged; the raw
+    # ``_get_prefill_in_flight_count`` stays exported for observability and
+    # back-compat.
+    evidence["prefill_in_flight"] = _get_live_prefill_in_flight_count(srv)
     try:
         evidence["prefill_cap"] = _effective_prefill_cap(
             _server_config_of(srv), max_local or 1

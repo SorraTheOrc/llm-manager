@@ -63,8 +63,28 @@ EVICTION_PREFILL_DEADLINE = "prefill_deadline"
 #: post-deploy window can count early detours separately from 120 s ones.
 EVICTION_MEASURED_CACHE_DEFICIT = "measured_cache_deficit"
 
-#: The no-progress watchdog released an accepted dispatch.
+#: The no-progress watchdog released an accepted dispatch. Retained as the
+#: umbrella fallback for a release the watchdog could not attribute to a
+#: distinct prefill reason (LP-0MWKQJHSM000CI6W AC1): every attributable
+#: release now carries one of the three distinct reasons below, so the
+#: umbrella label can no longer stand in for a behavioural class.
 EVICTION_NO_PROGRESS_WATCHDOG = "no_progress_watchdog"
+
+#: The watchdog cut a dispatch still inside its hard ceiling but far over its
+#: admission-priced prefill duration (runaway prefill, ``elapsed >
+#: eta_prefill_s * local_prefill_eta_factor``). This is the distinct reason the
+#: sweep already computed for ``lease_released`` (LP-0MW8VOKB9002W2C1); the
+#: post-acceptance eviction line now reports it instead of the umbrella label.
+EVICTION_PREFILL_ETA_EXCEEDED = "prefill_eta_exceeded"
+
+#: The watchdog observed no measured progress for
+#: ``local_dispatch_no_progress_timeout_seconds`` — a genuine wedge, distinct
+#: from a progressing-but-slow prefill.
+EVICTION_PREFILL_STALLED = "prefill_stalled"
+
+#: The dispatch exceeded ``local_dispatch_max_prefill_seconds`` (the hard
+#: lifetime ceiling) regardless of observed progress.
+EVICTION_PREFILL_MAX_EXCEEDED = "prefill_max_exceeded"
 
 #: An inactive dispatch record expired past ``expires_at``.
 EVICTION_IDLE_TIMEOUT = "idle_timeout"
@@ -85,6 +105,9 @@ EVICTION_REASONS_AFTER_ACCEPTANCE: tuple[str, ...] = (
     EVICTION_PREFILL_DEADLINE,
     EVICTION_MEASURED_CACHE_DEFICIT,
     EVICTION_NO_PROGRESS_WATCHDOG,
+    EVICTION_PREFILL_ETA_EXCEEDED,
+    EVICTION_PREFILL_STALLED,
+    EVICTION_PREFILL_MAX_EXCEEDED,
     EVICTION_IDLE_TIMEOUT,
     EVICTION_ORPHAN_CLEANUP,
     EVICTION_LEASE_EVICTED,
@@ -101,6 +124,9 @@ EVICTION_REASONS: tuple[str, ...] = (
     EVICTION_PREFILL_DEADLINE,
     EVICTION_MEASURED_CACHE_DEFICIT,
     EVICTION_NO_PROGRESS_WATCHDOG,
+    EVICTION_PREFILL_ETA_EXCEEDED,
+    EVICTION_PREFILL_STALLED,
+    EVICTION_PREFILL_MAX_EXCEEDED,
     EVICTION_IDLE_TIMEOUT,
     EVICTION_ORPHAN_CLEANUP,
     EVICTION_BACKEND_RESTART,
@@ -161,9 +187,10 @@ def record_eviction_after_acceptance(
             from the record's ``started_at`` (monotonic) when omitted.
         extra_fields: Optional caller-specific ``key=value`` evidence appended
             to the line (e.g. the measured/priced numbers behind a
-            ``measured_cache_deficit`` release). Omitted (``None``) leaves the
-            line byte-for-byte as before, so every pre-existing consumer and
-            test regex is unaffected.
+            ``measured_cache_deficit`` release). It is rendered after the
+            always-present release-context evidence (``task_started``,
+            ``progress_observed``, ``queue_wait_s``), so a caller's key order
+            is preserved.
 
     Returns:
         True when an event was emitted (and counted), False when suppressed
@@ -240,10 +267,15 @@ def record_eviction_after_acceptance(
     # The association evidence is APPENDED (AC10e): ``llama_task_id_reason=``
     # only when a known slot could not be attributed, then any caller evidence,
     # so every pre-existing key keeps its position for deployed parsers.
-    _suffix = _format_extra_fields(extra_fields)
     _reason_suffix = (
         f" llama_task_id_reason={task_id_reason}" if task_id_reason else ""
     )
+    # LP-0MWKQJHSM000CI6W: release-context evidence (task started, progress
+    # observed, queue wait) is appended to every eviction line. It follows all
+    # pre-existing keys, so a deployed positional parser is unaffected; caller
+    # evidence (``extra_fields``) still comes last.
+    _release_context = _release_context_fields(record, llama_task_id)
+    _suffix = _format_extra_fields({**_release_context, **(extra_fields or {})})
     try:
         logger.error(
             "local_eviction_after_acceptance session=%s reason=%s "
@@ -264,6 +296,62 @@ def record_eviction_after_acceptance(
     except Exception:
         pass
     return True
+
+
+def _release_context_fields(
+    record: dict | None, llama_task_id: int | None
+) -> dict[str, object]:
+    """Return the release-context evidence appended to every eviction line.
+
+    LP-0MWKQJHSM000CI6W: the pre-first-byte abort class cannot be classified
+    from the reason alone. These three trailing fields let the post-deploy
+    window (LP-0MWM0CP4B001088M AC3) split every eviction by whether the
+    backend task actually started, whether any **measured** token progress was
+    observed, and how much contention-queue wait preceded the dispatch —
+    without moving any pre-existing key.
+
+    - ``task_started``: ``yes`` when the llama-server task id was resolved from
+      the cached ``/slots`` snapshot, ``no`` otherwise (the same evidence the
+      ``task_id_not_started`` reason names).
+    - ``progress_observed``: ``yes`` only when a measured numeric token
+      progress was recorded on the record (``last_progress > 0``); a
+      liveness-only lease extension is deliberately not counted as progress.
+    - ``queue_wait_s``: the contention-queue wait stamped on the record at
+      admission, ``unknown`` when the record carries none.
+
+    LP-0MWM0CPQN009SHJR adds two **correlation** fields for the retry-outcome
+    join (append-only, so no pre-existing key moves):
+
+    - ``prompt_fp``: the stable prompt identity the dispatch record carried from
+      admission (:func:`proxy.retry_outcome.prompt_fingerprint`), so the abort
+      can be joined to the caller's next dispatch of the same prompt;
+    - ``turn``: the per-request correlation id stamped on the record, extra
+      provenance for the join (``unknown`` when the record carries none).
+    """
+    record = record or {}
+    task_started = "yes" if llama_task_id is not None else "no"
+    progress_observed = False
+    try:
+        progress = record.get("last_progress")
+        progress_observed = progress is not None and float(progress) > 0.0
+    except (TypeError, ValueError):
+        progress_observed = False
+    queue_wait_value: object
+    try:
+        queue_wait_value = max(0.0, float(record.get("queue_wait_s")))
+    except (TypeError, ValueError):
+        queue_wait_value = None
+    turn_value = record.get("turn")
+    return {
+        "task_started": task_started,
+        "progress_observed": "yes" if progress_observed else "no",
+        "queue_wait_s": queue_wait_value,
+        # LP-0MWM0CPQN009SHJR: the retry-outcome correlation key. A pre-change
+        # record carries no prompt fingerprint; it renders ``unknown`` rather
+        # than a fabricated value, so an unjoinable abort is visibly so.
+        "prompt_fp": record.get("prompt_fp") or "unknown",
+        "turn": turn_value if turn_value else "unknown",
+    }
 
 
 def _format_extra_fields(extra_fields: Mapping[str, object] | None) -> str:

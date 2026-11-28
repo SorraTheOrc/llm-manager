@@ -1,0 +1,720 @@
+{
+  "work_item": "LP-0MWSD6D24002J0K7",
+  "work_item_title": "Re-measure a 24 h restart-free window after the fix",
+  "parent": "LP-0MWRXFO0I005UBVM",
+  "parent_title": "Close the residual undatable slots_stale share (AC4/AC5)",
+  "fix_under_test": [
+    {
+      "commit": "aa6115bcc",
+      "item": "LP-0MWSD6CEE0068T19",
+      "change": "joiner-side /slots snapshot age (undatable share)"
+    },
+    {
+      "commit": "5ef9b5ebb",
+      "item": "LP-0MWRWBJPP001Q5JX",
+      "change": "measured-basis prefill calibration ETA"
+    },
+    {
+      "commit": "989358278",
+      "item": "LP-0MWKQJHSM000CI6W",
+      "change": "label split classification (loaded build at the anchor)"
+    }
+  ],
+  "measurement_run_utc": "2026-11-28T12:55:35Z",
+  "tool_work_item_note": "capacity_signal_verification.py stamps meta.work_item = LP-0MVOG6YRA000T9PK, the tool's own owning item, not this measurement's item",
+  "window": {
+    "since_local": "2026-11-26 10:18:00",
+    "until_local": "2026-11-27 10:18:00",
+    "half_open": true,
+    "duration_hours": 24.0,
+    "local_timezone": "GMT (UTC) \u2014 host TZ is Europe/Dublin, GMT in November; verified at run time",
+    "anchored_to": "proxy restart 2026-11-26T10:17:48Z pid 2364780; window start = first whole minute after it",
+    "window_closed": true,
+    "attribution_basis": "docs/dev/measurement-windows.md \u00a7 2/\u00a7 3.1 row billing this item as a window owner of the anchor (\u00a7 4.4 'one window, many measurements'), registered 2026-11-26T17:09:23Z (commit 91ad69d63) \u2014 before the window closed"
+  },
+  "restart_integrity": {
+    "anchor_restart_marker": "2026-11-26 10:17:49,970 - INFO - Logging initialised at /var/log/llama-proxy/proxy.log pid=2364780",
+    "anchor_attribution": "2026-11-26 10:17:49,975 - INFO - Proxy restart attribution: source=manual actor=unknown reason=LP-0MWKQJHSM000CI6W label split deploy \u2014 V1 window LP-0MWM0CP4B001088M, 24 h restart-free",
+    "pre_window_restarts": [
+      {
+        "marker": "2026-11-26 10:17:17,141 pid=2364484",
+        "attribution": "reason=manual (no reason provided)",
+        "relation": "superseded 31 s later by the anchoring launch; outside the window"
+      },
+      {
+        "marker": "2026-11-26 10:17:45/49 pid=2364780",
+        "attribution": "see anchor_attribution",
+        "relation": "the anchor; 11 s before window start, so outside the window"
+      }
+    ],
+    "in_window_startup_markers": 0,
+    "markers_searched": [
+      "Logging initialised",
+      "Proxy restart attribution",
+      "Rotated previous proxy log aside",
+      "Started server process",
+      "application startup"
+    ],
+    "in_window_marker_files_checked": [
+      "proxy.log.2026-11-26_10.gz",
+      "proxy.log.2026-11-26_16.gz",
+      "proxy.log.2026-11-26_22",
+      "proxy.log-2026-11-27_00.gz",
+      "proxy.log.2026-11-27_04",
+      "proxy.log.2026-11-27_10"
+    ],
+    "post_window_restart": {
+      "marker": "2026-11-27 21:25:31,905 - INFO - Logging initialised at /var/log/llama-proxy/proxy.log pid=2883701",
+      "attribution": "reason=LP-0MWM0CPQN009SHJR retry-outcome deploy \u2014 opens V2 window LP-0MWM0CQDM004M2BQ, >=48h restart-free",
+      "relation": "11 h 07 m after the window closed (2026-11-27T10:18:00Z); cannot void this window"
+    }
+  },
+  "coverage": {
+    "covered": true,
+    "measured_hours": 24.0,
+    "window_hours": 24.0,
+    "covered_fraction": 1.0,
+    "gaps": [],
+    "window_start_gap_seconds": 0.0,
+    "window_end_gap_seconds": 0.0,
+    "spans": [
+      {
+        "file": "proxy.log.2026-11-26_10.gz",
+        "first": "2026-11-26 10:18:00",
+        "last": "2026-11-26 16:17:48",
+        "lines": 184765
+      },
+      {
+        "file": "proxy.log.2026-11-26_16.gz",
+        "first": "2026-11-26 16:17:49",
+        "last": "2026-11-26 22:17:48",
+        "lines": 226769
+      },
+      {
+        "file": "proxy.log-2026-11-27_00.gz",
+        "first": "2026-11-26 22:17:49",
+        "last": "2026-11-27 00:00:00",
+        "lines": 79030
+      },
+      {
+        "file": "proxy.log.2026-11-26_22",
+        "first": "2026-11-27 00:00:00",
+        "last": "2026-11-27 04:17:48",
+        "lines": 68091
+      },
+      {
+        "file": "proxy.log.2026-11-27_04",
+        "first": "2026-11-27 04:17:50",
+        "last": "2026-11-27 10:17:48",
+        "lines": 81223
+      },
+      {
+        "file": "proxy.log.2026-11-27_10",
+        "first": "2026-11-27 10:17:50",
+        "last": "2026-11-27 10:18:00",
+        "lines": 63
+      }
+    ],
+    "first_poll": "2026-11-26 10:18:00",
+    "last_poll": "2026-11-27 10:17:59"
+  },
+  "deployed_build": {
+    "loaded_at_anchor": "989358278 (dev HEAD at 2026-11-26T04:47:16Z)",
+    "ancestry_verified": [
+      "aa6115bcc",
+      "5ef9b5ebb"
+    ],
+    "ancestry_method": "git merge-base --is-ancestor <commit> 989358278",
+    "checkout_dev_head_at_run": "c9c3a2f49 (2026-11-27T21:06:02Z) \u2014 the checkout tip moves without a restart, so it is not the loaded code",
+    "status_schema_version_in_window": 8
+  },
+  "commands": {
+    "measurement": "python3 scripts/capacity_signal_verification.py --since '2026-11-26 10:18:00' --until '2026-11-27 10:18:00' --window-closed --label slots-stale-postfix-24h-rearm --limit 250 --json --write-artifacts ~/proxy-usage-reports/slots-stale-postfix-24h-2026-11-26-to-27",
+    "tightened_age_reading": "python3 scripts/slots_snapshot_age_distribution.py --since '2026-11-26 10:18:00' --until '2026-11-27 10:18:00' --threshold-seconds 2 --threshold-seconds 5 --threshold-seconds 300 --json > ~/proxy-usage-reports/slots-stale-postfix-24h-2026-11-26-to-27/age_distribution.json",
+    "per_hour": "the per_hour blocks are produced by the snippet in \u00a7 3 of docs/dev/slots-stale-postfix-window-2026-11-26-to-27.md (reuses scripts/lib/proxy_logs.py + scripts/lib/capacity_signals.py, so the hourly totals reconcile with the tool: 16,296 polls / 6 stale)",
+    "raw_segment_archive": "python3 scripts/proxy_usage_window_archive.py archive --log-dir /var/log/llama-proxy --dest ~/proxy-usage-reports/slots-stale-postfix-24h-2026-11-26-to-27/raw --start '2026-11-26 10:18:00' --end '2026-11-27 10:18:00'"
+  },
+  "artifacts": {
+    "dir": "~/proxy-usage-reports/slots-stale-postfix-24h-2026-11-26-to-27",
+    "measurement_json": "measurement.json",
+    "measurement_txt": "measurement.txt",
+    "tightened_age_reading": "age_distribution.json",
+    "per_hour": "per_hour.json",
+    "raw_segments": "raw/ (8 files, 92,800,421 bytes, gzip+cmp verified)",
+    "raw_segment_checksums": "raw/SHA256SUMS",
+    "raw_segment_sha256": {
+      "llama-server.log-2026-11-26.gz": "2e2cfe1d18ba59102e3bdca66a854f8c9faeddfa636e5d3207b3c0de068f0da8",
+      "llama-server.log-2026-11-27.gz": "4fe332f0a4137cc0831db64091257ac274dd9c5a083e411f94250a045ff945d1",
+      "proxy.log-2026-11-27_00.gz": "0c556b4a6b298fba7bd614d43a676abad8a447da06de11a81f0de503d39c87bf",
+      "proxy.log.2026-11-26_10.gz": "918ee7f4b24fffaefe695ab64245d044fe50ddf4aa83722e4ebfdce9ac2ad52b",
+      "proxy.log.2026-11-26_16.gz": "838f0bec2ea9de7048310c29753bfef1369624c44895bcf0848fd290d19815e9",
+      "proxy.log.2026-11-26_22": "59519be5a4959ca89098564d4f1c07c728dd094e0f0e246e84975bfc81de1a6e",
+      "proxy.log.2026-11-27_04": "1b17b88f13a3c00f3e6f829f5b5e73f7e5aae2a0b6a52fa2d2eeb11b772ebd8d",
+      "proxy.log.2026-11-27_10": "dd737404e6cc86a0150c7962cadaa492b28f6b00d5cb67d5807c80fcdebde293"
+    }
+  },
+  "before_reading": {
+    "window_local": "2026-11-18 10:25:00 .. 2026-11-19 10:25:00",
+    "record": "docs/dev/slots-stale-postfix-window-2026-11-18-to-19.json",
+    "status_polls": 12450,
+    "slots_stale": {
+      "count": 608,
+      "rate": 0.0488
+    },
+    "stale_composition": {
+      "over_age": 51,
+      "undatable": 557
+    },
+    "undatable_share": {
+      "count": 557,
+      "of_polls": 12450,
+      "rate": 0.0447
+    },
+    "loaded_build": "d8ce36dc9"
+  },
+  "after_reading": {
+    "status_polls": 16296,
+    "slots_stale": {
+      "count": 6,
+      "rate": 0.0004
+    },
+    "stale_composition": {
+      "over_age": 0,
+      "undatable": 6
+    },
+    "undatable_share": {
+      "count": 6,
+      "of_polls": 16296,
+      "rate": 0.000368
+    },
+    "stale_by_source": {
+      "detail_cache": 0,
+      "counts_cache": 6,
+      "unknown": 0
+    },
+    "stale_by_poll_latency_band": {
+      "lt_1s": 0,
+      "1s_to_2s": 6,
+      "2s_to_5s": 0,
+      "gte_5s": 0,
+      "unknown": 0
+    },
+    "unattributed_stale_polls": 0,
+    "derivation": {
+      "derived_from_snapshot_age": 16296,
+      "from_published_flag": 0,
+      "disagreements_with_published_flag": 0
+    },
+    "stale_polls": [
+      {
+        "ts_utc": "2026-11-26T10:18:02Z",
+        "snapshot_source": "none",
+        "slots_snapshot_age_seconds": null,
+        "slots_stale_reason": "query_timeout",
+        "status_query_ms": 4,
+        "slots_counts_ms": 1050,
+        "slots_detail_ms": 0,
+        "total_slots": 0,
+        "available_slots": 0,
+        "latency_ms": 1056,
+        "capacity_hint": "idle",
+        "slots_upstream_calls": 0,
+        "explanation": "first poll of the window, 14 s after the anchoring restart: the shared /slots fetch was still cold, so no snapshot existed to date"
+      },
+      {
+        "ts_utc": "2026-11-26T10:46:49Z",
+        "snapshot_source": "none",
+        "slots_snapshot_age_seconds": null,
+        "slots_stale_reason": null,
+        "status_query_ms": 1144,
+        "slots_counts_ms": null,
+        "slots_detail_ms": null,
+        "total_slots": 0,
+        "available_slots": 0,
+        "latency_ms": 1147,
+        "capacity_hint": "idle",
+        "slots_upstream_calls": 0,
+        "explanation": "no snapshot materialised: the status request waited ~1.14 s on the coalesced refresh and returned without a snapshot (counts/detail phases never attempted)"
+      },
+      {
+        "ts_utc": "2026-11-26T14:05:21Z",
+        "snapshot_source": "none",
+        "slots_snapshot_age_seconds": null,
+        "slots_stale_reason": null,
+        "status_query_ms": 1038,
+        "slots_counts_ms": null,
+        "slots_detail_ms": null,
+        "total_slots": 0,
+        "available_slots": 0,
+        "latency_ms": 1165,
+        "capacity_hint": "idle",
+        "slots_upstream_calls": 0,
+        "explanation": "no snapshot materialised: ~1.04 s refresh wait, no snapshot returned"
+      },
+      {
+        "ts_utc": "2026-11-26T15:29:27Z",
+        "snapshot_source": "none",
+        "slots_snapshot_age_seconds": null,
+        "slots_stale_reason": null,
+        "status_query_ms": 1010,
+        "slots_counts_ms": null,
+        "slots_detail_ms": null,
+        "total_slots": 0,
+        "available_slots": 0,
+        "latency_ms": 1013,
+        "capacity_hint": "idle",
+        "slots_upstream_calls": 0,
+        "explanation": "no snapshot materialised: ~1.01 s refresh wait, no snapshot returned"
+      },
+      {
+        "ts_utc": "2026-11-26T21:18:32Z",
+        "snapshot_source": "none",
+        "slots_snapshot_age_seconds": null,
+        "slots_stale_reason": null,
+        "status_query_ms": 1091,
+        "slots_counts_ms": null,
+        "slots_detail_ms": null,
+        "total_slots": 0,
+        "available_slots": 0,
+        "latency_ms": 1095,
+        "capacity_hint": "idle",
+        "slots_upstream_calls": 0,
+        "explanation": "no snapshot materialised: ~1.09 s refresh wait, no snapshot returned"
+      },
+      {
+        "ts_utc": "2026-11-26T21:23:42Z",
+        "snapshot_source": "none",
+        "slots_snapshot_age_seconds": null,
+        "slots_stale_reason": null,
+        "status_query_ms": 1008,
+        "slots_counts_ms": null,
+        "slots_detail_ms": null,
+        "total_slots": 0,
+        "available_slots": 0,
+        "latency_ms": 1010,
+        "capacity_hint": "idle",
+        "slots_upstream_calls": 0,
+        "explanation": "no snapshot materialised: ~1.01 s refresh wait, no snapshot returned"
+      }
+    ],
+    "target": 0.005,
+    "verdict": "MET \u2014 0.0368 % undatable, 0.0368 % slots_stale, both far below the 0.5 % target"
+  },
+  "agreement_check_f4": {
+    "capacity_signal_verification_slots_stale": 6,
+    "over_age_plus_undatable": 6,
+    "agrees": true,
+    "slots_snapshot_age_distribution_contract_stale": 6,
+    "slots_snapshot_age_distribution_undatable": 6
+  },
+  "tightened_reading": {
+    "tool": "scripts/slots_snapshot_age_distribution.py",
+    "generated_at": "2026-11-28T12:55:44",
+    "polls": {
+      "status_polls": 16296,
+      "polls_with_age_field": 16296,
+      "datable": 16290,
+      "undatable": 6,
+      "no_age_field": 0
+    },
+    "ceiling_seconds": 300.0,
+    "age_seconds": {
+      "count": 16290,
+      "min": 2.024928107857704e-05,
+      "p50": 0.7439425461925566,
+      "p90": 38.511369343847036,
+      "p99": 144.89091538684443,
+      "max": 295.4449747498147
+    },
+    "contract_stale": {
+      "count": 6,
+      "rate_of_status_polls": 0.0004
+    },
+    "thresholds": [
+      {
+        "threshold_seconds": 2.0,
+        "over": 5618,
+        "rate_of_datable": 0.3449,
+        "rate_of_status_polls": 0.3447,
+        "by_capacity_hint": {
+          "prefill_bound": 4610,
+          "saturated": 702,
+          "unknown": 306
+        }
+      },
+      {
+        "threshold_seconds": 5.0,
+        "over": 5168,
+        "rate_of_datable": 0.3172,
+        "rate_of_status_polls": 0.3171,
+        "by_capacity_hint": {
+          "prefill_bound": 4250,
+          "saturated": 624,
+          "unknown": 294
+        }
+      },
+      {
+        "threshold_seconds": 300.0,
+        "over": 0,
+        "rate_of_datable": 0.0,
+        "rate_of_status_polls": 0.0,
+        "by_capacity_hint": {}
+      }
+    ]
+  },
+  "per_hour": {
+    "window": {
+      "since": "2026-11-26T10:18:00Z",
+      "until": "2026-11-27T10:18:00Z"
+    },
+    "hours": [
+      {
+        "hour_utc": "2026-11-26T10:00Z",
+        "polls": 621,
+        "slots_stale": 2,
+        "rate": 0.003221
+      },
+      {
+        "hour_utc": "2026-11-26T11:00Z",
+        "polls": 660,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T12:00Z",
+        "polls": 577,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T13:00Z",
+        "polls": 704,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T14:00Z",
+        "polls": 538,
+        "slots_stale": 1,
+        "rate": 0.001859
+      },
+      {
+        "hour_utc": "2026-11-26T15:00Z",
+        "polls": 321,
+        "slots_stale": 1,
+        "rate": 0.003115
+      },
+      {
+        "hour_utc": "2026-11-26T16:00Z",
+        "polls": 818,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T17:00Z",
+        "polls": 721,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T18:00Z",
+        "polls": 1306,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T19:00Z",
+        "polls": 1272,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T20:00Z",
+        "polls": 1336,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T21:00Z",
+        "polls": 928,
+        "slots_stale": 2,
+        "rate": 0.002155
+      },
+      {
+        "hour_utc": "2026-11-26T22:00Z",
+        "polls": 1009,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-26T23:00Z",
+        "polls": 1275,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T00:00Z",
+        "polls": 352,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T01:00Z",
+        "polls": 527,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T02:00Z",
+        "polls": 254,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T03:00Z",
+        "polls": 491,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T04:00Z",
+        "polls": 684,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T05:00Z",
+        "polls": 511,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T06:00Z",
+        "polls": 203,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T07:00Z",
+        "polls": 307,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T08:00Z",
+        "polls": 501,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T09:00Z",
+        "polls": 327,
+        "slots_stale": 0,
+        "rate": 0.0
+      },
+      {
+        "hour_utc": "2026-11-27T10:00Z",
+        "polls": 53,
+        "slots_stale": 0,
+        "rate": 0.0
+      }
+    ],
+    "totals": {
+      "polls": 16296,
+      "slots_stale": 6
+    }
+  },
+  "capacity_signals": {
+    "capacity_hint": {
+      "histogram": {
+        "abandoned_busy": 352,
+        "idle": 6918,
+        "prefill_bound": 4706,
+        "saturated": 4010,
+        "unknown": 310
+      },
+      "rates": {
+        "abandoned_busy": 0.0216,
+        "idle": 0.4245,
+        "prefill_bound": 0.2888,
+        "saturated": 0.2461,
+        "unknown": 0.019
+      }
+    },
+    "saturated_without_available_slots": {
+      "count": 1928,
+      "rate_of_polls": 0.1183
+    },
+    "saturated_without_live_work": {
+      "count": 4,
+      "rate_of_polls": 0.0002,
+      "all_attributed": true,
+      "by_cause": {
+        "measured_cache_deficit": 1,
+        "session_evicted": 3
+      },
+      "timestamps": [
+        "2026-11-26 22:39:56",
+        "2026-11-26 23:02:35",
+        "2026-11-26 16:39:41",
+        "2026-11-26 20:42:18"
+      ]
+    },
+    "stale_saturated_without_live_work": {
+      "judgeable_polls": 16296,
+      "over_age_polls": 0,
+      "undatable_polls": 6,
+      "violations": 0,
+      "violations_over_age": 0,
+      "violations_undatable": 0,
+      "violation_timestamps": [],
+      "rows": []
+    },
+    "per_phase_read_path": {
+      "instrumented": true,
+      "polls_with_fields": 16296,
+      "phases": {
+        "status_query_ms": {
+          "stale": {
+            "count": 6,
+            "not_attempted": 0,
+            "p50": 1010,
+            "p90": 1144,
+            "p99": 1144
+          },
+          "fresh": {
+            "count": 16290,
+            "not_attempted": 0,
+            "p50": 5,
+            "p90": 7,
+            "p99": 51
+          }
+        },
+        "slots_counts_ms": {
+          "stale": {
+            "count": 1,
+            "not_attempted": 5,
+            "p50": 1050,
+            "p90": 1050,
+            "p99": 1050
+          },
+          "fresh": {
+            "count": 16290,
+            "not_attempted": 0,
+            "p50": 0,
+            "p90": 1050,
+            "p99": 1127
+          }
+        },
+        "slots_detail_ms": {
+          "stale": {
+            "count": 1,
+            "not_attempted": 5,
+            "p50": 0,
+            "p90": 0,
+            "p99": 0
+          },
+          "fresh": {
+            "count": 16290,
+            "not_attempted": 0,
+            "p50": 0,
+            "p90": 0,
+            "p99": 0
+          }
+        }
+      },
+      "upstream_calls": {
+        "stale": {
+          "0": 6
+        },
+        "fresh": {
+          "0": 14791,
+          "1": 1499
+        }
+      },
+      "snapshot_source": {
+        "stale": {
+          "none": 6
+        },
+        "fresh": {
+          "snapshot": 5734,
+          "ttl_cache": 9435,
+          "upstream": 1121
+        }
+      }
+    },
+    "abandoned_local_dispatches": {
+      "count": 421,
+      "by_reason": {
+        "client_disconnect": 3,
+        "measured_cache_deficit": 3,
+        "prefill_deadline": 2,
+        "session_evicted": 413
+      }
+    },
+    "local_dispatches": {
+      "count": 2492,
+      "by_cache_state": {
+        "cold": 580,
+        "unknown": 328,
+        "warm": 1584
+      },
+      "distinct_sessions": 257,
+      "herdr_session_dispatches": 111
+    },
+    "prefill_thrash_cooldown": {
+      "count": 0,
+      "distinct_sessions": 0,
+      "skips_with_free_gpu": 0,
+      "skips_without_live_local_work": 0,
+      "releases": {
+        "count": 0,
+        "by_reason": {}
+      }
+    },
+    "herdr_downtime_dispatches": {
+      "available": true,
+      "covered": false,
+      "count": 0,
+      "note": "dispatch log does not cover the requested window (retained span 2026-11-16 18:24:55.395000 .. 2026-11-18 13:23:42.958000); a count of 0 means 'not retained', not 'no dispatches'"
+    }
+  },
+  "tool_verdict": {
+    "verdict": "TARGETS MISSED",
+    "checks": [
+      {
+        "target": "coverage: requested window fully represented by logs",
+        "observed": 0,
+        "pass": true
+      },
+      {
+        "target": "slots_stale rate < 5.0% of status polls",
+        "observed": 0.0004,
+        "pass": true
+      },
+      {
+        "target": "capacity_hint=saturated only with live local work",
+        "observed": 4,
+        "pass": false
+      },
+      {
+        "target": "no poll served from a stale snapshot reports saturated without live local work",
+        "observed": 0,
+        "pass": true
+      }
+    ],
+    "notes": [
+      "abandonment reasons are widened with measured_cache_deficit: the historical counts (247 polls / 2.12 % pre-fix AC1 baseline, 12 polls / 0.11 % post-fix AC4 residual) were computed with the narrower four-reason set, so before/after comparisons are read knowingly",
+      "herdr downtime dispatch count not verifiable for this window: dispatch log does not cover the requested window (retained span 2026-11-16 18:24:55.395000 .. 2026-11-18 13:23:42.958000); a count of 0 means 'not retained', not 'no dispatches'",
+      "4 of 4 violating polls attributed within 600s (by cause: measured_cache_deficit=1, session_evicted=3; live-work corroboration window 10s)"
+    ]
+  },
+  "ac_outcomes": {
+    "AC1": "met \u2014 anchor registered before the window closed (docs/dev/measurement-windows.md \u00a7 2/\u00a7 3.1, commit 91ad69d63, 2026-11-26T17:09:23Z < 2026-11-27T10:18:00Z); pid, restart attribution, first whole minute and loaded build all recorded",
+    "AC2_AC4": "met \u2014 undatable share fell 4.47 % (557/12,450) \u2192 0.0368 % (6/16,296), slots_stale 4.88 % \u2192 0.0368 %, on a 24.0 h restart-free window with 0 in-window restart markers",
+    "AC4_agreement": "met \u2014 slots_stale 6 == over-age 0 + undatable 6, and both tools independently report 6",
+    "AC5": "met \u2014 dataset + report committed under docs/dev/ with window bounds, poll count, per-hour breakdown and both threshold figures",
+    "AC6": "met \u2014 both figures recorded on LP-0MWRXFO0I005UBVM with links to the committed artefacts",
+    "AC7": "met \u2014 0 over-age polls; the 6 residual stale polls are all explained (source=none, no snapshot materialised within the ~1.0-1.1 s refresh wait), none is a provenance gap"
+  }
+}

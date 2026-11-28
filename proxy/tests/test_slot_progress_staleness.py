@@ -346,13 +346,14 @@ class TestStatusEndpointStaleLog:
 
     @pytest.mark.asyncio
     async def test_status_never_reports_n_decoded_above_live_after_stale_log(self):
-        """AC5: with a stale log and ``slots_stale=true`` the served value is live.
+        """AC5: with a stale log, a cache-served poll still reports the live value.
 
         Simulates one broadcast cycle with a *frozen* log: the fresh ``/slots``
         query reports ``n_decoded=794`` and the stale log claims ``35199``.  A
         later status request whose fresh detail query fails then serves the
-        fallback cache with ``slots_stale=true`` — and must report 794, never
-        35199.
+        fallback cache (``slots_detail_stale=true``; the snapshot is seconds
+        old, so the age-derived ``slots_stale`` is false) — and must report
+        794, never 35199.
         """
         from proxy.observability import (
             _enrich_slot_details_with_progress,
@@ -426,7 +427,7 @@ class TestStatusEndpointStaleLog:
                                                     )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["slots_stale"] is True
+        assert body["slots_detail_stale"] is True  # served from the fallback cache
         reported = body["slots"][0]["n_decoded"]
         assert reported == live_n_decoded
         assert reported <= live_n_decoded

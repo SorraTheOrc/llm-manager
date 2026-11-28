@@ -267,6 +267,29 @@ Outputs written to:
       matched pairs are scored; a dispatch whose guard logged no priced ETA
       (inert/uncalibrated, or an inactive observe-mode decision) is counted as
       unmatched and never folded in.
+    - **measured-basis coverage** — `basis_split`
+      (LP-0MWRQ6LSV009DVP4 AC3): the measured-vs-predicted split of
+      ETA-priced admissions, sourced from each `local_admission_guard` line's
+      additive `eta_pricing_basis=` field. Entries: `measured`, `predicted`,
+      `unknown` (lines that predate the field — never relabelled `predicted`),
+      `total`, and `measured_share_pct` = `measured / (measured + predicted)`
+      (`null` when neither basis was observed, so an empty window renders
+      `n/a`, not `0`). Only **admitted** guard records with a positive
+      `eta_prefill_s` are counted (enforced refusals never dispatched). The
+      pre-change 2026-11-21 baseline was `2.3 %` measured (103 of 4 457
+      residency decisions, ladder-gated).
+    - **absolute error p50/p90** — `accuracy`: `samples` (matched pairs),
+      `p50_pct` (the same figure as `prefill_eta_accuracy`) and `p90_pct`
+      (LP-0MWRQ6LSV009DVP4 AC4), both the **absolute** relative error
+      `|predicted − observed| / observed × 100`. The 2026-11-21 pre-change
+      baseline p50 was `863.4 %` (predicted p50 34.95 s vs observed p50
+      3.44 s).
+  - `prefill_eta_accuracy` — the guard's priced prefill ETA vs the dispatch's
+    observed first byte over matched pairs, **median absolute relative error**
+    (see `performance_metric_inputs`). Its `local_admission_guard` line now
+    carries `eta_pricing_basis=measured|predicted` and `eta_pricing_ratio=`, so
+    the report can state the basis the ETA was priced on and the basis split
+    above can be derived. Both fields are absent on pre-change lines.
   - `status_capacity_hint` — the same `capacity_hint` distribution as a
     top-level key (`{idle: n, prefill_bound: n, saturated: n}`), so
     `jq .status_capacity_hint` answers "what did the payload claim while the
@@ -734,7 +757,9 @@ exists.)
   relative band is the only unit-free reading of "within 10 % of the target".
   A metric may override it with `tolerance_pct` in the committed defaults
   file; an absent, non-numeric or negative value falls back to the 10 %
-  default (see [Verdict rule](#verdict-rule-tolerance-band)).
+  default. An explicit `0` is a deliberate zero-width, one-sided band that is
+  rendered `±0 %` and preserved (see
+  [Verdict rule](#verdict-rule-tolerance-band)).
 - **Actual** — this window's measurement. `n/a` (never `0`) when the window
   cannot be measured: no GPU sample, no llama-server eval lines, no matched
   ETA pairs, and so on. A genuine measured zero renders as `0.0 <unit>`.
@@ -785,6 +810,14 @@ not reported as a regression. The band is relative and direction-aware
   back to 10 and never fails the run. A value other than 10 carries a one-line
   rationale comment beside it, because widening or tightening a metric's band
   weakens or strengthens its verdict.
+- **An explicit `tolerance_pct: 0` is a strict, one-sided band.** It is not
+  read as an absent value (a falsy `0` must not restore the 10 % default): the
+  band collapses onto the target, so a lower-is-better metric is `Met` only
+  when `actual <= target` and a higher-is-better metric only when
+  `actual >= target`. The row renders `±0 %` so the choice is visible. The
+  committed defaults use it for `fallback_rate` (LP-0MWJOUY4E002FNHP,
+  approved option (a)): an over-target window is `Unmet` even when it would
+  have sat inside the former ±10 % band.
 - **A zero target has a zero-width band.** 10 % of zero is zero, so a
   lower-is-better metric whose target is 0 is `Met` only at an actual of 0.
   This is stated rather than replaced by an invented absolute epsilon.
@@ -805,10 +838,10 @@ key, the `--json` key and the detail-subsection prefix.
 | `prompt_eval_speed` | Prompt eval speed | tok/s | higher is better | llama-server prompt eval timing |
 | `time_to_first_token` | Time to first token | ms | lower is better | `dispatch_first_byte_ms` and `ttft_seconds` log lines |
 | `stream_error_rate` | Stream error rate | % | lower is better | `Stream error` and `Stream finished reason=error` lines |
-| `context_pressure` | Context-size pressure | % | lower is better | `routing_skip_local estimated_tokens` lines |
+| `context_pressure` | Context-size pressure | % | lower is better | Per-session peak context (`max_context_size`) versus the effective per-slot context (`local_model_ctx_size` / active slots) |
 | `prompt_cache_hit_ratio` | Prompt cache hit ratio | ratio | higher is better | `cached_ratio` and `cache_state` log fields |
 | `contention_denials_per_hour` | Contention denials per hour | denials/h | lower is better | `local_dispatch_denied` log events |
-| `prefill_eta_accuracy` | Prefill ETA accuracy | % | higher is better | `local_admission_guard` prefill ETA and dispatch first-byte pairs |
+| `prefill_eta_accuracy` | Prefill ETA error | % | lower is better | median absolute relative error between the admission guard's priced prefill ETA and the dispatch's observed first byte (local_admission_guard and dispatch first-byte pairs) |
 
 How each value is calculated (`aggregation.performance_metric_inputs` is the
 single roll-up that produces exactly these keys):
@@ -831,6 +864,10 @@ single roll-up that produces exactly these keys):
 - **`fallback_rate`** — share of the window's requests that produced
   `Fallback triggered` events, as a percentage; the dominant fallback reason
   is rendered in the **Fallback reasons** section rather than in the table.
+  The verdict is **strict**: the committed defaults give it
+  `tolerance_pct: 0` (LP-0MWJOUY4E002FNHP), so an over-target window reads
+  `Unmet` with no +tolerance band above the target — see [Verdict
+  rule](#verdict-rule-tolerance-band).
 - **`decode_speed`** — median decode throughput (tok/s) from `Stream finished`
   token counts for local streams in the window (the same figure the **Decode
   speed** section renders).
@@ -843,11 +880,12 @@ single roll-up that produces exactly these keys):
 - **`stream_error_rate`** — share of streams ending in error, from `Stream
   error` and `Stream finished reason=error` lines divided by all streams (the
   **Error analysis** section).
-- **`context_pressure`** — share of local requests whose estimated prompt size
-  is at or above the per-slot context threshold, from
-  `routing_skip_local estimated_tokens` lines against the configured slot
-  geometry (the **Context sizes approaching per-slot limits**
-  recommendation).
+- **`context_pressure`** — share of sessions whose peak context
+  (`max_context_size`) is at or above 80 % of their effective per-slot context
+  (`local_model_ctx_size` / active slots), the same measure the **Context
+  sizes approaching per-slot limits** recommendation applies. Sessions whose
+  per-slot limit cannot be resolved are excluded, and a window with no
+  measurable session renders `n/a`, never `0`.
 - **`prompt_cache_hit_ratio`** — median `cached_ratio` across local dispatches
   (a 0–1 ratio, rendered to three decimals); the warm/cold share comes from
   the `cache_state` field. The underlying data section is **Time to first
@@ -858,12 +896,18 @@ single roll-up that produces exactly these keys):
 - **`prefill_eta_accuracy`** — median **absolute relative error** between the
   admission guard's priced ETA and the observed first byte over matched pairs
   (`median(|predicted − observed| / observed × 100)`, the
-  **Local contention prediction vs reality** section's M2 figure), recorded as
-  an accuracy percentage: **`100 − error`**, clamped at 0 because an error
-  above 100 % is no accuracy at all. The registry direction is
-  higher-is-better, so recording the raw error would make the best-3
-  retention keep the *worst* windows. `n/a` when no dispatch pairs with a
-  guard record.
+  **Local contention prediction vs reality** section's M2 figure), reported
+  as-is (LP-0MWJOUZG9008Q4RG): the registry direction is lower-is-better, so a
+  smaller error is a better prediction and the best-3 retention keeps the
+  *best* (smallest-error) windows. Errors above 100 % are reported above 100 %
+  — never clamped to an accuracy percentage. `n/a` when no dispatch pairs
+  with a guard record. **Part of the over-prediction is unobservable
+  prompt-cache warmth, not calibration error** (LP-0MWRQ6ZID000HZAZ): the ETA
+  prices per-session KV residency while llama-server's cross-session prompt
+  cache can still serve a dispatch logged as cold, so a large error is not the
+  calibration to retune (see the prompt-cache blind spot in
+  [Limitations](#limitations); the separate measured-prefix defect is
+  LP-0MWRQ6LSV009DVP4).
 
 ### Committed defaults: `metrics/performance_metrics.yaml`
 
@@ -888,7 +932,9 @@ Every field except `measurements` is optional: a field a custom defaults file
 omits is reported as `not documented in the committed metrics defaults.`
 rather than invented. `tolerance_pct` is the metric's verdict band (default
 10, see [Verdict rule](#verdict-rule-tolerance-band)); it is a number, not
-prose. `data_section_anchor` is the `##` heading of the data
+prose. An explicit `0` is kept as a deliberate strict zero band, and the
+committed defaults declare it for `fallback_rate`. `data_section_anchor` is
+the `##` heading of the data
 section reporting the metric's figures; the renderer links to it instead of
 restating its tables. Loading either file never writes it, and
 `config_loader`'s guarded-import YAML pattern keeps PyYAML optional — no new
@@ -909,12 +955,17 @@ metrics:
       fingerprint: slots=2,ctx=131072   # configuration era ('' when unknown)
       value: 9.12                 # measured value, in the registry unit
       window: '2026-11-03'        # window id; one measurement per window
-  context_pressure:
+  decode_speed:
     measurements:
     - date: '2026-11-03'
       fingerprint: slots=2,ctx=131072
-      value: 0.0
+      value: 32.1
       window: '2026-11-03'
+notes:
+  gpu_busy:
+  - at: '2026-11-15'                    # reset date (YYYY-MM-DD)
+    event: definition_change            # the only event kind today
+    note: "why the metric was redefined and its history reset"
 ```
 
 - Every registered metric appears, with its `measurements` list (empty until
@@ -926,6 +977,49 @@ metrics:
   override it **per metric**, so the live file always wins where it has
   something to say; a missing file simply leaves that metric empty.
 - A metric with no measurable actual is not recorded at all — never as `0`.
+- The optional `notes` block records deliberate discontinuities per metric
+  id (`at`, `event`, `note`); it is preserved verbatim across the nightly
+  load → merge → save cycle, so a recorded reset is never lost or duplicated.
+
+### Definition-change history resets
+
+A baseline and a target are only meaningful over **one** metric definition, so
+when a metric's semantics change its recorded history is reset rather than
+continued: the measurements of the two definitions are never compared, and the
+scorecard reads **Insufficient history** until three post-change windows are
+recorded (a reset therefore never fabricates a target). The reset is a
+documented discontinuity, not data loss — `performance_metrics.reset_metric_history()`
+clears the metric's `measurements` and appends a `definition_change` event in
+the state file's `notes` block:
+
+```python
+import sys
+sys.path.insert(0, ".pi/skills/proxy-usage-analysis/scripts")
+import performance_metrics as pm
+
+state_path = "/home/user/proxy-usage-reports/performance_metrics_state.yaml"
+state = pm.load_state(state_path)
+pm.reset_metric_history(
+    state,
+    "prefill_eta_accuracy",
+    note="why the definition changed and what the new semantics are",
+    reset_at="2026-11-17",
+)
+pm.save_state(state, state_path)   # the only writer of the state file
+```
+
+Only the named metric is touched: every other metric keeps its measurements
+and its existing notes. Recorded resets in this deployment:
+
+| Metric | Reset | New definition |
+|---|---|---|
+| `gpu_busy` | 2026-11-15 | attributable `gpu:computing_workload:bool` share (power ≥ 90 W **and** a busy local slot), no longer the power-only `gpu:computing:bool` share (LP-0MWG7KQVZ008DBZM) |
+| `context_pressure` | 2026-11-17 | share of sessions whose peak context is at or above **80 % of the effective per-slot context** (the retired measure sampled served per-request prompts against 100 %, which read a structural `0.0 %`; LP-0MWJOV2S7001CVS5) |
+| `prefill_eta_accuracy` | 2026-11-17 | the **raw median absolute relative error** (`median(|predicted − observed| / observed × 100)`), registered lower-is-better (the retired `100 − error` accuracy conversion clamped the row to ~0–8 %; LP-0MWJOUZG9008Q4RG, LP-0MWJOV2S7001CVS5) |
+
+`fallback_rate` history is **retained**: only its verdict band changed
+(strict, `tolerance_pct: 0`), so its measurements still mean the same thing
+and remain comparable across the change (LP-0MWJOUY4E002FNHP).
 
 ### Backfilling the history (`--seed-metrics-history`)
 
@@ -2114,6 +2208,26 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   and applies the 25 % tolerance. A window with no guard records (inert guard,
   or pre-change logs) reports the matched figure as `inconclusive` with
   `unmatched_dispatches` counted — never as a fabricated match.
+- **The ETA prices per-session KV residency, not llama-server's cross-session
+  prompt cache (LP-0MWRQ6ZID000HZAZ, parent; blind spot named with
+  LP-0MVGDUV5E005UWBQ).** `cached_ratio` is a per-(model, session) ratio — the
+  share of the prompt served from the slot's own KV — while llama-server's
+  `--cache-ram` prompt cache (shipped cap `40960` MiB) is
+  shared *across* sessions. A dispatch logged with `cached_ratio=0.0` can
+  therefore still be **warm** and fast to first byte, and the cache is unpriced
+  input: warmth is unobservable at admission (there is no synchronous `/slots`
+  probe on the hot path — `/slots` was measured held >15 s during a prompt
+  batch, LP-0MUXTW4MD003TVIC — so `proxy/proxy/residency.py` prices a *cached*
+  snapshot and the guard uses a prediction) and only knowable post hoc
+  (`update_cached_ratio` writes turn N's usage, `record_measured_divergence`
+  corrects turn N+1). So a large `prefill_eta_accuracy` — 863 % median in the
+  2026-11-21 window — is partly over-conservative pricing of warmth the ETA
+  could not see, **not** only calibration error; retuning the conservatism
+  factor or the percentile knobs cannot recover it. **Distinct from
+  LP-0MWRQ6LSV009DVP4**, which is a *measured* resident prefix (`n_past_actual`)
+  available in the admission path but not yet wired into the ETA — a fixable
+  defect. The two causes must not be conflated when attributing an
+  over-prediction.
 
 - **Engine eval timings are summed, never placed in time
   (LP-0MVNWULLI006ZYXX).** llama-server writes no per-line timestamps

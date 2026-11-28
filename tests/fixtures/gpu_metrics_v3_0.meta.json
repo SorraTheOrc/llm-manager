@@ -1,0 +1,19 @@
+{
+  "captured_at": "2026-11-18T18:52:30Z",
+  "source_path": "/sys/class/drm/card0/device/gpu_metrics",
+  "host_kernel": "7.0.0-38-generic",
+  "host": "gfx1151 (Strix Halo APU), amdgpu card0",
+  "structure_size_bytes": 264,
+  "sha256": "f584c65b73c34ad4337d418f1f4879322c2b7c97985a60d9bbd14724c7444357",
+  "header": {
+    "structure_size": 264,
+    "format_revision": 3,
+    "content_revision": 0
+  },
+  "hwmon": {
+    "path": "/sys/class/drm/card0/device/hwmon/hwmon5/power1_average",
+    "power1_average_uw": 42011000,
+    "paired_read_span_ms": 0.721
+  },
+  "tail_padding_hex": "ffffffff"
+}

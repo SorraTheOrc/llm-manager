@@ -339,11 +339,15 @@ async def _dispatch_cleanup_loop() -> None:
 
     1. ``_cleanup_stale_local_dispatch`` — evicts inactive lease records
        whose *expires_at* has passed.
-    2. ``_recover_stuck_local_active_queries`` — resets a stuck
+    2. ``_reclaim_orphaned_prefill_markers`` — drops every
+       ``local_prefill_in_flight`` marker with no backing dispatch record
+       (LP-0MWL5KM8X00193B3), so an orphan left by an older build or a future
+       leak cannot deny local dispatch forever.
+    3. ``_recover_stuck_local_active_queries`` — resets a stuck
        ``local_active_queries`` counter when no active dispatch records exist.
-    3. ``_recover_stuck_global_active_queries`` — resets the global
+    4. ``_recover_stuck_global_active_queries`` — resets the global
        ``active_queries`` counter when no local work remains.
-    4. ``_recover_stuck_generating_queries`` — reclaims stale
+    5. ``_recover_stuck_generating_queries`` — reclaims stale
        ``local_generating_queries`` / ``local_generating_sessions`` entries
        (session keys leaked by an aborted decrement in the streaming
        generator's finally block, LP-0MTYAWDCQ006RGYU).
@@ -358,6 +362,7 @@ async def _dispatch_cleanup_loop() -> None:
             import proxy.server as _srv
             from proxy.router_helpers import (
                 _cleanup_stale_local_dispatch,
+                _reclaim_orphaned_prefill_markers,
                 _recover_stuck_generating_queries,
                 _recover_stuck_global_active_queries,
                 _recover_stuck_local_active_queries,
@@ -368,6 +373,19 @@ async def _dispatch_cleanup_loop() -> None:
                     logger.info(
                         "dispatch_cleanup removed %s stale lease(s)",
                         removed,
+                    )
+                except Exception:
+                    pass
+            # LP-0MWKWGLRT003AUG4 AC6 (LP-0MWL5KM8X00193B3): a marker with no
+            # backing dispatch record is reclaimed by the next tick instead of
+            # needing a restart or a hand-issued lease release. The pass runs
+            # after the stale-record cleanup, holds no ``await`` and logs one
+            # line per reclaimed marker; a healthy tick logs nothing.
+            for reclaimed_session in _reclaim_orphaned_prefill_markers(_srv):
+                try:
+                    logger.info(
+                        "prefill_marker_reclaimed session=%s reason=orphaned",
+                        reclaimed_session,
                     )
                 except Exception:
                     pass

@@ -229,3 +229,92 @@ def test_report_omits_the_section_when_every_check_is_zero():
     report = reporting.build_report(_analyse([]), {})
 
     assert "## Prefill admission regression" not in report
+
+
+# ---------------------------------------------------------------------------
+# Prefill-ETA raw error metric (LP-0MWJOUV5P007R799)
+# ---------------------------------------------------------------------------
+#
+# Parent LP-0MWEOGIUK006B1DD Q3 answer (a): the producer approved reporting the
+# median absolute relative **error** of the matched prefill-ETA pairs directly
+# and registering ``prefill_eta_accuracy`` lower-is-better. The aggregation
+# helper already returns that error (p50 ≈ 1041 % on recent windows, because the
+# priced ETA is a cache-cold bound while the observed first byte is cache-warm);
+# the implementation child (LP-0MWJOUZG9008Q4RG) removed the
+# ``max(0, 100 − error)`` conversion, so a 1041 % error renders as 1041.0 % and
+# a ≈92 % error as ≈92 %.
+#
+# These tests use real matched pairs (the same ``local_admission_guard`` and
+# ``dispatch_first_byte_ms`` lines the rest of this module parses), so the
+# assertion is that the scorecard's actual **is** the aggregation's figure, not
+# a transformed stand-in.
+
+
+def _eta_guard_line(eta_prefill_s: float, session: str = USER_SESSION) -> str:
+    """An ``enforced=false`` guard record: the ETA it priced for the dispatch."""
+    return (
+        f"{TS} - INFO - local_admission_guard decision=admit reason=within_budget "
+        f"enforced=false eta_prefill_s={eta_prefill_s} eta_occupancy_s=0.0 "
+        f"projected_wait_s={eta_prefill_s} budget_s=60.0 deadline_s=120.0 "
+        "deadline_budget_s=114.0 new_tokens=25383 budget_tokens=25000 "
+        "busy_slots=2 in_flight_prefills=1 free_slot=false priority=medium "
+        f"policy=reject model=Qwen3 samples=0 provider=local-qwen3 session={session}"
+    )
+
+
+def _eta_dispatch_line(
+    dispatch_to_first_byte_ms: float,
+    session: str = USER_SESSION,
+    ts: str = "2026-10-25 10:00:41,123",
+) -> str:
+    """The local dispatch's first byte, joined to its guard record by session."""
+    return (
+        f"{ts} - INFO - dispatch_first_byte_ms={dispatch_to_first_byte_ms} "
+        f"dispatch_to_first_byte_ms={dispatch_to_first_byte_ms} "
+        "cache_state=cold cached_ratio=0.000 queue_wait_ms=0.0 "
+        f"session={session} model=Qwen3"
+    )
+
+
+def _eta_pair_summary(eta_prefill_s: float, first_byte_ms: float):
+    """A window holding exactly one matched predicted/observed ETA pair."""
+    return _analyse([_eta_guard_line(eta_prefill_s), _eta_dispatch_line(first_byte_ms)])
+
+
+def test_the_scorecard_actual_is_the_raw_median_error_from_the_aggregation():
+    """A 1041.5 % median error is reported as 1041.5 — not clamped to 0.0.
+
+    The priced 468 s cache-cold ETA against a 41 s observed first byte is the
+    shape of the recent windows whose row is frozen at ~0 %.
+    """
+    summary = _eta_pair_summary(468.0, 41_000.0)
+
+    assert aggregation.prefill_eta_accuracy(summary) == pytest.approx(1041.5)
+    assert reporting._performance_metric_actuals(summary, None, None)[
+        "prefill_eta_accuracy"
+    ] == pytest.approx(1041.5)
+
+
+def test_a_ninety_two_percent_error_is_not_reported_as_eight_percent_accuracy():
+    """The documented ≈8 % window: 92.3 % error must stay 92.3, not become
+    7.7 % "accuracy"."""
+    summary = _eta_pair_summary(10.0, 5_200.0)
+
+    assert aggregation.prefill_eta_accuracy(summary) == pytest.approx(92.3)
+    assert reporting._performance_metric_actuals(summary, None, None)[
+        "prefill_eta_accuracy"
+    ] == pytest.approx(92.3)
+
+
+def test_no_matched_pair_still_reports_not_available():
+    """A guard record whose session never produces a first byte is unmatched:
+    the metric is ``n/a`` (``None``), never a fabricated 0."""
+    summary = _analyse([_eta_guard_line(468.0, session="unmatched-session")])
+
+    assert aggregation.prefill_eta_accuracy(summary) is None
+    assert (
+        reporting._performance_metric_actuals(summary, None, None)[
+            "prefill_eta_accuracy"
+        ]
+        is None
+    )

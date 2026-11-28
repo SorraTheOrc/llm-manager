@@ -22,7 +22,13 @@ closure verdict needs:
   with the evidence columns the rules consumed (AC4), including whether another
   tenant held the pool, whether the backend reported *any* prefill progress in
   the dispatch window, and whether the dispatch started inside an
-  abandoned-prefill backlog window.
+  abandoned-prefill backlog window;
+- a **stall-weighted rate** (``Σ elapsed_s / window_hours``, split by reason and
+  by user/audit) beside the per-event rate, with stall percentiles and the
+  share of aborts that were sub-second (LP-0MW7V30AZ007JB5Z). A count of
+  events cannot price a defect: a 0.4 s ``measured_cache_deficit`` detour and a
+  180 s ``prefill_deadline`` stall are the same +1 to the (b2) event rate and
+  wildly different to the user.
 
 Profile of the evidence, and why it is proxy-log-only
 -----------------------------------------------------
@@ -63,10 +69,27 @@ the dispatch monitor; see ``proxy/proxy/admission_events.py``)::
         local_in_flight_requests=N local_owner_session_id=S ...
     Stream finished: reason=R tokens=A/B/C session=S provider=local ...
 
+    # LP-0MWM0CPQN009SHJR retry-outcome join (emission: proxy/retry_outcome.py):
+    #
+    local_dispatch_outcome session=S prompt_fp=F outcome=O endpoint=E [turn=T]
+    dispatch_first_byte_ms=... session=S ... [turn=T]     # local first byte
+    ttft_seconds=F session=S provider=O model=M [turn=T]   # remote first byte
+
+    The eviction line additionally carries ``prompt_fp=F`` and ``turn=T``
+    (appended after the release-context fields), the correlation key the join
+    matches on.
+
 Usage::
 
     python3 proxy/scripts/analyse_prefill_deadline_residual.py \\
         --start "2026-10-29 14:08:10" --end "2026-10-30 14:08:10" --json
+
+    # stall-weighted cost: 180 s is the shipped backstop (AC2's ``>= deadline
+    # - 1 s`` bucket); pass --deadline-seconds if the deployed
+    # local_prefill_deadline_seconds differs (the analyser is log-only and
+    # never reads proxy config)
+    python3 proxy/scripts/analyse_prefill_deadline_residual.py \\
+        --start ... --end ... --deadline-seconds 180 --json
 
     # release→cancel accounting + corrected window model: point at the
     # llama-server log(s) covering exactly the same window (comma-separated
@@ -105,6 +128,144 @@ DEFAULT_LOG_GLOB = "proxy.log*"
 REASON_PREFILL_DEADLINE = "prefill_deadline"
 REASON_MEASURED_CACHE_DEFICIT = "measured_cache_deficit"
 
+#: The distinct prefill-watchdog release reasons introduced by
+#: LP-0MWKQJHSM000CI6W. Before that change the post-acceptance eviction line
+#: carried only the umbrella ``no_progress_watchdog`` label even when the sweep
+#: had computed one of these, so the per-reason split could be met by
+#: relabelling. They are ordinary reasons to :func:`reason_split` (which groups
+#: by whatever value the line carries), and are named here so a consumer can
+#: tell an early abort from a genuine wedge without hard-coding strings.
+REASON_PREFILL_ETA_EXCEEDED = "prefill_eta_exceeded"
+REASON_PREFILL_STALLED = "prefill_stalled"
+REASON_PREFILL_MAX_EXCEEDED = "prefill_max_exceeded"
+
+#: The umbrella the watchdog falls back to when no distinct reason applies.
+REASON_NO_PROGRESS_WATCHDOG = "no_progress_watchdog"
+
+#: Every distinct watchdog release reason (used by the reconciliation test).
+WATCHDOG_RELEASE_REASONS: tuple[str, ...] = (
+    REASON_PREFILL_ETA_EXCEEDED,
+    REASON_PREFILL_STALLED,
+    REASON_PREFILL_MAX_EXCEEDED,
+    REASON_NO_PROGRESS_WATCHDOG,
+)
+
+#: The ``llama_task_id_reason`` that means the cached ``/slots`` snapshot named a
+#: task for the dispatch's slot and it was not the session's (LP-0MW959RRO008AAH9).
+#: This is the field the group-2 baseline counted (20 of 184 evictions), so the
+#: never-started share stays comparable across the split (LP-0MWM0CP4B001088M
+#: AC3).
+TASK_ID_REASON_NOT_STARTED = "task_id_not_started"
+
+#: The eviction fields the release-context classification reads. The last three
+#: were added by LP-0MWKQJHSM000CI6W and are simply absent on a pre-split line;
+#: every other key pre-dates both changes, so this surface adds no log field.
+RELEASE_CONTEXT_SOURCE_FIELDS = (
+    "reason",
+    "session",
+    "slot_id",
+    "llama_task_id_reason",
+    "task_started",
+    "progress_observed",
+    "queue_wait_s",
+    "elapsed_s",
+)
+
+#: Queue-wait buckets, in reporting order (seconds of measured contention-queue
+#: wait before admission). ``unknown`` is a first-class value, never ``0``.
+QUEUE_WAIT_BUCKET_LABELS: tuple[str, ...] = (
+    "zero",
+    "(0, 1]",
+    "(1, 5]",
+    "(5, 30]",
+    "> 30",
+    "unknown",
+)
+
+RELEASE_CONTEXT_NOTE = (
+    "Release-context classification of the post-acceptance evictions: counts "
+    "and Σ elapsed_s / h by emitted reason, by ``task_started``, by "
+    "``progress_observed`` and by queue-wait bucket. ``task_started=no`` is "
+    "further split by whether the slot was resolvable at all, because a "
+    "dispatch whose slot is unknown is *not attributable* — that is not the "
+    "same evidence as a known slot with no backend task, and only the latter "
+    "is ``llama_task_id_reason=task_id_not_started`` (the field the group-2 "
+    "baseline counted). A line logged before the split carries none of the "
+    "three fields and is reported as ``unknown``, never inferred."
+)
+
+#: Retry-outcome vocabulary (LP-0MWM0CPQN009SHJR). ``none`` means the analyser
+#: observed no next dispatch of the session inside the window — it is a join
+#: result, never an emitted outcome (the proxy only emits ``local_accepted`` /
+#: ``local_refused`` / ``remote`` on ``local_dispatch_outcome`` lines).
+RETRY_OUTCOME_LOCAL_ACCEPTED = "local_accepted"
+RETRY_OUTCOME_LOCAL_REFUSED = "local_refused"
+RETRY_OUTCOME_REMOTE = "remote"
+RETRY_OUTCOME_NONE = "none"
+
+#: When one client turn emits several outcome lines (a refusal that then
+#: escalates remotely), the turn's terminal outcome is the first name present,
+#: in this order — remote wins over an admitted local dispatch, which wins
+#: over a bare refusal.
+RETRY_OUTCOME_PRECEDENCE: tuple[str, ...] = (
+    RETRY_OUTCOME_REMOTE,
+    RETRY_OUTCOME_LOCAL_ACCEPTED,
+    RETRY_OUTCOME_LOCAL_REFUSED,
+)
+
+RETRY_JOIN_OUTCOME_VOCABULARY: tuple[str, ...] = (
+    RETRY_OUTCOME_LOCAL_ACCEPTED,
+    RETRY_OUTCOME_LOCAL_REFUSED,
+    RETRY_OUTCOME_REMOTE,
+    RETRY_OUTCOME_NONE,
+)
+
+#: The ``retry_join`` block's published latency percentiles (AC3).
+RETRY_JOIN_PERCENTILES = (50, 95)
+
+#: The eviction/outcome/first-byte fields the retry join reads, so a reader can
+#: see that the block consumes no pre-existing key (AC4: the diff is logging
+#: plus analysis).
+RETRY_JOIN_SOURCE_FIELDS: tuple[str, ...] = (
+    "session",
+    "prompt_fp",
+    "outcome",
+    "turn",
+    "ts",
+    "elapsed_s",
+)
+
+#: The "same prompt" tolerance: identical ``prompt_fp`` values (SHA-256 of the
+#: request's ``messages`` list), so sampling parameters never change it.
+RETRY_JOIN_TOLERANCE = (
+    "Two dispatches carry the 'same prompt' when their ``prompt_fp`` values "
+    "are equal. The fingerprint is the SHA-256 of the request's ``messages`` "
+    "list (canonical JSON), so sampling/generation parameters are ignored and "
+    "only a changed message list (new turn content) changes it."
+)
+
+#: Coverage caveat for every retry-join figure (AC6).
+RETRY_JOIN_CAVEAT = (
+    "The join is log-only and cross-turn: an abort is matched to the next "
+    "dispatch of the same session (by timestamp), and a single turn's several "
+    "outcome lines are collapsed to one terminal outcome (precedence: "
+    "remote > local_accepted > local_refused). It cannot correlate across a "
+    "client restart that changes the session id, nor across sessions; a retry "
+    "that lands after the window close is reported as never-completed, not as "
+    "escaped. A first-byte latency is measured only when the retry produced a "
+    "local or remote first byte inside the window."
+)
+
+RETRY_JOIN_NOTE = (
+    "Retry-outcome join (LP-0MWM0CPQN009SHJR): what the caller of each "
+    "post-acceptance abort experienced next — the next dispatch outcome of the "
+    "same session (local accepted / local refused / remote / none), the time "
+    "from the abort to first byte on a completed retry, and whether the retry "
+    "carried the same prompt. Per abort reason this reports the share retried, "
+    "median/p95 extra latency to first byte, and the share that never completed "
+    "in the window, so a 15 s abort that lands a remote retry immediately reads "
+    "differently from one that leaves the request unanswered."
+)
 #: The parent AC4 classifier (LP-0MVOAQDB4002D56G): agent audit runs use session
 #: ids prefixed ``audit-``; every other session — including an unattributed one
 #: — is user traffic. Mirrors ``reporting.AUDIT_SESSION_PREFIX`` so the two
@@ -207,6 +368,46 @@ LLAMA_COVERAGE_NOTE = (
     "llama_task_id/slot_id takes precedence when present)."
 )
 
+#: The proxy's prefill-deadline backstop (``local_prefill_deadline_seconds`` in
+#: ``proxy/config.yaml``), used **only** to define the ``>= deadline - 1 s``
+#: stall bucket. This analyser is deliberately log-only — it never reads proxy
+#: configuration — so the value is an explicit, overridable argument
+#: (``--deadline-seconds``) and every payload names the threshold it used
+#: instead of silently inheriting a constant that a config change invalidated
+#: (the 2026-10-31 widening 120 s → 180 s is exactly such a change).
+DEFAULT_PREFILL_DEADLINE_S = 180.0
+
+#: Slack under the deadline that still counts as "the client waited the whole
+#: deadline" (AC2's ``>= deadline - 1 s`` bucket).
+NEAR_DEADLINE_SLACK_S = 1.0
+
+#: An abort faster than this is a *detour*, not a stall (AC2 ``< 1 s``).
+SUB_SECOND_STALL_S = 1.0
+
+#: A stall shorter than this is still materially different from a deadline wait
+#: (AC2 ``< 5 s``); the boundary exists so the report can name the fast class.
+SHORT_STALL_S = 5.0
+
+#: Percentiles published per reason and per session class (AC2).
+STALL_PERCENTILES = (50, 90, 95, 99)
+
+#: The eviction fields the stall cost reads. Every one already exists on
+#: :class:`EvictionEvent` and is already emitted on the
+#: ``local_eviction_after_acceptance`` line, so this surface adds no log field
+#: and cannot change proxy behaviour (AC6, asserted by a test).
+STALL_SOURCE_FIELDS = ("reason", "session", "elapsed_s")
+
+STALL_COST_NOTE = (
+    "Stall-weighted cost of the evictions in this window: Σ elapsed_s over the "
+    "window hours, split by reason and by session class, with per-reason stall "
+    "percentiles and the counts of aborts under 1 s, under 5 s and within "
+    f"{NEAR_DEADLINE_SLACK_S:g} s of the deadline. A "
+    "measured_cache_deficit detour is the early detector working; a "
+    "prefill_deadline stall is the client waiting the whole deadline. The two "
+    "are counted equally by an event rate and are not equivalent in cost, so "
+    "read this block beside the per-event rate rather than instead of it."
+)
+
 ATTRIBUTION_OCCUPANCY = "occupancy"
 ATTRIBUTION_CAPACITY = "capacity"
 ATTRIBUTION_PREDICTED_WARMTH = "predicted-warmth"
@@ -251,6 +452,19 @@ class EvictionEvent:
     endpoint: str
     llama_task_id: int | None = None
     slot_id: int | None = None
+    #: ``llama_task_id_reason`` when a known slot could not be attributed.
+    task_id_reason: str | None = None
+    #: ``task_started``/``progress_observed`` are tri-state: ``None`` means the
+    #: line predates the split (LP-0MWKQJHSM000CI6W), which is **not** ``no``.
+    task_started: bool | None = None
+    progress_observed: bool | None = None
+    #: Measured contention-queue wait stamped at admission (``None`` = unknown).
+    queue_wait_s: float | None = None
+    #: LP-0MWM0CPQN009SHJR: the retry-join correlation key — the stable prompt
+    #: identity recorded on the eviction line (``None`` on a pre-change line).
+    prompt_fp: str | None = None
+    #: The per-request correlation id stamped on the record, when present.
+    turn: str | None = None
 
     @property
     def dispatch_start(self) -> datetime:
@@ -261,6 +475,39 @@ class EvictionEvent:
         if self.estimated_tokens <= 0:
             return 0.0
         return max(0.0, 1.0 - (self.new_tokens / self.estimated_tokens))
+
+
+@dataclass(frozen=True)
+class DispatchOutcome:
+    """One ``local_dispatch_outcome`` line (LP-0MWM0CPQN009SHJR).
+
+    The proxy emits one of these for a local admission (``local_accepted``), a
+    local refusal (``local_refused``) and a remote serve (``remote``). A single
+    client turn can emit several as the provider chain moves; the join collapses
+    them with :data:`RETRY_OUTCOME_PRECEDENCE`.
+    """
+
+    ts: datetime
+    session: str
+    outcome: str
+    prompt_fp: str | None = None
+    turn: str | None = None
+
+
+@dataclass(frozen=True)
+class FirstByte:
+    """A first byte for a session, local (``dispatch_first_byte_ms``) or
+    remote (``ttft_seconds``).
+
+    ``provider`` is ``"local"`` or the remote ``provider=`` token; ``turn`` is
+    the per-request id both lines already carry, used to pair the first byte
+    with its outcome line.
+    """
+
+    ts: datetime
+    session: str
+    provider: str
+    turn: str | None = None
 
 
 @dataclass(frozen=True)
@@ -412,6 +659,9 @@ class WindowLog:
     progress_signatures: list[ProgressSignature] = field(default_factory=list)
     local_completions: list[tuple[datetime, str]] = field(default_factory=list)
     status_polls: list[StatusPoll] = field(default_factory=list)
+    #: LP-0MWM0CPQN009SHJR: the retry-outcome join's raw material.
+    dispatch_outcomes: list[DispatchOutcome] = field(default_factory=list)
+    first_bytes: list[FirstByte] = field(default_factory=list)
     lines_in_window: int = 0
     duplicate_lines_dropped: int = 0
     files_read: int = 0
@@ -463,6 +713,41 @@ def _float(value: str | None) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if number == number else None
+
+
+def _tri_state(value: str | None) -> bool | None:
+    """Parse a ``yes``/``no`` log field, keeping absence as ``None``.
+
+    LP-0MWKQJHSM000CI6W added ``task_started`` and ``progress_observed`` to the
+    eviction line; a window logged before it carries neither. Mapping absence to
+    ``False`` would report every pre-split abort as "task not started", so the
+    distinction is preserved deliberately.
+    """
+    if value is None:
+        return None
+    token = str(value).strip().lower()
+    if token == "yes":
+        return True
+    if token == "no":
+        return False
+    return None
+
+
+def _maybe_queue_wait(value: str | None) -> float | None:
+    """Parse ``queue_wait_s``; ``unknown``/absent stays ``None`` (never 0)."""
+    return _float(value)
+
+
+def _maybe_str(value: str | None) -> str | None:
+    """Keep a string field, mapping ``unknown``/absent to ``None``.
+
+    LP-0MWM0CPQN009SHJR: a pre-change eviction line carries neither
+    ``prompt_fp`` nor ``turn``; absence must stay ``None`` (unattributable),
+    never a fabricated empty string, so the join can report it as unknown.
+    """
+    if value is None or value == "unknown" or value == "":
+        return None
+    return value
 
 
 def read_log_lines(paths, failures: list[str] | None = None) -> list[str]:
@@ -526,6 +811,13 @@ def _parse_line(log: WindowLog, ts: datetime, line: str) -> None:
                 endpoint=fields.get("endpoint") or "unknown",
                 llama_task_id=_maybe_int(fields.get("llama_task_id")),
                 slot_id=_maybe_int(fields.get("slot_id")),
+                task_id_reason=fields.get("llama_task_id_reason"),
+                task_started=_tri_state(fields.get("task_started")),
+                progress_observed=_tri_state(fields.get("progress_observed")),
+                queue_wait_s=_maybe_queue_wait(fields.get("queue_wait_s")),
+                # LP-0MWM0CPQN009SHJR: the retry-join correlation key.
+                prompt_fp=_maybe_str(fields.get("prompt_fp")),
+                turn=_maybe_str(fields.get("turn")),
             )
         )
         return
@@ -588,6 +880,52 @@ def _parse_line(log: WindowLog, ts: datetime, line: str) -> None:
                 ),
             )
         )
+        return
+    # LP-0MWM0CPQN009SHJR: the retry-outcome join's two raw streams. The proxy
+    # emits one ``local_dispatch_outcome`` line per local admission/refusal or
+    # remote serve; the first byte on a retry is the pre-existing
+    # ``dispatch_first_byte_ms`` (local) or ``ttft_seconds`` (remote) line.
+    if "local_dispatch_outcome " in line:
+        fields = parse_fields(line)
+        session = fields.get("session")
+        outcome = fields.get("outcome")
+        if session and outcome:
+            log.dispatch_outcomes.append(
+                DispatchOutcome(
+                    ts=ts,
+                    session=session,
+                    outcome=outcome,
+                    prompt_fp=_maybe_str(fields.get("prompt_fp")),
+                    turn=_maybe_str(fields.get("turn")),
+                )
+            )
+        return
+    if "dispatch_first_byte_ms=" in line:
+        fields = parse_fields(line)
+        session = fields.get("session")
+        if session:
+            log.first_bytes.append(
+                FirstByte(
+                    ts=ts,
+                    session=session,
+                    provider="local",
+                    turn=_maybe_str(fields.get("turn")),
+                )
+            )
+        return
+    if "ttft_seconds=" in line:
+        fields = parse_fields(line)
+        session = fields.get("session")
+        if session:
+            log.first_bytes.append(
+                FirstByte(
+                    ts=ts,
+                    session=session,
+                    provider=fields.get("provider") or "remote",
+                    turn=_maybe_str(fields.get("turn")),
+                )
+            )
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +1013,450 @@ def _group_by(items, key) -> dict:
     for item in items:
         grouped[key(item)].append(item)
     return dict(grouped)
+
+
+def _share(part: int, total: int) -> float:
+    """A count's share of a total (0.0 for an empty population)."""
+    return round((part / total), 4) if total else 0.0
+
+
+def _elapsed_buckets(events, deadline_seconds: float) -> dict:
+    """The three stall buckets AC2 asks for, over one event population.
+
+    ``under_1s`` is the fast-detour class (``measured_cache_deficit`` does its
+    job here), ``under_5s`` widens it slightly, and ``at_or_near_deadline``
+    counts the clients that waited the whole backstop. Shares are of the
+    population passed in, so a reason with two events and one sub-second abort
+    reports 0.5 rather than diluting it against the whole window.
+    """
+    threshold = round(deadline_seconds - NEAR_DEADLINE_SLACK_S, 3)
+    total = len(events)
+    sub_second = sum(1 for e in events if e.elapsed_s < SUB_SECOND_STALL_S)
+    short = sum(1 for e in events if e.elapsed_s < SHORT_STALL_S)
+    near = sum(1 for e in events if e.elapsed_s >= threshold)
+    return {
+        "under_1s": {"count": sub_second, "share": _share(sub_second, total)},
+        "under_5s": {"count": short, "share": _share(short, total)},
+        "at_or_near_deadline": {
+            "count": near,
+            "share": _share(near, total),
+            "threshold_s": threshold,
+        },
+    }
+
+
+def _stall_row(events, hours: float, deadline_seconds: float, *, keep_values: bool) -> dict:
+    """One aggregate stall row: events, Σ seconds, the per-hour rate, shape.
+
+    ``keep_values`` adds the raw per-event ``elapsed_s`` list. Only the
+    per-reason-per-class rows keep it: the report layer composes the (b2)
+    composite (``prefill_deadline`` + ``measured_cache_deficit``) from those
+    two lists, which keeps the composite's definition in one place instead of
+    duplicating it here.
+    """
+    stalls = [float(event.elapsed_s) for event in events]
+    total_seconds = round(sum(stalls), 3)
+    row = {
+        "events": len(events),
+        "stall_seconds": total_seconds,
+        "stall_seconds_per_hour": (
+            round(total_seconds / hours, 3) if hours else 0.0
+        ),
+        "percentiles": _percentiles(stalls, STALL_PERCENTILES),
+        "buckets": _elapsed_buckets(events, deadline_seconds),
+    }
+    if keep_values:
+        row["values"] = [round(value, 3) for value in stalls]
+    return row
+
+
+def stall_cost(
+    evictions,
+    hours: float,
+    deadline_seconds: float = DEFAULT_PREFILL_DEADLINE_S,
+) -> dict:
+    """The stall-weighted cost of a window's post-acceptance evictions (AC1/AC2).
+
+    Publishes ``stall_seconds_per_hour = Σ elapsed_s / hours`` for the window,
+    for each reason and for each reason x session class, beside the existing
+    per-event rate (which stays in ``evictions.per_hour`` and ``reason_split``
+    unchanged). This is the figure that can reward making aborts faster: two
+    ``measured_cache_deficit`` aborts totalling 0.8 s and one
+    ``prefill_deadline`` stall totalling 180 s are 1 and 1 to the event rate
+    and 0.8 s/h and 180 s/h here.
+
+    Derived only from :data:`STALL_SOURCE_FIELDS`, every one of which the
+    ``local_eviction_after_acceptance`` line already carries, so nothing about
+    the proxy's emission changes (AC6).
+    """
+    deadline_seconds = float(deadline_seconds)
+    by_reason: dict[str, dict] = {}
+    for reason, group in sorted(_group_by(evictions, lambda e: e.reason).items()):
+        row = _stall_row(group, hours, deadline_seconds, keep_values=False)
+        row["by_session_class"] = {
+            cls: _stall_row(
+                [event for event in group if session_class(event.session) == cls],
+                hours,
+                deadline_seconds,
+                keep_values=True,
+            )
+            for cls in ("user", "audit")
+        }
+        by_reason[str(reason)] = row
+
+    # Any new eviction reason must reach the payload without a code change: the
+    # session-class buckets are built from the classifier, not from a reason
+    # allowlist.
+    total = _stall_row(evictions, hours, deadline_seconds, keep_values=False)
+    total["by_session_class"] = {
+        cls: _stall_row(
+            [event for event in evictions if session_class(event.session) == cls],
+            hours,
+            deadline_seconds,
+            keep_values=False,
+        )
+        for cls in ("user", "audit")
+    }
+    return {
+        "hours": round(hours, 3),
+        "deadline_seconds": deadline_seconds,
+        "buckets": {
+            "sub_second_s": SUB_SECOND_STALL_S,
+            "short_stall_s": SHORT_STALL_S,
+            "near_deadline_slack_s": NEAR_DEADLINE_SLACK_S,
+        },
+        "source_fields": list(STALL_SOURCE_FIELDS),
+        "total": total,
+        "by_reason": by_reason,
+        "note": STALL_COST_NOTE,
+    }
+
+
+def _release_label(value: bool | None) -> str:
+    """Render a tri-state release-context flag as ``yes``/``no``/``unknown``."""
+    if value is None:
+        return "unknown"
+    return "yes" if value else "no"
+
+
+def _queue_wait_bucket(seconds: float | None) -> str:
+    """Bucket a measured queue wait; ``None`` (unmeasured) is ``unknown``."""
+    if seconds is None:
+        return "unknown"
+    value = float(seconds)
+    if value <= 0:
+        return "zero"
+    if value <= 1:
+        return "(0, 1]"
+    if value <= 5:
+        return "(1, 5]"
+    if value <= 30:
+        return "(5, 30]"
+    return "> 30"
+
+
+def _release_aggregate(events, hours: float, population: int) -> dict:
+    """One release-context row: events, share, session split, Σ stall."""
+    group = list(events)
+    user = sum(1 for effect in group if session_class(effect.session) == "user")
+    seconds = round(sum(float(effect.elapsed_s) for effect in group), 3)
+    return {
+        "events": len(group),
+        "share": _share(len(group), population),
+        "user": user,
+        "audit": len(group) - user,
+        "stall_seconds": seconds,
+        "stall_seconds_per_hour": round(seconds / hours, 3) if hours else 0.0,
+    }
+
+
+def _task_id_reason_counts(events) -> dict:
+    counts = Counter(
+        effect.task_id_reason for effect in events if effect.task_id_reason
+    )
+    return dict(sorted(counts.items()))
+
+
+def release_context_split(evictions, hours: float) -> dict:
+    """Classify a window's evictions by release context (V1 AC3).
+
+    LP-0MWM0CP4B001088M AC3: once the umbrella ``no_progress_watchdog`` label
+    was split (LP-0MWKQJHSM000CI6W), a window must classify every
+    post-acceptance abort by the emitted reason, ``task_started``,
+    ``progress_observed`` and the queue-wait bucket, and must make the
+    never-started share explicit and comparable with the group-2 baseline
+    (20/184 ``llama_task_id_reason=task_id_not_started``).
+
+    Two honesty rules are structural rather than advisory:
+
+    - a pre-split line carries none of the three fields and lands in the
+      ``unknown`` row of every dimension (absence is never inferred as ``no``);
+    - ``task_started=no`` is published together with a split by whether the
+      slot was resolvable, because only a *known* slot with no backend task
+      carries ``task_id_not_started`` — a dispatch whose slot is unknown is not
+      attributable, which is weaker evidence than a task that never started.
+    """
+    events = list(evictions)
+    population = len(events)
+    with_context = [effect for effect in events if effect.task_started is not None]
+
+    by_reason: dict[str, dict] = {}
+    for reason, group in sorted(_group_by(events, lambda e: e.reason).items()):
+        row = _release_aggregate(group, hours, population)
+        row["never_started"] = sum(
+            1
+            for effect in group
+            if effect.task_id_reason == TASK_ID_REASON_NOT_STARTED
+        )
+        by_reason[str(reason)] = row
+
+    by_task_started = {
+        label: _release_aggregate(
+            [e for e in events if _release_label(e.task_started) == label],
+            hours,
+            population,
+        )
+        for label in ("yes", "no", "unknown")
+    }
+    by_progress_observed = {
+        label: _release_aggregate(
+            [e for e in events if _release_label(e.progress_observed) == label],
+            hours,
+            population,
+        )
+        for label in ("yes", "no", "unknown")
+    }
+    by_queue_wait_bucket = {
+        label: _release_aggregate(
+            [e for e in events if _queue_wait_bucket(e.queue_wait_s) == label],
+            hours,
+            population,
+        )
+        for label in QUEUE_WAIT_BUCKET_LABELS
+    }
+
+    not_started_reason = [
+        effect
+        for effect in events
+        if effect.task_id_reason == TASK_ID_REASON_NOT_STARTED
+    ]
+    never_started = _release_aggregate(not_started_reason, hours, population)
+    never_started["basis"] = f"llama_task_id_reason={TASK_ID_REASON_NOT_STARTED}"
+    never_started["by_task_id_reason"] = _task_id_reason_counts(not_started_reason)
+    never_started["by_reason"] = dict(
+        sorted(
+            Counter(effect.reason for effect in not_started_reason).items()
+        )
+    )
+
+    task_started_no = [effect for effect in events if effect.task_started is False]
+    by_slot = {
+        "slot_known": [effect for effect in task_started_no if effect.slot_id is not None],
+        "slot_unknown": [effect for effect in task_started_no if effect.slot_id is None],
+    }
+    task_started_no_by_slot: dict[str, dict] = {}
+    for label, group in by_slot.items():
+        row = _release_aggregate(group, hours, population)
+        row["by_task_id_reason"] = _task_id_reason_counts(group)
+        task_started_no_by_slot[label] = row
+
+    priced_as_new = [
+        effect
+        for effect in events
+        if effect.estimated_tokens > 0
+        and effect.new_tokens >= effect.estimated_tokens
+    ]
+    priced = _release_aggregate(priced_as_new, hours, population)
+
+    total_seconds = round(
+        sum(float(effect.elapsed_s) for effect in events), 3
+    )
+    return {
+        "hours": round(hours, 3),
+        "events": population,
+        "events_with_release_context": len(with_context),
+        "events_without_release_context": population - len(with_context),
+        "stall_seconds": total_seconds,
+        "stall_seconds_per_hour": (
+            round(total_seconds / hours, 3) if hours else 0.0
+        ),
+        "source_fields": list(RELEASE_CONTEXT_SOURCE_FIELDS),
+        "queue_wait_buckets": list(QUEUE_WAIT_BUCKET_LABELS),
+        "by_reason": by_reason,
+        "by_task_started": by_task_started,
+        "by_progress_observed": by_progress_observed,
+        "by_queue_wait_bucket": by_queue_wait_bucket,
+        "never_started": never_started,
+        "task_started_no_by_slot": task_started_no_by_slot,
+        "priced_as_new_compute": priced,
+        "note": RELEASE_CONTEXT_NOTE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Retry-outcome join (LP-0MWM0CPQN009SHJR)
+# ---------------------------------------------------------------------------
+
+
+def _terminal_outcome(group: list[DispatchOutcome]) -> str:
+    """The terminal outcome of one retry turn, by :data:`RETRY_OUTCOME_PRECEDENCE`.
+
+    A provider chain can emit several ``local_dispatch_outcome`` lines for one
+    client request (a local refusal that then escalates remotely, or two local
+    admits across an in-request retry); the turn's terminal outcome is the
+    first name present in precedence order.
+    """
+    present = {item.outcome for item in group}
+    for name in RETRY_OUTCOME_PRECEDENCE:
+        if name in present:
+            return name
+    return group[-1].outcome if group else RETRY_OUTCOME_NONE
+
+
+def _join_abort_row(
+    event: EvictionEvent,
+    outcomes_after: list[DispatchOutcome],
+    first_bytes_after: list[FirstByte],
+) -> dict:
+    """One abort's join row: outcome, same-prompt, latency, completion.
+
+    *outcomes_after* is the session's ``local_dispatch_outcome`` lines strictly
+    after the abort (earliest first); *first_bytes_after* the session's first
+    bytes strictly after the abort. ``none`` is reported when no next dispatch
+    was observed; a first-byte latency is only meaningful for a completed
+    retry. Absent correlation keys render ``None`` (never a guessed value).
+    """
+    row: dict = {
+        "ts": event.ts.isoformat(sep=" ", timespec="seconds"),
+        "session": event.session,
+        "reason": event.reason,
+        "elapsed_s": round(float(event.elapsed_s), 3),
+        "prompt_fp": event.prompt_fp,
+        "turn": event.turn,
+    }
+    if not outcomes_after:
+        row["outcome"] = RETRY_OUTCOME_NONE
+        row["retried"] = False
+        row["same_prompt"] = None
+        row["abort_to_first_byte_s"] = None
+        row["completed"] = False
+        row["retry_turn"] = None
+        row["retry_prompt_fp"] = None
+        return row
+
+    first = outcomes_after[0]
+    turn = first.turn if first.turn else None
+    # Collapse a single turn's several outcome lines (the chain can move local
+    # refusal -> remote in one request) to its terminal outcome.
+    group = [
+        item for item in outcomes_after if turn is None or item.turn == turn
+    ]
+    outcome = _terminal_outcome(group)
+    retry_fp = first.prompt_fp
+    same_prompt = None
+    if event.prompt_fp and retry_fp:
+        same_prompt = event.prompt_fp == retry_fp
+
+    # The retry's first byte: the earliest same-session first-byte line whose
+    # turn matches the retry (or simply the earliest after the retry's outcome
+    # line when no turn was bound). ``dispatch_first_byte_ms`` for local,
+    # ``ttft_seconds`` for remote.
+    fb = None
+    if turn is not None:
+        for candidate in first_bytes_after:
+            if candidate.turn == turn and candidate.ts >= first.ts:
+                fb = candidate
+                break
+    if fb is None:
+        for candidate in first_bytes_after:
+            if candidate.ts >= first.ts:
+                fb = candidate
+                break
+    row["retried"] = outcome != RETRY_OUTCOME_NONE
+    row["outcome"] = outcome
+    row["same_prompt"] = same_prompt
+    row["completed"] = fb is not None
+    row["abort_to_first_byte_s"] = (
+        round((fb.ts - event.ts).total_seconds(), 3) if fb is not None else None
+    )
+    row["retry_turn"] = first.turn
+    row["retry_prompt_fp"] = first.prompt_fp
+    row["first_byte_provider"] = fb.provider if fb is not None else None
+    return row
+
+
+def _retry_stats(rows: list[dict]) -> dict:
+    """One aggregate row: aborts, retried share, outcome split, latency."""
+    total = len(rows)
+    outcome = Counter(row["outcome"] for row in rows)
+    retried = sum(1 for row in rows if row["retried"])
+    completed = sum(1 for row in rows if row["completed"])
+    same = sum(1 for row in rows if row["same_prompt"] is True)
+    same_unknown = sum(1 for row in rows if row["same_prompt"] is None)
+    latencies = [
+        float(row["abort_to_first_byte_s"])
+        for row in rows
+        if row["completed"] and row["abort_to_first_byte_s"] is not None
+    ]
+    return {
+        "aborts": total,
+        "retried": {"count": retried, "share": _share(retried, total)},
+        "outcome": {
+            name: outcome.get(name, 0) for name in RETRY_JOIN_OUTCOME_VOCABULARY
+        },
+        "same_prompt": {
+            "count": same,
+            "share_of_retried": _share(same, retried) if retried else 0.0,
+            "unknown": same_unknown,
+        },
+        "abort_to_first_byte_s": _percentiles(latencies, RETRY_JOIN_PERCENTILES),
+        "completed": {"count": completed, "share": _share(completed, total)},
+        "never_completed": {
+            "count": total - completed,
+            "share": _share(total - completed, total),
+        },
+    }
+
+
+def retry_join(log: WindowLog, hours: float) -> dict:
+    """Join every post-acceptance abort to the caller's next dispatch (AC1-AC3).
+
+    Per abort the row reports the next dispatch outcome of the same session
+    (``local_accepted`` / ``local_refused`` / ``remote`` / ``none``), whether
+    that retry carried the same prompt (``prompt_fp`` equality), and the time
+    from the abort to the retry's first byte (measured only when the retry
+    completed inside the window). Aggregates are published per abort reason
+    (share retried, median/p95 extra latency to first byte, share that never
+    completed in the window) beside the overall row. Log-only: nothing here
+    reads or changes proxy configuration (AC4).
+    """
+    outcomes = sorted(log.dispatch_outcomes, key=lambda o: (o.ts, o.session))
+    first_bytes = sorted(log.first_bytes, key=lambda f: (f.ts, f.session))
+    rows: list[dict] = []
+    for event in sorted(log.evictions, key=lambda e: (e.ts, e.session)):
+        outcomes_after = [
+            o for o in outcomes if o.session == event.session and o.ts > event.ts
+        ]
+        first_after = [
+            f for f in first_bytes if f.session == event.session and f.ts > event.ts
+        ]
+        rows.append(_join_abort_row(event, outcomes_after, first_after))
+
+    by_reason: dict[str, dict] = {}
+    for reason, group in _group_by(rows, lambda r: r["reason"]).items():
+        by_reason[str(reason)] = _retry_stats(group)
+    return {
+        "hours": round(hours, 3),
+        "aborts": len(rows),
+        "source_fields": list(RETRY_JOIN_SOURCE_FIELDS),
+        "outcome_vocabulary": list(RETRY_JOIN_OUTCOME_VOCABULARY),
+        "tolerance": RETRY_JOIN_TOLERANCE,
+        "caveat": RETRY_JOIN_CAVEAT,
+        "total": _retry_stats(rows),
+        "by_reason": by_reason,
+        "note": RETRY_JOIN_NOTE,
+        "rows": rows,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1694,6 +2476,7 @@ def build_report(
     *,
     log_dir: str | None = None,
     llama_log: str | None = None,
+    deadline_seconds: float = DEFAULT_PREFILL_DEADLINE_S,
 ) -> dict:
     hours = max((end - start).total_seconds() / 3600.0, 0.0)
     llama, llama_spec = _load_llama_lifecycle(llama_log)
@@ -1736,6 +2519,20 @@ def build_report(
             "per_hour": round(len(log.evictions) / hours, 3) if hours else None,
         },
         "reason_split": reason_split(log.evictions, hours),
+        # AC3 (LP-0MWM0CP4B001088M): classify every post-acceptance abort by
+        # the emitted reason plus the release context the label split added.
+        "release_context_split": release_context_split(log.evictions, hours),
+        # AC1-AC3 (LP-0MWM0CPQN009SHJR): join each post-acceptance abort to the
+        # caller's next dispatch, so a fast successful retry is distinguished
+        # from a request left unanswered.
+        "retry_join": retry_join(log, hours),
+        # AC1/AC2 (LP-0MW7V30AZ007JB5Z): the stall-weighted rate and stall
+        # shape beside the per-event rate above. ``deadline_seconds`` is echoed
+        # so the ``>= deadline - 1 s`` bucket is always relative to a stated
+        # threshold rather than an assumed one.
+        "stall_cost": stall_cost(
+            log.evictions, hours, deadline_seconds=deadline_seconds
+        ),
         "distributions": {
             "prefill_deadline": distributions(deadline_events),
         },
@@ -1821,6 +2618,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output", help="write the JSON report here instead of stdout")
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=DEFAULT_PREFILL_DEADLINE_S,
+        help=(
+            "prefill-deadline backstop in seconds, used only to define the "
+            "'at or near deadline' stall bucket (default: %(default)s, the "
+            "shipped local_prefill_deadline_seconds); log-only analysis cannot "
+            "read proxy config, so pass the deployed value if it differs"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="emit the JSON dataset (default: a short text summary)")
     return parser.parse_args(argv)
 
@@ -1841,7 +2649,14 @@ def main(argv: list[str] | None = None) -> int:
     log.files_read = len(paths) - len(failures)
     for failed in failures:
         print(f"warning: unreadable log file skipped: {failed}", file=sys.stderr)
-    report = build_report(log, start, end, log_dir=args.log_dir, llama_log=args.llama_log)
+    report = build_report(
+        log,
+        start,
+        end,
+        log_dir=args.log_dir,
+        llama_log=args.llama_log,
+        deadline_seconds=args.deadline_seconds,
+    )
     if failures:
         report["source"]["unreadable_files"] = failures
     payload = json.dumps(report, indent=2, sort_keys=True)
@@ -1871,6 +2686,68 @@ def _text_summary(report: dict) -> str:
             f"(user {split['user']} / audit {split['audit']}) — "
             f"user {split['user_per_hour']}/h, audit {split['audit_per_hour']}/h"
         )
+    cost = report.get("stall_cost")
+    if cost:
+        total = cost["total"]
+        lines.append(
+            f"Stall cost: {total['stall_seconds']} s over {cost['hours']} h = "
+            f"{total['stall_seconds_per_hour']:.1f} s/h "
+            f"({total['events']} events; an event rate counts a 0.4 s detour and "
+            "a full-deadline stall equally, this does not)"
+        )
+        for reason, row in sorted(
+            cost["by_reason"].items(),
+            key=lambda item: -item[1]["stall_seconds"],
+        ):
+            user = row["by_session_class"]["user"]
+            pct = user["percentiles"]
+            lines.append(
+                f"  {reason}: user {user['stall_seconds']} s "
+                f"({user['stall_seconds_per_hour']:.1f} s/h) over "
+                f"{user['events']} event(s); p50={pct['p50']} p90={pct['p90']} "
+                f"p95={pct['p95']} p99={pct['p99']} s; "
+                f"{user['buckets']['under_1s']['count']} under 1 s, "
+                f"{user['buckets']['at_or_near_deadline']['count']} at/near the "
+                f"{cost['deadline_seconds']:g} s deadline"
+            )
+    context = report.get("release_context_split")
+    if context:
+        started = context["by_task_started"]
+        never = context["never_started"]
+        lines.append(
+            "Release context: task_started yes="
+            f"{started['yes']['events']} no={started['no']['events']} "
+            f"unknown={started['unknown']['events']}; never-started "
+            f"(task_id_not_started) {never['events']} "
+            f"({never['share']:.1%}); {context['events_without_release_context']} "
+            "line(s) without release context (pre-split)"
+        )
+    retry = report.get("retry_join")
+    if retry and retry.get("aborts"):
+        total = retry["total"]
+        lat = total["abort_to_first_byte_s"]
+        lines.append(
+            f"Retry outcome: {total['retried']['count']}/{retry['aborts']} "
+            f"aborts retried ({total['retried']['share']:.1%}); outcome "
+            + ", ".join(
+                f"{name}={count}" for name, count in total["outcome"].items()
+            )
+            + f"; {total['never_completed']['count']} never completed "
+            f"({total['never_completed']['share']:.1%}); abort→first-byte "
+            f"p50={lat['p50']} p95={lat['p95']} s (n={lat['count']})"
+        )
+        for reason, row in sorted(retry["by_reason"].items()):
+            rlat = row["abort_to_first_byte_s"]
+            outcome = ", ".join(
+                f"{name}={count}" for name, count in row["outcome"].items() if count
+            )
+            lines.append(
+                f"  {reason}: retried {row['retried']['count']}/{row['aborts']} "
+                f"({row['retried']['share']:.1%}) [{outcome or 'none'}]; "
+                f"never completed {row['never_completed']['count']} "
+                f"({row['never_completed']['share']:.1%}); abort→first-byte "
+                f"p50={rlat['p50']} p95={rlat['p95']} s (n={rlat['count']})"
+            )
     basis = report.get("seconds_basis")
     if basis is not None:
         if basis["tok_s"] is None:

@@ -33,18 +33,25 @@ evidence for the same session at the measured dispatch start
 
 ``high_priority_inert``
     ``high`` priority was *genuinely* inert: every time bound was disabled, so
-    the guard returned ``no_budget`` and nothing was priced. This class now
-    requires a logged inert ``no_budget`` decision; an **unlogged**
+    the guard returned ``no_budget`` and nothing was priced (legacy bare
+    ``reason=no_budget`` lines). New inert lines log
+    ``reason=inert_admit reason_inert=no_budget`` and class as
+    ``inert_no_budget`` instead (LP-0MVZF4SU10032OZH). An **unlogged**
     high-priority eviction is ``inert_unlogged`` like any other priority
-    (LP-0MVZQUT3A0039MLY). Before the guard fix ``high`` was inert by
-    construction (it never queues), so this class used to absorb every
-    unlogged high-priority eviction.
+    (LP-0MVZQUT3A0039MLY).
+
+``inert_no_budget`` / ``inert_insufficient_samples`` / ``inert_policy_off``
+    (LP-0MVZF4SU10032OZH AC1/AC2) the inert admit was LOGGED with
+    ``reason=inert_admit reason_inert=<reason>``, so the class is distinguished
+    by the inert reason: ``no_budget`` (every time bound disabled, nothing
+    priced), ``insufficient_samples`` (uncalibrated ``(model, bucket)``
+    window), ``policy_off`` (guard disabled in config). This is what used to
+    be invisible as ``inert_unlogged``.
 
 ``inert_unlogged``
-    No admission line at the dispatch instant and no override: the guard
-    returned an inert decision, which by design logs nothing (an uncalibrated
-    bucket, or ``high`` priority with no logged ``no_budget`` line, is the
-    remaining explanation). Un-attributable from the log alone.
+    No admission evidence at all at the dispatch instant and no override: a
+    log-rotation gap, a line the window predates, or an inert admit whose
+    ``reason_inert=`` could not be read. Un-attributable from the log alone.
 
 Usage::
 
@@ -88,13 +95,28 @@ OVERRIDE_BEFORE = timedelta(seconds=45)
 OVERRIDE_AFTER = timedelta(seconds=10)
 
 #: The inert ``no_budget`` reason: returned when every time bound is disabled.
-#: Inert decisions log nothing by default, so a line carrying this reason only
-#: appears when an inert decision was explicitly logged (LP-0MVZQUT3A0039MLY).
-INERT_NO_BUDGET = "no_budget"
+#: Legacy lines carry ``reason=no_budget``; NEW inert lines (LP-0MVZF4SU10032OZH)
+#: carry ``reason=inert_admit reason_inert=no_budget`` and are classed as
+#: ``inert_no_budget``, never ``high_priority_inert``.
+REASON_NO_BUDGET = "no_budget"
+
+#: The inert admission reason logged for an inert admit (LP-0MVZF4SU10032OZH):
+#: the guard admitted without adjudicating (an uncalibrated bucket, every time
+#: bound disabled, or the policy off). The underlying reason rides in
+#: ``reason_inert=`` and is what ``inert_unlogged`` is now split by.
+INERT_ADMIT = "inert_admit"
+
+#: ``reason_inert=`` values carried on a ``reason=inert_admit`` line.
+INERT_REASON_INSUFFICIENT_SAMPLES = "insufficient_samples"
+INERT_REASON_POLICY_OFF = "policy_off"
 
 #: Stable class vocabulary, in report order. ``high_priority_inert`` requires a
-#: logged inert ``no_budget`` decision; an unlogged ``high`` eviction is
+#: logged legacy ``reason=no_budget`` decision; an unlogged ``high`` eviction is
 #: ``inert_unlogged`` like any other unlogged priority (LP-0MVZQUT3A0039MLY).
+#: The three ``inert_*`` classes (LP-0MVZF4SU10032OZH) split what used to be
+#: the single ``inert_unlogged`` catch-all by the logged inert reason, so the
+#: self-reinforcing uncalibrated-bucket trap is distinguishable from a
+#: nothing-priced ``no_budget`` admit from the log alone.
 ADMISSION_CLASSES = (
     "rung_accepted",
     "priced_within_queue_budget",
@@ -103,6 +125,9 @@ ADMISSION_CLASSES = (
     "economic_override",
     "capacity_override",
     "high_priority_inert",
+    "inert_no_budget",
+    "inert_insufficient_samples",
+    "inert_policy_off",
     "inert_unlogged",
 )
 
@@ -110,6 +135,15 @@ RUNG_ACCEPTED = "rung_accepted"
 PRICED_WITHIN_QUEUE_BUDGET = "priced_within_queue_budget"
 PRICED_ABOVE_BOUND = "priced_above_bound"
 HIGH_PRIORITY_INERT = "high_priority_inert"
+#: (LP-0MVZF4SU10032OZH) the inert classes the old ``inert_unlogged`` split
+#: into, keyed by the logged ``reason_inert=`` value:
+#: ``no_budget`` (nothing was priced — every time bound disabled),
+#: ``insufficient_samples`` (uncalibrated ``(model, bucket)`` window), and
+#: ``policy_off`` (guard disabled in config). ``inert_unlogged`` now means
+#: "no admission evidence at all at the dispatch instant".
+INERT_NO_BUDGET = "inert_no_budget"
+INERT_INSUFFICIENT_SAMPLES = "inert_insufficient_samples"
+INERT_POLICY_OFF = "inert_policy_off"
 INERT_UNLOGGED = "inert_unlogged"
 
 DEFAULT_BUDGET_TOKENS = 25_000
@@ -250,16 +284,27 @@ def classify(
     row["priority"] = max(seen, key=lambda item: item[0])[1] if seen else None
 
     session_guards = guard_decisions.get(session, [])
-    # An inert ``no_budget`` decision admits nothing: exclude it from the
-    # pricing lookup and use it only to recognise the genuine inert-high case
-    # (LP-0MVZQUT3A0039MLY). Everything else — including the absence of a guard
-    # line, which is how an uncalibrated bucket and, by design, an inert
-    # decision present themselves — falls through to ``inert_unlogged``.
+    # A logged inert admit (``reason=inert_admit``, LP-0MVZF4SU10032OZH)
+    # proves the guard was consulted and admitted without adjudicating; its
+    # ``reason_inert=`` value is the attribution, so it must not enter the
+    # priced-ETA lookup below. The legacy bare ``reason=no_budget`` line is
+    # likewise not a priced admission — it only recognises the genuine
+    # inert-high case (LP-0MVZQUT3A0039MLY). Everything else — including the
+    # absence of any guard line — falls through to ``inert_unlogged``.
+    inert_admit = _nearest(
+        [
+            decision
+            for decision in session_guards
+            if str(decision.get("reason", "")) == INERT_ADMIT
+        ],
+        dispatch_start, GUARD_BEFORE, GUARD_AFTER,
+    )
     guard = _nearest(
         [
             decision
             for decision in session_guards
-            if str(decision.get("reason", "")) != INERT_NO_BUDGET
+            if str(decision.get("reason", ""))
+            not in (REASON_NO_BUDGET, INERT_ADMIT)
         ],
         dispatch_start, GUARD_BEFORE, GUARD_AFTER, admits_only=True,
     )
@@ -267,7 +312,7 @@ def classify(
         [
             decision
             for decision in session_guards
-            if str(decision.get("reason", "")) == INERT_NO_BUDGET
+            if str(decision.get("reason", "")) == REASON_NO_BUDGET
         ],
         dispatch_start, GUARD_BEFORE, GUARD_AFTER,
     )
@@ -294,8 +339,30 @@ def classify(
         else:
             row["admission"] = PRICED_ABOVE_BOUND
     elif override is not None:
+        # A routing override is the path that ADMITTED the dispatch; an inert
+        # guard merely abstained afterwards (the idle-override dispatch still
+        # runs through the direct guard, which now logs its inert abstention).
+        # The override must therefore win, so ``idle_override`` /
+        # ``economic_override`` / ``capacity_override`` keep their exact
+        # pre-change attribution.
         row["admission"] = override["kind"]
         row["override_reason"] = override.get("reason")
+    elif inert_admit is not None:
+        # An inert admit carries the underlying reason in ``reason_inert=``
+        # (LP-0MVZF4SU10032OZH AC1) — the split AC2 asks for. When the value
+        # is missing/unreadable the event stays ``inert_unlogged``: the split
+        # is only as good as the evidence.
+        _inert_reason = str(inert_admit.get("reason_inert", ""))
+        row["inert_reason"] = _inert_reason
+        row.update(guard_eta_s=_num(inert_admit, "eta_prefill_s"))
+        if _inert_reason == REASON_NO_BUDGET:
+            row["admission"] = INERT_NO_BUDGET
+        elif _inert_reason == INERT_REASON_INSUFFICIENT_SAMPLES:
+            row["admission"] = INERT_INSUFFICIENT_SAMPLES
+        elif _inert_reason == INERT_REASON_POLICY_OFF:
+            row["admission"] = INERT_POLICY_OFF
+        else:
+            row["admission"] = INERT_UNLOGGED
     elif row["priority"] == "high" and inert_no_budget is not None:
         row["admission"] = HIGH_PRIORITY_INERT
     else:

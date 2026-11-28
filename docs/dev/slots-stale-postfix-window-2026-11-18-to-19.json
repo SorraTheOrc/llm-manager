@@ -1,0 +1,572 @@
+{
+  "work_item": "LP-0MWLZ68SF0052E7Z",
+  "f6_disposition_item": "LP-0MVVXGMRN007NCJP",
+  "f6_disposition_item_title": "Re-measure 24 h window; record AC2 disposition",
+  "parent": "LP-0MVVCO1N7004TNGY",
+  "parent_title": "slots_stale 29.59 % over a 24 h window \u2014 /slots refresh still misses its freshness budget under load",
+  "epic": "LP-0MWM0B7IQ008W2FP",
+  "fix_under_test": [
+    "LP-0MVVXGLTM008ROJ9 (F3 shared /slots snapshot, 156f3cd3d)",
+    "LP-0MVVXGM54009TOXD (F4 age-derived slots_stale, schema 8, 1aeca7059)",
+    "LP-0MVVXGMGB004DUGR (F5 residual attribution, d8ce36dc9)"
+  ],
+  "measurement_run_utc": "2026-11-22T11:52:13Z",
+  "window": {
+    "since_local": "2026-11-18 10:25:00",
+    "until_local": "2026-11-19 10:25:00",
+    "half_open": true,
+    "duration_hours": 24.0,
+    "anchored_to": "proxy restart 2026-11-18T10:24:26Z pid 1789326; window start = first whole minute after it",
+    "window_closed": true,
+    "local_timezone": "GMT (UTC), verified at run time"
+  },
+  "restart_integrity": {
+    "anchor_restart_marker": "2026-11-18 10:24:29,033 - INFO - Logging initialised at /var/log/llama-proxy/proxy.log pid=1789326",
+    "anchor_attribution": "2026-11-18 10:24:29,048 - INFO - Proxy restart attribution: source=manual actor=unknown reason=LP-0MVVCO1N7004TNGY: deploy F3 shared /slots snapshot (156f3cd3d) + F4 age-derived slots_stale schema 8 (1aeca7059) + F5 residual attribution (d8ce36dc9)",
+    "in_window_startup_markers": 0,
+    "in_window_startup_marker_files_checked": [
+      "proxy.log.2026-11-18_10.gz",
+      "proxy.log.2026-11-18_16.gz",
+      "proxy.log-2026-11-19_00.gz",
+      "proxy.log.2026-11-18_22.gz",
+      "proxy.log.2026-11-19_04.gz",
+      "proxy.log.2026-11-19_10.gz"
+    ],
+    "markers_searched": [
+      "Logging initialised",
+      "Rotated previous proxy log aside",
+      "Started server process",
+      "application startup"
+    ],
+    "post_window_restart": {
+      "marker": "2026-11-19 19:36:07,546 - INFO - Logging initialised at /var/log/llama-proxy/proxy.log pid=2765810",
+      "attribution": "source=manual actor=unknown reason=manual (no reason provided)",
+      "relation": "strictly after the window end (2026-11-19T10:25:00Z); cannot void this window"
+    }
+  },
+  "coverage": {
+    "covered": true,
+    "max_gap_seconds": 3600.0,
+    "window_closed": true,
+    "spans": [
+      {
+        "file": "proxy.log.2026-11-18_10.gz",
+        "first": "2026-11-18 10:25:00",
+        "last": "2026-11-18 16:24:26",
+        "lines": 69288
+      },
+      {
+        "file": "proxy.log.2026-11-18_16.gz",
+        "first": "2026-11-18 16:24:27",
+        "last": "2026-11-18 22:24:25",
+        "lines": 77086
+      },
+      {
+        "file": "proxy.log-2026-11-19_00.gz",
+        "first": "2026-11-18 22:24:28",
+        "last": "2026-11-19 00:00:27",
+        "lines": 27139
+      },
+      {
+        "file": "proxy.log.2026-11-18_22.gz",
+        "first": "2026-11-19 00:00:29",
+        "last": "2026-11-19 04:24:26",
+        "lines": 30303
+      },
+      {
+        "file": "proxy.log.2026-11-19_04.gz",
+        "first": "2026-11-19 04:24:28",
+        "last": "2026-11-19 10:24:24",
+        "lines": 36319
+      },
+      {
+        "file": "proxy.log.2026-11-19_10.gz",
+        "first": "2026-11-19 10:24:29",
+        "last": "2026-11-19 10:24:58",
+        "lines": 39
+      }
+    ],
+    "gaps": [],
+    "window_start_gap_seconds": 0.0,
+    "window_end_gap_seconds": 2.0
+  },
+  "deployed_build": {
+    "loaded_at_anchor": "d8ce36dc9 (dev HEAD at 2026-11-18T10:24:26Z; equals the F5 implementation commit)",
+    "checkout_dev_head_at_run": "33193b28c (2026-11-20T13:09:42Z, worktree base for the run)",
+    "status_schema_version_in_window": 8
+  },
+  "commands": {
+    "measurement": "python3 scripts/capacity_signal_verification.py --since '2026-11-18 10:25:00' --until '2026-11-19 10:25:00' --window-closed --label slots-stale-postfix --limit 250 --json --write-artifacts ~/proxy-usage-reports/slots-stale-postfix",
+    "tightened_age_reading": "python3 scripts/slots_snapshot_age_distribution.py --since '2026-11-18 10:25:00' --until '2026-11-19 10:25:00' --threshold-seconds 2 --threshold-seconds 5 --threshold-seconds 300 --json",
+    "raw_segment_archive": "python3 scripts/proxy_usage_window_archive.py archive --log-dir /var/log/llama-proxy --dest ~/proxy-usage-reports/slots-stale-postfix/raw --start '2026-11-18 10:25:00' --end '2026-11-19 10:25:00'"
+  },
+  "artifacts": {
+    "dir": "~/proxy-usage-reports/slots-stale-postfix",
+    "measurement_json": "~/proxy-usage-reports/slots-stale-postfix/measurement.json",
+    "measurement_txt": "~/proxy-usage-reports/slots-stale-postfix/measurement.txt",
+    "tightened_age_reading": "~/proxy-usage-reports/slots-stale-postfix/age_distribution.json",
+    "raw_segments": "~/proxy-usage-reports/slots-stale-postfix/raw (8 files, 8.8 MB, gzip+cmp verified)",
+    "raw_segment_checksums": "~/proxy-usage-reports/slots-stale-postfix/raw/SHA256SUMS"
+  },
+  "as_configured_reading": {
+    "definition": "slots_stale = slots_snapshot_age_seconds > slots_max_snapshot_age_seconds (300 s), or no datable snapshot (F4 / schema 8)",
+    "ceiling_seconds": 300.0,
+    "status_polls": 12450,
+    "slots_stale": {
+      "count": 608,
+      "denominator": 12450,
+      "rate": 0.0488
+    },
+    "slots_stale_derivation": {
+      "derived_from_snapshot_age": 12450,
+      "from_published_flag": 0,
+      "disagreements_with_published_flag": 0
+    },
+    "slots_stale_attribution": {
+      "by_source": {
+        "detail_cache": 51,
+        "counts_cache": 557,
+        "unknown": 0
+      },
+      "by_latency_band": {
+        "lt_1s": 550,
+        "1s_to_2s": 58,
+        "2s_to_5s": 0,
+        "gte_5s": 0,
+        "unknown": 0
+      },
+      "unattributed": 0
+    },
+    "stale_composition": {
+      "over_age": 51,
+      "undatable": 557,
+      "note": "reconciles with capacity_signal_verification: 608 stale = 51 over-age (detail_cache) + 557 undatable (counts_cache, slots_snapshot_source=none)"
+    },
+    "verdict_under_5_percent": true
+  },
+  "tightened_reading": {
+    "tool": "scripts/slots_snapshot_age_distribution.py",
+    "generated_at": "2026-11-22T11:56:45",
+    "polls": {
+      "status_polls": 12450,
+      "polls_with_age_field": 12450,
+      "datable": 11893,
+      "undatable": 557,
+      "no_age_field": 0
+    },
+    "ceiling_seconds": 300.0,
+    "age_seconds": {
+      "count": 11893,
+      "min": 5.3677940741181374e-05,
+      "p50": 0.7327805829700083,
+      "p90": 35.13590749306604,
+      "p99": 187.7324174400419,
+      "max": 424.2006449489854
+    },
+    "contract_stale": {
+      "count": 608,
+      "rate_of_status_polls": 0.0488
+    },
+    "capacity_hint_counts": {
+      "abandoned_busy": 131,
+      "idle": 6780,
+      "prefill_bound": 3099,
+      "saturated": 2033,
+      "unknown": 407
+    },
+    "thresholds": [
+      {
+        "threshold_seconds": 2.0,
+        "over": 3758,
+        "rate_of_datable": 0.316,
+        "rate_of_status_polls": 0.3018,
+        "by_capacity_hint": {
+          "prefill_bound": 3057,
+          "saturated": 300,
+          "unknown": 401
+        }
+      },
+      {
+        "threshold_seconds": 5.0,
+        "over": 3542,
+        "rate_of_datable": 0.2978,
+        "rate_of_status_polls": 0.2845,
+        "by_capacity_hint": {
+          "prefill_bound": 2888,
+          "saturated": 278,
+          "unknown": 376
+        }
+      },
+      {
+        "threshold_seconds": 300.0,
+        "over": 51,
+        "rate_of_datable": 0.0043,
+        "rate_of_status_polls": 0.0041,
+        "by_capacity_hint": {
+          "unknown": 51
+        }
+      }
+    ],
+    "log_dir": "/var/log/llama-proxy",
+    "window": {
+      "since": "2026-11-18 10:25:00",
+      "until": "2026-11-19 10:25:00",
+      "half_open": true
+    }
+  },
+  "capacity_signals": {
+    "capacity_hint": {
+      "histogram": {
+        "abandoned_busy": 131,
+        "idle": 6780,
+        "prefill_bound": 3099,
+        "saturated": 2033,
+        "unknown": 407
+      },
+      "rates": {
+        "abandoned_busy": 0.0105,
+        "idle": 0.5446,
+        "prefill_bound": 0.2489,
+        "saturated": 0.1633,
+        "unknown": 0.0327
+      }
+    },
+    "saturated_without_live_work": {
+      "count": 11,
+      "rate_of_polls": 0.0009,
+      "rate_of_saturated": 0.0054,
+      "worst_timestamps": [
+        {
+          "minute": "2026-11-18 10:39",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-18 12:13",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-18 12:21",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-18 12:44",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-18 19:32",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-18 21:33",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-18 22:46",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-18 22:59",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-18 23:46",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-19 00:31",
+          "polls": 1
+        },
+        {
+          "minute": "2026-11-19 07:27",
+          "polls": 1
+        }
+      ],
+      "examples": [
+        "2026-11-18 22:46:24",
+        "2026-11-18 22:59:04",
+        "2026-11-18 23:46:17",
+        "2026-11-18 10:39:52",
+        "2026-11-18 12:13:42",
+        "2026-11-18 12:21:54",
+        "2026-11-18 12:44:44",
+        "2026-11-18 19:32:33",
+        "2026-11-18 21:33:39",
+        "2026-11-19 00:31:43",
+        "2026-11-19 07:27:06"
+      ],
+      "rows": [
+        {
+          "timestamp": "2026-11-18 22:46:24",
+          "latency_ms": 6,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-18 22:59:04",
+          "latency_ms": 9,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-18 23:46:17",
+          "latency_ms": 7,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-18 10:39:52",
+          "latency_ms": 5,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-18 12:13:42",
+          "latency_ms": 7,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-18 12:21:54",
+          "latency_ms": 6,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-18 12:44:44",
+          "latency_ms": 6,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-18 19:32:33",
+          "latency_ms": 6,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-18 21:33:39",
+          "latency_ms": 5,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-19 00:31:43",
+          "latency_ms": 5,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        },
+        {
+          "timestamp": "2026-11-19 07:27:06",
+          "latency_ms": 6,
+          "slots_detail_stale": false,
+          "available_slots": 1,
+          "local_in_flight_requests": 0,
+          "local_active_query": "false",
+          "local_owner_session_id": "None",
+          "slots_stale": "false",
+          "slot_counts_stale": "false"
+        }
+      ]
+    },
+    "saturated_without_available_slots": {
+      "count": 582,
+      "rate_of_polls": 0.0467
+    },
+    "stale_saturated_without_live_work": {
+      "judgeable_polls": 12450,
+      "over_age_polls": 51,
+      "undatable_polls": 557,
+      "violations": 0,
+      "violations_over_age": 0,
+      "violations_undatable": 0,
+      "violation_timestamps": [],
+      "rows": []
+    },
+    "per_phase_read_path": {
+      "instrumented": true,
+      "polls_with_fields": 12450,
+      "phases": {
+        "status_query_ms": {
+          "stale": {
+            "count": 608,
+            "not_attempted": 0,
+            "p50": 5,
+            "p90": 22,
+            "p99": 147
+          },
+          "fresh": {
+            "count": 11842,
+            "not_attempted": 0,
+            "p50": 5,
+            "p90": 7,
+            "p99": 20
+          }
+        },
+        "slots_counts_ms": {
+          "stale": {
+            "count": 607,
+            "not_attempted": 1,
+            "p50": 310,
+            "p90": 979,
+            "p99": 1061
+          },
+          "fresh": {
+            "count": 11842,
+            "not_attempted": 0,
+            "p50": 0,
+            "p90": 1050,
+            "p99": 1066
+          }
+        },
+        "slots_detail_ms": {
+          "stale": {
+            "count": 607,
+            "not_attempted": 1,
+            "p50": 0,
+            "p90": 0,
+            "p99": 0
+          },
+          "fresh": {
+            "count": 11842,
+            "not_attempted": 0,
+            "p50": 0,
+            "p90": 0,
+            "p99": 0
+          }
+        }
+      },
+      "upstream_calls": {
+        "stale": {
+          "0": 600,
+          "1": 8
+        },
+        "fresh": {
+          "0": 10892,
+          "1": 950
+        }
+      },
+      "snapshot_source": {
+        "stale": {
+          "none": 557,
+          "snapshot": 51
+        },
+        "fresh": {
+          "snapshot": 3761,
+          "ttl_cache": 7912,
+          "upstream": 169
+        }
+      }
+    },
+    "local_dispatches": {
+      "count": 2394,
+      "by_cache_state": {
+        "cold": 434,
+        "unknown": 898,
+        "warm": 1062
+      },
+      "distinct_sessions": 265,
+      "herdr_session_dispatches": 143
+    },
+    "herdr_downtime_dispatches": {
+      "path": "/home/rgardler/projects/llm/.worklog/downtime-dispatches.log",
+      "available": true,
+      "covered": false,
+      "log_first": "2026-11-16 18:24:55.395000",
+      "log_last": "2026-11-18 13:23:42.958000",
+      "count": 21,
+      "rows_read": 100,
+      "rows_skipped": 0,
+      "entries": 21,
+      "note": "dispatch log does not cover the requested window (retained span 2026-11-16 18:24:55.395000 .. 2026-11-18 13:23:42.958000); a count of 0 means 'not retained', not 'no dispatches'"
+    },
+    "abandonment_events": {
+      "count": 418,
+      "by_reason": {
+        "client_disconnect": 3,
+        "measured_cache_deficit": 5,
+        "prefill_deadline": 1,
+        "session_evicted": 409
+      }
+    }
+  },
+  "verdict": {
+    "verdict": "TARGETS MISSED",
+    "checks": [
+      {
+        "target": "coverage: requested window fully represented by logs",
+        "observed": 0,
+        "pass": true
+      },
+      {
+        "target": "slots_stale rate < 5.0% of status polls",
+        "observed": 0.0488,
+        "pass": true
+      },
+      {
+        "target": "capacity_hint=saturated only with live local work",
+        "observed": 11,
+        "pass": false
+      },
+      {
+        "target": "no poll served from a stale snapshot reports saturated without live local work",
+        "observed": 0,
+        "pass": true
+      }
+    ],
+    "notes": [
+      "abandonment reasons are widened with measured_cache_deficit: the historical counts (247 polls / 2.12 % pre-fix AC1 baseline, 12 polls / 0.11 % post-fix AC4 residual) were computed with the narrower four-reason set, so before/after comparisons are read knowingly",
+      "herdr downtime dispatch count not verifiable for this window: dispatch log does not cover the requested window (retained span 2026-11-16 18:24:55.395000 .. 2026-11-18 13:23:42.958000); a count of 0 means 'not retained', not 'no dispatches'",
+      "11 of 11 violating polls attributed within 600s (by cause: live_work_attribution_lag=3, session_evicted=8; live-work corroboration window 10s)"
+    ]
+  }
+}

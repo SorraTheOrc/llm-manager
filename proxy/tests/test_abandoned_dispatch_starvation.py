@@ -293,8 +293,8 @@ def test_no_drain_warm_path_is_unchanged(clock):
     """AC4: with no abandoned entry on the session's slot, admission is exactly
     today's behaviour: no refusal, no drain log line, session keeps its slot.
     (Not xfail: the warm path must already hold and stay green.)"""
-    from proxy.session import _slot_registry_key
     from proxy.router_helpers import _try_acquire_local_dispatch
+    from proxy.session import _slot_registry_key
 
     srv = _server_stub()
     with patch.dict(

@@ -63,6 +63,7 @@ def _fresh_cache(monkeypatch):
     yield
     obs.reset_slots_poll_cache()
     obs._slots_poll_inflight.clear()
+    obs.reset_slots_snapshot_state()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -556,16 +557,6 @@ class _FakeLock:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVVXGHHB0073W1B red-first (AC1): the pre-fix path fans out to one "
-        "upstream /slots fetch per poll (counts + detail cascade), so 5 concurrent "
-        "polls issue 5 fetches; the shared snapshot read path "
-        "(LP-0MVVXGLTM008ROJ9) must collapse this to exactly 1 — remove the "
-        "xfail when the contract lands."
-    ),
-)
 async def test_status_path_fanout_exactly_one_upstream_fetch_for_5_concurrent_polls():
     """AC2: 5 concurrent status polls inside the freshness window issue exactly
     one upstream /slots request (exact call count, not a ``<=`` bound).
@@ -616,4 +607,456 @@ async def test_status_path_fanout_exactly_one_upstream_fetch_for_5_concurrent_po
     assert len(backend.calls) == 1, (
         f"5 concurrent status polls inside the freshness window must issue exactly "
         f"one upstream /slots request, got {len(backend.calls)}: {backend.calls}"
+    )
+    # The shared fetch outlives every poll's budget by design (that is what
+    # stops the polls from promoting a second fetch); reap it so no task leaks
+    # into the next test.
+    await obs.acancel_slots_snapshot_tasks()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared snapshot read path (LP-0MVVXGLTM008ROJ9)
+#
+# One poll ⇒ one snapshot ⇒ one bounded upstream fetch. The counts pair and the
+# per-slot detail are derived from that single payload (AC3), the poll reuses
+# the snapshot while it is within the coalescer's freshness window (AC1), and a
+# poll whose budget expires degrades without cancelling the shared fetch, which
+# lands for later polls instead of extending this one (AC2).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _ScriptedBackend:
+    """Raw ``/slots`` fetch stub: records attempts, answers from a script."""
+
+    def __init__(self, status: int = 200, payload=None, delay: float = 0.0, error=None):
+        self.status = status
+        self.payload = payload if payload is not None else list(_SLOTS_PAYLOAD)
+        self.delay = delay
+        self.error = error
+        self.calls: list[str] = []
+
+    async def __call__(self, url: str, timeout: float, client=None):
+        self.calls.append(url)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return self.status, self.payload
+
+
+def _with_default_slots_model(monkeypatch):
+    """Pin the model id so the shared fetch URL is deterministic."""
+    monkeypatch.setattr(obs, "_resolve_slots_model_id", lambda model: model or "m")
+
+
+@pytest.mark.asyncio
+async def test_read_scope_derives_counts_and_detail_from_one_fetch(monkeypatch):
+    """AC1/AC3: one poll's counts and detail share one upstream fetch."""
+    _with_default_slots_model(monkeypatch)
+    backend = _ScriptedBackend()
+    monkeypatch.setattr(obs, "_do_slots_fetch", backend)
+
+    with obs.slots_read_scope(budget_seconds=1.0):
+        available, total = await obs._query_slots(None, 8080, model="m", timeout=1.0)
+        details = await obs._query_slots_detail(8080, timeout=1.0, model="m")
+
+    assert len(backend.calls) == 1, (
+        "a poll's counts and detail reads must share ONE upstream /slots fetch, "
+        f"got {len(backend.calls)}"
+    )
+    assert (available, total) == (1, 2)
+    assert [slot["is_processing"] for slot in details] == [False, True]
+    # AC3: the summary is counted from the SAME list that is served.
+    assert available == sum(1 for slot in details if not slot["is_processing"])
+
+
+@pytest.mark.asyncio
+async def test_read_scope_dedupes_a_failed_attempt_across_phases(monkeypatch):
+    """AC1: a failed fetch is not retried by the detail phase of the same poll."""
+    _with_default_slots_model(monkeypatch)
+    backend = _ScriptedBackend(error=TimeoutError("backend hung"))
+    monkeypatch.setattr(obs, "_do_slots_fetch", backend)
+    counts_out: dict = {}
+    detail_out: dict = {}
+
+    with obs.slots_read_scope(budget_seconds=1.0):
+        counts = await obs._query_slots(
+            None, 8080, model="m", timeout=1.0, status_out=counts_out
+        )
+        details = await obs._query_slots_detail(
+            8080, timeout=1.0, model="m", status_out=detail_out
+        )
+
+    assert len(backend.calls) == 1, (
+        "the detail phase must reuse the counts phase's failed attempt instead "
+        f"of issuing a second fetch, got {len(backend.calls)}"
+    )
+    assert counts == (0, 0)
+    assert details == []
+    assert counts_out.get("reason") == "timeout"
+    assert detail_out.get("reason") == "timeout"
+    # The detail read reused the shared attempt, so the handler must not record
+    # the same failure a second time.
+    assert detail_out.get("shared_read") is True
+
+
+@pytest.mark.asyncio
+async def test_pending_snapshot_degrades_without_cancelling_the_shared_fetch(monkeypatch):
+    """AC2: a fetch slower than the poll budget neither blocks nor dies."""
+    _with_default_slots_model(monkeypatch)
+    backend = _ScriptedBackend(delay=0.3)
+    monkeypatch.setattr(obs, "_do_slots_fetch", backend)
+
+    started = time.monotonic()
+    with obs.slots_read_scope(budget_seconds=0.05):
+        counts = await obs._query_slots(None, 8080, model="m", timeout=5.0)
+        details = await obs._query_slots_detail(8080, timeout=5.0, model="m")
+    elapsed = time.monotonic() - started
+
+    assert len(backend.calls) == 1
+    assert counts == (0, 0), "a pending fetch asserts no counts"
+    assert details == [], "a pending fetch serves no detail"
+    assert elapsed < 0.25, (
+        f"the poll must degrade at its budget instead of waiting out the fetch "
+        f"(took {elapsed:.2f}s)"
+    )
+    # The shared fetch survived the poll's budget.
+    assert obs._slots_snapshot_tasks, (
+        "the shared fetch must keep running after the poll's budget expires"
+    )
+
+    # ... and its payload is available to the next poll from the coalesced
+    # cache (the fetch lands at ~0.3 s; the default TTL then serves it).
+    await asyncio.sleep(0.4)
+    available, total = await obs._query_slots(None, 8080, model="m", timeout=1.0)
+    assert (available, total) == (1, 2)
+    assert len(backend.calls) == 1, (
+        "the completed shared fetch must serve the next poll from the cache, "
+        f"not trigger another fetch (got {len(backend.calls)})"
+    )
+
+
+def test_derive_slots_from_payload_is_the_single_source_of_counts():
+    """AC3: counts and detail come from one derivation, never two readings."""
+    payload = [
+        {"id": 0, "is_processing": False, "next_token": {"n_decoded": 3}, "n_past": 12},
+        {"id": 1, "is_processing": True, "next_token": None, "id_task": 7},
+        # No ``is_processing`` field at all: the counts and the detail must
+        # still agree on the same interpretation (not processing).
+        {"id": 2},
+    ]
+    available, total, slots = obs.derive_slots_from_payload(payload)
+
+    assert total == 3
+    assert [slot["slot_id"] for slot in slots] == [0, 1, 2]
+    assert [slot["is_processing"] for slot in slots] == [False, True, False]
+    assert available == sum(1 for slot in slots if not slot["is_processing"]) == 2
+    assert slots[0]["n_decoded"] == 3
+    assert slots[0]["context_tokens"] == 12
+    assert slots[1]["id_task"] == 7
+    # A malformed payload is rejected rather than half-derived.
+    assert obs.derive_slots_from_payload("not-a-list") is None
+    assert obs.derive_slots_from_payload([1, 2]) is None
+    assert obs.derive_slots_from_payload([]) == (0, 0, ())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Joining poll publishes the fetch stamp
+# (LP-0MWSD6B5F003P9CN → LP-0MWSD6CEE0068T19, parent LP-0MWRXFO0I005UBVM)
+#
+# A status poll that JOINS another poll's in-flight shared ``/slots`` fetch is
+# served the leader's real payload. Until the fix, it published
+# ``slots_snapshot_age_seconds=None`` / ``slots_snapshot_source="none"``: the
+# age is derived in ``proxy/proxy/handlers.py`` as a three-way branch
+#
+#   1. ``detail_stale or counts_stale``   → ``snapshot``  (cache stamps)
+#   2. ``elif slots_upstream_calls:``      → ``upstream``  (this poll's fetch)
+#   3. ``else:``                           → ``failure_backoff`` / ``ttl_cache``
+#
+# and a joiner satisfies none of them: ``_read_slots_snapshot`` starts no fetch
+# (``created=False`` ⇒ ``upstream_calls=0``) while its provenance *does* carry
+# ``source="upstream"`` and the landing ``fetched_at`` of the fetch that
+# produced the payload it was served. Branch 2 therefore does not fire and
+# branch 3 ignored ``source="upstream"``, so the published age stayed ``None``
+# — and the age-derived ``slots_stale`` contract called a seconds-old payload
+# stale (the measured 557 undatable polls of 608 stale ones).
+#
+# The fix (LP-0MWSD6CEE0068T19) makes branch 3 also label a JOINED fetch from
+# the provenance it was served: the age comes from that fetch's landing stamp
+# — never from the joining poll's own receive time, so a fossil cannot be
+# re-stamped fresh — and a poll that served nothing still publishes ``none``.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _GatedBackend:
+    """Raw ``/slots`` fetch stub that holds the ONE shared fetch until released.
+
+    ``started`` fires when the leader's upstream fetch begins, ``release`` lets
+    it land, and ``calls`` records every upstream attempt so the test can prove
+    the joiner caused none.
+    """
+
+    def __init__(self, payload=None, status: int = 200):
+        self.payload = payload if payload is not None else list(_SLOTS_PAYLOAD)
+        self.status = status
+        self.calls: list[str] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, url: str, timeout: float, client=None):
+        self.calls.append(url)
+        self.started.set()
+        await self.release.wait()
+        return self.status, self.payload
+
+
+def _status_records_by_client_port(records: list[logging.LogRecord]) -> dict:
+    """Index this test's ``status_request`` records by the caller's port."""
+    return {
+        rec.client_port: rec
+        for rec in records
+        if rec.getMessage() == "status_request"
+    }
+
+
+async def _drive_join_pair(
+    monkeypatch,
+    backend: _GatedBackend,
+    leader_port: int,
+    joiner_port: int,
+) -> dict:
+    """Drive one leader poll and one JOINING poll against the status endpoint.
+
+    Two REAL ``/llama/local/status`` requests run concurrently through the
+    production read path (only the raw upstream ``/slots`` fetch and the
+    llama-status query are stubbed). The leader's fetch is held open until the
+    second poll has attached to the SAME shared task, so the second poll is
+    provably a follower — not a TTL cache hit and not a pending-timeout
+    degradation.
+
+    Returns the two published ``status_request`` records keyed by
+    ``leader_rec`` / ``joiner_rec`` plus the two response payloads, so a test
+    can assert on what an operator actually reads.
+    """
+    from unittest.mock import MagicMock
+    from unittest.mock import patch as _patch
+
+    from proxy.server import app
+
+    from proxy import server
+
+    async def fake_query():
+        return {"llama_server_running": True}
+
+    # Observe the coalescer's entry point: ``created=False`` means this poll
+    # joined an in-flight fetch instead of starting one.
+    real_shared_task = obs._shared_slots_snapshot_task
+    joined = asyncio.Event()
+
+    def _observing_shared_task(url, timeout, client):
+        task, created = real_shared_task(url, timeout, client)
+        if not created:
+            joined.set()
+        return task, created
+
+    monkeypatch.setattr(obs, "_shared_slots_snapshot_task", _observing_shared_task)
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    collector = _Collect()
+    collector.setLevel(logging.INFO)
+    log = logging.getLogger("llama-proxy")
+    prev_level = log.level
+    log.setLevel(logging.INFO)
+    log.addHandler(collector)
+
+    # Distinct client ports let each published status line be attributed to the
+    # leader or the joiner request deterministically.
+    leader_transport = httpx.ASGITransport(
+        app=app, client=("127.0.0.1", leader_port)
+    )
+    joiner_transport = httpx.ASGITransport(
+        app=app, client=("127.0.0.1", joiner_port)
+    )
+
+    leader_resp = joiner_resp = None
+    try:
+        with (
+            _patch("proxy.server.query_llama_status", side_effect=fake_query),
+            _patch.object(obs, "_do_slots_fetch", backend),
+            _patch.multiple(
+                server,
+                current_model="test-model",
+                model_switch_refcount=0,
+                model_switch_lock=_FakeLock(),
+                background_loads={},
+                local_dispatch_records={},
+                local_dispatch_records_lock=_FakeLock(),
+                _http_client=MagicMock(),
+                config={"server": {"llama_server_port": 8080}},
+            ),
+        ):
+            async with (
+                httpx.AsyncClient(
+                    transport=leader_transport, base_url="http://test"
+                ) as leader_client,
+                httpx.AsyncClient(
+                    transport=joiner_transport, base_url="http://test"
+                ) as joiner_client,
+            ):
+                leader_task = asyncio.create_task(
+                    leader_client.get("/llama/local/status")
+                )
+                # The leader is inside its upstream fetch ...
+                await asyncio.wait_for(backend.started.wait(), timeout=2.0)
+                joiner_task = asyncio.create_task(
+                    joiner_client.get("/llama/local/status")
+                )
+                try:
+                    # ... and the second poll has attached to the SAME task.
+                    await asyncio.wait_for(joined.wait(), timeout=2.0)
+                finally:
+                    # Never leave the held fetch (or either request) pending,
+                    # even when an assertion above fails.
+                    backend.release.set()
+                leader_resp, joiner_resp = await asyncio.gather(
+                    leader_task, joiner_task
+                )
+    finally:
+        log.removeHandler(collector)
+        log.setLevel(prev_level)
+        await obs.acancel_slots_snapshot_tasks()
+
+    assert leader_resp is not None and joiner_resp is not None
+    assert leader_resp.status_code == 200 and joiner_resp.status_code == 200
+    # AC4: the joiner caused no upstream call and the leader performed exactly
+    # one — this is a real join, not a cache hit and not a timeout.
+    assert len(backend.calls) == 1, (
+        "the two polls must share exactly ONE upstream /slots fetch, got "
+        f"{len(backend.calls)}: {backend.calls}"
+    )
+    assert all("/slots" in url for url in backend.calls)
+
+    by_port = _status_records_by_client_port(records)
+    assert leader_port in by_port and joiner_port in by_port, (
+        f"expected one status_request line per poll, got ports {sorted(by_port)}"
+    )
+    return {
+        "leader_rec": by_port[leader_port],
+        "joiner_rec": by_port[joiner_port],
+        "leader_payload": leader_resp.json(),
+        "joiner_payload": joiner_resp.json(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_joining_poll_publishes_the_fetch_stamp(monkeypatch):
+    """A joiner is served a dated payload and publishes that fetch's stamp.
+
+    Red-first reproduction of the parent's defect: before the fix this poll
+    reported ``slots_snapshot_age_seconds=None`` / ``slots_snapshot_source=
+    "none"`` even though a seconds-old payload was served, so the age-derived
+    ``slots_stale`` contract flagged it stale.
+    """
+    pair = await _drive_join_pair(
+        monkeypatch, _GatedBackend(), leader_port=1111, joiner_port=2222
+    )
+    leader_rec = pair["leader_rec"]
+    joiner_rec = pair["joiner_rec"]
+    leader_payload = pair["leader_payload"]
+    joiner_payload = pair["joiner_payload"]
+
+    # AC4: the leader's own fetch is attributed to it ...
+    assert leader_rec.slots_upstream_calls == 1
+    # ... and the joiner is served that fetch's payload, without a fetch of its
+    # own, after waiting on it (both phases are fresh, unlike a timeout).
+    assert joiner_rec.slots_upstream_calls == 0, (
+        "a joining poll must publish slots_upstream_calls=0; it performed no "
+        f"upstream call (got {joiner_rec.slots_upstream_calls})"
+    )
+    assert joiner_rec.slots_counts_ms >= 0
+    assert joiner_payload["slots"] == leader_payload["slots"], (
+        "the joiner must be served the leader's own payload, got "
+        f"{joiner_payload['slots']!r} vs {leader_payload['slots']!r}"
+    )
+    assert joiner_payload["available_slots"] == leader_payload["available_slots"]
+    assert joiner_payload["total_slots"] == leader_payload["total_slots"]
+
+    # AC2/AC3: a payload WAS served, so its age must be published and its
+    # source must name the serving path — never ``none``.
+    assert joiner_rec.slots_snapshot_age_seconds is not None, (
+        "a joining poll was served a real /slots payload but published no "
+        "snapshot age, so the age-derived slots_stale calls it stale"
+    )
+    assert joiner_rec.slots_snapshot_age_seconds == pytest.approx(0.0, abs=2.0)
+    assert joiner_rec.slots_snapshot_source != "none", (
+        "a joining poll's snapshot source must name the serving path, got "
+        f"{joiner_rec.slots_snapshot_source!r}"
+    )
+    assert joiner_rec.slots_snapshot_source in {"upstream", "ttl_cache", "snapshot"}
+    assert joiner_payload["slots_stale"] is False, (
+        "a seconds-old shared payload must not be reported stale"
+    )
+
+
+@pytest.mark.asyncio
+async def test_joined_payload_has_one_age_for_leader_and_joiner(monkeypatch):
+    """One payload ⇒ one age: both polls age the SAME fetch stamp.
+
+    The leader ages the payload from the stamp it landed; the joiner must age
+    the very same payload from the very same stamp, so the two published ages
+    differ only by the (sub-second) gap between the two status lines. An age
+    measured from the joiner's own receive time would not exist before the fix
+    at all, and one derived from a *newer* stamp would read near zero for a
+    fossil payload — both are excluded here.
+    """
+    pair = await _drive_join_pair(
+        monkeypatch, _GatedBackend(), leader_port=3333, joiner_port=4444
+    )
+    leader_age = pair["leader_rec"].slots_snapshot_age_seconds
+    joiner_age = pair["joiner_rec"].slots_snapshot_age_seconds
+    assert leader_age is not None and joiner_age is not None, (
+        "both polls were served the shared payload, so both must publish an "
+        f"age (leader={leader_age!r}, joiner={joiner_age!r})"
+    )
+    assert pair["joiner_rec"].slots_snapshot_source == "upstream"
+    assert pair["leader_rec"].slots_snapshot_source == "upstream"
+    assert pair["joiner_payload"]["slots"] == pair["leader_payload"]["slots"]
+    # Same landing stamp, published microseconds apart: the ages agree to well
+    # under a second, and the joiner's (published later) is never younger.
+    assert 0.0 <= joiner_age - leader_age < 2.0, (
+        "leader and joiner must age the SAME payload from the SAME landing "
+        f"stamp (leader={leader_age}, joiner={joiner_age})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_join_that_serves_no_payload_publishes_no_age(monkeypatch):
+    """A join of a FAILED fetch served nothing: no age, and still ``none``.
+
+    Guards the fix's boundary: inheriting the stamp must not turn a poll that
+    was served no payload into a datable one. Only a landed, usable fetch is
+    aged — a failed shared fetch leaves the joiner exactly as it was
+    (``slots_snapshot_age_seconds=None``, ``slots_snapshot_source="none"``).
+    """
+    pair = await _drive_join_pair(
+        monkeypatch,
+        _GatedBackend(status=500),
+        leader_port=5555,
+        joiner_port=6666,
+    )
+    joiner_rec = pair["joiner_rec"]
+    assert pair["joiner_payload"]["slots"] == []
+    assert joiner_rec.slots_upstream_calls == 0
+    assert joiner_rec.slots_snapshot_age_seconds is None, (
+        "a joining poll whose shared fetch failed was served no payload, so it "
+        f"must publish no age (got {joiner_rec.slots_snapshot_age_seconds!r})"
+    )
+    assert joiner_rec.slots_snapshot_source == "none", (
+        "a joining poll served nothing must keep slots_snapshot_source='none', "
+        f"got {joiner_rec.slots_snapshot_source!r}"
     )

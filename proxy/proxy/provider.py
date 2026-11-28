@@ -163,6 +163,12 @@ def _budget_diagnostics(decision) -> dict[str, str]:
 # In-memory cooldown tracking: provider_name -> expiry_timestamp (seconds since epoch)
 _provider_unavailable_until: dict[str, float] = {}
 
+#: Clock seam (LP-0MWL58KAK003JZ41): tests override this to drive cooldown
+#: expiry deterministically; production reads ``time.time`` via the wrapper.
+def _cooldown_now() -> float:
+    return time.time()
+
+
 # Consecutive failure count for exponential backoff: provider_name -> count
 # Incremented on each failure, reset to 0 on success.
 _provider_failure_count: dict[str, int] = {}
@@ -3823,6 +3829,66 @@ def resolve_resident_prefix(
     )
 
 
+#: Residency sources that carry a real reusable-prefix MEASUREMENT
+#: (LP-0MWRQ6LSV009DVP4 AC1). ``session_slot`` is deliberately excluded — the
+#: slot is owned but its size is unknown (``n_past_actual is None``), so there
+#: is no measurement to price from.
+_ETA_MEASURED_SOURCES = (
+    RESIDENCY_SOURCE_MEASURED,
+    RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
+)
+
+
+def _eta_measured_n_past(facts) -> int | None:
+    """The measured ``n_past_actual`` the ETA may price from, or ``None``.
+
+    Parent AC1 (LP-0MWRQ6LSV009DVP4): when a *measured* resident prefix exists
+    (``source`` is ``measured`` — live ``context_tokens`` — or
+    ``measured_last_dispatch`` — the ``(model, session)`` measurement store),
+    the ETA is priced from ``min(n_past_actual, estimated_tokens)``. Every
+    other source (``session_slot`` with ``n_past_actual is None``,
+    ``non_resident``, ``unknown``, a stale view) returns ``None`` so the guard
+    keeps the predicted ratio: no measurement is inferred from absent data.
+    """
+    if facts is None:
+        return None
+    if getattr(facts, "source", None) in _ETA_MEASURED_SOURCES:
+        return getattr(facts, "n_past_actual", None)
+    return None
+
+
+def _resolve_eta_residency(
+    model_name: str | None,
+    session_id: str | None,
+    estimated_tokens: int,
+    *,
+    endpoint: str | None = None,
+    server_config: dict | None = None,
+    view=None,
+) -> tuple[int | None, "ResidentPrefixFacts | None"]:
+    """Resolve the measured resident prefix for ETA pricing **once**.
+
+    Returns ``(measured_n_past, facts)``. Facts are read from the
+    **already-cached** residency view (:func:`resolve_resident_prefix`) — never
+    a synchronous ``/slots`` query (llama-server holds ``/slots`` >15 s while
+    processing a prompt batch, LP-0MUXTW4MD003TVIC). Fail-open: any error
+    returns ``(None, None)``, so the guard keeps the predicted-ratio price and
+    never breaks routing on an observability path (LP-0MWRQ6LSV009DVP4 AC1).
+    """
+    try:
+        facts = resolve_resident_prefix(
+            session_id,
+            estimated_tokens,
+            view=view,
+            endpoint=endpoint,
+            model_name=model_name,
+            server_config=server_config,
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None, None
+    return _eta_measured_n_past(facts), facts
+
+
 #: Skip reason emitted when the tenancy bound refuses a new session (AC2).
 #: Mirrors ``proxy.router_helpers.TENANCY_SKIP_REASON``; kept local so the
 #: ladder does not need a module-level import of ``router_helpers`` (which
@@ -4753,6 +4819,13 @@ def _idle_admission_budget_verdict(
         model_name = provider_cfg.get("llama_model", "") if isinstance(
             provider_cfg, dict
         ) else ""
+        # Measured-basis ETA pricing (LP-0MWRQ6LSV009DVP4 AC1): resolve the
+        # measured resident prefix once so the idle-admit verdict prices the
+        # same way the direct guard does.
+        measured_n_past, _eta_facts = _resolve_eta_residency(
+            model_name, session_id, estimated_tokens,
+            server_config=server_cfg,
+        )
         decision = prefill_eta.evaluate_admission(
             config,
             model_name,
@@ -4760,6 +4833,7 @@ def _idle_admission_budget_verdict(
             cached_ratio,
             "medium",
             residency_measured=_residency_is_measured(model_name, session_id),
+            measured_n_past=measured_n_past,
         )
         # LP-0MVODJ3P6000AIUM AC1: return the decision for BOTH verdicts so
         # the idle-admit accept path can thread the ETA the guard actually
@@ -5752,7 +5826,7 @@ def mark_provider_unavailable(
         cooldown_seconds = min(backoff, cooldown_seconds)
         _provider_failure_count[provider_name] = count + 1
 
-    _provider_unavailable_until[provider_name] = time.time() + cooldown_seconds
+    _provider_unavailable_until[provider_name] = _cooldown_now() + cooldown_seconds
     _persist_provider_state_best_effort()
 
 
@@ -5786,7 +5860,7 @@ def _provider_cooldown_remaining(provider_name: str) -> int:
     expiry = _provider_unavailable_until.get(provider_name)
     if expiry is None:
         return 0
-    remaining = expiry - time.time()
+    remaining = expiry - _cooldown_now()
     if remaining <= 0:
         # Cooldown expired — clean up entry
         del _provider_unavailable_until[provider_name]
@@ -8122,9 +8196,11 @@ def _local_concurrency_info(
     target accepts (LP-0MRPILSMW004T4H8).
 
     *session_id* (LP-0MW0VH2LB008JSKQ) lets the routing gate exclude the
-    requesting session's own idle lease; it is forwarded only when the target
-    accepts it, so ``(config)``-only and ``(config, endpoint=…)`` stubs used by
-    existing tests keep working unchanged.
+    requesting session's own non-occupying record — its idle lease, and since
+    LP-0MWNHBG7D002NH5S also its finished-but-not-yet-released record; it is
+    forwarded only when the target accepts it, so ``(config)``-only and
+    ``(config, endpoint=…)`` stubs used by existing tests keep working
+    unchanged.
     """
     fn = _get_local_concurrency_info
     try:
@@ -8166,10 +8242,10 @@ def _dispatch_local(ptr_local, request, path, endpoint: str | None):
     return ptr_local(request, path)
 
 
-def _is_own_idle_lease(
+def _is_own_record_non_occupancy(
     key, record: dict, session_id: str | None
 ) -> bool:
-    """True when *key* is the requesting session's own **idle** lease.
+    """True when *key* is the requesting session's own **non-occupying** record.
 
     LP-0MW0VH2LB008JSKQ: the routing concurrency gate and the dispatch-lease
     gate must agree about the requesting session's own record. The lease gate
@@ -8180,16 +8256,56 @@ def _is_own_idle_lease(
     own lease window was pushed remote while nothing was generating (measured
     2026-11-03: 15 of 82 ``local_concurrency_limit`` fall-throughs).
 
-    Only an **inactive** record is excluded. A record that is still ``active``
-    is genuine in-flight work — a second concurrent request from the same
-    session must be gated exactly as before — so active records always count.
+    LP-0MWNHBG7D002NH5S: the predicate is keyed on the record's **explicit
+    streaming state**, not on ``active`` and not on a teardown timestamp. The
+    record is the requester's own non-occupancy when it holds **no** streaming
+    dispatch token, which covers both shapes that must not gate the returning
+    session:
+
+    - an **idle lease** — ``active: False`` (the LP-0MW0VH2LB008JSKQ case);
+    - **finished-but-not-yet-released** — ``active: True`` with an empty
+      ``streaming_dispatch_tokens`` set, i.e. the stream has emitted its
+      terminal chunk
+      (``router_helpers._mark_local_dispatch_stream_finished``) but
+      ``request._cleanup_after_request`` has not released the credit yet. A
+      sequential client's next turn lands inside that window (~145 ms measured
+      against ~1.41 s of teardown latency) and used to be exiled with
+      ``local_concurrency_limit``.
+
+    While the own record holds **at least one** streaming dispatch token it is
+    genuine in-flight work (a second concurrent request from the same session),
+    so it keeps counting exactly as before.
+
+    A record **without** a ``streaming_dispatch_tokens`` key predates the
+    marker (legacy or hand-built record): :func:`_dispatch_streaming_tokens`
+    reports ``None`` for it and the predicate falls back to the pre-change
+    behaviour — only an ``active: False`` own record is excluded.
+
+    ``session_id`` of ``None``/empty excludes nothing (AC3), and the predicate
+    is a pure read (it never mutates the record, the registry or a counter).
     """
     if not session_id or not isinstance(record, dict):
         return False
-    if record.get("active"):
-        return False
     key_session = key[1] if isinstance(key, tuple) and len(key) == 2 else key
-    return key_session == session_id
+    if key_session != session_id:
+        return False
+    # Local import: ``router_helpers`` lazily imports the server to avoid a
+    # cycle, so this module keeps its imports of it function-local. Only the
+    # requester's own record reaches here, at most a couple per routing pass.
+    from proxy.router_helpers import _dispatch_streaming_tokens
+
+    streaming = _dispatch_streaming_tokens(record)
+    if streaming is None:
+        # Legacy record (no marker): keyed on ``active`` alone, as before.
+        return not record.get("active")
+    return not streaming
+
+
+#: Backwards-compatible alias (LP-0MWNHBG7D002NH5S). The predicate used to be
+#: called ``_is_own_idle_lease`` because it only recognised an ``active: False``
+#: record; it now recognises any own record that is not streaming. Kept so
+#: existing callers, guards and docs that name the old predicate keep working.
+_is_own_idle_lease = _is_own_record_non_occupancy
 
 
 def _get_local_concurrency_info(
@@ -8208,9 +8324,11 @@ def _get_local_concurrency_info(
     single-server mode), the global ``local_generating_queries`` counter is
     used.
 
-    *session_id* is the requesting session. Its **own idle lease** is not
-    occupancy (see :func:`_is_own_idle_lease`), so a returning session keeps
-    the slot its lease reserved. ``None`` (anonymous/legacy callers, and the
+    *session_id* is the requesting session. Its own **non-occupying** record is
+    not occupancy (see :func:`_is_own_record_non_occupancy`), so a returning
+    session keeps the slot its lease reserved — including the
+    finished-but-not-yet-released window between a turn's terminal chunk and its
+    teardown (LP-0MWNHBG7D002NH5S). ``None`` (anonymous/legacy callers, and the
     pool-description readers used by the status surface) excludes nothing and
     keeps today's count exactly (LP-0MW0VH2LB008JSKQ AC3).
 
@@ -8256,14 +8374,14 @@ def _get_local_concurrency_info(
                     now = time.monotonic()
                     for key, record in records.items():
                         if isinstance(key, tuple) and len(key) == 2 and key[0] == endpoint:
-                            if _is_own_idle_lease(key, record, session_id):
+                            if _is_own_record_non_occupancy(key, record, session_id):
                                 continue
                             if record.get("active") or record.get("expires_at", 0) > now:
                                 cur_active += 1
                         elif not isinstance(key, tuple) and endpoint == default_ep:
                             # Legacy plain-key record occupies the default
                             # server's pool alongside tuple-keyed records.
-                            if _is_own_idle_lease(key, record, session_id):
+                            if _is_own_record_non_occupancy(key, record, session_id):
                                 continue
                             if record.get("active") or record.get("expires_at", 0) > now:
                                 cur_active += 1
@@ -9143,6 +9261,7 @@ async def _promote_too_large_local_request(
     body_json: dict | None,
     routing_estimate,
     session_id: str | None = None,
+    priority: str | None = None,
 ) -> list[dict]:
     """Drop the local entry when a pin-local request is ``too_large`` (AC1).
 
@@ -9163,9 +9282,19 @@ async def _promote_too_large_local_request(
       prompt is not mistaken for a cold one,
     * ``server.local_cold_prefill_budget_tokens`` through
       :func:`_cold_prefill_budget_tokens` (i.e.
-      :data:`proxy.prefill_eta.COLD_PREFILL_BUDGET_KEY`), and
+      :data:`proxy.prefill_eta.COLD_PREFILL_BUDGET_KEY`),
     * the local entry's own context ceiling
-      (:func:`_provider_context_limit`).
+      (:func:`_provider_context_limit`), and
+    * the admission guard's own decision for the deadline token capacity
+      (LP-0MW957RB3000ER79, LP-0MWFN1DIL002TTSP AC1): ``evaluate_admission``
+      prices the whole prompt cold when residency is unmeasured and the
+      measured new tokens when a measured record exists, and attributes the
+      CAPACITY refusal only when the deadline / deadline-relative safety
+      budget is not the binding temporal bound on the same cold price — so a
+      prompt whose cold basis exceeds the capacity is promoted exactly like a
+      flat-cap ``prefill_budget_exceeded`` request, never kept pinned for a
+      retry waiting cannot help. An uncalibrated capacity stays fail-open
+      (AC5).
 
     The classification itself is delegated to
     :func:`admission_reserve.local_capacity_verdict` — the single verdict
@@ -9228,9 +9357,46 @@ async def _promote_too_large_local_request(
         new_tokens = int(estimated * (1 - float(cached_ratio or 0.0)))
     except (TypeError, ValueError):  # pragma: no cover - defensive
         new_tokens = 0
-    from proxy import admission_reserve
+    from proxy import admission_reserve, prefill_eta
+
+    # Deadline token capacity (LP-0MW957RB3000ER79, LP-0MWFN1DIL002TTSP AC1):
+    # the admission guard prices the whole prompt cold when residency is
+    # unmeasured and the measured new tokens when a measured record exists, and
+    # attributes the CAPACITY refusal only when neither the deadline nor its
+    # deadline-relative safety budget is the binding bound on the same cold
+    # price (the temporal deadline refusal is deliberately kept otherwise —
+    # the capacity would be redundant there). Let the guard's own decision
+    # classify the request instead of re-deriving a size table here, so the
+    # promotion can never disagree with the in-loop admission gate about
+    # whether a prompt's COLD basis exceeds the deadline capacity
+    # (single-implementation contract LP-0MVSLZY470051ZB2 AC3). An
+    # uncalibrated capacity stays fail-open (AC5).
+    model_name = local_entry.get("llama_model") or ""
+    # Measured-basis ETA pricing (LP-0MWRQ6LSV009DVP4 AC1): resolve the measured
+    # resident prefix once so the pre-dispatch capacity classifier prices the
+    # request exactly as the in-loop admission guard does.
+    measured_n_past, _eta_facts = _resolve_eta_residency(
+        model_name,
+        session_id,
+        estimated,
+        server_config=(config.get("server", config) if isinstance(config, dict) else None),
+    )
+    try:
+        decision = prefill_eta.evaluate_admission(
+            config,
+            model_name,
+            estimated,
+            cached_ratio,
+            priority,
+            residency_measured=_residency_is_measured(model_name, session_id),
+            measured_n_past=measured_n_past,
+        )
+    except Exception:  # pragma: no cover - defensive, mirrors the guard
+        logger.debug("too-large verdict: admission guard failed", exc_info=True)
+        decision = None
 
     verdict = admission_reserve.local_capacity_verdict(
+        decision,
         new_tokens=new_tokens,
         budget_tokens=_cold_prefill_budget_tokens(config),
         estimated_tokens=estimated,
@@ -9456,6 +9622,19 @@ def _build_local_only_refusal_response(
         reason=reason,
         new_tokens=new_tokens,
         budget_tokens=budget_tokens,
+        # Deadline capacity evidence (LP-0MW957RB3000ER79): threaded from the
+        # guard decision so a capacity refusal classifies ``too_large`` even
+        # under a coarse fallback reason, and never advertises a retry timer
+        # (LP-0MWFN1DIL002TTSP AC2).
+        deadline_capacity_tokens=_admission_token_evidence(
+            attempt, "deadline_capacity_tokens"
+        ),
+        capacity_priced_tokens=_admission_token_evidence(
+            attempt, "capacity_priced_tokens"
+        ),
+        deadline_capacity_calibrated=bool(
+            attempt.get("deadline_capacity_calibrated", False)
+        ),
     )
     timing = _refusal_retry_timing(
         reason,
@@ -10377,6 +10556,19 @@ async def _prefill_admission_guard(
             messages,
             server_config=server_cfg,
         )
+        # Measured-basis ETA pricing (LP-0MWRQ6LSV009DVP4 AC1): resolve the
+        # session's measured resident prefix once, from the already-cached
+        # residency view (never a synchronous /slots query). The measured
+        # figure prices new_tokens only when a REAL measurement exists
+        # (``measured`` / ``measured_last_dispatch``); every other source keeps
+        # the predicted ratio.
+        measured_n_past, _eta_facts = _resolve_eta_residency(
+            model_name,
+            session_id,
+            estimated_tokens,
+            endpoint=endpoint,
+            server_config=server_cfg,
+        )
         # Occupancy-aware verdict (LP-0MVICD2YW004DJPV): the wait a newcomer
         # actually faces is its own prefill *plus* the occupied gate ahead of
         # it, so the guard needs the occupants before it can compare against
@@ -10406,8 +10598,31 @@ async def _prefill_admission_guard(
             # whole prompt, so a predicted-warm prompt can never slip past the
             # capacity on optimism.
             residency_measured=_residency_is_measured(model_name, session_id),
+            # Measured resident prefix for the ETA price (LP-0MWRQ6LSV009DVP4
+            # AC1); ``None`` keeps the predicted ratio.
+            measured_n_past=measured_n_past,
         )
         if not decision.active:
+            # An inert decision admits without adjudicating (an uncalibrated
+            # bucket, every time bound disabled, or policy off). Log it with
+            # ``reason=inert_admit reason_inert=<reason>`` so a later
+            # ``prefill_deadline`` eviction of this dispatch is attributable
+            # from the log alone (LP-0MVZF4SU10032OZH AC1); the return stays
+            # ``None`` so today's queueing behaviour is byte-for-byte
+            # unchanged.
+            prefill_eta.record_guard_decision(
+                decision,
+                provider=(
+                    provider_cfg.get("name")
+                    if isinstance(provider_cfg, dict)
+                    else None
+                ),
+                session_id=session_id,
+                model=model_name,
+                priority=priority,
+                reason_label=reason_label,
+                free_slot=free_slot,
+            )
             return None
         # For the deadline refusal keep the decision's own reason so the
         # log reason is ``prefill_eta_exceeds_deadline`` on both paths
@@ -10479,6 +10694,14 @@ def _local_admission_evidence(decision: Any) -> dict[str, Any]:
     capacity_priced = getattr(decision, "capacity_priced_tokens", None)
     if capacity_priced:
         evidence["capacity_priced_tokens"] = int(capacity_priced)
+    # LP-0MW957RB3000ER79 / LP-0MWFN1DIL002TTSP AC2: whether the capacity is
+    # calibrated decides whether it is enforceable — the refusal payload's
+    # verdict must classify a capacity refusal as ``too_large`` even when a
+    # coarse fallback reason masks the decision reason, so the flag is
+    # threaded with the token counts the verdict helper consumes.
+    calibrated = getattr(decision, "deadline_capacity_calibrated", False)
+    if capacity_tokens is not None:
+        evidence["deadline_capacity_calibrated"] = bool(calibrated)
     return evidence
 
 
@@ -10668,6 +10891,44 @@ def _queue_new_tokens_from_request(request) -> int | None:
 #: including the slot-retry re-dispatches) inherits the same verbatim numbers
 #: instead of re-pricing the prompt at record creation.
 LOCAL_ADMISSION_EVIDENCE_ATTR = "_local_admission_evidence"
+
+
+def _stamp_pricing_for_decision(
+    decision,
+    routing_cached_ratio: float,
+    routing_new_tokens: int,
+    estimated_tokens: int,
+) -> tuple[float, int]:
+    """The ``(cached_ratio, new_tokens)`` the dispatch record should stamp.
+
+    Parent AC2 (LP-0MWRQ6LSV009DVP4): when the governing decision priced from a
+    **measured** resident prefix (``eta_pricing_basis == "measured"``), stamp the
+    ratio and new-token count the ETA actually enforced, so
+    ``prefill_eta_accuracy`` scores the priced figure instead of a re-derived
+    prediction. Every other case — no decision, a predicted-basis decision, the
+    ``predicted`` rollback — returns the routing-time values byte-for-byte.
+
+    Best-effort: a malformed decision or estimate falls back to the routing
+    values; the stamp must never break a routing decision.
+    """
+    try:
+        if (
+            decision is None
+            or getattr(decision, "eta_pricing_basis", None) != "measured"
+        ):
+            return routing_cached_ratio, routing_new_tokens
+        measured_ratio = getattr(decision, "eta_pricing_ratio", None)
+        if measured_ratio is None:
+            return routing_cached_ratio, routing_new_tokens
+        decided_new = getattr(decision, "new_tokens", None)
+        if isinstance(decided_new, int) and not isinstance(decided_new, bool):
+            return float(measured_ratio), decided_new
+        return float(measured_ratio), max(
+            0,
+            int(round(float(estimated_tokens or 0) * (1.0 - float(measured_ratio)))),
+        )
+    except Exception:
+        return routing_cached_ratio, routing_new_tokens
 
 
 def _stamp_local_admission_evidence(
@@ -15607,6 +15868,7 @@ async def _proxy_with_remote_fallback_cycle(
         body_json,
         _routing_estimate,
         session_id=_budget_session_id,
+        priority=_priority,
     )
     if _promoted_chain is not _chain:
         _chain = _promoted_chain
@@ -16503,6 +16765,7 @@ async def _proxy_with_fallback_cycle(
         body_json,
         _routing_estimate,
         session_id=_session_id,
+        priority=_priority,
     )
     if _promoted_chain is not _chain:
         _chain = _promoted_chain
@@ -17860,12 +18123,26 @@ async def _proxy_with_fallback_cycle(
                     ) if _admission_snapshot_decision is not None else None
                 except Exception:
                     _snapshot_busy, _snapshot_in_flight = None, None
+                # Stamped-evidence basis (LP-0MWRQ6LSV009DVP4 AC2): when the
+                # governing decision priced from a MEASURED resident prefix,
+                # stamp that measured ratio and its new-token count, so
+                # ``prefill_eta_accuracy`` scores the figure the guard actually
+                # enforced rather than the routing-time prediction. Every other
+                # case (prediction, ``session_slot``, stale view, the
+                # ``predicted`` rollback) keeps the routing values
+                # byte-for-byte.
+                _stamp_cached_ratio, _stamp_new_tokens = _stamp_pricing_for_decision(
+                    _admission_snapshot_decision,
+                    _routing_cached_ratio,
+                    _routing_new_tokens,
+                    _estimated_tokens,
+                )
                 try:
                     _stamp_local_admission_evidence(
                         request,
                         estimated_tokens=_estimated_tokens,
-                        cached_ratio=_routing_cached_ratio,
-                        new_tokens=_routing_new_tokens,
+                        cached_ratio=_stamp_cached_ratio,
+                        new_tokens=_stamp_new_tokens,
                         decision=_admission_snapshot_decision,
                         model_name=_llama_model or provider_name,
                         busy_slots=_snapshot_busy,

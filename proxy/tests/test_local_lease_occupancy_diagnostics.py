@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MWM1S06M007BUKC
+# smell: formatting
+# severity: high
+# description: Ambiguous variable name: `l`
+# -->
 """Local dispatch-lease occupancy: stale records, denial evidence, divergence.
 
 LP-0MW0KZTWC004HXQ5. On 2026-11-03 the proxy refused local dispatches while
@@ -143,6 +149,30 @@ async def test_prune_removes_only_inactive_expired_records():
 
     assert removed == ["stale"], f"only the inactive expired record is stale: {removed}"
     assert set(srv.local_dispatch_records) == {"cooldown", "live", "lapsed-live"}
+
+
+@pytest.mark.asyncio
+async def test_prune_pops_the_stale_records_prefill_marker():
+    """AC2 (LP-0MWKWGLRT003AUG4): pruning a stale record pops its marker.
+
+    The incident shape: an inactive, expired record is pruned and its slot is
+    freed, but the session's ``local_prefill_in_flight`` entry survives — with
+    ``local_max_concurrent_prefills: 1`` that single orphan denies every later
+    local dispatch while llama-server reports free slots.
+    """
+    srv = _make_srv(
+        records={"stale-session": _record(active=False, expires_in=-5.0)},
+        markers={"stale-session": True},
+    )
+
+    removed = helpers._prune_stale_dispatch_records(srv, time.monotonic())
+
+    assert removed == ["stale-session"]
+    assert srv.local_dispatch_records == {}, "the stale record must be pruned"
+    assert srv.local_prefill_in_flight == {}, (
+        "pruning a stale record must pop its prefill marker: "
+        f"markers={srv.local_prefill_in_flight}"
+    )
 
 
 @pytest.mark.asyncio
@@ -482,16 +512,16 @@ async def test_denial_line_carries_occupancy_evidence_and_names_the_owner(monkey
     assert "max_local=2" in line
     assert "llama_available_slots=2" in line
 
-    divergences = [l for l in _log_lines(server.logger, "info")
-                   if l.startswith("local_occupancy_divergence")]
+    divergences = [line for line in _log_lines(server.logger, "info")
+                   if line.startswith("local_occupancy_divergence")]
     assert divergences, "a refusal llama contradicts must be logged as a divergence"
     assert (
         f"reason={helpers.LOCAL_OCCUPANCY_DIVERGENCE_LLAMA_FREE_SLOTS}" in divergences[0]
     )
     assert "owner=owner-session" in divergences[0]
     assert not [
-        l for l in _log_lines(server.logger, "warning")
-        if l.startswith("local_occupancy_divergence")
+        line for line in _log_lines(server.logger, "warning")
+        if line.startswith("local_occupancy_divergence")
     ], (
         "a llama-count disagreement is an expected capacity-view split, so it is "
         "logged at INFO beside the denial rather than into the WARNING stream"
@@ -503,14 +533,14 @@ async def test_full_pool_matching_llama_logs_no_divergence(monkeypatch):
     """AC3/AC5: a refusal llama agrees with is not a divergence."""
     lines = await _drive_denial(monkeypatch, generating=2, llama_counts=(0, 2))
 
-    assert [l for l in lines if l.startswith("local_dispatch_denied")]
+    assert [line for line in lines if line.startswith("local_dispatch_denied")]
     assert "llama_available_slots=0" in [
-        l for l in lines if l.startswith("local_dispatch_denied")
+        line for line in lines if line.startswith("local_dispatch_denied")
     ][0]
     assert not [
-        l
-        for l in _log_lines(server.logger, "info")
-        if l.startswith("local_occupancy_divergence")
+        line
+        for line in _log_lines(server.logger, "info")
+        if line.startswith("local_occupancy_divergence")
     ], "a full pool that llama agrees with is not a divergence"
 
 
@@ -579,7 +609,6 @@ async def test_all_slots_busy_reports_zero_available_slots():
     because the lease registry happens to be empty.
     """
     import httpx
-
     from proxy.server import app
 
     async def fake_query():

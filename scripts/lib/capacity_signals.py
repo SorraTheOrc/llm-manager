@@ -29,6 +29,17 @@ Derivation contract (identical on both surfaces)
     poll is **excluded from the denominator** rather than counted as fresh —
     the pre-fix surface never emitted the field, so counting it fresh would
     understate the rate.
+``slots_age_fields`` / ``slots_stale_from_age``
+    The age-derived ``slots_stale`` definition (F4 of LP-0MVVCO1N7004TNGY,
+    LP-0MVVXGM54009TOXD): a poll that carries both
+    ``slots_snapshot_age_seconds`` and ``slots_max_snapshot_age_seconds`` is
+    judged by the delivered contract (age > ceiling ⇒ stale, ``age ==
+    ceiling`` ⇒ fresh, undatable snapshot ⇒ stale) instead of by the flag its
+    own build published. That makes post-change windows — and the F1-era
+    windows that carry the same pair — measurable under one definition. A
+    poll with **no** age field (a pre-F1 line) keeps its published flag, so
+    old-schema windows are counted exactly as before. ``None`` means "no
+    derivation available"; the caller falls back to ``stale_flag``.
 ``in_window``
     ``[since, until)`` — the lower bound inclusive, the upper exclusive, so
     adjacent windows never double-count a poll. The nightly analyzer's other
@@ -104,6 +115,20 @@ STATUS_FIELD_RE = re.compile(
 
 #: The field whose presence decides whether a poll enters the rate denominator.
 FIELD_SLOTS_STALE = "slots_stale"
+
+#: The age/ceiling pair the age-derived ``slots_stale`` definition reads
+#: (LP-0MVVXGM54009TOXD). Read through their own regex, like the per-phase
+#: fields, so ``status_fields`` keeps its fixed field set and pre-F1 windows
+#: stay measurable through the unchanged surface.
+SLOTS_AGE_FIELDS = (
+    "slots_snapshot_age_seconds",
+    "slots_max_snapshot_age_seconds",
+)
+
+SLOTS_AGE_FIELD_RE = re.compile(
+    r"\b(?P<key>slots_snapshot_age_seconds|slots_max_snapshot_age_seconds)"
+    r"=(?P<value>[^\s]+)"
+)
 
 #: ``latency_ms`` bands separating a fast fresh poll (< 1 s) from one that
 #: exhausted the ``/slots`` query budget (2.0 s counts / 1.0 s detail) and
@@ -414,6 +439,57 @@ def stale_flag(fields: Mapping[str, str]) -> bool | None:
     if value is None:
         return None
     return value == "true"
+
+
+def slots_age_fields(line: str) -> dict[str, str]:
+    """Return the ``slots_snapshot_age_seconds``/``slots_max_snapshot_age_seconds``
+    pair present on *line* (an empty dict on a pre-F1 line)."""
+    return {
+        match.group("key"): match.group("value")
+        for match in SLOTS_AGE_FIELD_RE.finditer(line)
+    }
+
+
+def _parse_age_seconds(value: str | None) -> float | None:
+    """Parse an age/ceiling field; ``None`` for absent, ``None`` literal, NaN."""
+    if value is None or value == "None":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return parsed
+
+
+def slots_stale_from_age(fields: Mapping[str, str]) -> bool | None:
+    """Derive ``slots_stale`` from the published age/ceiling pair.
+
+    The delivered definition (LP-0MVVXGM54009TOXD): ``slots_stale`` is ``true``
+    **iff** the served snapshot's age exceeds the delivered ceiling, and
+    ``true`` when the poll could not date a snapshot at all. ``age == ceiling``
+    is fresh (the ceiling is the last acceptable age).
+
+    Returns ``None`` — no derivation available — when the line carries neither
+    field (a pre-F1 window) or the ceiling is unusable; the caller then falls
+    back to the line's own ``slots_stale`` flag, so those windows are counted
+    exactly as before. A line that *does* carry
+    ``slots_snapshot_age_seconds=None`` is a post-F1 poll that could not date
+    its snapshot: under the contract that is stale, not "unknown".
+    """
+    if "slots_snapshot_age_seconds" not in fields:
+        return None
+    age_field = fields.get("slots_snapshot_age_seconds")
+    ceiling = _parse_age_seconds(fields.get("slots_max_snapshot_age_seconds"))
+    if ceiling is None:
+        # Nothing to judge the age against (e.g. an F1-era line on a build
+        # without the ceiling). Not an age-derived verdict.
+        return None
+    age = _parse_age_seconds(age_field)
+    if age is None:
+        return True  # undatable snapshot: the contract reports it stale
+    return age > ceiling
 
 
 def tally_stale(flags: Iterable[bool | None]) -> tuple[int, int]:

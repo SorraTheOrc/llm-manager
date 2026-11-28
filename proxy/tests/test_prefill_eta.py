@@ -452,14 +452,31 @@ def test_logged_decision_line_is_parsable(caplog):
     assert "session=s-1" in line
 
 
-def test_inert_decisions_are_not_logged(caplog):
-    """An inert guard made no decision — logging it would flood the log."""
+def test_inert_admit_is_logged(caplog):
+    """An inert admit is logged with ``reason=inert_admit``.
+
+    LP-0MVZF4SU10032OZH AC1: the inert path admitting a dispatch must be
+    established from the log — a later ``prefill_deadline`` eviction of that
+    dispatch is un-attributable otherwise (measured 47 of 126 in 24 h). The
+    verdict stays ``admit`` and the underlying inert reason rides in
+    ``reason_inert=``, so the line can never be read as a refusal and today's
+    queueing behaviour is unchanged.
+    """
     caplog.set_level(logging.INFO, logger="llama-proxy")
     decision = prefill_eta.evaluate_admission(_cfg(), "Qwen3", 100_000, 0.0, "low")
     prefill_eta.record_guard_decision(decision, provider="local-llama")
 
     assert decision.active is False
-    assert not [r for r in caplog.records if r.getMessage().startswith("local_admission_guard")]
+    lines = [
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("local_admission_guard")
+    ]
+    assert len(lines) == 1
+    assert "decision=admit" in lines[0]
+    assert "reason=inert_admit" in lines[0]
+    assert f"reason_inert={decision.reason}" in lines[0]
+    assert "enforced=false" in lines[0]
+    assert "provider=local-llama" in lines[0]
 
 
 # ---------------------------------------------------------------------------

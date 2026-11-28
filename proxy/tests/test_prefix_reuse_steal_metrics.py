@@ -26,11 +26,10 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 import proxy.metrics as metrics
 import proxy.router as router
 import proxy.router_helpers as router_helpers
+import pytest
 
 MODEL = "Qwen3"
 SESSION = "sess-reuse-steal-1"

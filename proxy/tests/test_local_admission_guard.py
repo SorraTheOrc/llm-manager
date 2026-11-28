@@ -384,7 +384,13 @@ async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, capl
 async def test_missing_calibration_keeps_queueing_unchanged(
     mixed_model_config, caplog
 ):
-    """AC3: with no calibration the guard is inert and today's queue applies."""
+    """AC3: with no calibration the guard is inert and today's queue applies.
+
+    LP-0MVZF4SU10032OZH AC1: the inert admit is now LOGGED
+    (``reason=inert_admit reason_inert=insufficient_samples``) so a later
+    ``prefill_deadline`` eviction is attributable from the log, but the
+    verdict and the queueing behaviour are unchanged.
+    """
     caplog.set_level(logging.INFO, logger="llama-proxy")
     concurrency = _MutableConcurrency(1, 1)
     calls: list[str] = []
@@ -427,7 +433,10 @@ async def test_missing_calibration_keeps_queueing_unchanged(
     assert result.status_code == 200
     assert calls == ["local"]
     messages = " ".join(r.getMessage() for r in caplog.records)
-    assert "local_admission_guard" not in messages
+    assert "decision=admit" in messages
+    assert "reason=inert_admit" in messages
+    assert "reason_inert=insufficient_samples" in messages
+    assert "decision=reject" not in messages, "an inert guard must never refuse"
 
 
 @pytest.mark.asyncio
@@ -3501,11 +3510,11 @@ async def test_dead_remote_chain_makes_the_eta_verdict_irrelevant(caplog):
 # refused with its own reason, falls through to the remote tier and never
 # queues, while the boundary and the rollbacks keep the old routing.
 #
-# The queue-entry guard is not exercised here: it is reachable only for a
-# pin-local request (a ``remote-ok`` request falls back as soon as the slots
-# are busy), and a pin-local capacity refusal currently keeps the pin and
-# returns a retryable 429 — filed as a discovered work item rather than pinned
-# as expected behaviour.
+# The queue-entry guard is reachable only for a pin-local request (a
+# ``remote-ok`` request falls back as soon as the slots are busy), and since
+# LP-0MWFN1DIL002TTSP such a capacity refusal keeps its capacity reason and is
+# promoted (served by the remote tier) instead of returning the retryable 429
+# it used to — pinned by the ``test_pin_local_capacity_refusal_*`` rows below.
 # ---------------------------------------------------------------------------
 
 def _capacity_cfg(**server_overrides) -> dict:
@@ -3691,3 +3700,195 @@ async def test_uncalibrated_cold_window_never_refuses_at_admission(
     assert calls == ["local"], "an uncalibrated capacity must not refuse local work"
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "reason=prefill_eta_exceeds_capacity" not in messages
+
+# ---------------------------------------------------------------------------
+# Pin-local capacity refusal keeps the pin / advertises a retryable 429
+# (LP-0MWFN1DIL002TTSP AC1/AC2/AC3)
+#
+# Observed before the fix: with ``X-Local-Preference: local-preferred`` and a
+# prompt whose COLD basis exceeds the deadline token capacity (but is inside
+# the flat cap), the pre-loop promotion adjudged the request ``deferrable``
+# (it never prices the deadline capacity) and the direct/queue guard refusal
+# kept the pin: the fall-through stamped the coarse ``local_admission_guard``
+# on the request and the pin predicate rebuilt the verdict from that coarse
+# token — ``429`` with ``"reason": "local_admission_guard"``, ``"verdict":
+# "deferrable"``, ``"retryable": true`` and ``calls == []``.
+#
+# The fix prices the deadline token capacity (1) in the pre-loop promotion,
+# so the too-large request is promoted exactly like the flat-cap one, and
+# (2) in the single verdict implementation, so a capacity refusal can never be
+# downgraded to ``deferrable`` — the verdict reads the decision's deadline
+# capacity evidence even when a coarse fallback token is recorded. Finally the
+# guard fall-through keeps the specific capacity reason instead of clobbering
+# it with ``local_admission_guard``, so any refusal still produced carries the
+# capacity reason and no retry timer (AC2).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "concurrency", [(0, 1), (1, 1)],
+    ids=["free-slot-direct", "busy-slot-queue"],
+)
+async def test_pin_local_capacity_refusal_is_promoted_not_refused(
+    mixed_model_config, concurrency
+):
+    """AC1: pin-local + a cold basis above ``deadline_capacity_tokens`` is
+    promoted — the local entry is stripped pre-loop and the remote tier serves
+    it — exactly as a flat-cap ``prefill_budget_exceeded`` request is. Both
+    the direct (free-slot) and the queue (busy-slot) paths that used to return
+    the retryable deferrable 429 now serve remotely: ``200``, ``calls ==
+    ["remote"]``, no local-admission refusal body and no retry timer."""
+    _seed_calibration(tokens=40_000, ms_per_token=3.9)
+    config = _capacity_cfg()
+    capacity = _capacity_tokens(config)
+    prompt = capacity * 2
+    assert prompt < 65_536, "must stay inside the same calibration bucket"
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch(
+            "proxy.provider._get_local_concurrency_info",
+            _MutableConcurrency(*concurrency),
+        ),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=prompt, cached_ratio=0.95),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+            "v1/chat/completions",
+            mixed_model_config,
+            config,
+        )
+
+    assert result.status_code == 200, f"got {result.status_code}"
+    assert calls == ["remote"], (
+        "a capacity-exceeding pin-local request must be served by the remote "
+        f"tier, never refused for local capacity; got dispatches={calls}"
+    )
+    assert result.headers.get("X-Local-Route") == "remote"
+    assert result.headers.get("Retry-After") is None, (
+        "waiting cannot help; a promoted request must not advertise a delay"
+    )
+    body = json.loads(result.body)
+    assert body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
+        "promotion must not produce a local-capacity refusal"
+    )
+    assert body.get("verdict") != admission_reserve.CAPACITY_DEFERRABLE
+
+
+@pytest.mark.asyncio
+async def test_capacity_refusal_not_downgraded_by_coarse_fallback_reason(
+    mixed_model_config, caplog
+):
+    """AC2: the pin predicate never rebuilds a capacity refusal as
+    ``deferrable`` from the coarse ``local_admission_guard`` fallback token.
+
+    This reproduces the exact observed condition: the direct guard refused with
+    ``prefill_eta_exceeds_capacity`` (a ``too_large`` decision on the request)
+    and the fall-through then stamped ``local_admission_guard``, which
+    previously masked the capacity reason so the pin stayed and the refusal
+    answered ``deferrable`` with a retry timer."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_calibration(tokens=40_000, ms_per_token=3.9)
+    config = _capacity_cfg()
+    capacity = _capacity_tokens(config)
+    prompt = capacity * 2
+
+    # The guard refusal exactly as ``_prefill_admission_guard`` builds it for
+    # a predicted-warm (unmeasured residency) prompt whose cold basis exceeds
+    # the deadline capacity.
+    decision = prefill_eta.evaluate_admission(
+        config,
+        "Qwen3",
+        prompt,
+        0.95,
+        "low",
+        busy_slots=0,
+        in_flight_prefills=0,
+        residency_measured=False,
+    )
+    assert decision.reason == "prefill_eta_exceeds_capacity"
+    assert decision.capacity_priced_tokens > decision.deadline_capacity_tokens
+
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
+    request._local_admission_decision = decision
+    # The guard fall-through clobbered the request reason with the coarse
+    # token (LP-0MWFN1DIL002TTSP AC2 — this was the masking defect).
+    provider._note_local_fallback_reason(request, "local_admission_guard")
+
+    verdict = provider._local_capacity_verdict_for_request(request)
+    assert verdict.verdict == admission_reserve.CAPACITY_TOO_LARGE, (
+        "the decision's deadline-capacity evidence must win over the coarse "
+        f"umbrella token; got {verdict}"
+    )
+
+    # The pin predicate therefore declines the pin: the request is never
+    # refused for local capacity.
+    assert (
+        provider._local_preference_pins_local(request, "local-preferred")
+        is False
+    ), "a too-large capacity refusal must not hold the pin"
+
+
+@pytest.mark.asyncio
+async def test_capacity_refusal_payload_keeps_reason_and_no_timer():
+    """AC2: a refusal that is still produced (a remote-less chain cannot be
+    promoted) keeps ``reason=prefill_eta_exceeds_capacity``, a ``too_large``
+    verdict and no retry timer — the payload contract the observed 429
+    violated (it answered ``local_admission_guard`` / ``deferrable`` /
+    ``retryable``)."""
+    _seed_calibration(tokens=40_000, ms_per_token=3.9)
+    config = _capacity_cfg()
+    capacity = _capacity_tokens(config)
+    prompt = capacity * 2
+    remote_less_chain = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"}
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+    async def _local(_req, _path):
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch(
+            "proxy.provider._get_local_concurrency_info",
+            _MutableConcurrency(0, 1),
+        ),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=prompt, cached_ratio=0.95),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+            "v1/chat/completions",
+            remote_less_chain,
+            config,
+        )
+
+    body = json.loads(result.body)
+    assert result.status_code == 429, f"got {result.status_code}"
+    assert body.get("reason") == "prefill_eta_exceeds_capacity", (
+        "a capacity refusal must keep its own reason, never the coarse "
+        f"local_admission_guard; got {body.get('reason')!r}"
+    )
+    assert (
+        result.headers.get("X-Local-Fallback-Reason")
+        == "prefill_eta_exceeds_capacity"
+    )
+    assert body.get("retryable") is False
+    assert body.get("retry_after") is None
+    assert result.headers.get("Retry-After") is None, (
+        "waiting cannot help; a capacity refusal must not advertise a delay"
+    )

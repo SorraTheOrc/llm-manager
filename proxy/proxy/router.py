@@ -34,6 +34,45 @@ def _srv():
     return _m
 
 
+def _note_dispatch_outcome(
+    request,
+    session_id,
+    kind,
+    *,
+    endpoint=None,
+    prompt_fp=None,
+):
+    """Emit one ``local_dispatch_outcome`` line (LP-0MWM0CPQN009SHJR).
+
+    ``kind`` is ``"accepted"`` / ``"refused"`` / ``"remote"``; it is
+    resolved to the canonical outcome vocabulary in
+    :mod:`proxy.retry_outcome`. The line records that this client's dispatch
+    was admitted locally, refused locally, or served remotely, so an earlier
+    abort of the same session/prompt can be joined to what followed.
+    Measurement-only — wrapped so it can never raise into a dispatch path and
+    never changes an admission decision, abort policy or threshold (AC4).
+    """
+    try:
+        from proxy import retry_outcome as _retry_outcome
+
+        outcome = {
+            "accepted": _retry_outcome.OUTCOME_LOCAL_ACCEPTED,
+            "refused": _retry_outcome.OUTCOME_LOCAL_REFUSED,
+            "remote": _retry_outcome.OUTCOME_REMOTE,
+        }.get(kind, kind)
+        if prompt_fp is None:
+            prompt_fp = _retry_outcome.request_prompt_fingerprint(request)
+        _retry_outcome.record_dispatch_outcome(
+            _srv(),
+            session_id,
+            prompt_fp,
+            outcome,
+            endpoint=endpoint,
+        )
+    except Exception:
+        pass
+
+
 def _log_local_stream_client_disconnect(srv, session_id, model_name):
     """Log a terminal ``Stream finished: reason=client_disconnect`` line.
 
@@ -208,6 +247,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_per_model_query,
     _local_dispatch_gate,
     _local_dispatch_occupancy_evidence,
+    _mark_local_dispatch_stream_finished,
     _mark_local_dispatch_terminal,
     _normalize_outgoing_headers,
     _note_local_dispatch_release,
@@ -887,6 +927,20 @@ async def _cleanup_after_request(
     await _decrement_active_queries(srv)
     await _decrement_per_model_query(srv, model_name)
     if decrement_local:
+        # LP-0MWNHBFN6000GH2J AC4: a non-streaming local response reaches its
+        # terminal state here, so its dispatch is marked stream-finished
+        # immediately before the credit is claimed and released. The streaming
+        # path has already marked at its terminal chunk (a no-op here thanks to
+        # the per-request guard). A client disconnect is deliberately NOT a
+        # terminal chunk: the record keeps counting for as long as its credit
+        # is held (AC5).
+        if not disconnected:
+            try:
+                await _mark_local_dispatch_stream_finished(
+                    srv, session_id, endpoint=backend, request=request
+                )
+            except Exception:
+                pass
         await _decrement_local_active_queries(
             srv,
             session_key=session_id,
@@ -1263,6 +1317,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     # which prompt failed.
     _client_prompt_fingerprint = _prefill_thrash_fingerprint(body_json)
 
+    # LP-0MWM0CPQN009SHJR: the stable prompt identity for the retry-outcome
+    # join, captured from the client's ORIGINAL body before ``_handle_session``
+    # rewrites ``messages`` to a delta. Stamped on the request so the dispatch
+    # record, the eviction line and every ``local_dispatch_outcome`` line carry
+    # one value; measurement-only and never raises.
+    _prompt_fp = None
+    try:
+        from proxy import retry_outcome as _retry_outcome
+
+        _prompt_fp = _retry_outcome.stamp_prompt_fingerprint(request, body_json)
+    except Exception:
+        _prompt_fp = None
+
     # Session handling – incremental prompt ingestion
     session_result = await _handle_session(
         srv, body_json, server_config, request.headers
@@ -1571,6 +1638,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
         # No remote providers or remote attempts failed — reject due to concurrency
         _record_backend_signal("concurrency_rejects")
+        # LP-0MWM0CPQN009SHJR: record the refusal as the caller's next-dispatch
+        # outcome so an earlier abort of this session can be joined to it.
+        _note_dispatch_outcome(request, session_id, "refused", endpoint=endpoint)
         srv.logger.warning(
             "concurrency_reject active=%s max=%s path=%s",
             cur_active,
@@ -1621,6 +1691,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         )
     )
     if _local_gate_refused:
+        # LP-0MWM0CPQN009SHJR: the gate refused local for this request.
+        _note_dispatch_outcome(request, session_id, "refused", endpoint=endpoint)
         try:
             record_http_error(
                 "v1/chat/completions", "5xx", _local_gate_reason
@@ -1674,6 +1746,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             request=request,
         )
         if not acquired:
+            # LP-0MWM0CPQN009SHJR: the local lease/occupancy gate refused this
+            # dispatch (cold start or no slots) — the caller was not admitted
+            # locally on this attempt. Recorded as a next-dispatch outcome so
+            # an earlier abort of this session can be joined to it (AC1/AC2).
+            _note_dispatch_outcome(
+                request, session_id, "refused", endpoint=endpoint
+            )
             _cold = cold_start.is_cold(server_config)
             # AC2/AC3 (LP-0MW0KZTWC004HXQ5): a refusal must be diagnosable from
             # the log alone. The evidence snapshot names every input the gate
@@ -1786,6 +1865,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
     )
     if slot_response is not None:
+        # LP-0MWM0CPQN009SHJR: the slot-availability probe refused the dispatch.
+        _note_dispatch_outcome(request, session_id, "refused", endpoint=endpoint)
         return slot_response
 
     # Mark active query
@@ -1843,6 +1924,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         request._local_dispatch_started_at = _dispatch_start
     except Exception:
         pass
+    # LP-0MWM0CPQN009SHJR: the dispatch is admitted locally — record it as the
+    # caller's next-dispatch outcome. This fires for explicit and anonymous
+    # sessions alike (both record-create paths are above). An abort of THIS
+    # dispatch is logged separately by the eviction sink; an in-request retry
+    # re-enters here and emits its own line, which is exactly the "next
+    # attempt" the join needs.
+    _note_dispatch_outcome(request, session_id, "accepted", endpoint=endpoint, prompt_fp=_prompt_fp)
 
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
@@ -2751,6 +2839,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         collected_content: list[str] = []
                         saw_done = False
                         saw_finish = False
+                        # LP-0MWNHBFN6000GH2J: the dispatch's stream reaches its
+                        # terminal chunk at most once; the per-request guard in
+                        # ``_mark_local_dispatch_stream_finished`` makes a
+                        # repeated detection a no-op too.
+                        _stream_finished_marked = False
                         # Client disconnect detection (LP-0MQTHP828000JYM6)
                         disconnected = False
                         _disconnect_check_count = 0
@@ -3175,6 +3268,32 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 except Exception:
                                     pass
 
+                                # Terminal-chunk finished marking
+                                # (LP-0MWNHBFN6000GH2J AC1): the moment the
+                                # response's terminal chunk is seen, this
+                                # dispatch's credit token leaves the record's
+                                # ``streaming_dispatch_tokens`` set, so the
+                                # routing gate can tell a finished-but-not-yet-
+                                # released turn from genuinely in-flight work.
+                                # The credit itself is untouched — teardown
+                                # still claims and releases it (AC3) — and a
+                                # marking failure is logged and leaves the
+                                # record counting (AC6).
+                                if (
+                                    (saw_done or saw_finish)
+                                    and not _stream_finished_marked
+                                ):
+                                    _stream_finished_marked = True
+                                    try:
+                                        await _mark_local_dispatch_stream_finished(
+                                            srv,
+                                            session_id,
+                                            endpoint=endpoint,
+                                            request=request,
+                                        )
+                                    except Exception:
+                                        pass
+
                                 if _has_actual_data:
                                     # Dispatch→first-byte capture: first actual data chunk marks the
                                     # generating phase and gives the distribution-relevant latency
@@ -3231,10 +3350,49 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                 # joined heuristically from ``routing_check`` lines. Both values are
                                                 # already computed above in this function; appending them keeps
                                                 # every existing log consumer (and regex) byte-compatible.
+                                                #
+                                                # LP-0MWRWBJPP001Q5JX (path (c) of
+                                                # docs/dev/prompt-cache-tuning.md): feed the
+                                                # priced calibration window from the dispatch's
+                                                # MEASURED prompt_progress reuse when one exists,
+                                                # so a cross-session cache hit is recorded as a
+                                                # hit instead of a whole-prompt cold prefill.
+                                                # Falls back to the routing prediction
+                                                # byte-for-byte whenever no usable measurement
+                                                # exists, and never raises on the stream path.
+                                                # The resolved ratio/basis are also logged on the
+                                                # dispatch_first_byte_ms line so the window's
+                                                # composition is attributable.
+                                                _window_measured = None
+                                                _window_ratio = _cached_ratio
+                                                _window_ratio_basis = "predicted"
+                                                try:
+                                                    from proxy.prefill_eta import (
+                                                        resolve_window_ratio,
+                                                    )
+
+                                                    _window_measured = (
+                                                        _measured_prefill.get_measured_prefill(
+                                                            model_name, session_id
+                                                        )
+                                                    )
+                                                    _window_ratio, _window_ratio_basis = (
+                                                        resolve_window_ratio(
+                                                            _cached_ratio,
+                                                            _window_measured.measured_cached_ratio
+                                                            if _window_measured is not None
+                                                            else None,
+                                                        )
+                                                    )
+                                                except Exception:
+                                                    _window_measured = None
+                                                    _window_ratio = _cached_ratio
+                                                    _window_ratio_basis = "predicted"
                                                 srv.logger.info(
                                                     "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f "
                                                     "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s "
-                                                    "priority=%s estimated_tokens=%d%s",
+                                                    "priority=%s estimated_tokens=%d "
+                                                    "window_cached_ratio=%.4f window_ratio_basis=%s%s",
                                                     _first_byte_total_ms,
                                                     _first_byte_service_ms,
                                                     _cache_state,
@@ -3244,6 +3402,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     model_name or "unknown",
                                                     _priority or "unknown",
                                                     int(_estimated_tokens or 0),
+                                                    _window_ratio,
+                                                    _window_ratio_basis,
                                                     turn_field(),
                                                 )
                                                 # Feed the prefill-ETA calibration window
@@ -3281,9 +3441,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     record_dispatch_sample(
                                                         model_name,
                                                         _estimated_tokens,
-                                                        _cached_ratio,
+                                                        _window_ratio,
                                                         _first_byte_service_ms,
                                                         contended=_is_contended,
+                                                        ratio_basis=_window_ratio_basis,
                                                     )
                                                     # Q410 AC1 / Q2(option a):
                                                     # feed the genuinely-cold
@@ -3302,22 +3463,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     # observed) simply records
                                                     # nothing.
                                                     try:
-                                                        from proxy.measured_prefill import (
-                                                            get_measured_prefill,
-                                                        )
                                                         from proxy.prefill_eta import (
                                                             record_cold_measured_sample,
                                                         )
 
-                                                        _cold_measured = get_measured_prefill(
-                                                            model_name, session_id
-                                                        )
-                                                        if _cold_measured is not None:
+                                                        if _window_measured is not None:
                                                             record_cold_measured_sample(
                                                                 model_name,
                                                                 _estimated_tokens,
-                                                                _cold_measured.measured_cached_ratio,
-                                                                _cold_measured.processed,
+                                                                _window_measured.measured_cached_ratio,
+                                                                _window_measured.processed,
                                                                 _first_byte_service_ms,
                                                             )
                                                     except Exception:
@@ -3587,6 +3742,36 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             # Drop any trailing partial so the synthetic error is
                             # emitted as its own event (LP-0MUOBUPBC002GYTL).
                             _reframer.discard_pending()
+                            # Terminal-chunk finished marking on the error path
+                            # (LP-0MWOZFF7T001YA87 AC1): the synthesised
+                            # ``finish_reason=error`` + ``[DONE]`` pair emitted
+                            # below *is* this dispatch's terminal chunk, so the
+                            # credit token leaves ``streaming_dispatch_tokens``
+                            # here exactly as it does for an upstream terminal
+                            # chunk above. Without this the marker survived
+                            # until request teardown — which the slot save in
+                            # this generator's ``finally`` block delays by
+                            # ~10-25 s — so the routing gate kept counting the
+                            # session's own record and exiled its retry with
+                            # ``local_concurrency_limit``.
+                            #
+                            # Marking only removes the token from the marker
+                            # set: ``active`` and ``dispatch_credits`` are
+                            # untouched, so teardown still claims and releases
+                            # exactly its own credit. A client disconnect never
+                            # reaches this branch (``GeneratorExit`` /
+                            # ``CancelledError`` have their own handlers), so a
+                            # disconnected-but-credit-holding stream keeps
+                            # counting.
+                            try:
+                                await _mark_local_dispatch_stream_finished(
+                                    srv,
+                                    session_id,
+                                    endpoint=endpoint,
+                                    request=request,
+                                )
+                            except Exception:
+                                pass
                             # Synthesize a final SSE event so the client receives a
                             # proper finish_reason marker even on stream error.
                             final_obj = _build_stream_error_event(
