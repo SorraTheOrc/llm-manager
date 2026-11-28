@@ -1077,7 +1077,9 @@ tightening today would start life *failing* at 31.6 % with nothing gained.
 **Revisit trigger** (recorded so the question cannot drift): set a freshness SLO
 from the post-fix distribution only when **both** hold — (i) undatable polls
 below **0.5 %** over a 24 h window (LP-0MWRXFO0I005UBVM closed), and (ii) the
-nightly age series (LP-0MWRXGPO3004GXD7) has **≥ 14 days** of data. A threshold
+nightly age series (LP-0MWRXGPO3004GXD7) has **≥ 14 days** of data. **Clause (i)
+is satisfied as of the 2026-11-26→27 re-measurement (0.0368 %); clause (ii) is
+not assessed here**, so no threshold moves until the producer rules on it. A threshold
 that moves must ship the relabelling test (LP-0MWRXH13L000UXSA AC3), and every
 pre/post figure is labelled by the definition that produced it. Until then,
 quote `slots_stale` only with its definition and watch the distribution above
@@ -1103,4 +1105,29 @@ python3 scripts/slots_snapshot_age_distribution.py \
 Full record: [`docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md`](../../docs/dev/slots-stale-postfix-window-2026-11-18-to-19.md)
 (+ `.json`); the staleness contract, reason vocabulary and ceiling are stated
 for operators in [`docs/local-slots-observability.md`](../../docs/local-slots-observability.md).
+
+#### Re-measured after the joiner-age fix (LP-0MWSD6D24002J0K7)
+
+Second 24 h window, `2026-11-26T10:18:00Z → 2026-11-27T10:18:00Z`, restart-free
+(0 in-window startup markers), 100 % log coverage, loaded build `989358278`
+(carries `aa6115bcc` and `5ef9b5ebb`). The **counts-cache provenance gap is
+gone**: the undatable share fell to a handful of refresh timeouts.
+
+| Reading | 2026-11-18 → 19 | 2026-11-26 → 27 |
+|---|---|---|
+| Status polls | 12,450 | **16,296** |
+| `slots_stale` at the 300 s ceiling | 4.88 % (608) | **0.0368 % (6)** |
+| — over the ceiling | 51 (`detail_cache`) | **0** |
+| — no datable snapshot | 557 (4.47 %, `counts_cache`) | **6 (0.0368 %, `slots_snapshot_source=none`, refresh timeout)** |
+| Snapshot age, datable polls | p50 0.73 s · p90 35.14 s · max 424.20 s | p50 **0.74 s** · p90 **38.51 s** · max **295.44 s** |
+| Tightened reading, age > 2 s | 31.60 % of datable | **34.49 %** of datable (82.1 % `prefill_bound`) |
+| `saturated` without live local work | 11, 11/11 attributed | **4, 4/4 attributed** |
+
+Agreement check: `slots_stale` **6 == over-age 0 + undatable 6**, and
+`slots_snapshot_age_distribution.py` independently reports the same 6.
+Full record:
+[`docs/dev/slots-stale-postfix-window-2026-11-26-to-27.md`](../../docs/dev/slots-stale-postfix-window-2026-11-26-to-27.md)
+(+ `.json`). The freshness distribution is **unchanged in shape** (the
+prefill-bound tail still dominates), so the two-tier framing below still stands:
+this fix removed the *undatable* class, not the backend-driven staleness.
 
